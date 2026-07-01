@@ -1,0 +1,8 @@
+packages:
+  - packages/*
+  - apps/*
+allowBuilds:
+  esbuild: true
+# Supply-chain: don't install versions published less than 3 days ago
+# (compromised-maintainer window). See CLAUDE.md "Security posture".
+minimumReleaseAge: 4320
