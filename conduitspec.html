@@ -1,0 +1,872 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conduit — Technical Specification</title>
+<style>
+  :root{
+    --bg:#f7f5ef; --bg-2:#fefdfb; --panel:#ffffff; --ink:#16161a; --ink-soft:#3a3a42;
+    --muted:#71717a; --faint:#a1a1aa;
+    --accent:#5b4bff; --accent-2:#8b7bff; --accent-soft:rgba(91,75,255,.10);
+    --accent-ink:#4a3ce0;
+    --line:#e7e4db; --line-soft:#efece4;
+    --code-bg:#f3f1ea; --code-ink:#2a2a2a; --code-border:#e7e4db;
+    --ok:#0e9f6e; --ok-soft:rgba(14,159,110,.10);
+    --warn:#d97706; --warn-soft:rgba(217,119,6,.10);
+    --danger:#e02424; --danger-soft:rgba(224,36,36,.09);
+    --shadow:0 1px 2px rgba(20,20,30,.04),0 8px 24px -12px rgba(20,20,30,.12);
+    --shadow-sm:0 1px 2px rgba(20,20,30,.05);
+    --maxw:880px;
+  }
+  @media (prefers-color-scheme: dark){
+    :root{
+      --bg:#131316; --bg-2:#17171b; --panel:#1c1c22; --ink:#ededf0; --ink-soft:#c7c7cf;
+      --muted:#9a9aa3; --faint:#6c6c76;
+      --accent:#9d92ff; --accent-2:#b3a9ff; --accent-soft:rgba(157,146,255,.14);
+      --accent-ink:#b8aeff;
+      --line:#2a2a32; --line-soft:#23232a;
+      --code-bg:#202027; --code-ink:#e4e4e8; --code-border:#2e2e37;
+      --ok:#34d399; --ok-soft:rgba(52,211,153,.12);
+      --warn:#fbbf24; --warn-soft:rgba(251,191,36,.12);
+      --danger:#f87171; --danger-soft:rgba(248,113,113,.12);
+      --shadow:0 1px 2px rgba(0,0,0,.4),0 12px 32px -14px rgba(0,0,0,.6);
+      --shadow-sm:0 1px 2px rgba(0,0,0,.35);
+    }
+  }
+  *{box-sizing:border-box}
+  html{scroll-behavior:smooth}
+  body{margin:0;background:var(--bg);color:var(--ink);
+    -webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility;
+    font:16px/1.7 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;}
+
+  .wrap{display:grid;grid-template-columns:268px minmax(0,1fr);gap:0;max-width:1280px;margin:0 auto;}
+
+  /* ---------- Sidebar ---------- */
+  nav{position:sticky;top:0;align-self:start;height:100vh;overflow-y:auto;
+    padding:30px 16px 40px;border-right:1px solid var(--line);font-size:13.5px;
+    background:linear-gradient(180deg,var(--bg-2),var(--bg));
+    scrollbar-width:thin;scrollbar-color:var(--line) transparent;}
+  nav::-webkit-scrollbar{width:8px}
+  nav::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+  nav .brand{font-weight:800;font-size:20px;letter-spacing:-.03em;margin-bottom:2px;
+    display:flex;align-items:center;gap:2px;}
+  nav .brand .dot{color:var(--accent);
+    text-shadow:0 0 18px var(--accent);}
+  nav .sub{color:var(--muted);font-size:11.5px;margin-bottom:22px;
+    padding-bottom:16px;border-bottom:1px solid var(--line-soft);
+    text-transform:uppercase;letter-spacing:.06em;font-weight:600;}
+  nav a{display:block;color:var(--muted);text-decoration:none;padding:5px 10px;
+    border-radius:7px;transition:color .15s ease,background .15s ease;
+    border-left:2px solid transparent;line-height:1.4;}
+  nav a:hover{color:var(--ink);background:var(--accent-soft);}
+  nav a.nav-h2{font-weight:600;margin-top:3px;}
+  nav a.nav-h3{padding-left:24px;font-size:12.5px;color:var(--faint);}
+  nav a.nav-h3:hover{color:var(--ink);}
+  nav a.active{color:var(--accent-ink);background:var(--accent-soft);
+    border-left-color:var(--accent);font-weight:700;}
+
+  /* ---------- Main column ---------- */
+  main{padding:64px 60px 140px;max-width:var(--maxw);}
+  main>*{animation:none}
+
+  h1{font-size:40px;line-height:1.1;letter-spacing:-.035em;margin:0 0 8px;
+    font-weight:820;
+    background:linear-gradient(120deg,var(--ink),var(--accent-ink));
+    -webkit-background-clip:text;background-clip:text;color:transparent;}
+  h2{font-size:26px;letter-spacing:-.025em;margin:60px 0 16px;
+    padding-top:34px;border-top:1px solid var(--line);font-weight:760;
+    line-height:1.25;scroll-margin-top:24px;}
+  h2 code{font-size:.78em}
+  h3{font-size:18.5px;margin:34px 0 10px;font-weight:680;letter-spacing:-.01em;
+    color:var(--ink);scroll-margin-top:24px;}
+  h4{font-size:14px;margin:22px 0 6px;color:var(--muted);font-weight:700;
+    text-transform:uppercase;letter-spacing:.05em;}
+  p,li{color:var(--ink-soft);}
+  p{margin:12px 0}
+  strong{color:var(--ink);font-weight:680}
+  em{color:var(--ink)}
+  li{margin:5px 0}
+  ul,ol{padding-left:22px}
+  li::marker{color:var(--accent)}
+  a{color:var(--accent-ink);text-decoration:none;
+    border-bottom:1px solid var(--accent-soft);transition:border-color .15s ease;}
+  a:hover{border-bottom-color:var(--accent);}
+
+  /* ---------- Callouts ---------- */
+  blockquote{margin:22px 0;padding:16px 22px;
+    border-left:3px solid var(--accent);
+    background:linear-gradient(90deg,var(--accent-soft),transparent 80%);
+    border-radius:0 10px 10px 0;color:var(--ink);box-shadow:var(--shadow-sm);}
+  blockquote p{margin:6px 0;color:var(--ink)}
+
+  /* ---------- Inline + block code ---------- */
+  code{background:var(--code-bg);color:var(--accent-ink);padding:.14em .42em;
+    border-radius:5px;border:1px solid var(--code-border);
+    font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;}
+  pre{position:relative;background:var(--code-bg);border:1px solid var(--code-border);
+    border-radius:12px;padding:18px 20px;overflow:auto;margin:18px 0;
+    box-shadow:var(--shadow-sm);scrollbar-width:thin;}
+  pre::before{content:"";position:absolute;top:0;left:0;right:0;height:3px;
+    border-radius:12px 12px 0 0;
+    background:linear-gradient(90deg,var(--accent),var(--accent-2));opacity:.7;}
+  pre code{background:none;border:none;color:var(--code-ink);padding:0;font-size:12.5px;
+    line-height:1.6;}
+  pre::-webkit-scrollbar{height:9px}
+  pre::-webkit-scrollbar-thumb{background:var(--line);border-radius:8px}
+
+  /* ---------- Tables ---------- */
+  table{border-collapse:separate;border-spacing:0;width:100%;margin:20px 0;font-size:14px;
+    display:block;overflow-x:auto;border:1px solid var(--line);border-radius:12px;
+    box-shadow:var(--shadow-sm);}
+  th,td{border-bottom:1px solid var(--line-soft);
+    border-right:1px solid var(--line-soft);padding:10px 14px;
+    text-align:left;vertical-align:top;}
+  tr td:last-child,tr th:last-child{border-right:none}
+  tbody tr:last-child td{border-bottom:none}
+  th{background:var(--code-bg);font-weight:700;color:var(--ink);
+    position:sticky;top:0;letter-spacing:-.01em;}
+  tbody tr:nth-child(even){background:var(--accent-soft);}
+  tbody tr:hover{background:var(--accent-soft);}
+
+  /* ---------- Misc ---------- */
+  hr{border:none;height:1px;margin:48px 0;
+    background:linear-gradient(90deg,transparent,var(--line),transparent);}
+  .meta-card{background:var(--panel);border:1px solid var(--line);border-radius:14px;
+    padding:20px 24px;margin:20px 0 8px;box-shadow:var(--shadow);}
+  .tag{display:inline-block;
+    background:linear-gradient(120deg,var(--accent),var(--accent-2));
+    color:#fff;font-size:11px;font-weight:700;padding:3px 10px;border-radius:999px;
+    letter-spacing:.03em;vertical-align:middle;box-shadow:0 2px 8px -2px var(--accent);}
+
+  @media (max-width:860px){
+    .wrap{grid-template-columns:1fr;} nav{display:none;} main{padding:36px 22px 90px;}
+    h1{font-size:32px}
+  }
+  @media (prefers-reduced-motion:reduce){
+    html{scroll-behavior:auto} *{transition:none!important}
+  }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <nav>
+    <div class="brand">Conduit<span class="dot">.</span></div>
+    <div class="sub">Technical Spec · v0.1</div>
+    <a class="nav-h2" href="#1-overview">1. Overview</a>
+<a class="nav-h3" href="#1-1-one-line-definition">1.1 One-line definition</a>
+<a class="nav-h3" href="#1-2-thesis">1.2 Thesis</a>
+<a class="nav-h3" href="#1-3-what-conduit-adds-beyond-the-prior-art">1.3 What Conduit adds beyond the prior art</a>
+<a class="nav-h2" href="#2-goals-amp-non-goals">2. Goals &amp; Non-Goals</a>
+<a class="nav-h3" href="#2-1-goals">2.1 Goals</a>
+<a class="nav-h3" href="#2-2-non-goals-v1">2.2 Non-Goals (v1)</a>
+<a class="nav-h2" href="#3-terminology-amp-data-model">3. Terminology &amp; Data Model</a>
+<a class="nav-h2" href="#4-core-concepts-the-two-pillars">4. Core Concepts (the two pillars)</a>
+<a class="nav-h3" href="#4-1-one-tool-shape">4.1 One tool shape</a>
+<a class="nav-h3" href="#4-2-progressive-disclosure-quot-thousands-of-tools-no-bloat-quot">4.2 Progressive disclosure (&quot;thousands of tools, no bloat&quot;)</a>
+<a class="nav-h2" href="#5-architecture">5. Architecture</a>
+<a class="nav-h3" href="#5-1-topology-mcp-proxy">5.1 Topology — MCP Proxy</a>
+<a class="nav-h3" href="#5-2-components-single-process-single-binary">5.2 Components (single process, single binary)</a>
+<a class="nav-h3" href="#5-3-per-call-pipeline-server-side-the-heart">5.3 Per-call pipeline (server-side, the heart)</a>
+<a class="nav-h3" href="#5-4-unifying-code-mode-and-mcp-proxy-views">5.4 Unifying code-mode and MCP-proxy views</a>
+<a class="nav-h3" href="#5-5-pause-resume-deterministic-replay">5.5 Pause/resume — deterministic replay</a>
+<a class="nav-h2" href="#6-the-execute-tool-amp-code-mode-workflow">6. The execute tool &amp; code-mode workflow</a>
+<a class="nav-h2" href="#7-ingestion-amp-normalization">7. Ingestion &amp; normalization</a>
+<a class="nav-h2" href="#8-catalog-amp-progressive-disclosure">8. Catalog &amp; progressive disclosure</a>
+<a class="nav-h2" href="#9-connections-credentials-amp-the-security-boundary">9. Connections, credentials &amp; the security boundary</a>
+<a class="nav-h3" href="#9-1-connection-model">9.1 Connection model</a>
+<a class="nav-h3" href="#9-2-credential-boundary-invariant-load-bearing">9.2 Credential-boundary invariant (load-bearing)</a>
+<a class="nav-h3" href="#9-3-network-ssrf-control">9.3 Network / SSRF control</a>
+<a class="nav-h2" href="#10-policy-engine">10. Policy engine</a>
+<a class="nav-h3" href="#10-1-riskclass-derived-from-imported-semantics">10.1 riskClass (derived from imported semantics)</a>
+<a class="nav-h3" href="#10-2-three-policy-states-per-tool">10.2 Three policy states (per tool)</a>
+<a class="nav-h3" href="#10-3-input-aware-rules-conduit-differentiator">10.3 Input-aware rules (CONDUIT DIFFERENTIATOR)</a>
+<a class="nav-h2" href="#11-observability-trace-conduit-differentiator-shipped-not-quot-coming-soon-quot">11. Observability / Trace (CONDUIT DIFFERENTIATOR — shipped, not &quot;coming soon&quot;)</a>
+<a class="nav-h2" href="#12-surfaces-all-over-one-core">12. Surfaces (all over one core)</a>
+<a class="nav-h2" href="#13-deployment-modes-full-parity">13. Deployment modes (full parity)</a>
+<a class="nav-h3" href="#13-1-cli-local">13.1 CLI / local</a>
+<a class="nav-h3" href="#13-2-desktop-app">13.2 Desktop app</a>
+<a class="nav-h3" href="#13-3-cloud-hosted-commercial">13.3 Cloud (hosted, commercial)</a>
+<a class="nav-h3" href="#13-4-self-host-docker">13.4 Self-host — Docker</a>
+<a class="nav-h3" href="#13-5-self-host-cloudflare-worker">13.5 Self-host — Cloudflare Worker</a>
+<a class="nav-h2" href="#14-onboarding">14. Onboarding</a>
+<a class="nav-h2" href="#15-public-api-cli-surface-initial">15. Public API / CLI surface (initial)</a>
+<a class="nav-h2" href="#16-security-model-consolidated">16. Security model (consolidated)</a>
+<a class="nav-h2" href="#17-phased-build-plan-parity-sequenced">17. Phased build plan (parity, sequenced)</a>
+<a class="nav-h2" href="#18-open-questions-decisions-to-lock">18. Open questions / decisions to lock</a>
+<a class="nav-h2" href="#19-branding-naming">19. Branding / naming</a>
+<a class="nav-h2" href="#20-tech-stack-locked-for-phase-0">20. Tech stack (locked for Phase 0)</a>
+  </nav>
+  <main>
+    <h1 id="conduit-technical-specification-v0-1-draft">Conduit — Technical Specification (v0.1)</h1>
+<p><strong>Product:</strong> Conduit — the open-source integration layer for AI agents.
+<strong>Domain:</strong> useconduithq.com · <strong>npm scope:</strong> <code>@conduithq/*</code> · <strong>CLI binary:</strong> <code>conduit</code>
+<strong>License:</strong> MIT (open-core; hosted Cloud is the commercial layer)
+<strong>Status:</strong> For review.</p>
+<hr>
+<h2 id="1-overview">1. Overview</h2>
+<h3 id="1-1-one-line-definition">1.1 One-line definition</h3>
+<p>Conduit is the open-source integration layer for AI agents: <strong>one catalog for every
+tool, shared across every agent you use.</strong> Configure each integration once (MCP servers,
+OpenAPI specs, GraphQL endpoints) with authentication and per-tool policies, then use that
+same catalog from any MCP-compatible agent.</p>
+<h3 id="1-2-thesis">1.2 Thesis</h3>
+<blockquote>
+<p>Your agent should be able to reach your company&#39;s resources in a way that isn&#39;t scary.
+Most setups force a choice between <strong>locked-down-and-useless</strong> or <strong>wide-open-and-risky</strong>.
+Conduit dissolves that dichotomy: once a tool is in <strong>one shape</strong> (a name + two schemas)
+and every call flows through <strong>one gateway</strong>, the <strong>same guardrails apply everywhere</strong>.
+<strong>The whole idea: make the safe path the easy path.</strong></p>
+</blockquote>
+<h3 id="1-3-what-conduit-adds-beyond-the-prior-art">1.3 What Conduit adds beyond the prior art</h3>
+<ol>
+<li><strong>Observability / Trace shipped as first-class</strong> (not &quot;coming soon&quot;): every run and tool
+call is recorded, inspectable, and auditable after the fact, on day one.</li>
+<li><strong>Input-aware policy engine</strong>: beyond Allow / Require-approval / Block per tool, policies
+can branch on the <em>actual argument values</em> of a call (e.g., auto-approve <code>refund</code> under
+$50, require approval at or above; allow <code>sendEmail</code> only to internal domains).</li>
+</ol>
+<p>Everything else is a faithful re-implementation of the proven core.</p>
+<hr>
+<h2 id="2-goals-amp-non-goals">2. Goals &amp; Non-Goals</h2>
+<h3 id="2-1-goals">2.1 Goals</h3>
+<ul>
+<li>A single MCP endpoint in front of all integrations; connect once, every agent gets the
+same catalog with shared auth and policies.</li>
+<li>Normalize <strong>MCP / OpenAPI / GraphQL / custom JS</strong> tools into one uniform shape.</li>
+<li><strong>Progressive disclosure</strong>: show the model a single <code>execute</code> tool; load a tool&#39;s schema
+only when code actually calls it, so the prompt never balloons.</li>
+<li><strong>Code-mode execution</strong>: the model writes TypeScript that runs in an isolated sandbox.</li>
+<li><strong>Credentials never reach the agent or model.</strong></li>
+<li><strong>Per-tool policies</strong> with spec-derived defaults; auto-run safe, pull a human in for the rest.</li>
+<li><strong>Full surface parity</strong>: MCP server, CLI, desktop app, programmatic SDK; same core.</li>
+<li><strong>Full deployment parity</strong>: CLI/local, desktop, hosted Cloud, self-host (Docker + Cloudflare).</li>
+<li>&quot;<strong>Same code paths, different deployment.</strong>&quot; No behavioral fork between local and cloud.</li>
+</ul>
+<h3 id="2-2-non-goals-v1">2.2 Non-Goals (v1)</h3>
+<ul>
+<li>Not a general agent framework / orchestrator (it&#39;s the integration layer beneath one).</li>
+<li>Not a model provider or prompt framework.</li>
+<li>Not a replacement for the upstream services — it proxies them.</li>
+<li>No multi-tenant SaaS beyond what Cloud requires (self-host is single-tenant).</li>
+</ul>
+<hr>
+<h2 id="3-terminology-amp-data-model">3. Terminology &amp; Data Model</h2>
+<p>The whole product rests on a small, exact vocabulary.</p>
+<ul>
+<li><strong>Source</strong> — a description of available tools: an MCP server URL, an OpenAPI spec, or a
+GraphQL endpoint (+ custom JS plugin). The raw input to ingestion.</li>
+<li><strong>Integration</strong> — something Conduit connects to, <em>defined by</em> a Source. It describes the
+<strong>catalog of tools</strong>. On its own it is <strong>not</strong> live or authenticated.</li>
+<li><strong>Connection</strong> — a <strong>configured instance</strong> of an Integration. One Integration may have
+<strong>many</strong> Connections (e.g., the same API authenticated for two accounts). A Connection
+<strong>does not have to be authenticated</strong> (public APIs / public MCP servers need no creds).</li>
+<li><strong>Tool</strong> — one callable operation in the catalog, normalized to <strong>{ name, inputSchema,
+outputSchema, riskClass, source-semantics }</strong>. Addressed via a <strong>namespace</strong> (e.g.
+<code>github.issues.create</code>).</li>
+<li><strong>Policy</strong> — per-tool control: <strong>Allow / Require approval / Block</strong>, seeded from a
+spec-derived default, tunable anytime, extended with <strong>input-aware rules</strong> (§10).</li>
+<li><strong>Execution</strong> — one invocation of the <code>execute</code> tool: model-written code running in the
+sandbox, producing tool calls. Executions can <strong>pause</strong> (for auth or approval) and
+<strong>resume</strong> by id (<code>exec_...</code>).</li>
+<li><strong>Connection prefix</strong> — addressing scheme <code>service.&lt;org-slug&gt;.&lt;env&gt;</code>, where
+<code>&lt;org-slug&gt;</code> is the org slug (single org per instance; <code>CONDUIT_ORG_SLUG</code>, §13) and
+<code>&lt;env&gt;</code> selects the account/environment. Examples below use <code>org</code> as an illustrative slug
+(e.g. <code>github.org.main</code> = Production GitHub).</li>
+</ul>
+<p><strong>Relational shape:</strong></p>
+<pre><code>Source ──defines──&gt; Integration ──has many──&gt; Connection(s)
+                         │
+                         └──contains──&gt; Tool(s) ──governed by──&gt; Policy
+Execution ──makes──&gt; Tool calls ──recorded as──&gt; Trace events
+</code></pre>
+<hr>
+<h2 id="4-core-concepts-the-two-pillars">4. Core Concepts (the two pillars)</h2>
+<h3 id="4-1-one-tool-shape">4.1 One tool shape</h3>
+<p>Wiring tools to agents is fiddly, per-client, and easy to get wrong. Conduit makes every
+tool, from any protocol, look the <strong>same</strong>: <strong>one name, one input schema, one output
+schema</strong>, so any agent can call any of them the same way. MCP, OpenAPI, GraphQL, or a
+custom integration all become <code>{ name, inputSchema, outputSchema }</code> under the hood.</p>
+<p><strong>Consequence:</strong> because tools share one shape, the <strong>calling surface is interchangeable</strong> —
+MCP clients, the CLI, and a drop-in SDK client are all clients of the same core; adding a
+new entry point requires <strong>zero</strong> changes to tools, schemas, or policies.</p>
+<h3 id="4-2-progressive-disclosure-quot-thousands-of-tools-no-bloat-quot">4.2 Progressive disclosure (&quot;thousands of tools, no bloat&quot;)</h3>
+<p>Connect everything and Conduit still shows the model a <strong>single tool</strong> (<code>execute</code>). It
+<strong>searches the catalog</strong> and loads a tool&#39;s schema <strong>only when the code actually calls it</strong>,
+so the prompt never balloons.</p>
+<p><strong>Target metric (the demo):</strong> a representative catalog of ~1,600 tools across GitHub/Stripe/
+Jira/Sentry costs ~278,800 tokens if injected directly, vs. <strong>1 tool / ~1,044 tokens</strong> with
+Conduit. The interactive before/after token comparison is a first-class marketing artifact.</p>
+<hr>
+<h2 id="5-architecture">5. Architecture</h2>
+<h3 id="5-1-topology-mcp-proxy">5.1 Topology — MCP Proxy</h3>
+<p>Conduit is <strong>one MCP endpoint in front of all integrations.</strong> Agents connect <em>in</em> (speak
+MCP to Conduit); Conduit connects <em>out</em> to integrations and <strong>re-exposes them as one
+catalog.</strong> Every tool call passes through the proxy, <strong>which is where auth and policy live.</strong></p>
+<pre><code>   Claude Code ┐                          ┌─ Sentry  (OpenAPI)
+   Cursor      ┤                          ├─ GitHub  (GraphQL)
+   Codex       ┤──MCP──&gt; [ CONDUIT ] ──out─┼─ Linear  (MCP)
+   ChatGPT     ┤        one endpoint       ├─ Stripe  (OpenAPI)
+   your SDK    ┘        one catalog        └─ custom JS plugins
+</code></pre>
+<h3 id="5-2-components-single-process-single-binary">5.2 Components (single process, single binary)</h3>
+<ul>
+<li><strong>Ingestion / normalizer</strong> — turns a Source into an Integration + normalized Tools.</li>
+<li><strong>Catalog</strong> — searchable index of all Tools (powers progressive disclosure).</li>
+<li><strong>Sandbox</strong> — <strong>QuickJS</strong> runtime that executes model-written TS/JS. Small, embeddable,
+isolatable; portable across container <em>and</em> Cloudflare Worker.</li>
+<li><strong>Credential resolver</strong> — host-side; binds <code>connectionRef → secret</code> and attaches it to the
+outbound request <strong>outside</strong> the sandbox.</li>
+<li><strong>Policy engine</strong> — evaluates riskClass + input-aware rules per call; allow / pause / block.</li>
+<li><strong>Execution manager</strong> — runs executions; handles pause/resume (<code>exec_...</code>).</li>
+<li><strong>Trace store</strong> — records every run + tool call for audit (§11).</li>
+<li><strong>Auth</strong> — pluggable: built-in session auth (better-auth) <em>or</em> delegated (Cloudflare Access / JWT).</li>
+<li><strong>Storage</strong> — pluggable: <strong>libSQL/SQLite</strong> single file (single-node) or <strong>D1</strong> (Worker).</li>
+<li><strong>Web console</strong> — Integrations workspace, connections, policies, Connect card, Trace viewer.</li>
+<li><strong>Surfaces</strong> — MCP server (<code>/mcp</code>), CLI, desktop shell, programmatic SDK; thin shells over the core.</li>
+</ul>
+<h3 id="5-3-per-call-pipeline-server-side-the-heart">5.3 Per-call pipeline (server-side, the heart)</h3>
+<p>For each tool call emitted by sandboxed code:</p>
+<ol>
+<li><strong>Resolve</strong> the target Integration/Connection (by namespace + connection prefix).</li>
+<li><strong>Enforce policy</strong> (riskClass + input-aware rules) → allow / pause-for-approval / block.</li>
+<li><strong>Attach credentials</strong> to the upstream request, <strong>host-side, outside the sandbox.</strong></li>
+<li><strong>Call upstream</strong>, capture result + latency.</li>
+<li><strong>Record</strong> a Trace event.</li>
+<li><strong>Return</strong> the result to the sandbox.</li>
+</ol>
+<p>The agent only ever talks to Conduit; <strong>credentials never reach it.</strong></p>
+<h3 id="5-4-unifying-code-mode-and-mcp-proxy-views">5.4 Unifying code-mode and MCP-proxy views</h3>
+<p>Both framings are simultaneously true: the <strong>single MCP tool</strong> the client sees is <code>execute</code>;
+the model&#39;s TypeScript runs in the sandbox, and <strong>that code&#39;s tool calls</strong> are what traverse
+the §5.3 pipeline. &quot;Code-mode MCP&quot; = (one MCP tool) + (a sandbox that runs code that calls
+the catalog). Spec consumers should hold both views at once.</p>
+<h3 id="5-5-pause-resume-deterministic-replay">5.5 Pause/resume — deterministic replay (decided)</h3>
+<p>Executions pause only at <strong>tool-call boundaries</strong> (a policy approval or an auth prompt).
+The mechanism is <strong>deterministic replay</strong>, not VM snapshotting: every tool call&#39;s result is
+<strong>journaled</strong> — the Trace store (§11) doubles as the replay log. On resume, the execution&#39;s
+code re-runs from the top; journaled calls return their <strong>memoized results</strong> without
+re-hitting upstream; the execution proceeds live from the first un-journaled call. <strong>One
+mechanism powers both the audit differentiator and pause/resume correctness.</strong></p>
+<ul>
+<li><strong>Survives restarts:</strong> a paused Execution is pure data (code + journal); the daemon can
+restart — or a different worker can pick it up — and resume it.</li>
+<li><strong>Determinism contract:</strong> sandbox code must be deterministic between tool calls. Conduit
+enforces the boundary cases: <code>Date.now()</code> and <code>Math.random()</code> values are recorded on
+first run and replayed verbatim on resume.</li>
+<li><strong>Approval TTL:</strong> a pending approval expires after a configurable window
+(<code>CONDUIT_APPROVAL_TTL</code>, default 72h); the Execution then fails with a policy-timeout
+error, recorded in Trace.</li>
+</ul>
+<hr>
+<h2 id="6-the-execute-tool-amp-code-mode-workflow">6. The <code>execute</code> tool &amp; code-mode workflow</h2>
+<p><strong>The only tool the client sees:</strong> <code>execute</code> —</p>
+<blockquote>
+<p>&quot;Execute TypeScript in a sandboxed runtime with access to configured API tools.&quot;</p>
+</blockquote>
+<p><strong>The 4-step workflow the model uses:</strong></p>
+<pre><code class="language-ts">// 1. discover by intent
+const { items } = await tools.search({ query });
+// 2. pick a path
+const path = items[0]?.path;
+// 3. load just that tool&#39;s schema (lazy)
+const details = await tools.describe.tool({ path, includeSchemas: true });
+// 4. call it, type-safely
+const result = await tools[path](input);
+</code></pre>
+<p>Plus typed direct calls once a path is known, e.g. <code>await tools.github.issues.list({ owner, repo })</code>.</p>
+<p><strong>Available connection prefixes</strong> are surfaced to the model in the <code>execute</code> description, e.g.:</p>
+<pre><code>- github.org.main : Production GitHub
+- stripe.org.main : Live Stripe account
+- jira.org.main   : Team Jira
+</code></pre>
+<p>The sandbox can <code>import</code> from the npm ecosystem (e.g. an AI SDK) from a <strong>vetted allowlist</strong>,
+with all network egress <strong>gated by SSRF/policy controls</strong> (§9.3) — decided: allowlist +
+egress-gated (not full-npm). This is what makes code-mode strictly more expressive than JSON
+tool-calling or a fixed CLI (the model authors new behavior, not just invokes pre-built
+verbs), while keeping the import attack surface bounded. The allowlist is operator-configurable.</p>
+<hr>
+<h2 id="7-ingestion-amp-normalization">7. Ingestion &amp; normalization</h2>
+<p><strong>Supported Source types:</strong> OpenAPI spec · GraphQL endpoint · MCP server · custom JS plugin.</p>
+<p><strong>Add a Source</strong> (web &quot;Add Source&quot; auto-detects type, indexes tools, handles auth) or via API:</p>
+<pre><code>conduit call conduit openapi addSource &#39;{
+  &quot;spec&quot;: &quot;https://petstore3.swagger.io/api/v3/openapi.json&quot;,
+  &quot;namespace&quot;: &quot;petstore&quot;,
+  &quot;baseUrl&quot;: &quot;https://petstore3.swagger.io/api/v3&quot;
+}&#39;
+</code></pre>
+<ul>
+<li><strong><code>namespace</code></strong> groups/addresses the tools (<code>conduit call petstore ...</code>).</li>
+<li><strong><code>baseUrl</code></strong> is required when the OpenAPI document has relative <code>servers</code> entries.</li>
+<li><strong>Conduit&#39;s own management API is itself an Integration</strong> (the <code>conduit</code> namespace) —
+self-managing / dogfooded.</li>
+</ul>
+<p><strong>Normalization output per tool:</strong> <code>{ name, namespace, inputSchema, outputSchema, riskClass, sourceSemantics }</code>. riskClass is derived in §10.1.</p>
+<p><strong>Missing output schemas:</strong> when a source declares no output schema (common for MCP
+servers), <code>outputSchema</code> defaults to a permissive <code>unknown</code>/passthrough schema — the
+&quot;one tool shape&quot; stays uniform without over-claiming validation.</p>
+<p><strong>Source refresh &amp; policy persistence:</strong> re-ingesting a Source diffs the catalog. Policies
+are keyed by tool name and <strong>persist across refreshes</strong>; manual overrides and input-aware
+rules are <strong>never silently reverted</strong> to spec-derived defaults. New tools get defaults;
+removed tools&#39; policies are archived (restored if the tool reappears); tools whose schemas
+changed are <strong>flagged for review</strong> in the console.</p>
+<hr>
+<h2 id="8-catalog-amp-progressive-disclosure">8. Catalog &amp; progressive disclosure</h2>
+<ul>
+<li><strong><code>tools.search({ query, limit })</code></strong> — intent search over the full catalog; returns ranked
+paths with minimal metadata (no full schemas).</li>
+<li><strong><code>tools.describe.tool({ path, includeSchemas })</code></strong> — lazily loads the full input/output
+schema for one tool.</li>
+<li><strong><code>tools[path](input)</code></strong> — invoke.</li>
+<li>The model&#39;s prompt only ever contains the <code>execute</code> tool + connection prefixes; schemas are
+pulled on demand. This is the mechanism behind &quot;thousands of tools, no bloat.&quot;</li>
+</ul>
+<hr>
+<h2 id="9-connections-credentials-amp-the-security-boundary">9. Connections, credentials &amp; the security boundary</h2>
+<h3 id="9-1-connection-model">9.1 Connection model</h3>
+<ul>
+<li>A Connection is a configured instance of an Integration; <strong>many per integration</strong> (e.g.
+two accounts of the same API). <strong>Auth optional</strong> (public sources need none).</li>
+<li>Per-user credentials <strong>and</strong> shared credentials. &quot;Set up once, whole team has it&quot; — no
+onboarding ritual, no toggling integrations on/off mid-task.</li>
+</ul>
+<h3 id="9-2-credential-boundary-invariant-load-bearing">9.2 Credential-boundary invariant (load-bearing)</h3>
+<ul>
+<li>Tool calls run in an <strong>isolated sandbox (QuickJS).</strong></li>
+<li>Credentials are <strong>resolved host-side, at call time</strong>, and <strong>injected into the outbound
+request only.</strong></li>
+<li>A secret <strong>never</strong> enters any of these four zones: <strong>(1) the sandbox heap, (2) the
+agent-written code, (3) the agent, (4) the model.</strong></li>
+<li>The sandbox calls a tool <strong>by reference (name/handle)</strong>; Conduit binds reference→secret
+<strong>outside</strong> the sandbox and constructs the authenticated request. The credential and the
+sandbox address space <strong>never coexist.</strong></li>
+<li><strong>Stored secrets are encrypted at rest</strong> with a master key (operator-manageable).</li>
+</ul>
+<h3 id="9-3-network-ssrf-control">9.3 Network / SSRF control</h3>
+<ul>
+<li>Sandboxed code&#39;s egress to <strong>loopback / private addresses is OFF by default</strong> (an opt-in
+flag enables it only when the code is trusted).</li>
+</ul>
+<hr>
+<h2 id="10-policy-engine">10. Policy engine</h2>
+<h3 id="10-1-riskclass-derived-from-imported-semantics">10.1 riskClass (derived from imported semantics)</h3>
+<p>Every tool gets a normalized <code>riskClass</code>, populated by a per-protocol classifier:</p>
+<table>
+<thead>
+<tr>
+<th>Source</th>
+<th>Signal</th>
+<th>Default mapping</th>
+</tr>
+</thead>
+<tbody><tr>
+<td>OpenAPI</td>
+<td>HTTP verb</td>
+<td>GET/HEAD/OPTIONS → <strong>safe</strong>; POST/PUT/PATCH → <strong>review</strong>; DELETE → <strong>destructive</strong></td>
+</tr>
+<tr>
+<td>MCP</td>
+<td><code>destructiveHint</code> (+ <code>readOnlyHint</code>)</td>
+<td>hint → <strong>destructive</strong>; read-only → <strong>safe</strong></td>
+</tr>
+<tr>
+<td>GraphQL</td>
+<td>operation type</td>
+<td>query → <strong>safe</strong>; mutation → <strong>destructive</strong></td>
+</tr>
+<tr>
+<td>custom JS</td>
+<td>plugin-declared</td>
+<td>author-declared, defaults to <strong>review</strong></td>
+</tr>
+</tbody></table>
+<p>Heuristics are imperfect (POST can be safe or destructive), so <strong>manual overrides</strong> are
+always allowed.</p>
+<h3 id="10-2-three-policy-states-per-tool">10.2 Three policy states (per tool)</h3>
+<ul>
+<li><strong>Allow</strong> — runs uninterrupted.</li>
+<li><strong>Require approval</strong> — the call <strong>pauses</strong> until a human approves (the Execution suspends;
+resume by id).</li>
+<li><strong>Block</strong> — cannot be called.</li>
+</ul>
+<p>Defaults: safe → Allow; review → Require approval; destructive → Require approval; tunable for any tool anytime.
+&quot;Agents auto-run the safe stuff and ask before the rest.&quot;</p>
+<p><strong>Where approvals surface:</strong> a pending-approvals view (+ badge) in the web console;
+<code>conduit approvals list|approve|deny</code> in the CLI; and a paused Execution returns its
+<code>exec_id</code> plus a human-readable reason to the calling agent, so the agent can tell the
+user exactly what it is waiting on. Push notifications (webhook/Slack) are deferred (§18).</p>
+<h3 id="10-3-input-aware-rules-conduit-differentiator">10.3 Input-aware rules (CONDUIT DIFFERENTIATOR)</h3>
+<p>Policies may branch on the <strong>actual argument values</strong> of a call. <strong>Two authoring modes</strong>
+(decided — support both): <strong>(a) declarative YAML</strong> for simple value rules (easy/safe to
+author, approachable for non-devs), and <strong>(b) typed TS predicates</strong> — rules as TypeScript
+functions over the tool&#39;s typed input, for complex logic with compile-time checking against
+the known input schema. YAML rules compile down to the same evaluation as TS predicates.</p>
+<p>YAML form (illustrative):</p>
+<pre><code class="language-yaml">- tool: stripe.*.refund
+  when: { input.amount: { gte: 5000 } }   # cents
+  then: require_approval
+  else: allow
+- tool: &quot;*.sendEmail&quot;
+  when: { input.to: { matches: &quot;*@ourcompany.com&quot; } }
+  then: allow
+  else: require_approval
+- tool: &quot;*.delete*&quot;
+  then: require_approval
+</code></pre>
+<p>Typed TS predicate form (for complex logic):</p>
+<pre><code class="language-ts">definePolicy(&quot;stripe.*.refund&quot;, (input: RefundInput, ctx) =&gt;
+  input.amount &gt;= 5000 || !ctx.user.isAdmin ? &quot;require_approval&quot; : &quot;allow&quot;
+);
+</code></pre>
+<p>Evaluation: input-aware rules layer <strong>on top of</strong> riskClass defaults; most-specific match wins;
+explicit Block always wins. Because tools are strongly typed, both forms validate against the
+known input schema at policy-author time.</p>
+<hr>
+<h2 id="11-observability-trace-conduit-differentiator-shipped-not-quot-coming-soon-quot">11. Observability / Trace (CONDUIT DIFFERENTIATOR — shipped, not &quot;coming soon&quot;)</h2>
+<ul>
+<li><strong>One place to see every run and tool call.</strong> Audit any decision after the fact.</li>
+<li><strong>Per execution:</strong> id, total wall time, the code that ran, policy decisions, pause/resume
+events, final result/error.</li>
+<li><strong>Per tool call:</strong> namespace.tool, latency, input (redacted per policy), output summary,
+upstream status, policy verdict. Example row set:<pre><code>run_7421            1.42s
+sentry.getIssue     184ms
+github.searchCode   391ms
+linear.createIssue  612ms
+</code></pre>
+</li>
+<li><strong>Secret redaction:</strong> Trace never stores raw credentials (consistent with §9.2); sensitive
+inputs masked per policy.</li>
+<li><strong>Surfaces:</strong> Trace viewer in the web console; <code>conduit trace ...</code> in the CLI; queryable via SDK.</li>
+<li><strong>Retention:</strong> configurable locally (SQLite); export (JSON) for external audit/SIEM.
+Cloud-scale retention tiers are deferred (§18).</li>
+</ul>
+<hr>
+<h2 id="12-surfaces-all-over-one-core">12. Surfaces (all over one core)</h2>
+<table>
+<thead>
+<tr>
+<th>Surface</th>
+<th>What it is</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><strong>MCP server</strong></td>
+<td>streamable-HTTP endpoint at <code>/mcp</code> (+ stdio). The default agent connection.</td>
+</tr>
+<tr>
+<td><strong>CLI</strong> (<code>conduit</code>)</td>
+<td>drive the local service from the terminal; headless/server friendly.</td>
+</tr>
+<tr>
+<td><strong>Desktop app</strong></td>
+<td>native window + graphical console; a <strong>companion</strong> to the CLI driving the <strong>same</strong> local background service (not a second runtime). Mac/Windows/Linux.</td>
+</tr>
+<tr>
+<td><strong>Programmatic SDK</strong></td>
+<td><code>@conduithq/sdk</code> — drop-in native client; the foundation all other surfaces are built on.</td>
+</tr>
+<tr>
+<td><strong>gen-UI dashboard</strong></td>
+<td>generated UI bound to proxy objects (actionable components).</td>
+</tr>
+<tr>
+<td><strong>Reusable workflows</strong></td>
+<td>saved code-mode snippets; can receive webhooks / schedule crons.</td>
+</tr>
+</tbody></table>
+<p>&quot;Today it is a code-mode MCP. It could just as well be the CLI, a one-off script, a gen-UI
+dashboard, or a reusable workflow. <strong>Same tools, every surface.</strong>&quot;</p>
+<hr>
+<h2 id="13-deployment-modes-full-parity">13. Deployment modes (full parity)</h2>
+<p>All modes are the <strong>same core, different packaging</strong> (&quot;same code paths, different deployment&quot;).</p>
+<h3 id="13-1-cli-local">13.1 CLI / local</h3>
+<ul>
+<li>Requires <strong>Node.js 20+</strong>. <code>npm install -g @conduithq/cli</code> (pnpm/bun/yarn supported).</li>
+<li><code>conduit install</code> — install/start the <strong>durable background service</strong> (survives restarts).</li>
+<li><code>conduit web</code> — open web UI (default <code>http://127.0.0.1:&lt;PORT&gt;</code>).</li>
+<li><code>conduit web --foreground</code> — throwaway foreground runtime.</li>
+<li>Integrations, credentials, policies stay <strong>local</strong>.</li>
+<li><strong>Local trust boundary:</strong> the local daemon binds <strong>127.0.0.1</strong> and its <code>/mcp</code> +
+API are <strong>unauthenticated</strong> (loopback-only trust). Any deployment that binds beyond
+loopback — Docker&#39;s default <code>0.0.0.0</code>, Cloud, Worker — <strong>runs with auth enabled</strong>;
+the unauthenticated convenience exists only in loopback mode.</li>
+</ul>
+<h3 id="13-2-desktop-app">13.2 Desktop app</h3>
+<ul>
+<li>Native shell over the same local service. Integrations workspace; manage connections &amp;
+policies; Connect card for agents. Data stays on the machine.</li>
+</ul>
+<h3 id="13-3-cloud-hosted-commercial">13.3 Cloud (hosted, commercial)</h3>
+<ul>
+<li>Same catalog/auth/policies, run for us. Free tier. Sign in → add integration → create
+connection → point agents at the hosted <code>/mcp</code>. Works with <strong>cloud agents (ChatGPT)</strong>.</li>
+</ul>
+<h3 id="13-4-self-host-docker">13.4 Self-host — Docker</h3>
+<ul>
+<li><strong>Whole server in one container</strong> over a <strong>libSQL (SQLite) file</strong>: typed API + MCP server +
+auth + QuickJS execution + web console, <strong>one process, no external DB/worker/proxy</strong>.</li>
+<li><code>docker run -d -p &lt;PORT&gt;:&lt;PORT&gt; -v conduit-data:/data ghcr.io/&lt;org&gt;/conduit-selfhost:latest</code>
+(or <code>docker compose up -d --build</code> from <code>apps/host-selfhost</code>).</li>
+<li><strong>Ownership:</strong> first account = <strong>owner</strong>; thereafter <strong>invite-only</strong> (single-use links from
+Admin); open signup closed. Headless bootstrap via env (below).</li>
+<li><strong>Persistence:</strong> SQLite DB + generated encryption keys live in <code>/data</code> (back up the volume;
+primarily <code>data.db</code>).</li>
+</ul>
+<p><strong>Environment variables</strong> (all optional; bare run boots a working instance — <code>CONDUIT_</code> prefix):</p>
+<table>
+<thead>
+<tr>
+<th>Variable</th>
+<th>Default</th>
+<th>Purpose</th>
+</tr>
+</thead>
+<tbody><tr>
+<td><code>PORT</code></td>
+<td>7878</td>
+<td>HTTP port</td>
+</tr>
+<tr>
+<td><code>CONDUIT_HOST</code></td>
+<td>0.0.0.0</td>
+<td>Bind address</td>
+</tr>
+<tr>
+<td><code>CONDUIT_DATA_DIR</code></td>
+<td>/data</td>
+<td>DB + generated keys</td>
+</tr>
+<tr>
+<td><code>CONDUIT_DB_PATH</code></td>
+<td><code>&lt;data&gt;/data.db</code></td>
+<td>SQLite file</td>
+</tr>
+<tr>
+<td><code>CONDUIT_WEB_BASE_URL</code></td>
+<td>auto</td>
+<td>Public browser URL; <strong>required behind a domain/TLS</strong> (else invalid-origin)</td>
+</tr>
+<tr>
+<td><code>CONDUIT_AUTH_SECRET</code></td>
+<td>generated, persisted</td>
+<td>Session secret (32+ chars); rotating signs everyone out</td>
+</tr>
+<tr>
+<td><code>CONDUIT_SECRET_KEY</code></td>
+<td>generated, persisted</td>
+<td><strong>Master key encrypting stored secrets</strong></td>
+</tr>
+<tr>
+<td><code>CONDUIT_BOOTSTRAP_ADMIN_EMAIL</code></td>
+<td>unset</td>
+<td>Pre-create admin headlessly</td>
+</tr>
+<tr>
+<td><code>CONDUIT_BOOTSTRAP_ADMIN_PASSWORD</code></td>
+<td>unset</td>
+<td>Bootstrap admin password</td>
+</tr>
+<tr>
+<td><code>CONDUIT_BOOTSTRAP_ADMIN_NAME</code></td>
+<td>Admin</td>
+<td>Bootstrap admin display name</td>
+</tr>
+<tr>
+<td><code>CONDUIT_ORG_NAME</code></td>
+<td>Default</td>
+<td>Single org every user joins</td>
+</tr>
+<tr>
+<td><code>CONDUIT_ORG_SLUG</code></td>
+<td>default</td>
+<td>Org URL slug</td>
+</tr>
+<tr>
+<td><code>CONDUIT_ALLOW_LOCAL_NETWORK</code></td>
+<td>false</td>
+<td>Allow sandbox egress to loopback/private (SSRF-sensitive)</td>
+</tr>
+</tbody></table>
+<h3 id="13-5-self-host-cloudflare-worker">13.5 Self-host — Cloudflare Worker</h3>
+<ul>
+<li><strong>Single Worker</strong> in your account. <strong>Auth via Cloudflare Access</strong> (no separate app login;
+JWT validated on every request). <strong>Storage = D1.</strong> <strong>QuickJS</strong> execution inside the Worker.
+Web console + API + MCP all from one Worker. <strong>Single-tenant</strong> (one org; manage members in
+Access).</li>
+<li>Deploy from <code>apps/host-cloudflare</code>: <code>wrangler login</code> → <code>deploy:setup</code> (idempotent: create/
+reuse D1, write id to <code>wrangler.jsonc</code>, generate+upload <code>CONDUIT_SECRET_KEY</code>, deploy).</li>
+<li>Put behind Access (else API/MCP routes 401): add self-hosted Access app → set domain →
+policy → copy <strong>AUD</strong> → redeploy with <code>ACCESS_AUD</code> + <code>ACCESS_TEAM_DOMAIN</code>.</li>
+</ul>
+<hr>
+<h2 id="14-onboarding">14. Onboarding</h2>
+<ul>
+<li><strong>Agent-run setup prompt</strong> (copy-paste into Claude/Cursor/any MCP agent): helps pick the run
+mode, install, connect over MCP, and get the first integration working end-to-end.</li>
+<li><strong><code>add-mcp</code> helper</strong> (<code>npx add-mcp &lt;url&gt; --transport http --name conduit</code>) auto-detects the
+client and writes its config. The Connect card shows the exact command prefilled.</li>
+<li><strong>MCP startup-reload caveat (must surface in UX):</strong> most MCP clients only load servers at
+startup; after adding Conduit, the user may need to <strong>restart the client / open a new chat</strong>
+before Conduit&#39;s tools appear.</li>
+</ul>
+<hr>
+<h2 id="15-public-api-cli-surface-initial">15. Public API / CLI surface (initial)</h2>
+<pre><code>conduit install                         # durable background service
+conduit web [--foreground]              # web UI
+conduit tools search &quot;&lt;intent&gt;&quot;         # find tools by intent
+conduit tools sources                   # list integrations + tool counts
+conduit call &lt;path...&gt; --help           # browse a namespace
+conduit call &lt;path...&gt; &#39;&lt;json&gt;&#39;     # invoke (path = namespace + segments, e.g. github issues create)
+conduit call conduit openapi addSource &#39;&lt;json&gt;&#39;   # add an integration (self-managing ns)
+conduit resume --execution-id &lt;exec_id&gt; # resume a paused (auth/approval) execution
+conduit approvals [list|approve &lt;id&gt;|deny &lt;id&gt;]  # pending approval queue
+conduit trace [list|show &lt;run_id&gt;]      # observability (Conduit addition)
+</code></pre>
+<ul>
+<li><code>call</code>, <code>resume</code>, <code>tools …</code> auto-start the local daemon if needed.</li>
+<li>MCP endpoint: streamable-HTTP at <code>/mcp</code> (+ stdio transport).</li>
+</ul>
+<hr>
+<h2 id="16-security-model-consolidated">16. Security model (consolidated)</h2>
+<ol>
+<li><strong>Sandboxed execution</strong> (QuickJS) for all tool code.</li>
+<li><strong>Credential-boundary invariant</strong> (§9.2): host-side resolution, outbound-only injection,
+four exclusion zones, reference-not-secret in the sandbox.</li>
+<li><strong>Secrets encrypted at rest</strong> (master key, operator-manageable).</li>
+<li><strong>Per-tool + input-aware policy</strong> gating every call (allow/approval/block).</li>
+<li><strong>SSRF control</strong>: private-network egress off by default.</li>
+<li><strong>Sandbox resource limits</strong>: per-execution wall-clock timeout, memory ceiling, and
+output-size cap (defaults 60s / 128 MB / 1 MB; operator-tunable). A runaway
+<code>while(true)</code> is interrupted, not babysat.</li>
+<li><strong>Pluggable auth</strong>: built-in session auth or delegated identity (Access/JWT).</li>
+<li><strong>Origin pinning</strong>: <code>CONDUIT_WEB_BASE_URL</code> must match for browser logins.</li>
+<li><strong>Audit</strong>: every call traced and exportable; secrets redacted in Trace.</li>
+</ol>
+<hr>
+<h2 id="17-phased-build-plan-parity-sequenced">17. Phased build plan (parity, sequenced)</h2>
+<p><strong>Phase 0 — Core SDK (<code>@conduithq/sdk</code>)</strong></p>
+<ul>
+<li>Data model (Source/Integration/Connection/Tool/Policy/Execution).</li>
+<li>Normalizers: OpenAPI + MCP first (GraphQL + custom JS next).</li>
+<li>Catalog + <code>tools.search</code> / <code>tools.describe.tool</code> / typed call.</li>
+<li>QuickJS sandbox + the <code>execute</code> tool + 4-step workflow.</li>
+<li>Credential resolver + boundary invariant. SQLite storage. Secrets-at-rest.</li>
+</ul>
+<p><strong>Phase 1 — Local runtime + CLI + MCP</strong></p>
+<ul>
+<li>Durable background service; <code>/mcp</code> streamable-HTTP + stdio; <code>conduit</code> CLI; <code>add-mcp</code>.</li>
+<li>Web console: Add Source, connections, policies, Connect card.</li>
+<li>Policy engine v1 (riskClass + three states + overrides).</li>
+</ul>
+<p><strong>Phase 2 — Differentiators</strong></p>
+<ul>
+<li><strong>Trace</strong> end-to-end (store, web viewer, <code>conduit trace</code>, export, redaction).</li>
+<li><strong>Input-aware policy rules</strong> (value-based branching) + schema-aware authoring.</li>
+</ul>
+<p><strong>Phase 3 — Desktop app</strong></p>
+<ul>
+<li>Native shell over the same local service (Mac/Win/Linux).</li>
+</ul>
+<p><strong>Phase 4 — Hosted Cloud</strong></p>
+<ul>
+<li>Multi-user org, hosted <code>/mcp</code>, free tier, billing, per-user + shared credentials.</li>
+</ul>
+<p><strong>Phase 5 — Self-host parity</strong></p>
+<ul>
+<li>Docker single-container image (libSQL) + env/bootstrap/ownership/invites.</li>
+<li>Cloudflare Worker (D1 + Access-delegated auth + QuickJS).</li>
+</ul>
+<p><strong>Cross-cutting:</strong> the token-savings <strong>before/after demo</strong> as a marketing/QA artifact.</p>
+<hr>
+<h2 id="18-open-questions-decisions-to-lock">18. Open questions / decisions to lock</h2>
+<p><strong>Resolved (locked):</strong></p>
+<ul>
+<li><strong>Sandbox engine:</strong> ✅ <strong>QuickJS</strong> (faithful) — portability across container + Worker; npm
+compat handled via the allowlist (below) rather than a heavier isolate.</li>
+<li><strong>Policy rule language:</strong> ✅ <strong>Both</strong> — declarative YAML + typed TS predicates (§10.3).</li>
+<li><strong>In-sandbox npm imports:</strong> ✅ <strong>Allowlist + egress-gated</strong> (§6, §9.3) — vetted packages
+only; all egress through proxy/policy.</li>
+<li><strong>Default local port:</strong> ✅ <strong>7878</strong> — distinct, dedicated default; used throughout §13 and the env table.</li>
+<li><strong>Connection-prefix grammar:</strong> ✅ <code>service.&lt;org-slug&gt;.&lt;env&gt;</code> (§3, §6) — env/account map onto the <code>&lt;env&gt;</code> segment.</li>
+<li><strong>Pause/resume model:</strong> ✅ <strong>Deterministic replay</strong> (§5.5) — tool-call results journaled
+in Trace; resume re-runs code against memoized results; no VM snapshots.</li>
+<li><strong>Tech stack:</strong> ✅ locked for Phase 0 (§20) — TypeScript/ESM, pnpm workspaces,
+quickjs-emscripten, Ajv + Zod, Vitest, libSQL.</li>
+</ul>
+<p><strong>Deferred (future phases — none block v0.1 / Phase 0):</strong></p>
+<ol>
+<li><strong>Auth library</strong> for built-in mode (better-auth-equivalent) and the delegated-auth contract — Phase 1.</li>
+<li><strong>Trace storage scale</strong> (SQLite fine locally; Cloud needs a real store + retention tiers) — Phase 4.</li>
+<li><strong>npm allowlist contents</strong>: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.</li>
+<li><strong>Pricing shape</strong> for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.</li>
+<li><strong>Approval push notifications</strong> (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.</li>
+</ol>
+<hr>
+<h2 id="19-branding-naming">19. Branding / naming</h2>
+<ul>
+<li><strong>Product:</strong> Conduit · <strong>Domain:</strong> useconduithq.com</li>
+<li><strong>npm:</strong> <code>@conduithq/sdk</code>, <code>@conduithq/cli</code> (bare <code>conduit</code> is taken; scope is free)</li>
+<li><strong>CLI binary:</strong> <code>conduit</code></li>
+<li><strong>Container image:</strong> <code>ghcr.io/&lt;org&gt;/conduit-selfhost</code></li>
+<li>Verify <code>useconduithq.com</code> (and <code>.dev</code>/<code>.sh</code> alternates) at a registrar before lock; npm
+scope <code>@conduithq</code> confirmed available.</li>
+</ul>
+<hr>
+<h2 id="20-tech-stack-locked-for-phase-0">20. Tech stack (locked for Phase 0)</h2>
+<ul>
+<li><strong>Language:</strong> TypeScript everywhere (strict mode, ESM-only). <strong>Node.js ≥ 20.</strong></li>
+<li><strong>Monorepo:</strong> pnpm workspaces — <code>packages/sdk</code>, <code>packages/cli</code>,
+<code>apps/host-selfhost</code>, <code>apps/host-cloudflare</code> (later: <code>apps/desktop</code>, web console).</li>
+<li><strong>QuickJS binding:</strong> <code>quickjs-emscripten</code> — the same WASM build runs in Node and in
+Cloudflare Workers, which is what makes §13 deployment parity real rather than aspirational.</li>
+<li><strong>Schemas &amp; validation:</strong> tools carry <strong>JSON Schema</strong> natively (OpenAPI and MCP already
+speak it); runtime validation via <strong>Ajv</strong>. Internal configs validated with <strong>Zod</strong>.</li>
+<li><strong>Storage:</strong> <code>@libsql/client</code> (file URL locally; D1 adapter on Workers) behind one
+storage interface.</li>
+<li><strong>Tests:</strong> Vitest. <strong>Build:</strong> tsup (per-package ESM bundles). <strong>Lint/format:</strong> deferred
+to Phase 1 (keep Phase 0 friction low).</li>
+</ul>
+
+  </main>
+</div>
+<script>
+  // Scroll-spy: highlight the TOC link for the section currently in view.
+  (function(){
+    const links = Array.from(document.querySelectorAll('nav a[href^="#"]'));
+    if (!links.length) return;
+    const byId = new Map(links.map(a => [decodeURIComponent(a.getAttribute('href').slice(1)), a]));
+    const targets = Array.from(byId.keys())
+      .map(id => document.getElementById(id))
+      .filter(Boolean);
+
+    let active = null;
+    const setActive = el => {
+      if (!el || el === active) return;
+      const link = byId.get(el.id);
+      if (!link) return;
+      if (active) { const prev = byId.get(active.id); if (prev) prev.classList.remove('active'); }
+      link.classList.add('active');
+      active = el;
+      // Keep the active link visible within the sidebar's own scroll area.
+      link.scrollIntoView({block:'nearest'});
+    };
+
+    const obs = new IntersectionObserver(entries => {
+      // Of everything intersecting, pick the heading nearest the top.
+      const visible = entries.filter(e => e.isIntersecting)
+        .sort((a,b) => a.boundingClientRect.top - b.boundingClientRect.top);
+      if (visible.length) setActive(visible[0].target);
+    }, { rootMargin: '0px 0px -75% 0px', threshold: 0 });
+
+    targets.forEach(t => obs.observe(t));
+
+    // Clicking a link should win immediately over the observer.
+    links.forEach(a => a.addEventListener('click', () => {
+      const id = decodeURIComponent(a.getAttribute('href').slice(1));
+      const el = document.getElementById(id);
+      if (el) setActive(el);
+    }));
+  })();
+</script>
+</body>
+</html>
