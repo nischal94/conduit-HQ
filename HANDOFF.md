@@ -19,69 +19,90 @@ A session that ends abnormally can't lie here; git tells on it.
 
 ---
 
-## Current handoff — written 2026-07-02 (foundation session)
+## Current handoff — written 2026-07-02 (sandbox session)
 
 ### Where things stand
 
-- `main` @ `1963363` (13 commits), working tree clean. 69/69 tests,
-  typecheck clean, Biome clean. Pre-commit hook gates tsc + vitest + lint.
-- **Phase 0 complete except the sandbox pair:** data model, OpenAPI + MCP
-  normalizers, catalog (lexical, behind `Catalog` seam), storage
-  (`ConduitStore` seam + SQLite impl), `SecretBox` secrets-at-rest.
-- INVARIANTS.md: 5 pinned ✅, 7 pending ⏳. CI draft exists at
-  `.github/ci.draft.yml` (unactivated; activation checklist in its header).
+- `main` @ `beb8803` (15 commits), working tree clean except this
+  handoff + LEARNINGS. 93/93 tests, typecheck clean, Biome clean.
+  Pre-commit hook gates spec-drift + tsc + vitest + lint.
+- **Sandbox pair landed:** `Sandbox` seam + `QuickJSSandbox`
+  (`packages/sdk/src/sandbox/`), `execute` tool surface + catalog tool
+  host (`packages/sdk/src/execute.ts`).
+- **Load-bearing design decision this session** (full rationale in the
+  `QuickJSSandbox` doc comment and LEARNINGS #9–11): the sandbox runs on
+  quickjs-emscripten's **plain sync build**, and tool-call suspension is
+  **§5.5 deterministic replay** (journal + seeded non-determinism), NOT
+  asyncified host functions. The asyncify build is defective for our
+  shape of use in 0.31.0 — any `await`-continuation calling an
+  asyncified host fn corrupts the WASM heap via `executePendingJobs`.
+  Do not "simplify" back to asyncify without re-verifying the library.
+- INVARIANTS.md: 7 pinned ✅ (added §16 caps, §4.2 token budget),
+  5 pending ⏳. §5.5's replay mechanism + seeds are implemented and
+  tested (un-prefixed) in `quickjs.test.ts`; the row stays ⏳ for the
+  execution manager's approval-pause wiring.
+- CI draft still unactivated at `.github/ci.draft.yml`.
 
-### Next task: QuickJS sandbox + `execute` tool (Phase 0 finale)
+### Next task: credential resolver + §9.2 boundary invariant (Phase 0 finale)
 
-Read before coding: spec §5.3–§5.5, §6, §8 (roadmap note), §9.2–§9.3,
-§16, §20; INVARIANTS.md ⏳ rows; CLAUDE.md security posture.
+The last unshipped §17 Phase 0 item. `SecretBox` (secrets-at-rest) and
+the `SecretRepository` exist; what's missing is the piece that binds
+`Connection.credentialRef → secret` at call time, host-side, and injects
+it into the outbound request only.
+
+Read before coding: spec §9.1–§9.2, §5.3 (step 3), §3 (Connection),
+§16 item 2; INVARIANTS.md §9.2 row; `store/store.ts` + `secrets.ts`.
 
 Acceptance criteria:
-- Sandbox behind an interface (same seam discipline as Catalog/ConduitStore),
-  QuickJS implementation via `quickjs-emscripten` (already a dependency).
-- Host-side bridge for `tools.search` / `tools.describe.tool` /
-  `tools[path](input)` that suspends at tool-call boundaries (the §5.3
-  pipeline mounts there; policy/credentials are NOT sandbox concerns).
-- §16 resource limits: wall-clock interrupt, memory ceiling, output-size
-  cap (60s / 128 MB / 1 MB defaults, configurable).
-- §5.5 determinism seeds: `Date.now()` / `Math.random()` seeded per
-  execution, recorded for replay.
-- `execute` tool description text incl. connection prefixes and "search
-  with concrete nouns/verbs; retry with synonyms if empty" (§8).
-- Invariant tests flipped in the same commits: §16 runaway-code
-  interruption; §4.2 token budget (serialize the execute surface, fail
-  above threshold); groundwork for §5.5 replay.
-
-Known trap to check first: async host functions in quickjs-emscripten
-need the asyncified runtime variant — confirm which variant supports
-async before designing the bridge.
+- Resolver behind an interface (seam discipline), consuming the
+  `ConduitStore`/`SecretBox` pieces that already exist.
+- Given a Connection, produce authenticated upstream-request material
+  (e.g. headers) **host-side**; the `ToolInvoker` in `execute.ts` is
+  where it mounts — policy and upstream calling remain Phase 1.
+- INVARIANT §9.2 test in the same commit, ledger row flips: a secret in
+  the store must never appear in (1) sandbox-reachable values — tool
+  results, journal entries, execute results, (2) agent code, while a
+  stub upstream request does receive it. Attack the claim beneath the
+  API like the secrets-at-rest test does (LEARNINGS #3).
+- Phase 0 then closes: run the CLAUDE.md milestone audit cadence —
+  `pnpm audit` + `/aikido:scan` + LEARNINGS/HANDOFF freshness sweep.
+  Note: `pnpm` routes through sfw; the audit may need the human's
+  terminal if the agent sandbox blocks it.
 
 ### Waiting on the human
 
 - GitHub repo creation (private recommended), then the CI activation
   checklist at the top of `.github/ci.draft.yml`.
+- Possibly the `pnpm audit` half of the Phase 0 milestone audit (above).
 
 ### Session quirks worth inheriting
 
 - Agent runs tools via direct binaries
-  (`packages/sdk/node_modules/.bin/{tsc,vitest}`, `node_modules/.bin/biome`)
-  — the `pnpm` shim routes through Socket Firewall, whose CA key the agent
-  sandbox correctly denies. Installs are always the human's, in their
-  terminal.
+  (`packages/sdk/node_modules/.bin/{tsc,vitest}`, `node_modules/.bin/biome`
+  from the repo root) — the `pnpm` shim routes through Socket Firewall,
+  whose CA key the agent sandbox correctly denies. Installs are always
+  the human's, in their terminal.
 - Git commits need the sandbox override (`.git` is deny-listed);
   `git init`-class commands are human-reserved by permission rules.
 - "certificate-25291" stderr noise in sandboxed commands is environmental;
   filter it, ignore it.
+- zsh eats words starting with `=` (e.g. `echo ===`) — use quotes in
+  Bash one-liners.
+- Ground truth about quickjs-emscripten behavior is its shipped dist in
+  `node_modules/.pnpm/quickjs-emscripten-core@0.31.0/...` — docs and
+  single-pass spikes both lied this session (LEARNINGS #9).
 
 ### Kickoff prompt for the next session
 
 > Continue building Conduit in ~/projects/conduit-HQ. Start by reading
 > HANDOFF.md and follow its protocol — it names the spec sections, the
-> acceptance criteria, and the known trap for the current task (QuickJS
-> sandbox + `execute` tool). Work autonomously per the project's memory:
-> decide commonsensical things yourself; confirm only destructive,
+> acceptance criteria, and the prior session's design decisions for the
+> current task (credential resolver + §9.2 boundary invariant, the
+> Phase 0 finale). Work autonomously per the project's memory: decide
+> commonsensical things yourself; confirm only destructive,
 > outward-facing, or scope-changing actions. Interface first, invariant
 > tests in the same commit as the code that earns them, INVARIANTS.md
 > rows flip in that commit, conventional commits, hook must stay green.
+> When Phase 0 closes, run the milestone audit cadence from CLAUDE.md.
 > At session end, rewrite HANDOFF.md and append LEARNINGS.md per the
 > protocol.

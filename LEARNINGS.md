@@ -95,3 +95,58 @@ data), `minimumReleaseAge` (3-day quarantine accepted), and the
 write-denied, review-required lockfile. Also learned: *deprecated* ≠
 *vulnerable* — `node-domexception` is an obsolete polyfill under libsql,
 not an exploit.
+
+## 2026-07-02 — Sandbox session (QuickJS + execute tool)
+
+Shipped: Sandbox seam + QuickJS implementation (sync build, §16 limits,
+§5.5 seeds + journal replay), `execute` tool surface + catalog tool host.
+93 tests, 7 invariants pinned (§16, §4.2 flipped this session).
+
+### 9. A spike that passes once proves the API exists, not that it's sound
+
+The asyncify spike ran clean, so the bridge got built on it — then the
+invariant tests failed *differently on every run* (timeout, refcount
+abort, OOB read). The handoff's "known trap" note asked which variant
+supports async host functions; the true question was whether the
+suspension machinery survives contact with the job queue. It does not:
+in quickjs-emscripten 0.31.0, any `await`-continuation that calls an
+asyncified host function suspends inside the synchronous
+`executePendingJobs` FFI wrapper, which then reads unwound stack garbage.
+The proof came from reading the library's *shipped dist* in node_modules
+(the sync binding is `assertSync`-wrapped; the `_MaybeAsync` binding is
+never used; `QuickJSAsyncRuntime` never overrides the job pump) — not
+from docs, and not from more spiking. Ground truth about a dependency
+lives in `node_modules`, and one green run is not evidence of soundness
+where probabilistic corruption is on the table.
+
+### 10. Nondeterministic failure *modes* mean corruption, not flaky tests
+
+Same suite, three runs, three different failures. The reflex reading is
+"flaky tests — add retries/timeouts"; the correct reading was "something
+is corrupting shared memory, and the test that dies is whoever touches
+it next." In WASM-land there is no segfault to make this obvious. The
+tell: assertion failures *inside the dependency's own invariants*
+(`gc_decref`, `free_zero_refcount`) rather than in our assertions.
+
+### 11. When a workaround fights the spec's own mechanism, re-read the spec
+
+The fix for the asyncify defect was already designed in §5.5:
+deterministic replay — run to the first un-journaled tool call, perform
+it while the VM is idle, journal, re-run. Asyncify was a *second*
+suspension mechanism the product never needed (a suspended WASM stack
+can't survive a restart or a 72h approval anyway). Deleting it removed
+the inflight-tracking/disposal-race machinery, made every guest run
+fully synchronous, and cut the sandbox suite from ~6s to ~0.4s. Lesson 6
+(one mechanism doing two jobs) keeps earning: replay now powers pause,
+resume, *and* the host bridge.
+
+### 12. Authority for security state lives host-side, never in guest values
+
+The suspension sentinel the guest sees is a plain catchable Error — and
+that's fine, because the host decides "this run suspended" from its own
+flags, set before the sentinel is thrown. Guest code that fakes a
+look-alike error, or swallows the real one in a try/catch, changes
+nothing: the interrupt handler kills the run on the host's say-so. The
+general rule mirrors §9.2: anything security-relevant is host-side state
+the sandbox can neither read nor forge; what crosses the membrane is
+data, not authority.
