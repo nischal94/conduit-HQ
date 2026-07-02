@@ -44,6 +44,10 @@ Its own supply chain and code must hold the same bar it sells.
   `persist-credentials: false`, and NEVER `pull_request_target`. Privileged
   workflows (publish, deploy) are separate, push/tag-triggered, and never
   execute PR-modified code. Actions get pinned to commit SHAs before enabling.
+  The repo-settings hardening that can't live in workflow files
+  (first-contributor approval, branch protection, org-wide read-only token)
+  is the ACTIVATION CHECKLIST at the top of `.github/ci.draft.yml` — work it
+  when the GitHub repo goes live.
 
 ### Product code
 

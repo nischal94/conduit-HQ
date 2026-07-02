@@ -13,8 +13,16 @@
 #   credentials, cloud creds, or publish tokens to this file. Privileged
 #   workflows (publish, deploy) belong in a separate push/tag-triggered
 #   workflow that never runs PR code.
-# - Before enabling, pin every `uses:` and docker image to a full commit SHA /
-#   digest, not a tag.
+# ACTIVATION CHECKLIST (do these in repo settings when this goes live —
+# none of them can be configured from inside this file):
+# 1. Pin every `uses:` and docker image below to a full commit SHA / digest.
+# 2. Settings → Actions → require approval for first-time contributors
+#    (bounds hostile-PR compute burn; the jobs here do run PR code).
+# 3. Branch protection on main: require all four checks, require branches
+#    up to date before merge.
+# 4. Settings → Actions → confirm the default GITHUB_TOKEN is read-only
+#    repo-wide (the permissions block below enforces it per-workflow;
+#    the setting enforces it for any future workflow someone adds).
 name: CI
 
 on:
@@ -87,6 +95,28 @@ jobs:
           # Full history so gitleaks scans every commit, not just HEAD.
           fetch-depth: 0
           persist-credentials: false
+      # The lockfile-review policy (CLAUDE.md) made visible: if a PR touches
+      # supply-chain-sensitive files, surface it loudly in the checks UI.
+      # Warning, not failure — legitimate dep changes are normal; the point
+      # is that a human can't miss that this diff needs the careful read.
+      - name: Flag supply-chain-sensitive changes for human review
+        if: github.event_name == 'pull_request'
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          changed=$(git diff --name-only "$BASE_SHA" HEAD -- \
+            pnpm-lock.yaml pnpm-workspace.yaml githooks/ .github/ package.json 'packages/*/package.json')
+          if [ -n "$changed" ]; then
+            echo "::warning title=Supply-chain review required::PR modifies: $(echo "$changed" | tr '\n' ' ')"
+            {
+              echo "## ⚠️ Supply-chain-sensitive files changed"
+              echo '```'
+              echo "$changed"
+              echo '```'
+              echo "Review these like code (CLAUDE.md security posture): lockfile"
+              echo "diffs, allowBuilds, hooks, CI workflows, dependency manifests."
+            } >> "$GITHUB_STEP_SUMMARY"
+          fi
       # Gitleaks binary directly — needs no token, prints redacted findings.
       - name: Secrets scan (full history)
         run: >
