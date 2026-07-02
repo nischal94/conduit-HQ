@@ -21,15 +21,21 @@ import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "./sandbox.js";
  *   results; execution proceeds live from the first un-journaled call.
  *
  * Why not the ASYNCIFY build's async host functions: in
- * quickjs-emscripten 0.31.0, a pending job (any `await` continuation)
- * that calls an asyncified host function suspends inside the synchronous
- * `executePendingJobs` FFI call, whose wrapper then reads unwound stack
- * garbage — heap corruption, not an error. There is no suspension-aware
- * job pump in the library. Replay avoids the entire class: the sync
- * build cannot suspend, and no VM ever waits on the host. It is also
- * what §5.5 demands anyway — a paused Execution must be pure data
- * (code + seeds + journal) that survives restarts, which a suspended
- * WASM stack never could.
+ * quickjs-emscripten 0.31.0, two or more asyncified host calls made
+ * from pending jobs (`await` continuations, `.then` callbacks) corrupt
+ * the WASM heap (verified 2026-07-02 with minimal repros: crashes are
+ * reliable but the signature varies — OOB reads, QuickJS GC
+ * assertions, broken asyncify rewinds; paranoid disposal ordering
+ * doesn't help; both calls complete with correct data before death;
+ * ingredient bisects gave inconsistent discriminators across script
+ * shapes, which is itself typical of allocation-dependent memory
+ * corruption). The library also has no suspension-aware job pump (its
+ * `_MaybeAsync` FFI binding is never used). Exact mechanism
+ * unconfirmed; see the upstream report. Replay avoids the entire
+ * class: the sync build cannot suspend, and no VM ever waits on the
+ * host. It is also what §5.5 demands anyway — a paused Execution must
+ * be pure data (code + seeds + journal) that survives restarts, which
+ * a suspended WASM stack never could.
  *
  * One context per run, one runtime per context: no state shared between
  * runs beyond the journal, which is host-owned data.

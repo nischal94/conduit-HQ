@@ -119,6 +119,23 @@ from docs, and not from more spiking. Ground truth about a dependency
 lives in `node_modules`, and one green run is not evidence of soundness
 where probabilistic corruption is on the table.
 
+> Corrected 2026-07-02 (same day, while drafting the upstream report):
+> the mechanism sentence above was itself an unverified inference, and
+> minimal repros falsified it twice — first a bare asyncified call from
+> a pumped `await`-continuation ran clean (killing "any continuation
+> corrupts"), then an "argument-read is the trigger" theory from one
+> bisect died on the next script shape. What survived every test: two
+> sequential asyncified host calls from pending jobs crash reliably
+> (varying signatures); the trivial single-call shape is clean; paranoid
+> disposal doesn't help; both calls complete with correct data before
+> death. Bisects giving inconsistent discriminators across shapes is
+> itself the diagnosis — allocation-noise-dependent heap corruption, so
+> "clean" configs may be silently corrupted too. Exact mechanism stays
+> unidentified; the facts live in the upstream issue. The lesson's own
+> rule caught its author twice: each plausible mechanism story felt like
+> a finding until the next experiment. The decision this justified
+> (sync build + replay) stands on §5.5 grounds regardless.
+
 ### 10. Nondeterministic failure *modes* mean corruption, not flaky tests
 
 Same suite, three runs, three different failures. The reflex reading is
