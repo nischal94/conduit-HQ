@@ -92,7 +92,7 @@ describe("InMemoryCatalog", () => {
       expect(seeded().search({ query: "  " })).toEqual([]);
     });
 
-    it("never leaks schemas into search hits (progressive disclosure)", () => {
+    it("INVARIANT §4.2: search hits never carry schemas (progressive disclosure)", () => {
       for (const hit of seeded().search({ query: "issues" })) {
         expect(Object.keys(hit).sort()).toEqual(
           expect.not.arrayContaining(["inputSchema", "outputSchema"]),
@@ -115,7 +115,7 @@ describe("InMemoryCatalog", () => {
       expect(described?.outputSchema).toBeUndefined();
     });
 
-    it("includes schemas only when explicitly asked (lazy loading)", () => {
+    it("INVARIANT §8: schemas load only when explicitly asked (lazy loading)", () => {
       const described = seeded().describe("github.issues.create", { includeSchemas: true });
       expect(described?.inputSchema).toEqual({ type: "object" });
       expect(described?.outputSchema).toEqual({});

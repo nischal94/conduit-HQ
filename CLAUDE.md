@@ -49,6 +49,15 @@ Its own supply chain and code must hold the same bar it sells.
   is the ACTIVATION CHECKLIST at the top of `.github/ci.draft.yml` — work it
   when the GitHub repo goes live.
 
+### Invariants ledger
+
+- `INVARIANTS.md` maps every load-bearing spec claim to the test that pins
+  it. Invariant tests carry an `INVARIANT §x.y:` prefix in the test name.
+- A module implementing a spec invariant may NOT land without its invariant
+  test in the same commit — and the ledger row flips in that commit too.
+- A ⏳ row is a promise the product makes but does not yet enforce; never
+  describe an unpinned invariant as "done".
+
 ### Product code
 
 - The spec's security invariants are hard requirements in code review: the

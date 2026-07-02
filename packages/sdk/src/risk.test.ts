@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { deriveRiskClass } from "./risk.js";
 
-describe("deriveRiskClass", () => {
+describe("deriveRiskClass (INVARIANT §10.1: default risk mapping)", () => {
   describe("openapi", () => {
     it.each([["GET"], ["HEAD"], ["OPTIONS"]])("classifies %s as safe", (method) => {
       expect(deriveRiskClass({ kind: "openapi", method, path: "/x" })).toBe("safe");
