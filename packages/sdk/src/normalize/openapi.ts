@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { PERMISSIVE_SCHEMA } from "../jsonschema.js";
 import { deriveRiskClass } from "../risk.js";
 import type { JsonSchema, Tool } from "../types.js";
 
@@ -33,12 +34,6 @@ const HTTP_METHODS = [
   "patch",
   "trace",
 ] as const;
-
-/**
- * Empty JSON Schema: matches any value. The spec §7 fallback when a source
- * declares no output schema — uniform shape without over-claiming validation.
- */
-const PERMISSIVE_SCHEMA: JsonSchema = {};
 
 // Boundary validation: just the envelope we rely on, not full OpenAPI.
 const documentEnvelope = z
