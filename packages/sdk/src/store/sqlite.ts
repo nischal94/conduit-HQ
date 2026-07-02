@@ -218,7 +218,10 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         await client.batch(statements, "write");
       },
       async get(name: string): Promise<Tool | undefined> {
-        const rs = await client.execute({ sql: "SELECT * FROM tools WHERE name = ?", args: [name] });
+        const rs = await client.execute({
+          sql: "SELECT * FROM tools WHERE name = ?",
+          args: [name],
+        });
         return rs.rows[0] === undefined ? undefined : rowToTool(rs.rows[0]);
       },
       async list(namespace?: string): Promise<Tool[]> {

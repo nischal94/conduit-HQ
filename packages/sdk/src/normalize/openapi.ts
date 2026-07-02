@@ -24,16 +24,7 @@ export interface NormalizedOpenApi {
   baseUrl: string;
 }
 
-const HTTP_METHODS = [
-  "get",
-  "put",
-  "post",
-  "delete",
-  "options",
-  "head",
-  "patch",
-  "trace",
-] as const;
+const HTTP_METHODS = ["get", "put", "post", "delete", "options", "head", "patch", "trace"] as const;
 
 // Boundary validation: just the envelope we rely on, not full OpenAPI.
 const documentEnvelope = z
@@ -209,9 +200,7 @@ export function normalizeOpenApi(options: NormalizeOpenApiOptions): NormalizedOp
   }
   const doc = parsed.data as JsonObject;
 
-  const absoluteServer = parsed.data.servers?.find((server) =>
-    /^https?:\/\//.test(server.url),
-  );
+  const absoluteServer = parsed.data.servers?.find((server) => /^https?:\/\//.test(server.url));
   const baseUrl = options.baseUrl ?? absoluteServer?.url;
   if (baseUrl === undefined) {
     throw new Error(

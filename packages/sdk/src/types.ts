@@ -77,12 +77,7 @@ export interface Policy {
   manualOverride: boolean;
 }
 
-export type ExecutionStatus =
-  | "running"
-  | "paused"
-  | "completed"
-  | "failed"
-  | "expired";
+export type ExecutionStatus = "running" | "paused" | "completed" | "failed" | "expired";
 
 /**
  * One invocation of the `execute` tool. Pause/resume works by deterministic

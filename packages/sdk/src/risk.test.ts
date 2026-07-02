@@ -34,9 +34,9 @@ describe("deriveRiskClass (INVARIANT §10.1: default risk mapping)", () => {
 
   describe("mcp", () => {
     it("classifies destructiveHint as destructive even when read-only is also claimed", () => {
-      expect(
-        deriveRiskClass({ kind: "mcp", destructiveHint: true, readOnlyHint: true }),
-      ).toBe("destructive");
+      expect(deriveRiskClass({ kind: "mcp", destructiveHint: true, readOnlyHint: true })).toBe(
+        "destructive",
+      );
     });
 
     it("classifies readOnlyHint as safe", () => {

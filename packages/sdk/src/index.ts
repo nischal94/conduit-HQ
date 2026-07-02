@@ -1,4 +1,3 @@
-export { InMemoryCatalog } from "./catalog.js";
 export type {
   Catalog,
   DescribeOptions,
@@ -6,10 +5,18 @@ export type {
   SearchOptions,
   ToolDescription,
 } from "./catalog.js";
+export { InMemoryCatalog } from "./catalog.js";
+export type { NormalizeMcpOptions } from "./normalize/mcp.js";
+export { normalizeMcp } from "./normalize/mcp.js";
+export type {
+  NormalizedOpenApi,
+  NormalizeOpenApiOptions,
+} from "./normalize/openapi.js";
+export { normalizeOpenApi } from "./normalize/openapi.js";
 export { deriveRiskClass } from "./risk.js";
 export { SecretBox } from "./secrets.js";
-export { openSqliteStore } from "./store/sqlite.js";
 export type { SqliteStoreOptions } from "./store/sqlite.js";
+export { openSqliteStore } from "./store/sqlite.js";
 export type {
   ConduitStore,
   ConnectionRepository,
@@ -21,13 +28,6 @@ export type {
   ToolRepository,
   TraceRepository,
 } from "./store/store.js";
-export { normalizeMcp } from "./normalize/mcp.js";
-export type { NormalizeMcpOptions } from "./normalize/mcp.js";
-export { normalizeOpenApi } from "./normalize/openapi.js";
-export type {
-  NormalizedOpenApi,
-  NormalizeOpenApiOptions,
-} from "./normalize/openapi.js";
 export type {
   Connection,
   Execution,

@@ -12,5 +12,8 @@
     "lint": "biome check .",
     "lint:fix": "biome check --write .",
     "verify": "pnpm typecheck && pnpm test"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.1"
   }
 }

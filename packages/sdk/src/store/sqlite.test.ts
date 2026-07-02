@@ -1,9 +1,9 @@
 import { createClient } from "@libsql/client";
 import { beforeEach, describe, expect, it } from "vitest";
 import { SecretBox } from "../secrets.js";
-import type { ConduitStore } from "./store.js";
-import { openSqliteStore } from "./sqlite.js";
 import type { Tool } from "../types.js";
+import { openSqliteStore } from "./sqlite.js";
+import type { ConduitStore } from "./store.js";
 
 function tool(overrides: Partial<Tool> & Pick<Tool, "name" | "namespace">): Tool {
   return {
