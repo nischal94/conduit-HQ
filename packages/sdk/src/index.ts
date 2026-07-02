@@ -14,6 +14,19 @@ export type {
 } from "./normalize/openapi.js";
 export { normalizeOpenApi } from "./normalize/openapi.js";
 export { deriveRiskClass } from "./risk.js";
+export { QuickJSSandbox } from "./sandbox/quickjs.js";
+export type {
+  ExecutionRequest,
+  ExecutionSeeds,
+  InterruptReason,
+  JournalEntry,
+  Sandbox,
+  SandboxError,
+  SandboxLimits,
+  SandboxResult,
+  ToolHost,
+} from "./sandbox/sandbox.js";
+export { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "./sandbox/sandbox.js";
 export { SecretBox } from "./secrets.js";
 export type { SqliteStoreOptions } from "./store/sqlite.js";
 export { openSqliteStore } from "./store/sqlite.js";
