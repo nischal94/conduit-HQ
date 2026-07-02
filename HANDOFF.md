@@ -73,10 +73,30 @@ Acceptance criteria:
   Note: `pnpm` routes through sfw; the audit may need the human's
   terminal if the agent sandbox blocks it.
 
+### First item next session: CI activation (repo now exists)
+
+Repo is live: https://github.com/nischal94/conduit-HQ (private, main
+pushed). Upstream asyncify bug corroborated on
+justjake/quickjs-emscripten#258. Pre-flight for CI activation already
+verified: `.nvmrc` exists; root package.json has lint / typecheck /
+test / build scripts. Remaining, in order:
+
+1. Agent: pin `uses:` actions + docker images in `.github/ci.draft.yml`
+   to commit SHAs / digests (gh api for action SHAs), commit.
+2. Agent via `gh api`: default GITHUB_TOKEN read-only
+   (actions/permissions/workflow), first-contributor approval, branch
+   protection on main — require the CI checks but leave
+   enforce_admins OFF so the solo direct-push flow keeps working.
+   NOTE: checklist says "four checks" but the workflow has FIVE jobs
+   (quality, meta, test, build, security) — stale count, require all 5.
+3. Human, in own terminal (workflow dir is deliberately
+   agent-unwritable):
+   `mkdir -p .github/workflows && git mv .github/ci.draft.yml .github/workflows/ci.yml`
+   then commit + push, and watch the first run go green.
+
 ### Waiting on the human
 
-- GitHub repo creation (private recommended), then the CI activation
-  checklist at the top of `.github/ci.draft.yml`.
+- Step 3 above (the git mv) when the agent has finished steps 1–2.
 - Possibly the `pnpm audit` half of the Phase 0 milestone audit (above).
 
 ### Session quirks worth inheriting
