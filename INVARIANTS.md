@@ -18,8 +18,8 @@ promise the product makes but does not yet enforce.
 | §4.2 / §8 — search hits never carry schemas | `packages/sdk/src/catalog.test.ts` | ✅ pinned |
 | §8 — schemas load only on explicit describe (lazy) | `packages/sdk/src/catalog.test.ts` | ✅ pinned |
 | §10.1 — riskClass default mapping table | `packages/sdk/src/risk.test.ts` | ✅ pinned |
-| §7 — policies persist across source refresh; manual overrides never silently reverted | — | ⏳ awaits storage layer |
-| §9.2 — secrets encrypted at rest (master key) | — | ⏳ awaits storage layer |
+| §7 — policies persist across source refresh; manual overrides never silently reverted | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
+| §9.2 — secrets encrypted at rest (master key) | `packages/sdk/src/store/sqlite.test.ts` + `secrets.test.ts` | ✅ pinned |
 | §4.2 — execute surface ≈ 1 tool / ~1,044 tokens | — | ⏳ awaits `execute` tool |
 | §9.2 — a secret never enters sandbox heap / agent code / agent / model | — | ⏳ awaits credential resolver + sandbox |
 | §9.3 — loopback/private egress off by default | — | ⏳ awaits egress gateway |
