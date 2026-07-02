@@ -1,0 +1,22 @@
+#!/bin/sh
+# Pre-commit gate: the same fast checks CI runs first (typecheck, tests, lint).
+# Enabled via: git config core.hooksPath githooks
+#
+# Rules for this file:
+# - NEVER add install commands here. Plain `sh` resolves the raw pnpm binary,
+#   which bypasses the Socket Firewall alias — fine for running checks, never
+#   acceptable for fetching packages.
+# - Keep total runtime under ~10s or people will start committing with -n.
+set -e
+cd "$(git rev-parse --show-toplevel)"
+
+# Extend this list as workspace packages grow.
+for pkg in packages/sdk; do
+  "$pkg/node_modules/.bin/tsc" --noEmit -p "$pkg/tsconfig.json"
+  "$pkg/node_modules/.bin/vitest" run --root "$pkg" --silent
+done
+
+# Lint once Biome is installed at the workspace root.
+if [ -x node_modules/.bin/biome ]; then
+  node_modules/.bin/biome check .
+fi
