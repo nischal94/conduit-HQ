@@ -38,6 +38,12 @@ Its own supply chain and code must hold the same bar it sells.
   versions (the compromised-maintainer window) age before we'll install them.
 - **Audit cadence**: run `pnpm audit` and an Aikido scan (`/aikido:scan`)
   before each phase milestone and before anything ships.
+- **CI is an unprivileged validation surface.** PR-triggered workflows run
+  untrusted code: `permissions: contents: read`, zero `secrets.*` references,
+  installs with `--ignore-scripts`, checkout with
+  `persist-credentials: false`, and NEVER `pull_request_target`. Privileged
+  workflows (publish, deploy) are separate, push/tag-triggered, and never
+  execute PR-modified code. Actions get pinned to commit SHAs before enabling.
 
 ### Product code
 

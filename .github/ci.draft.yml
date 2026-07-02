@@ -3,8 +3,18 @@
 # (Workflow files are deliberately not agent-writable on this machine; a human
 # moves this into place. Review it like code — CI is a supply-chain surface.)
 #
-# Before enabling on a real repo, consider pinning each action to a commit SHA
-# instead of a tag, per the project security posture.
+# THREAT MODEL (read before editing):
+# - pull_request runs UNTRUSTED code. A PR can modify package scripts, test
+#   files, pnpm-workspace.yaml (allowBuilds), and the lockfile — so every job
+#   here is an unprivileged validation surface: read-only token, zero
+#   `secrets.*` references, installs with --ignore-scripts, checkout
+#   credentials not persisted.
+# - NEVER switch any trigger to pull_request_target. Never add secrets, deploy
+#   credentials, cloud creds, or publish tokens to this file. Privileged
+#   workflows (publish, deploy) belong in a separate push/tag-triggered
+#   workflow that never runs PR code.
+# - Before enabling, pin every `uses:` and docker image to a full commit SHA /
+#   digest, not a tag.
 name: CI
 
 on:
@@ -12,18 +22,29 @@ on:
     branches: [main]
   pull_request:
 
+# Least privilege for the auto-generated GITHUB_TOKEN, workflow-wide.
+permissions:
+  contents: read
+
+# Superseded runs of the same branch/PR are cancelled, not stacked.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   quality:
     name: Lint + typecheck
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm lint
       - run: pnpm typecheck
 
@@ -32,12 +53,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm test
 
   build:
@@ -45,12 +68,14 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm build
 
   security:
@@ -59,16 +84,20 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history so gitleaks can scan every commit, not just HEAD.
+          # Full history so gitleaks scans every commit, not just HEAD.
           fetch-depth: 0
-      - uses: gitleaks/gitleaks-action@v2
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          persist-credentials: false
+      # Gitleaks binary directly — needs no token, prints redacted findings.
+      - name: Secrets scan (full history)
+        run: >
+          docker run --rm -v "$PWD:/repo"
+          ghcr.io/gitleaks/gitleaks:v8.21.2
+          detect --source /repo --no-banner --redact
       - uses: pnpm/action-setup@v4
       - uses: actions/setup-node@v4
         with:
           node-version-file: .nvmrc
           cache: pnpm
-      - run: pnpm install --frozen-lockfile
+      - run: pnpm install --frozen-lockfile --ignore-scripts
       # Fail only on high/critical; low/moderate noise gets reviewed, not churned.
       - run: pnpm audit --audit-level high
