@@ -1,4 +1,6 @@
 export { deriveRiskClass } from "./risk.js";
+export { normalizeMcp } from "./normalize/mcp.js";
+export type { NormalizeMcpOptions } from "./normalize/mcp.js";
 export { normalizeOpenApi } from "./normalize/openapi.js";
 export type {
   NormalizedOpenApi,
