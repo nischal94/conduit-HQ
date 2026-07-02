@@ -1,5 +1,15 @@
 # conduit-HQ — Project Instructions
 
+## Session protocol
+
+- **Start of session:** read `HANDOFF.md` first — it carries repo state,
+  the current task with acceptance criteria, and session quirks. Don't
+  re-derive project state from scratch.
+- **End of session:** rewrite `HANDOFF.md` (state, next task, kickoff
+  prompt) and append the session's lessons to `LEARNINGS.md`. A decision
+  or recommendation that lives only in chat does not exist — spec §18 for
+  product decisions, this file for rules, HANDOFF.md for state.
+
 ## Spec files: HTML is the source of truth
 
 `conduitspec.html` is the source. `conduitspec.md` is a derived, text-only copy
