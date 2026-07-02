@@ -273,6 +273,22 @@ schema for one tool.
 - The model's prompt only ever contains the `execute` tool + connection prefixes; schemas are
 pulled on demand. This is the mechanism behind "thousands of tools, no bloat."
 
+**Search ranking roadmap (decided — staged, evidence-gated):** the primary search
+caller is the *model*, which writes tool-shaped queries and retries cheaply — so ranking
+sophistication is bought only when data demands it.
+
+- **v0 (shipped):** lexical ranking in `InMemoryCatalog` — name-segment >
+name-substring > description token match; deterministic; the `execute` description
+tells the model to search with concrete nouns/verbs and retry on empty results.
+- **Phase 1 (with the storage layer):** `tools.search` moves to **SQLite FTS5 +
+BM25** behind the same `Catalog` interface — stemming and real ranking for zero new
+dependencies. Verify D1's FTS5 support for Worker parity then; if lacking, the Worker
+keeps the in-memory implementation (a config detail, not a fork).
+- **Phase 2 (instrument, then decide):** Trace records zero-hit searches, giving a real
+miss-rate metric. Embedding/semantic search is added **only if that data demands it**,
+and then only as **operator opt-in** — catalog metadata never leaves the machine by
+default (§9.3 spirit).
+
 ---
 
 ## 9. Connections, credentials & the security boundary
@@ -540,6 +556,7 @@ output-size cap (defaults 60s / 128 MB / 1 MB; operator-tunable). A runaway
 - Durable background service; `/mcp` streamable-HTTP + stdio; `conduit` CLI; `add-mcp`.
 - Web console: Add Source, connections, policies, Connect card.
 - Policy engine v1 (riskClass + three states + overrides).
+- `tools.search` upgraded to SQLite FTS5/BM25 behind the same Catalog interface (§8 roadmap).
 
 **Phase 2 — Differentiators**
 

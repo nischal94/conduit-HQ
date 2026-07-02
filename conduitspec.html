@@ -421,6 +421,22 @@ schema for one tool.</li>
 <li>The model&#39;s prompt only ever contains the <code>execute</code> tool + connection prefixes; schemas are
 pulled on demand. This is the mechanism behind &quot;thousands of tools, no bloat.&quot;</li>
 </ul>
+<p><strong>Search ranking roadmap (decided — staged, evidence-gated):</strong> the primary search
+caller is the <em>model</em>, which writes tool-shaped queries and retries cheaply — so ranking
+sophistication is bought only when data demands it.</p>
+<ul>
+<li><strong>v0 (shipped):</strong> lexical ranking in <code>InMemoryCatalog</code> — name-segment &gt;
+name-substring &gt; description token match; deterministic; the <code>execute</code> description
+tells the model to search with concrete nouns/verbs and retry on empty results.</li>
+<li><strong>Phase 1 (with the storage layer):</strong> <code>tools.search</code> moves to <strong>SQLite FTS5 +
+BM25</strong> behind the same <code>Catalog</code> interface — stemming and real ranking for zero new
+dependencies. Verify D1&#39;s FTS5 support for Worker parity then; if lacking, the Worker
+keeps the in-memory implementation (a config detail, not a fork).</li>
+<li><strong>Phase 2 (instrument, then decide):</strong> Trace records zero-hit searches, giving a real
+miss-rate metric. Embedding/semantic search is added <strong>only if that data demands it</strong>,
+and then only as <strong>operator opt-in</strong> — catalog metadata never leaves the machine by
+default (§9.3 spirit).</li>
+</ul>
 <hr>
 <h2 id="9-connections-credentials-amp-the-security-boundary">9. Connections, credentials &amp; the security boundary</h2>
 <h3 id="9-1-connection-model">9.1 Connection model</h3>
@@ -757,6 +773,7 @@ output-size cap (defaults 60s / 128 MB / 1 MB; operator-tunable). A runaway
 <li>Durable background service; <code>/mcp</code> streamable-HTTP + stdio; <code>conduit</code> CLI; <code>add-mcp</code>.</li>
 <li>Web console: Add Source, connections, policies, Connect card.</li>
 <li>Policy engine v1 (riskClass + three states + overrides).</li>
+<li><code>tools.search</code> upgraded to SQLite FTS5/BM25 behind the same Catalog interface (§8 roadmap).</li>
 </ul>
 <p><strong>Phase 2 — Differentiators</strong></p>
 <ul>
