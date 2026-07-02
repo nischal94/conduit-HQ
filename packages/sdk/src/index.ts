@@ -1,3 +1,11 @@
+export { InMemoryCatalog } from "./catalog.js";
+export type {
+  Catalog,
+  DescribeOptions,
+  SearchHit,
+  SearchOptions,
+  ToolDescription,
+} from "./catalog.js";
 export { deriveRiskClass } from "./risk.js";
 export { normalizeMcp } from "./normalize/mcp.js";
 export type { NormalizeMcpOptions } from "./normalize/mcp.js";
