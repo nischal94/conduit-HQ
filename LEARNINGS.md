@@ -6,6 +6,18 @@ Division of labor: the spec's §18 records *what* was decided, CLAUDE.md
 records *the rules*, this file records *what almost went wrong, what
 pattern caught it, and what we'd repeat*.
 
+**This file is history, not instructions.** Entries record what was true
+at their date. Anything an agent must act on has been promoted to an
+enforcement point that IS kept current — a CLAUDE.md rule, a spec
+section, a hook, a CI job, or an invariant test. Never execute from this
+file; execute from the enforcement points.
+
+**When a lesson is superseded:** the old entry stays, gaining a one-line
+`> Superseded <date>: <what changed, where the current rule lives>` note.
+Silent rewrites of past entries are forbidden — a journal that edits its
+own history can't be trusted about anything. Freshness sweep happens at
+each phase milestone (see CLAUDE.md audit cadence).
+
 ## 2026-07-02 — Foundation session (spec review → Phase 0 core)
 
 Shipped: spec v0.1 hardening (7 gaps closed, incl. deterministic-replay

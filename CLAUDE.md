@@ -47,7 +47,19 @@ Its own supply chain and code must hold the same bar it sells.
 - **`minimumReleaseAge` is set** in `pnpm-workspace.yaml` so freshly published
   versions (the compromised-maintainer window) age before we'll install them.
 - **Audit cadence**: run `pnpm audit` and an Aikido scan (`/aikido:scan`)
-  before each phase milestone and before anything ships.
+  before each phase milestone and before anything ships — plus a freshness
+  sweep of HANDOFF.md and LEARNINGS.md (mark superseded lessons; never
+  silently rewrite them).
+
+### Coverage beyond Biome
+
+- Biome owns JS/TS/JSON. Everything else gets a fit-for-purpose check,
+  not a linter by reflex: **spec drift** (pre-commit hook + CI regenerate
+  `conduitspec.md` and fail on mismatch — this also exercises
+  `html2md.py`'s behavior on every commit), **shellcheck** on `githooks/`
+  and **actionlint** on workflows (both in CI).
+- Deliberately NOT adopted: markdownlint, Python linting. Revisit if the
+  Python surface grows beyond `html2md.py` or the docs sprawl.
 - **CI is an unprivileged validation surface.** PR-triggered workflows run
   untrusted code: `permissions: contents: read`, zero `secrets.*` references,
   installs with `--ignore-scripts`, checkout with

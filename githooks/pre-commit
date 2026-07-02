@@ -10,6 +10,17 @@
 set -e
 cd "$(git rev-parse --show-toplevel)"
 
+# Spec drift (the CLAUDE.md regeneration rule, made mechanical):
+# conduitspec.md must be the exact derivation of conduitspec.html.
+tmp="$(mktemp)"
+python3 html2md.py conduitspec.html "$tmp" >/dev/null
+if ! cmp -s "$tmp" conduitspec.md; then
+  rm -f "$tmp"
+  echo "pre-commit: conduitspec.md is stale — run: python3 html2md.py && git add conduitspec.md" >&2
+  exit 1
+fi
+rm -f "$tmp"
+
 # Extend this list as workspace packages grow.
 for pkg in packages/sdk; do
   "$pkg/node_modules/.bin/tsc" --noEmit -p "$pkg/tsconfig.json"

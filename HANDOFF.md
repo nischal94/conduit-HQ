@@ -10,6 +10,13 @@ The baton between sessions. **Protocol:**
 3. This file only *points*; it never duplicates spec content. Git history
    is the archive of past handoffs.
 
+**Staleness tripwire (run before trusting anything below):** compare
+`git log -1 --format=%h` with `git log -1 --format=%h -- HANDOFF.md`.
+If they differ, work happened after this handoff was written — it is
+stale by exactly the commits between them. Reconstruct state from
+`git log` over that range, rewrite this file FIRST, then start the task.
+A session that ends abnormally can't lie here; git tells on it.
+
 ---
 
 ## Current handoff — written 2026-07-02 (foundation session)
@@ -53,8 +60,6 @@ async before designing the bridge.
 
 - GitHub repo creation (private recommended), then the CI activation
   checklist at the top of `.github/ci.draft.yml`.
-- Decision pending: spec drift-check in the pre-commit hook (suggested,
-  not yet approved).
 
 ### Session quirks worth inheriting
 
