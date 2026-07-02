@@ -130,11 +130,21 @@ where probabilistic corruption is on the table.
 > disposal doesn't help; both calls complete with correct data before
 > death. Bisects giving inconsistent discriminators across shapes is
 > itself the diagnosis — allocation-noise-dependent heap corruption, so
-> "clean" configs may be silently corrupted too. Exact mechanism stays
-> unidentified; the facts live in the upstream issue. The lesson's own
+> "clean" configs may be silently corrupted too. The lesson's own
 > rule caught its author twice: each plausible mechanism story felt like
 > a finding until the next experiment. The decision this justified
 > (sync build + replay) stands on §5.5 grounds regardless.
+>
+> Addendum (same day): a duplicate search before filing found the bug
+> already reported as justjake/quickjs-emscripten#258 (still present in
+> 0.32.0) — we corroborated there instead of filing. Upstream #239
+> identifies the probable mechanism, matching our own dist grep: the
+> release-asyncify FFI cwraps `QTS_ExecutePendingJob_MaybeAsync`
+> without `{async: true}`, and the runtime never routes through it.
+> Two more lessons for free: search the tracker before drafting the
+> issue, and the original inference ("suspension from a pending job
+> goes through a non-async-aware path") was directionally right — it
+> failed as a *specific* mechanism claim, not as a diagnosis.
 
 ### 10. Nondeterministic failure *modes* mean corruption, not flaky tests
 

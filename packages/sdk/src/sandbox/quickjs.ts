@@ -30,8 +30,11 @@ import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "./sandbox.js";
  * ingredient bisects gave inconsistent discriminators across script
  * shapes, which is itself typical of allocation-dependent memory
  * corruption). The library also has no suspension-aware job pump (its
- * `_MaybeAsync` FFI binding is never used). Exact mechanism
- * unconfirmed; see the upstream report. Replay avoids the entire
+ * `_MaybeAsync` FFI binding is never used). Upstream:
+ * justjake/quickjs-emscripten#258 (same bug, still in 0.32.0; our
+ * corroboration is commented there) and #239 (probable mechanism: the
+ * release-asyncify FFI cwraps QTS_ExecutePendingJob_MaybeAsync without
+ * `{async: true}`). Replay avoids the entire
  * class: the sync build cannot suspend, and no VM ever waits on the
  * host. It is also what §5.5 demands anyway — a paused Execution must
  * be pure data (code + seeds + journal) that survives restarts, which

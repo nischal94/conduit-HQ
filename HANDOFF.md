@@ -34,11 +34,13 @@ A session that ends abnormally can't lie here; git tells on it.
   quickjs-emscripten's **plain sync build**, and tool-call suspension is
   **§5.5 deterministic replay** (journal + seeded non-determinism), NOT
   asyncified host functions. The asyncify build is defective for our
-  shape of use in 0.31.0 — two-plus asyncified host calls from pending
-  jobs corrupt the WASM heap; repro'd minimally post-session, exact
-  upstream mechanism unconfirmed (see LEARNINGS #9 correction + the
-  upstream report). Do not "simplify" back to asyncify without
-  re-verifying the library.
+  shape of use — two-plus asyncified host calls from pending jobs
+  corrupt the WASM heap; repro'd minimally post-session on 0.31.0 and
+  confirmed upstream as justjake/quickjs-emscripten#258 (still present
+  in 0.32.0; our corroboration commented there). Probable mechanism is
+  #239: release-asyncify FFI cwraps QTS_ExecutePendingJob_MaybeAsync
+  without `{async: true}`. See LEARNINGS #9 correction. Do not
+  "simplify" back to asyncify without re-verifying the library.
 - INVARIANTS.md: 7 pinned ✅ (added §16 caps, §4.2 token budget),
   5 pending ⏳. §5.5's replay mechanism + seeds are implemented and
   tested (un-prefixed) in `quickjs.test.ts`; the row stays ⏳ for the
