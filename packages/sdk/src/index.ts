@@ -6,6 +6,13 @@ export type {
   ToolDescription,
 } from "./catalog.js";
 export { InMemoryCatalog } from "./catalog.js";
+export type {
+  BuildExecuteToolOptions,
+  ConnectionListing,
+  ExecuteToolDefinition,
+  ToolInvoker,
+} from "./execute.js";
+export { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execute.js";
 export type { NormalizeMcpOptions } from "./normalize/mcp.js";
 export { normalizeMcp } from "./normalize/mcp.js";
 export type {
