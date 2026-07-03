@@ -33,6 +33,9 @@ puts the human decision AFTER the clean-room CI evidence exists.
 
 - **Direct push to main is allowed only when every file in every pushed
   commit is on the inert-prose allowlist: `HANDOFF.md`, `LEARNINGS.md`.**
+  The agent pushes these via `scripts/push-docs` (verifies the allowlist,
+  then pushes) — the sanctioned narrow exception to the machine-level
+  deny on agent pushes to main, which stays intact for everything else.
 - **Everything else goes branch → PR → CI green + CodeRabbit review →
   merge.** That includes all code and tests, dependency manifests and
   the lockfile, `githooks/`, `.github/`, the spec pair + `html2md.py`,
