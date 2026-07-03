@@ -2,10 +2,10 @@
 # Guarded docs-only push to main (CLAUDE.md "Commit routing").
 #
 # The one sanctioned agent path for pushing main directly: verifies that
-# every outgoing commit touches nothing but the inert-prose allowlist
-# (HANDOFF.md, LEARNINGS.md), then pushes. Anything else exits loudly —
-# use the PR route. The pre-push hook re-checks the same rule, so a bug
-# here still gets caught there (two independent gates).
+# every outgoing commit touches only files on .pushallowlist, then
+# pushes. Anything else exits loudly — use the PR route. The pre-push
+# hook independently re-checks the same rule via the same shared lib
+# (scripts/routing-lib.sh), so a bug here still gets caught there.
 #
 # The agent-side permission allow for this script lives in
 # .claude/settings.local.json; the global deny on `git push origin main`
@@ -15,6 +15,10 @@ set -e
 
 cd "$(git rev-parse --show-toplevel)"
 
+# shellcheck source=scripts/routing-lib.sh
+. scripts/routing-lib.sh
+load_allowlist
+
 branch=$(git branch --show-current)
 if [ "$branch" != "main" ]; then
   echo "push-docs: refusing — current branch is '$branch', not main." >&2
@@ -23,10 +27,12 @@ fi
 
 git fetch origin main --quiet
 
-blocked=$(git diff --name-only origin/main..HEAD | grep -vxF -e HANDOFF.md -e LEARNINGS.md -e CLAUDE.md || true)
+changed=$(git diff --name-only origin/main..HEAD)
+blocked=$(blocked_paths "$changed")
+
 if [ -n "$blocked" ]; then
   {
-    echo "push-docs: refusing — outgoing commits touch more than inert prose:"
+    echo "push-docs: refusing — outgoing commits touch files not on .pushallowlist:"
     printf '%s\n' "$blocked" | sed 's/^/  /'
     echo "Route through a PR instead (CLAUDE.md: commit routing)."
   } >&2

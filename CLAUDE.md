@@ -37,17 +37,20 @@ Decided 2026-07-03 (rationale: LEARNINGS #13 and #16). Only the PR route
 puts the human decision AFTER the clean-room CI evidence exists.
 
 - **Direct push to main is allowed only when every file in every pushed
-  commit is on the allowlist: `HANDOFF.md`, `LEARNINGS.md`, `CLAUDE.md`.**
-  The agent pushes these via `scripts/push-docs` (verifies the allowlist,
-  then pushes) — the sanctioned narrow exception to the machine-level
-  deny on agent pushes to main, which stays intact for everything else.
-  (CLAUDE.md added 2026-07-04: its edits are already reviewed with the
-  human in chat before being written, so a PR re-review added ceremony,
-  not safety.)
-- **Everything else goes branch → PR → CI green + CodeRabbit review →
-  merge.** That includes all code and tests, dependency manifests and
-  the lockfile, `githooks/`, `.github/`, the spec pair + `html2md.py`,
-  and `INVARIANTS.md`. A mixed commit takes the stricter route.
+  commit is on `.pushallowlist`** (prose and housekeeping config that no
+  CI check or reviewer can evaluate — their only real review is the chat
+  where they're written). The agent pushes via `scripts/push-docs` — the
+  sanctioned narrow exception to the machine-level deny on agent pushes
+  to main. Extending the list is a direct-pushable one-line edit.
+- **The protected floor cannot be allowlisted.** `scripts/routing-lib.sh`
+  hardcodes the paths that always take the PR route — `packages/`,
+  `githooks/`, `scripts/`, `.github/`, dependency manifests + lockfile,
+  `biome.json`, `.nvmrc`, the spec pair + `html2md.py`, `INVARIANTS.md` —
+  and ignores (loudly) any allowlist entry under them. The list can grow
+  for prose; it structurally cannot open code, gates, or supply chain.
+  Widening the floor itself is a code change → PR by definition.
+- **Everything on the floor goes branch → PR → CI green + CodeRabbit
+  review → merge.** A mixed commit takes the stricter route.
 - Merge discipline is self-enforced until branch protection is available
   (see the ci.yml activation checklist): merge only on green, after
   reading the review.

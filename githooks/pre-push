@@ -1,17 +1,24 @@
 #!/bin/sh
 # Pre-push gate for the commit-routing rule (CLAUDE.md "Commit routing").
 #
-# Direct pushes to main may only touch inert prose (HANDOFF.md,
-# LEARNINGS.md). Everything else goes branch -> PR -> CI green -> merge:
-# only the PR route puts the human decision AFTER the clean-room CI
-# evidence exists, and the CI supply-chain review step fires only on
-# pull_request events.
+# Direct pushes to main may only touch files on .pushallowlist (prose
+# and housekeeping config the CI pipeline cannot evaluate). Everything
+# else goes branch -> PR -> CI green -> merge: only the PR route puts
+# the human decision AFTER the clean-room CI evidence exists, and the
+# CI supply-chain review step fires only on pull_request events.
+# The protected floor and list-loading logic live in
+# scripts/routing-lib.sh, shared with scripts/push-docs.
 #
 # This is a tripwire, not a wall: `git push --no-verify` bypasses it.
 # Treat a bypass as an incident worth a LEARNINGS note.
 # Enabled via: git config core.hooksPath githooks
 
 set -e
+
+# Hooks run from the repo root; the lib is part of the protected floor.
+# shellcheck source=scripts/routing-lib.sh
+. scripts/routing-lib.sh
+load_allowlist
 
 ZERO=0000000000000000000000000000000000000000
 
@@ -32,15 +39,14 @@ while read -r _ local_sha remote_ref remote_sha; do
     exit 1
   fi
 
-  blocked=$(printf '%s\n' "$changed" | grep -vxF -e HANDOFF.md -e LEARNINGS.md -e CLAUDE.md || true)
+  blocked=$(blocked_paths "$changed")
 
   if [ -n "$blocked" ]; then
     {
-      echo "pre-push: BLOCKED — this push to main touches more than inert prose:"
+      echo "pre-push: BLOCKED — this push to main touches files not on .pushallowlist:"
       printf '%s\n' "$blocked" | sed 's/^/  /'
       echo ""
-      echo "Only HANDOFF.md / LEARNINGS.md go direct to main (CLAUDE.md: commit routing)."
-      echo "Route it through a PR instead:"
+      echo "Route it through a PR instead (CLAUDE.md: commit routing):"
       echo "  git checkout -b <feat|fix|docs|refactor>/<name>   # commits come along"
       echo "  git push -u origin HEAD && gh pr create --fill"
       echo "  (then move local main back: git checkout main && git reset --keep origin/main)"
