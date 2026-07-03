@@ -32,7 +32,7 @@ while read -r _ local_sha remote_ref remote_sha; do
     exit 1
   fi
 
-  blocked=$(printf '%s\n' "$changed" | grep -vxF -e HANDOFF.md -e LEARNINGS.md || true)
+  blocked=$(printf '%s\n' "$changed" | grep -vxF -e HANDOFF.md -e LEARNINGS.md -e CLAUDE.md || true)
 
   if [ -n "$blocked" ]; then
     {
