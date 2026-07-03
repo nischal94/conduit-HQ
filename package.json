@@ -2,6 +2,7 @@
   "name": "conduit-hq",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.0.3",
   "engines": {
     "node": ">=20"
   },
