@@ -15,8 +15,11 @@
 
 set -e
 
-# Hooks run from the repo root; the lib is part of the protected floor.
+# Hooks run from the repo root; the lib is part of the protected floor
+# and is shellchecked as its own input (SC1091: CI invokes shellcheck
+# per-directory, so the sourced file isn't in its input set here).
 # shellcheck source=scripts/routing-lib.sh
+# shellcheck disable=SC1091
 . scripts/routing-lib.sh
 load_allowlist
 
