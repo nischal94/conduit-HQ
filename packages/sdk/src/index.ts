@@ -6,6 +6,8 @@ export type {
   ToolDescription,
 } from "./catalog.js";
 export { InMemoryCatalog } from "./catalog.js";
+export type { CredentialResolver, UpstreamAuth } from "./credentials.js";
+export { createStoreCredentialResolver } from "./credentials.js";
 export type {
   BuildExecuteToolOptions,
   ConnectionListing,
