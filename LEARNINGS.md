@@ -248,3 +248,22 @@ Rule in CLAUDE.md "Commit routing"; tripwire in `githooks/pre-push`.
 Design note: the allowlist is default-closed and file-based, never
 per-commit judgment — judgment erodes exactly when risk perception is
 worst.
+
+### 17. Untracking a file is a two-machine operation — the pull deletes it
+
+Incident (2026-07-04, recovered losslessly): to gitignore `assets/`,
+the safe-looking sequence — `git rm --cached` on a branch, verify files
+still on disk, merge the PR — deleted the files from disk anyway. The
+trap: `rm --cached` protects the working tree only on the machine and
+ref where it ran. Local main still *tracked* the files, so when the
+merge was pulled into main (auto-pulled by `gh pr merge`), applying
+"these paths leave tracking" to a tree that tracked them meant deleting
+them. Mid-branch verification checked the wrong moment; the deletion
+happened two commands later. Rules that follow: (1) before landing any
+commit that removes paths from tracking, copy those paths outside the
+repo first — restore after the pull; (2) a promise about file safety
+must be evaluated against the whole command sequence, not the one
+command it's about; (3) the end-state verification (files on disk,
+`git ls-files` empty) is the only check that counts. Recovery, for the
+record: committed bytes are never lost — `git show <commit>:<path>`
+writes them back exactly.
