@@ -1,6 +1,8 @@
 .DS_Store
 node_modules/
 .claude/settings.local.json
+# Personal reference material — stays on disk, never in the repo.
+assets/
 dist/
 *.log
 .env
