@@ -52,6 +52,10 @@ database rows rather than trusting the repository API, because that's
 where an attacker would look. Pending crown jewel: the token-budget test
 that makes "1 tool / ~1,044 tokens" build-breaking.
 
+> Superseded 2026-07-03 (the "pending" remark only): the token-budget
+> test landed 2026-07-02 (§4.2 row ✅ in INVARIANTS.md); the §9.2
+> boundary invariant landed 2026-07-03. The lesson itself stands.
+
 ### 4. Silent policy is indistinguishable from malfunction
 
 Three consecutive `git init` "failures" were actually a standing
@@ -177,3 +181,53 @@ nothing: the interrupt handler kills the run on the host's say-so. The
 general rule mirrors §9.2: anything security-relevant is host-side state
 the sandbox can neither read nor forge; what crosses the membrane is
 data, not authority.
+
+## 2026-07-03 — Phase 0 finale (CI pinning + credential resolver)
+
+Shipped: CI actions/images pinned to SHAs/digests, repo-settings
+verification, credential resolver + INVARIANT §9.2 boundary test.
+100 tests, 8 invariants pinned. Phase 0 complete; milestone audit run
+(Aikido clean; pnpm audit handed to the human — sfw shim can't run in
+the agent sandbox by design).
+
+### 13. A checklist written before contact with the platform is a hypothesis list
+
+The CI activation checklist assumed branch protection was a settings
+toggle away. Reality per `gh api`: fork-PR approval is *impossible* on
+private repos (422), and branch protection AND rulesets both 403 on a
+free-plan private repo. A checklist item you haven't executed is a
+hypothesis, and the honest states are more than done/not-done — this one
+now carries DONE / N-A-WHILE-PRIVATE / BLOCKED-BY-PLAN, each with its
+verification date, in the checklist itself. Same session, same file: the
+"four checks" count was stale against five actual jobs. Checklists drift
+the moment they're written; verification results belong *in* the
+checklist, not in the chat where they were discovered.
+
+### 14. Pin with values that can't be mistranscribed
+
+Two grades of pinning evidence this session: action SHAs came from
+`git ls-remote` (exact bytes, no eyeballing a web page — and annotated
+tags need the peeled `^{}` commit, or the pin points at a tag object),
+while OCI digests are *self-verifying* — the digest IS the sha256 of the
+manifest, so computing it locally against the registry's
+`Docker-Content-Digest` header proves the value beyond transcription
+error. When a value is load-bearing for supply-chain trust, prefer the
+channel where a typo is structurally impossible over the one where it's
+merely unlikely. (Sandbox sub-lesson: the agent's HTTP path was blocked
+three ways — gh config denied, curl deny-ruled, Node fetch ignores the
+proxy env — but `git ls-remote` honors the proxy and a manual CONNECT
+tunnel covers registries; exact-value channels existed without touching
+the sandbox config.)
+
+### 15. Where the spec is silent, don't invent vocabulary — make the data carry it
+
+The spec defines the §9.2 boundary but no auth-scheme taxonomy (bearer
+vs token vs basic). Instead of adding a scheme enum to Connection (a
+data-model change the spec never asked for), the stored secret carries
+its own scheme prefix and the resolver mounts it verbatim as the
+`Authorization` value: one mechanism, every header-based scheme, zero
+new vocabulary (lesson 6 again). The seam holds the door open — richer
+auth (query params, signing) extends `UpstreamAuth` without touching
+call sites. Corollary from the invariant test: a boundary test needs a
+*positive control* (the stub upstream DID receive the secret) or its
+negative assertions also pass on a pipeline that's simply broken.

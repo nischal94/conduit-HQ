@@ -19,85 +19,72 @@ A session that ends abnormally can't lie here; git tells on it.
 
 ---
 
-## Current handoff — written 2026-07-02 (sandbox session)
+## Current handoff — written 2026-07-03 (Phase 0 finale session)
 
 ### Where things stand
 
-- `main` @ `beb8803` (15 commits), working tree clean except this
-  handoff + LEARNINGS. 93/93 tests, typecheck clean, Biome clean.
-  Pre-commit hook gates spec-drift + tsc + vitest + lint.
-- **Sandbox pair landed:** `Sandbox` seam + `QuickJSSandbox`
-  (`packages/sdk/src/sandbox/`), `execute` tool surface + catalog tool
-  host (`packages/sdk/src/execute.ts`).
-- **Load-bearing design decision this session** (full rationale in the
-  `QuickJSSandbox` doc comment and LEARNINGS #9–11): the sandbox runs on
-  quickjs-emscripten's **plain sync build**, and tool-call suspension is
-  **§5.5 deterministic replay** (journal + seeded non-determinism), NOT
-  asyncified host functions. The asyncify build is defective for our
-  shape of use — two-plus asyncified host calls from pending jobs
-  corrupt the WASM heap; repro'd minimally post-session on 0.31.0 and
-  confirmed upstream as justjake/quickjs-emscripten#258 (still present
-  in 0.32.0; our corroboration commented there). Probable mechanism is
-  #239: release-asyncify FFI cwraps QTS_ExecutePendingJob_MaybeAsync
-  without `{async: true}`. See LEARNINGS #9 correction. Do not
-  "simplify" back to asyncify without re-verifying the library.
-- INVARIANTS.md: 7 pinned ✅ (added §16 caps, §4.2 token budget),
-  5 pending ⏳. §5.5's replay mechanism + seeds are implemented and
-  tested (un-prefixed) in `quickjs.test.ts`; the row stays ⏳ for the
-  execution manager's approval-pause wiring.
-- CI draft still unactivated at `.github/ci.draft.yml`.
+- **Phase 0 is complete.** Every §17 Phase 0 item shipped: data model,
+  OpenAPI + MCP normalizers, catalog, QuickJS sandbox + execute tool,
+  SQLite storage, secrets-at-rest, and (this session) the credential
+  resolver + §9.2 boundary invariant.
+- `main` @ `4997ba5` + this handoff/LEARNINGS commit. 100/100 tests,
+  typecheck clean, Biome clean. INVARIANTS.md: 8 pinned ✅, 4 ⏳
+  (§9.3 egress, §11 Trace redaction, §5.5 execution manager, §10.2
+  policy defaults).
+- **Credential resolver** (`packages/sdk/src/credentials.ts`):
+  `CredentialResolver` seam; store-backed impl binds
+  `Connection.credentialRef → secret` at call time, host-side, emitting
+  Authorization-header material. Stored secret carries its own scheme
+  prefix (spec has no auth-scheme vocabulary — LEARNINGS #15); dangling
+  refs fail closed; no caching, so rotation is live next call. The
+  INVARIANT §9.2 test in `credentials.test.ts` runs the real stack with
+  adversarial guest code + a positive control on a stub upstream.
+- **CI draft fully pinned** (`.github/ci.draft.yml`): all `uses:` at
+  commit SHAs, both docker images at digests. The activation checklist
+  in the file header now records verified per-item state.
+- **Milestone audit:** Aikido scan clean (0 findings on session files).
+  `pnpm audit` NOT run — agent-side pnpm goes through the sfw shim,
+  which the sandbox blocks by design → human's terminal (below).
+  LEARNINGS/HANDOFF freshness sweep done (one supersede note on #3).
 
-### Next task: credential resolver + §9.2 boundary invariant (Phase 0 finale)
+### Waiting on the human (all three are quick)
 
-The last unshipped §17 Phase 0 item. `SecretBox` (secrets-at-rest) and
-the `SecretRepository` exist; what's missing is the piece that binds
-`Connection.credentialRef → secret` at call time, host-side, and injects
-it into the outbound request only.
-
-Read before coding: spec §9.1–§9.2, §5.3 (step 3), §3 (Connection),
-§16 item 2; INVARIANTS.md §9.2 row; `store/store.ts` + `secrets.ts`.
-
-Acceptance criteria:
-- Resolver behind an interface (seam discipline), consuming the
-  `ConduitStore`/`SecretBox` pieces that already exist.
-- Given a Connection, produce authenticated upstream-request material
-  (e.g. headers) **host-side**; the `ToolInvoker` in `execute.ts` is
-  where it mounts — policy and upstream calling remain Phase 1.
-- INVARIANT §9.2 test in the same commit, ledger row flips: a secret in
-  the store must never appear in (1) sandbox-reachable values — tool
-  results, journal entries, execute results, (2) agent code, while a
-  stub upstream request does receive it. Attack the claim beneath the
-  API like the secrets-at-rest test does (LEARNINGS #3).
-- Phase 0 then closes: run the CLAUDE.md milestone audit cadence —
-  `pnpm audit` + `/aikido:scan` + LEARNINGS/HANDOFF freshness sweep.
-  Note: `pnpm` routes through sfw; the audit may need the human's
-  terminal if the agent sandbox blocks it.
-
-### First item next session: CI activation (repo now exists)
-
-Repo is live: https://github.com/nischal94/conduit-HQ (private, main
-pushed). Upstream asyncify bug corroborated on
-justjake/quickjs-emscripten#258. Pre-flight for CI activation already
-verified: `.nvmrc` exists; root package.json has lint / typecheck /
-test / build scripts. Remaining, in order:
-
-1. Agent: pin `uses:` actions + docker images in `.github/ci.draft.yml`
-   to commit SHAs / digests (gh api for action SHAs), commit.
-2. Agent via `gh api`: default GITHUB_TOKEN read-only
-   (actions/permissions/workflow), first-contributor approval, branch
-   protection on main — require the CI checks but leave
-   enforce_admins OFF so the solo direct-push flow keeps working.
-   NOTE: checklist says "four checks" but the workflow has FIVE jobs
-   (quality, meta, test, build, security) — stale count, require all 5.
-3. Human, in own terminal (workflow dir is deliberately
-   agent-unwritable):
+1. **CI activation** (agent steps are done):
    `mkdir -p .github/workflows && git mv .github/ci.draft.yml .github/workflows/ci.yml`
    then commit + push, and watch the first run go green.
+2. **Phase 0 audit, pnpm half:** run `pnpm audit --audit-level high` in
+   your own terminal (routes through sfw there).
+3. **Branch protection decision:** free-plan private repo → GitHub 403s
+   both branch protection and rulesets, and fork-PR approval is
+   impossible while private. Options: upgrade to Pro, make the repo
+   public, or defer. Details in the ci.draft.yml checklist items 2–3.
+   (Default GITHUB_TOKEN read-only: already verified done.)
 
-### Waiting on the human
+### Next task: policy engine v1 (spec §10.1–§10.2) — Phase 1 opener
 
-- Step 3 above (the git mv) when the agent has finished steps 1–2.
-- Possibly the `pnpm audit` half of the Phase 0 milestone audit (above).
+The §5.3 pipeline's step 2. riskClass derivation exists (`risk.ts`,
+§10.1 pinned); the `PolicyRepository` exists with override-persistence
+pinned. Missing: the engine that seeds per-tool policies from riskClass
+defaults and produces allow / require-approval / block verdicts for the
+ToolInvoker.
+
+Read before coding: spec §10.1–§10.2, §5.3 (step 2), §5.5 (what a
+require-approval verdict must eventually trigger); INVARIANTS.md §10.2
+row; `risk.ts`, `store/store.ts` (PolicyRepository), `execute.ts`
+(ToolInvoker mount point), LEARNINGS #4 (verdicts must carry reasons).
+
+Acceptance criteria:
+- Engine behind an interface (seam discipline), consuming
+  PolicyRepository + Tool.riskClass.
+- Seeding per §10.2: safe→Allow, review/destructive→Require approval;
+  manual overrides win and are never silently reverted (already pinned
+  at store level — the engine must respect it).
+- Verdicts are data with a human-readable reason (LEARNINGS #4: silent
+  policy reads as malfunction).
+- INVARIANT §10.2 test in the same commit; ledger row flips in that
+  commit.
+- Input-aware rules (§10.3) are Phase 2 — do NOT build them; leave the
+  seam able to grow them.
 
 ### Session quirks worth inheriting
 
@@ -108,25 +95,31 @@ test / build scripts. Remaining, in order:
   the human's, in their terminal.
 - Git commits need the sandbox override (`.git` is deny-listed);
   `git init`-class commands are human-reserved by permission rules.
+- Network from inside the sandbox: `curl` is deny-ruled, `gh` can't read
+  its config (credential file, correctly denied), and Node's `fetch`
+  ignores the proxy env. What works sandboxed: `git ls-remote` (honors
+  proxy; exact SHAs) and a manual CONNECT tunnel via `HTTPS_PROXY` for
+  anything else (see LEARNINGS #14). `gh api` works with the sandbox
+  override when genuinely needed.
 - "certificate-25291" stderr noise in sandboxed commands is environmental;
   filter it, ignore it.
 - zsh eats words starting with `=` (e.g. `echo ===`) — use quotes in
   Bash one-liners.
 - Ground truth about quickjs-emscripten behavior is its shipped dist in
   `node_modules/.pnpm/quickjs-emscripten-core@0.31.0/...` — docs and
-  single-pass spikes both lied this session (LEARNINGS #9).
+  single-pass spikes both lied (LEARNINGS #9). Do not "simplify" the
+  sandbox back to asyncify; upstream justjake/quickjs-emscripten#258.
 
 ### Kickoff prompt for the next session
 
 > Continue building Conduit in ~/projects/conduit-HQ. Start by reading
 > HANDOFF.md and follow its protocol — it names the spec sections, the
-> acceptance criteria, and the prior session's design decisions for the
-> current task (credential resolver + §9.2 boundary invariant, the
-> Phase 0 finale). Work autonomously per the project's memory: decide
-> commonsensical things yourself; confirm only destructive,
-> outward-facing, or scope-changing actions. Interface first, invariant
-> tests in the same commit as the code that earns them, INVARIANTS.md
-> rows flip in that commit, conventional commits, hook must stay green.
-> When Phase 0 closes, run the milestone audit cadence from CLAUDE.md.
-> At session end, rewrite HANDOFF.md and append LEARNINGS.md per the
-> protocol.
+> acceptance criteria, and the prior sessions' design decisions for the
+> current task (policy engine v1, the Phase 1 opener). Check the
+> "waiting on the human" list first and ask about anything still open.
+> Work autonomously per the project's memory: decide commonsensical
+> things yourself; confirm only destructive, outward-facing, or
+> scope-changing actions. Interface first, invariant tests in the same
+> commit as the code that earns them, INVARIANTS.md rows flip in that
+> commit, conventional commits, hook must stay green. At session end,
+> rewrite HANDOFF.md and append LEARNINGS.md per the protocol.
