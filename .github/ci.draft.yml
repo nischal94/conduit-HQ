@@ -17,13 +17,19 @@
 # none of them can be configured from inside this file):
 # 1. [DONE 2026-07-03] Every `uses:` and docker image below is pinned to a
 #    full commit SHA / digest. Keep it that way when bumping versions.
-# 2. Settings → Actions → require approval for first-time contributors
-#    (bounds hostile-PR compute burn; the jobs here do run PR code).
-# 3. Branch protection on main: require all five checks (quality, meta,
-#    test, build, security), require branches up to date before merge.
-# 4. Settings → Actions → confirm the default GITHUB_TOKEN is read-only
-#    repo-wide (the permissions block below enforces it per-workflow;
-#    the setting enforces it for any future workflow someone adds).
+# 2. [N/A WHILE PRIVATE — verified 2026-07-03] First-contributor approval:
+#    GitHub rejects fork-PR approval settings on private repos (422); the
+#    threat it bounds (hostile fork PRs) can't reach a private repo. MUST
+#    be enabled the day this repo goes public.
+# 3. [BLOCKED BY PLAN — verified 2026-07-03] Branch protection AND rulesets
+#    on a free-plan private repo both return 403 (need GitHub Pro or a
+#    public repo). Human decision: upgrade, go public, or defer. When
+#    unblocked: require all five checks (quality, meta, test, build,
+#    security), branches up to date before merge, enforce_admins OFF /
+#    admin bypass ON so the solo direct-push flow keeps working.
+# 4. [DONE — verified 2026-07-03 via gh api] Default GITHUB_TOKEN is
+#    read-only repo-wide, can_approve_pull_request_reviews=false (the
+#    permissions block below also enforces it per-workflow).
 name: CI
 
 on:
