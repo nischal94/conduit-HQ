@@ -6,9 +6,14 @@
   the current task with acceptance criteria, and session quirks. Don't
   re-derive project state from scratch.
 - **End of session:** rewrite `HANDOFF.md` (state, next task, kickoff
-  prompt) and append the session's lessons to `LEARNINGS.md`. A decision
-  or recommendation that lives only in chat does not exist — spec §18 for
-  product decisions, this file for rules, HANDOFF.md for state.
+  prompt), append the session's lessons to `LEARNINGS.md`, and publish
+  the **session debrief artifact** — the complete record of what
+  happened: acts, decisions with codification pointers, incidents named
+  honestly, verification evidence. Three tenses: HANDOFF is the baton
+  (future), LEARNINGS the distilled lessons (past), the debrief the full
+  narrative (past, complete). A decision or recommendation that lives
+  only in chat does not exist — spec §18 for product decisions, this
+  file for rules, HANDOFF.md for state.
 
 ## Spec files: HTML is the source of truth
 
@@ -32,15 +37,17 @@ Decided 2026-07-03 (rationale: LEARNINGS #13 and #16). Only the PR route
 puts the human decision AFTER the clean-room CI evidence exists.
 
 - **Direct push to main is allowed only when every file in every pushed
-  commit is on the inert-prose allowlist: `HANDOFF.md`, `LEARNINGS.md`.**
+  commit is on the allowlist: `HANDOFF.md`, `LEARNINGS.md`, `CLAUDE.md`.**
   The agent pushes these via `scripts/push-docs` (verifies the allowlist,
   then pushes) — the sanctioned narrow exception to the machine-level
   deny on agent pushes to main, which stays intact for everything else.
+  (CLAUDE.md added 2026-07-04: its edits are already reviewed with the
+  human in chat before being written, so a PR re-review added ceremony,
+  not safety.)
 - **Everything else goes branch → PR → CI green + CodeRabbit review →
   merge.** That includes all code and tests, dependency manifests and
   the lockfile, `githooks/`, `.github/`, the spec pair + `html2md.py`,
-  `INVARIANTS.md`, and this file. A mixed commit takes the stricter
-  route.
+  and `INVARIANTS.md`. A mixed commit takes the stricter route.
 - Merge discipline is self-enforced until branch protection is available
   (see the ci.yml activation checklist): merge only on green, after
   reading the review.
