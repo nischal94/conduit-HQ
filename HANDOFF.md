@@ -73,17 +73,31 @@ A session that ends abnormally can't lie here; git tells on it.
 - **Commit-routing PR #2: MERGED 2026-07-03** (`974eaf9`) — main's CI
   is green (first green run), the pre-push gate is live, CodeRabbit's
   first review passed with zero findings.
-- **Dependabot policy (2026-07-03):** alerts ON, auto-PRs OFF (rule in
-  CLAUDE.md via PR #3). esbuild alert dismissed as tolerable risk with
-  rationale; the bot's vitest PR self-closed when our deliberate fix
-  merged first.
+- **Dependabot policy (2026-07-03): fully implemented and verified.**
+  Alerts + malware alerts ON; security-update auto-PRs OFF (repo
+  setting confirmed `enabled:false` via API); version updates OFF.
+  Rule in CLAUDE.md via merged PR #3. esbuild alert dismissed as
+  tolerable risk with rationale.
+- **Guarded docs push landed (PR #4, merged 2026-07-04):**
+  `scripts/push-docs` verifies the inert-prose allowlist then pushes
+  main; agent-side allow rule in `.claude/settings.local.json` is
+  verified live (script runs promptless). The global deny on agent
+  `git push origin main` stays intact everywhere else.
+- **DECIDED 2026-07-04: HANDOFF.md and LEARNINGS.md stay git-tracked.**
+  Considered gitignoring them; rejected because the staleness tripwire,
+  LEARNINGS' tamper-evidence, fresh-clone continuity, and the entire
+  inert-prose push machinery depend on tracking. Instead, "strip or
+  relocate session docs" joins the going-public checklist — a one-line
+  comment the human should add to the ci.yml ACTIVATION CHECKLIST
+  (workflow file is agent-unwritable) next time it's open for editing.
+- **Branching discipline (2026-07-04):** cut feature branches from
+  `origin/main` after a fetch, never from local main — two PR branches
+  this session carried an unpushed local-main commit into their PRs
+  (benign, reviewed, but untidy).
 
 ### Waiting on the human
 
-1. **Merge PR #3** (Dependabot policy line in CLAUDE.md) once green.
-2. **Settings → Code security → disable "Dependabot security updates"**
-   (keep "Dependabot alerts" ON) — the API call for this was
-   permission-denied agent-side, so it's a UI toggle.
+Nothing. All session items closed and verified.
 
 ### Next task: policy engine v1 (spec §10.1–§10.2) — Phase 1 opener
 
