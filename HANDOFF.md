@@ -90,6 +90,14 @@ A session that ends abnormally can't lie here; git tells on it.
   relocate session docs" joins the going-public checklist — a one-line
   comment the human should add to the ci.yml ACTIVATION CHECKLIST
   (workflow file is agent-unwritable) next time it's open for editing.
+- **DECIDED 2026-07-04 (PR #5, merged `f470eb4`): CLAUDE.md joined the
+  direct-push allowlist** — its edits are reviewed with the human in
+  chat before being written, so PR re-review added ceremony, not
+  safety. Both gates updated. Session-end protocol now also requires
+  publishing the **session debrief artifact** (first one:
+  claude.ai/code/artifact/4eae7e42-0e75-408d-b01e-316517906986).
+- **Open question for the human:** `assets/` holds 7 tracked
+  screenshots (1.7 MB) referenced by nothing — delete, or keep?
 - **Branching discipline (2026-07-04):** cut feature branches from
   `origin/main` after a fetch, never from local main — two PR branches
   this session carried an unpushed local-main commit into their PRs
