@@ -96,8 +96,19 @@ A session that ends abnormally can't lie here; git tells on it.
   safety. Both gates updated. Session-end protocol now also requires
   publishing the **session debrief artifact** (first one:
   claude.ai/code/artifact/4eae7e42-0e75-408d-b01e-316517906986).
-- **Open question for the human:** `assets/` holds 7 tracked
-  screenshots (1.7 MB) referenced by nothing — delete, or keep?
+- **RESOLVED 2026-07-04, session tail (PRs #6–#9, all merged green):**
+  (1) `assets/` gitignored + untracked — the 7 screenshots stay on disk,
+  human's personal reference (incident during the untrack: the merge
+  pull deleted them from disk; recovered losslessly from history —
+  LEARNINGS #17). (2) Preventive ignores: coverage/, *.tsbuildinfo,
+  .claude/launch.json. (3) **Routing is now two-tier:** `.pushallowlist`
+  (data, itself allowlisted: HANDOFF, LEARNINGS, CLAUDE.md, .gitignore,
+  .editorconfig) over a hardcoded protected floor in
+  `scripts/routing-lib.sh` that both gates source — floor entries
+  smuggled into the list are ignored loudly. (4) CI's meta job now
+  shellchecks `scripts/*` too (human made the workflow edit; workflows
+  stay agent-unwritable by design — the classifier enforces this even
+  against shell-write workarounds).
 - **Branching discipline (2026-07-04):** cut feature branches from
   `origin/main` after a fetch, never from local main — two PR branches
   this session carried an unpushed local-main commit into their PRs
