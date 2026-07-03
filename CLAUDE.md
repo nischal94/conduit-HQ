@@ -70,6 +70,12 @@ Its own supply chain and code must hold the same bar it sells.
   before each phase milestone and before anything ships — plus a freshness
   sweep of HANDOFF.md and LEARNINGS.md (mark superseded lessons; never
   silently rewrite them).
+- **Dependabot: alerts ON, auto-PRs OFF** (decided 2026-07-03). Security
+  findings route through the audit triage — threat-model first, then fix
+  deliberately — never bot-generated lockfile merges, which land inside
+  the `minimumReleaseAge` window and bypass the human install path.
+  Accepted findings get a per-advisory dismissal carrying the rationale
+  (never a package-wide ignore, which would blind future advisories).
 
 ### Coverage beyond Biome
 
