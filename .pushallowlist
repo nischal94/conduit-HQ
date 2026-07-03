@@ -1,0 +1,12 @@
+# Files eligible for direct push to main via scripts/push-docs
+# (CLAUDE.md "Commit routing"). One path per line. Entries under the
+# protected floor in scripts/routing-lib.sh are ignored — this list can
+# grow for prose and housekeeping config, never for code, gates, or the
+# supply chain. This file is itself on the list: extending it is a
+# ten-second direct push, reviewed in chat like all agent work.
+HANDOFF.md
+LEARNINGS.md
+CLAUDE.md
+.gitignore
+.editorconfig
+.pushallowlist
