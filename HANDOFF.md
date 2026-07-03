@@ -39,26 +39,35 @@ A session that ends abnormally can't lie here; git tells on it.
   refs fail closed; no caching, so rotation is live next call. The
   INVARIANT §9.2 test in `credentials.test.ts` runs the real stack with
   adversarial guest code + a positive control on a stub upstream.
-- **CI draft fully pinned** (`.github/ci.draft.yml`): all `uses:` at
-  commit SHAs, both docker images at digests. The activation checklist
-  in the file header now records verified per-item state.
-- **Milestone audit:** Aikido scan clean (0 findings on session files).
-  `pnpm audit` NOT run — agent-side pnpm goes through the sfw shim,
-  which the sandbox blocks by design → human's terminal (below).
+- **CI is ACTIVE** (`.github/workflows/ci.yml`, moved by the human,
+  commit `daffd92`): all `uses:` at commit SHAs, both docker images at
+  digests. The activation checklist in the file header records verified
+  per-item state.
+- **Milestone audit: complete.** Aikido scan clean (0 findings on
+  session files). `pnpm audit` run in the human's terminal: found
+  vitest critical (GHSA-5xrq-8626-4rwp) + vite high
+  (GHSA-fx2h-pf6j-xcff), fixed same day by `09c3610` (vitest 3.2.6 +
+  vite 7.3.6); audit now reports **1 low only**, triaged and ACCEPTED
+  2026-07-03: esbuild GHSA-g7r4-m6w7-qqqr (dev-server file read,
+  Windows-only) — unreachable here (tsup uses esbuild's build API only,
+  no server, no Windows; devDependency, not in the published tree).
+  tsup latest (8.5.1) still pins esbuild ^0.27.0, so no in-range patch
+  exists; forcing 0.28.1 out-of-range is riskier than the finding.
+  Revisit when tsup widens its esbuild range — the milestone audit
+  cadence re-surfaces it automatically. Do NOT re-litigate from scratch.
   LEARNINGS/HANDOFF freshness sweep done (one supersede note on #3).
+- **DECIDED 2026-07-03: branch protection is DEFERRED.** Free-plan
+  private repo → GitHub 403s branch protection and rulesets; the human
+  chose defer over Pro/going-public. Consequence: CI checks run but are
+  not *required* — acceptable while there's a single committer.
+  Revisit trigger: a second committer, or the repo going public
+  (which also mandates first-contributor approval, see the ci.yml
+  checklist items 2–3). Default GITHUB_TOKEN read-only: verified done.
 
-### Waiting on the human (all three are quick)
+### Waiting on the human
 
-1. **CI activation** (agent steps are done):
-   `mkdir -p .github/workflows && git mv .github/ci.draft.yml .github/workflows/ci.yml`
-   then commit + push, and watch the first run go green.
-2. **Phase 0 audit, pnpm half:** run `pnpm audit --audit-level high` in
-   your own terminal (routes through sfw there).
-3. **Branch protection decision:** free-plan private repo → GitHub 403s
-   both branch protection and rulesets, and fork-PR approval is
-   impossible while private. Options: upgrade to Pro, make the repo
-   public, or defer. Details in the ci.draft.yml checklist items 2–3.
-   (Default GITHUB_TOKEN read-only: already verified done.)
+1. **Push, if not yet pushed** (`git push origin main`) and watch the
+   first CI run go green — five jobs.
 
 ### Next task: policy engine v1 (spec §10.1–§10.2) — Phase 1 opener
 
