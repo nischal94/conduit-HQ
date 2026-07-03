@@ -26,6 +26,26 @@ This keeps the two files text-identical. The HTML keeps all visual styling;
 the `.md` carries only the text. Never hand-edit `conduitspec.md` directly —
 always regenerate it from the HTML.
 
+## Commit routing: PR by default, direct push for inert prose only
+
+Decided 2026-07-03 (rationale: LEARNINGS #13 and #16). Only the PR route
+puts the human decision AFTER the clean-room CI evidence exists.
+
+- **Direct push to main is allowed only when every file in every pushed
+  commit is on the inert-prose allowlist: `HANDOFF.md`, `LEARNINGS.md`.**
+- **Everything else goes branch → PR → CI green + CodeRabbit review →
+  merge.** That includes all code and tests, dependency manifests and
+  the lockfile, `githooks/`, `.github/`, the spec pair + `html2md.py`,
+  `INVARIANTS.md`, and this file. A mixed commit takes the stricter
+  route.
+- Merge discipline is self-enforced until branch protection is available
+  (see the ci.yml activation checklist): merge only on green, after
+  reading the review.
+- Enforced mechanically by `githooks/pre-push` — a tripwire, not a wall.
+  A `--no-verify` bypass is an incident worth a LEARNINGS note.
+- When branch protection becomes available (Pro or public repo), turn on
+  required checks; this routing rule itself does not change.
+
 ## Security posture: enterprise-grade, non-negotiable
 
 Conduit is a security product (credential boundary, policy engine, sandbox).

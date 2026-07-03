@@ -231,3 +231,20 @@ auth (query params, signing) extends `UpstreamAuth` without touching
 call sites. Corollary from the invariant test: a boundary test needs a
 *positive control* (the stub upstream DID receive the secret) or its
 negative assertions also pass on a pipeline that's simply broken.
+
+### 16. The decision point that matters sits after the CI evidence
+
+First contact with live CI peeled back two failures the local hook could
+never see: pnpm/action-setup had no version to install (the hook's
+machine has pnpm; an empty VM must be told via `packageManager`), and
+shellcheck flagged the pre-commit hook itself (a hook doesn't lint
+itself). Hook green answers "is the code right on my machine"; CI green
+answers "is the repo self-sufficient from a bare VM" — different claims,
+and each caught what the other structurally cannot. Consequence, decided
+the same day: PR route by default, because only a PR places the human
+decision AFTER that clean-room evidence exists; direct push to main is
+reserved for the inert-prose allowlist (HANDOFF.md, LEARNINGS.md).
+Rule in CLAUDE.md "Commit routing"; tripwire in `githooks/pre-push`.
+Design note: the allowlist is default-closed and file-based, never
+per-commit judgment — judgment erodes exactly when risk perception is
+worst.

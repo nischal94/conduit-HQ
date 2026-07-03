@@ -64,10 +64,19 @@ A session that ends abnormally can't lie here; git tells on it.
   (which also mandates first-contributor approval, see the ci.yml
   checklist items 2–3). Default GITHUB_TOKEN read-only: verified done.
 
+- **DECIDED 2026-07-03: commit routing is PR-by-default.** Rule and
+  rationale live in CLAUDE.md "Commit routing" + LEARNINGS #16; tripwire
+  in `githooks/pre-push`. Direct push to main only for HANDOFF.md /
+  LEARNINGS.md. CodeRabbit is installed and reviews PRs. Feature work
+  starts on a `feat/…` branch, never on main.
+
 ### Waiting on the human
 
-1. **Push, if not yet pushed** (`git push origin main`) and watch the
-   first CI run go green — five jobs.
+1. **Merge the commit-routing PR** (branch `feat/commit-routing-gate`)
+   once its checks are green + CodeRabbit reviewed. Remote main's CI is
+   red until this merges — the PR carries `9b32930`, the fix for CI
+   run #1's failures (packageManager + shellcheck), plus the routing
+   gate. After merge: local main was reset to origin/main; pull normally.
 
 ### Next task: policy engine v1 (spec §10.1–§10.2) — Phase 1 opener
 
@@ -130,5 +139,7 @@ Acceptance criteria:
 > things yourself; confirm only destructive, outward-facing, or
 > scope-changing actions. Interface first, invariant tests in the same
 > commit as the code that earns them, INVARIANTS.md rows flip in that
-> commit, conventional commits, hook must stay green. At session end,
+> commit, conventional commits, hook must stay green. Feature work runs
+> on a branch and lands by PR per CLAUDE.md "Commit routing" — never
+> commit features to main directly. At session end,
 > rewrite HANDOFF.md and append LEARNINGS.md per the protocol.

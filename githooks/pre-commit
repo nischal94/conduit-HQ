@@ -21,7 +21,10 @@ if ! cmp -s "$tmp" conduitspec.md; then
 fi
 rm -f "$tmp"
 
-# Extend this list as workspace packages grow.
+# Extend this list as workspace packages grow. Deliberately an explicit
+# list, not a packages/* glob: a stray non-package dir must not break
+# commits, and new packages should opt in consciously.
+# shellcheck disable=SC2043
 for pkg in packages/sdk; do
   "$pkg/node_modules/.bin/tsc" --noEmit -p "$pkg/tsconfig.json"
   "$pkg/node_modules/.bin/vitest" run --root "$pkg" --silent
