@@ -70,13 +70,20 @@ A session that ends abnormally can't lie here; git tells on it.
   LEARNINGS.md. CodeRabbit is installed and reviews PRs. Feature work
   starts on a `feat/…` branch, never on main.
 
+- **Commit-routing PR #2: MERGED 2026-07-03** (`974eaf9`) — main's CI
+  is green (first green run), the pre-push gate is live, CodeRabbit's
+  first review passed with zero findings.
+- **Dependabot policy (2026-07-03):** alerts ON, auto-PRs OFF (rule in
+  CLAUDE.md via PR #3). esbuild alert dismissed as tolerable risk with
+  rationale; the bot's vitest PR self-closed when our deliberate fix
+  merged first.
+
 ### Waiting on the human
 
-1. **Merge the commit-routing PR** (branch `feat/commit-routing-gate`)
-   once its checks are green + CodeRabbit reviewed. Remote main's CI is
-   red until this merges — the PR carries `9b32930`, the fix for CI
-   run #1's failures (packageManager + shellcheck), plus the routing
-   gate. After merge: local main was reset to origin/main; pull normally.
+1. **Merge PR #3** (Dependabot policy line in CLAUDE.md) once green.
+2. **Settings → Code security → disable "Dependabot security updates"**
+   (keep "Dependabot alerts" ON) — the API call for this was
+   permission-denied agent-side, so it's a UI toggle.
 
 ### Next task: policy engine v1 (spec §10.1–§10.2) — Phase 1 opener
 
