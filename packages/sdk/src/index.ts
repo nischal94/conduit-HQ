@@ -22,6 +22,8 @@ export type {
   NormalizeOpenApiOptions,
 } from "./normalize/openapi.js";
 export { normalizeOpenApi } from "./normalize/openapi.js";
+export type { PolicyEngine, PolicyVerdict } from "./policy.js";
+export { createStorePolicyEngine } from "./policy.js";
 export { deriveRiskClass } from "./risk.js";
 export { QuickJSSandbox } from "./sandbox/quickjs.js";
 export type {
