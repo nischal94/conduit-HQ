@@ -21,6 +21,11 @@ A session that ends abnormally can't lie here; git tells on it.
 
 ## Current handoff — written 2026-07-03 (Phase 0 finale session)
 
+**Staleness reconciled 2026-07-06:** one commit landed after this
+handoff was written — PR #12 (`5d12c45`, docs: explain-diff skill
+credit revision, `.claude/skills/` only). No product, spec, or infra
+state changed; everything below remains accurate.
+
 ### Where things stand
 
 - **Phase 0 is complete.** Every §17 Phase 0 item shipped: data model,
