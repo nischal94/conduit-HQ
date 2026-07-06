@@ -303,3 +303,46 @@ break. A week later each of these is a consumer-breaking change.
 Extends #7: interfaces are where rewrites go to die — so schedule the
 adversarial interface review at the moment the interface has no
 dependents, not at the next milestone.
+
+## 2026-07-07 — Staleness reconciliation (PR #14 in flight)
+
+The session that produced PR #14 (sqlite vocabulary validation,
+2026-07-06, still open) ended without rewriting HANDOFF.md or appending
+here; this section was reconstructed from its durable artifacts — the
+PR body and the Tier 2 findings comment — by the follow-up session that
+caught the gap. Lesson #20 is distilled from that record; #21 is this
+session's own.
+
+### 20. Some corruption is erased before the fail-closed layer runs
+
+The policy engine's `default:` arms (lesson #18) catch out-of-vocabulary
+values that *reach* it — but `rowToPolicy`'s `manual_override === 1`
+check silently demoted any other integer to an inert row at
+deserialization, turning an operator's manual **block** into fail-open
+relative to operator intent. The engine can never catch this one: the
+corruption is normalized away before the engine sees the row. The
+general shape: a fail-closed guard only covers inputs that arrive as
+*recognizably* corrupt; a boundary that quietly coerces ("=== 1 means
+manual, everything else means inert") destroys the evidence. Validation
+must live at the deserialization boundary itself, throwing on anything
+outside the vocabulary. Corollary from the same PR: write-side CHECK
+constraints only bind fresh databases (`CREATE TABLE IF NOT EXISTS`
+leaves existing tables untouched), so read-side guards are the layer
+that covers legacy files — the two layers are deliberately independent,
+and the tests pin each separately.
+
+### 21. The staleness tripwire only sees main — open PRs are invisible to it
+
+The tripwire compares `git log -1` against `git log -1 -- HANDOFF.md`,
+which detects any session that committed to main and died before the
+handoff rewrite. But a session whose entire output is an unmerged PR
+branch leaves main untouched: this session ran the tripwire, got
+"fresh" (both `f9e6731`), while PR #14 — two commits, 12 new tests, a
+Tier 2 review, an explainer — sat open on GitHub, and the handoff still
+described its subject matter as a maybe-someday task chip. The fix is
+not a cleverer commit comparison; branch state lives outside the
+repo's main history by design. Pair the tripwire with
+`gh pr list --state all --limit 5` at session start (now in the HANDOFF
+protocol block), and treat "session ends with an open PR" as exactly
+the case where rewriting HANDOFF matters most — the PR's merge gate is
+a human obligation that otherwise lives nowhere except a chat log.
