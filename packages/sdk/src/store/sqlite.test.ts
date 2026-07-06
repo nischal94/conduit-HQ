@@ -208,4 +208,193 @@ describe("SqliteStore", () => {
       expect(await store.secrets.reveal("cred_x")).toBe("new");
     });
   });
+
+  describe("stored-vocabulary validation", () => {
+    // Second defense layer beneath the policy engine's fail-closed reads:
+    // rows written by a divergent writer (or a pre-CHECK schema) must fail
+    // loudly at deserialization, never load as silently-reshaped Policy/Tool
+    // values. Tables are pre-created WITHOUT constraints so CREATE TABLE IF
+    // NOT EXISTS leaves them — the legacy-database reality.
+    let legacy: ReturnType<typeof createClient>;
+    let legacyStore: ConduitStore;
+
+    beforeEach(async () => {
+      legacy = createClient({ url: ":memory:" });
+      await legacy.batch(
+        [
+          `CREATE TABLE tools (
+            name TEXT PRIMARY KEY,
+            namespace TEXT NOT NULL,
+            description TEXT,
+            input_schema TEXT NOT NULL,
+            output_schema TEXT NOT NULL,
+            risk_class TEXT NOT NULL,
+            source_semantics TEXT NOT NULL
+          )`,
+          `CREATE TABLE policies (
+            tool_name TEXT PRIMARY KEY,
+            action TEXT NOT NULL,
+            seeded_from TEXT NOT NULL,
+            manual_override INTEGER NOT NULL
+          )`,
+        ],
+        "write",
+      );
+      legacyStore = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+    });
+
+    async function insertPolicyRow(
+      action: string,
+      seededFrom: string,
+      manualOverride: number,
+      toolName = "github.issues.create",
+    ) {
+      await legacy.execute({
+        sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override)
+              VALUES (?, ?, ?, ?)`,
+        args: [toolName, action, seededFrom, manualOverride],
+      });
+    }
+
+    it("rejects a policy row with an unrecognized action", async () => {
+      await insertPolicyRow("permit", "review", 1);
+      await expect(legacyStore.policies.get("github.issues.create")).rejects.toThrow(
+        'unrecognized action "permit"',
+      );
+    });
+
+    it("rejects a policy row with an unrecognized seeded_from", async () => {
+      await insertPolicyRow("block", "moderate", 1);
+      await expect(legacyStore.policies.get("github.issues.create")).rejects.toThrow(
+        'unrecognized seeded_from "moderate"',
+      );
+    });
+
+    it("never demotes a policy row with manual_override outside 0/1 to inert", async () => {
+      // manualOverride: false would hand the verdict back to the derived
+      // default — an operator's manual block silently fails open.
+      await insertPolicyRow("block", "safe", 2);
+      await expect(legacyStore.policies.get("github.issues.create")).rejects.toThrow(
+        "manual_override must be 0 or 1",
+      );
+      await expect(legacyStore.policies.list()).rejects.toThrow("manual_override must be 0 or 1");
+    });
+
+    it("still reads valid policy rows from a legacy schema", async () => {
+      await insertPolicyRow("block", "review", 1);
+      const policy = await legacyStore.policies.get("github.issues.create");
+      expect(policy).toEqual({
+        toolName: "github.issues.create",
+        action: "block",
+        seededFrom: "review",
+        manualOverride: true,
+      });
+      // manual_override 0 is the other legal boundary value: it must read
+      // back as false, never be rejected by the 0/1 guard.
+      await insertPolicyRow("allow", "safe", 0, "github.issues.list");
+      expect(await legacyStore.policies.get("github.issues.list")).toEqual({
+        toolName: "github.issues.list",
+        action: "allow",
+        seededFrom: "safe",
+        manualOverride: false,
+      });
+    });
+
+    it("escapes untrusted identifiers in read-error context (no log injection)", async () => {
+      // tool_name comes from the same untrusted row as the bad value: a
+      // control character must reach logs escaped, not raw.
+      await insertPolicyRow("permit", "review", 1, "bad\u0007name");
+      await expect(legacyStore.policies.get("bad\u0007name")).rejects.toThrow(
+        'toolName: "bad\\u0007name"',
+      );
+    });
+
+    it("accepts every vocabulary member end to end (exhaustiveness pin)", async () => {
+      // POLICY_ACTIONS/RISK_CLASSES are compile-checked against out-of-union
+      // members but not against MISSING ones — deleting "require_approval"
+      // from the array would still compile and make every such row
+      // unreadable (and, via rows.map, fail list() wholesale). Round-trip
+      // each member through the fresh store so the constants and the CHECK
+      // constraints both stay exhaustive.
+      const actions = ["allow", "require_approval", "block"] as const;
+      const riskClasses = ["safe", "review", "destructive"] as const;
+      for (const [i, action] of actions.entries()) {
+        for (const [j, seededFrom] of riskClasses.entries()) {
+          const toolName = `vocab.a${i}s${j}`;
+          await store.policies.upsert({ toolName, action, seededFrom, manualOverride: true });
+          expect(await store.policies.get(toolName)).toEqual({
+            toolName,
+            action,
+            seededFrom,
+            manualOverride: true,
+          });
+        }
+      }
+      for (const [i, riskClass] of riskClasses.entries()) {
+        const namespace = `vocab${i}`;
+        const name = `${namespace}.tool`;
+        await store.tools.replaceNamespace(namespace, [tool({ name, namespace, riskClass })]);
+        expect((await store.tools.get(name))?.riskClass).toBe(riskClass);
+      }
+    });
+
+    it("rejects a tool row with an unrecognized risk_class", async () => {
+      await legacy.execute({
+        sql: `INSERT INTO tools (name, namespace, input_schema, output_schema, risk_class, source_semantics)
+              VALUES (?, ?, ?, ?, ?, ?)`,
+        args: ["x.search", "x", "{}", "{}", "extreme", '{"kind":"mcp"}'],
+      });
+      await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+        'unrecognized risk_class "extreme"',
+      );
+      await expect(legacyStore.tools.list()).rejects.toThrow('unrecognized risk_class "extreme"');
+    });
+
+    describe("CHECK constraints (fresh databases)", () => {
+      // Write-side twin of the read-side guards: a fresh schema refuses the
+      // bad row at INSERT time, beneath even the repository layer.
+      it("rejects writing an out-of-vocabulary policy action", async () => {
+        await expect(
+          client.execute({
+            sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override)
+                  VALUES (?, ?, ?, ?)`,
+            args: ["t", "permit", "safe", 0],
+          }),
+        ).rejects.toThrow(/check/i);
+      });
+
+      it("rejects writing an out-of-vocabulary seeded_from", async () => {
+        await expect(
+          client.execute({
+            sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override)
+                  VALUES (?, ?, ?, ?)`,
+            args: ["t", "block", "moderate", 0],
+          }),
+        ).rejects.toThrow(/check/i);
+      });
+
+      it("rejects writing manual_override outside 0/1", async () => {
+        await expect(
+          client.execute({
+            sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override)
+                  VALUES (?, ?, ?, ?)`,
+            args: ["t", "block", "safe", 2],
+          }),
+        ).rejects.toThrow(/check/i);
+      });
+
+      it("rejects writing an out-of-vocabulary risk_class", async () => {
+        await expect(
+          client.execute({
+            sql: `INSERT INTO tools (name, namespace, input_schema, output_schema, risk_class, source_semantics)
+                  VALUES (?, ?, ?, ?, ?, ?)`,
+            args: ["t", "x", "{}", "{}", "extreme", '{"kind":"mcp"}'],
+          }),
+        ).rejects.toThrow(/check/i);
+      });
+    });
+  });
 });
