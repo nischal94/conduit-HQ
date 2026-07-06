@@ -30,6 +30,10 @@ export interface SqliteStoreOptions {
   secretBox: SecretBox;
 }
 
+// The CHECK vocabularies below protect fresh schemas only: CREATE TABLE
+// IF NOT EXISTS never retrofits an existing table, so for legacy
+// databases the read-side vocabulary guards at the bottom of this file
+// are the enforcement layer.
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS sources (
     id TEXT PRIMARY KEY,

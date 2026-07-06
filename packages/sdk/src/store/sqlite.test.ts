@@ -1,9 +1,18 @@
 import { createClient } from "@libsql/client";
 import { beforeEach, describe, expect, it } from "vitest";
 import { SecretBox } from "../secrets.js";
-import type { Tool } from "../types.js";
+import type { ExecutionStatus, PolicyAction, RiskClass, SourceType, Tool } from "../types.js";
 import { openSqliteStore } from "./sqlite.js";
 import type { ConduitStore } from "./store.js";
+
+/**
+ * Compiler-pinned vocabulary list: Record<T, true> demands every union
+ * member as a key, so growing a union in types.ts fails this file's
+ * compilation until the pin tests cover the new member too.
+ */
+function vocabulary<T extends string>(members: Record<T, true>): T[] {
+  return Object.keys(members) as T[];
+}
 
 function tool(overrides: Partial<Tool> & Pick<Tool, "name" | "namespace">): Tool {
   return {
@@ -345,11 +354,16 @@ describe("SqliteStore", () => {
       // POLICY_ACTIONS/RISK_CLASSES are compile-checked against out-of-union
       // members but not against MISSING ones — deleting "require_approval"
       // from the array would still compile and make every such row
-      // unreadable (and, via rows.map, fail list() wholesale). Round-trip
-      // each member through the fresh store so the constants and the CHECK
-      // constraints both stay exhaustive.
-      const actions = ["allow", "require_approval", "block"] as const;
-      const riskClasses = ["safe", "review", "destructive"] as const;
+      // unreadable (and, via rows.map, fail list() wholesale). The
+      // vocabulary() lists are compiler-pinned to the unions; round-tripping
+      // them keeps the production constants and CHECK constraints in
+      // agreement with the unions.
+      const actions = vocabulary<PolicyAction>({
+        allow: true,
+        require_approval: true,
+        block: true,
+      });
+      const riskClasses = vocabulary<RiskClass>({ safe: true, review: true, destructive: true });
       for (const [i, action] of actions.entries()) {
         for (const [j, seededFrom] of riskClasses.entries()) {
           const toolName = `vocab.a${i}s${j}`;
@@ -408,17 +422,27 @@ describe("SqliteStore", () => {
     });
 
     it("accepts every source type, execution status, and trace verdict (exhaustiveness pin)", async () => {
-      // Same rationale as the policy/tool pin above: the vocabulary arrays
-      // are compile-checked against out-of-union members but not missing
-      // ones. Round-trip each member through the fresh store so the
-      // constants and the CHECK constraints both stay exhaustive.
-      const sourceTypes = ["openapi", "graphql", "mcp", "custom_js"] as const;
+      // Same rationale as the policy/tool pin above: the vocabulary()
+      // lists are compiler-pinned to the unions; round-tripping them keeps
+      // the production constants and CHECK constraints in agreement.
+      const sourceTypes = vocabulary<SourceType>({
+        openapi: true,
+        graphql: true,
+        mcp: true,
+        custom_js: true,
+      });
       for (const [i, type] of sourceTypes.entries()) {
         const id = `src_vocab_${i}`;
         await store.sources.upsert({ id, type, namespace: `vocab${i}`, location: "https://x" });
         expect((await store.sources.get(id))?.type).toBe(type);
       }
-      const statuses = ["running", "paused", "completed", "failed", "expired"] as const;
+      const statuses = vocabulary<ExecutionStatus>({
+        running: true,
+        paused: true,
+        completed: true,
+        failed: true,
+        expired: true,
+      });
       for (const [i, status] of statuses.entries()) {
         const id = `exec_vocab_${i}`;
         await store.executions.put({
@@ -430,7 +454,11 @@ describe("SqliteStore", () => {
         });
         expect((await store.executions.get(id))?.status).toBe(status);
       }
-      const verdicts = ["allow", "require_approval", "block"] as const;
+      const verdicts = vocabulary<PolicyAction>({
+        allow: true,
+        require_approval: true,
+        block: true,
+      });
       for (const [i, policyVerdict] of verdicts.entries()) {
         await store.trace.append({
           callId: `call_vocab_${i}`,
@@ -443,7 +471,7 @@ describe("SqliteStore", () => {
         });
       }
       const events = await store.trace.listByExecution("exec_vocab_0");
-      expect(events.map((event) => event.policyVerdict)).toEqual([...verdicts]);
+      expect(events.map((event) => event.policyVerdict)).toEqual(verdicts);
     });
 
     it("rejects a tool row with an unrecognized risk_class", async () => {
