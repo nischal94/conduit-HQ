@@ -267,3 +267,39 @@ command it's about; (3) the end-state verification (files on disk,
 `git ls-files` empty) is the only check that counts. Recovery, for the
 record: committed bytes are never lost — `git show <commit>:<path>`
 writes them back exactly.
+
+## 2026-07-06 — Policy engine v1 (Phase 1 opener, PR #13)
+
+### 18. TypeScript exhaustiveness ends where untyped storage begins
+
+The engine's verdict switches were compile-time-exhaustive over
+`RiskClass`/`PolicyAction` and had no `default` arms — Biome and tsc
+both content. Two of three Tier 2 reviewers independently traced the
+same hole: SQLite stores those fields as bare TEXT, `rowToPolicy`
+blind-casts, so an out-of-vocabulary value (schema drift, rollback,
+hand edit) walks past every `case` and the function returns
+`undefined` — making `evaluate` resolve `undefined` instead of a
+verdict. A caller checking `verdict?.action \!== "block"` reads that as
+proceed: fail-open at the fail-closed seam. My own suite was green
+because every test fed well-typed inputs — the invariant test pinned
+the table, not the edges where the table's inputs are corrupt. The
+pattern that keeps both guarantees: a `default` arm that binds the
+value to `never` (a legitimate new union member still breaks the
+build) and returns `block` with a reason naming the corrupt value.
+Corollary for review discipline: self-verified green is not reviewed —
+tests written by the author share the author's type-system blind spot.
+
+### 19. Interfaces are cheapest at zero callers — review them exactly then
+
+The Tier 2 pass landed between "seam exported" and "first consumer
+wired," and every interface finding was free to take: the two-argument
+signature (`toolName`, `tool`) that could disagree became a
+discriminated-union request; `input` joined as a required field before
+anything reads it (optional input on a security decision is fail-open
+by shape — a §10.3 caller that forgot it would silently skip every
+rule); `PolicyVerdictSource` shipped its full vocabulary (`"rule"`
+reserved, `"unknown_tool"` honest) so exhaustive consumers never
+break. A week later each of these is a consumer-breaking change.
+Extends #7: interfaces are where rewrites go to die — so schedule the
+adversarial interface review at the moment the interface has no
+dependents, not at the next milestone.
