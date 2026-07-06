@@ -120,10 +120,13 @@ Nothing. All session items closed and verified.
 
 ### Next task: policy engine v1 (spec §10.1–§10.2) — Phase 1 opener
 
-**New protocol applies (CLAUDE.md "Finding unknowns", added 2026-07-06):
-begin with a `/blindspot` codebase pass on spec §10 + the existing
-policy-adjacent code (risk.ts, PolicyRepository, execute.ts) BEFORE
-writing the plan; the plan is tweakable-format (likeliest-to-change
+**The blindspot pass is ALREADY DONE (2026-07-06):**
+claude.ai/code/artifact/911c178e-b63d-4162-8458-5917e708e60d — seven
+grounded cards (lazy seeding, verdict-as-data / no §5.5 pausing,
+unknown-tool→block fail-closed, provenance field for the §10.3 seam,
+reasons as product surface, block-never-derived, engine takes resolved
+Tool). Its "assembled prompt" section IS the implementation prompt —
+start from it. **Remaining protocol (CLAUDE.md "Finding unknowns"):** the plan is tweakable-format (likeliest-to-change
 first, degrees of freedom marked); keep a deviations log during the
 build; explainer + full-pass quiz before merge. New global skills:
 /blindspot, /pitch. Session debriefs + explainers are HTML artifacts;
