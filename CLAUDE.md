@@ -51,9 +51,17 @@ puts the human decision AFTER the clean-room CI evidence exists.
   Widening the floor itself is a code change → PR by definition.
 - **Everything on the floor goes branch → PR → CI green + CodeRabbit
   review → merge.** A mixed commit takes the stricter route.
+- **Load-bearing PRs ship with an explainer, unprompted.** Immediately
+  after opening a PR that touches product code, the sandbox boundary, or
+  the supply chain, the agent runs `/explain-diff` on it and posts the
+  artifact URL — before any merge talk. The human passes the quiz before
+  merging (Storey: one human fully understands each change before it
+  ships). Housekeeping PRs (config one-liners, checklist comments) are
+  exempt.
 - Merge discipline is self-enforced until branch protection is available
   (see the ci.yml activation checklist): merge only on green, after
-  reading the review.
+  reading the review — and for load-bearing PRs, after passing the
+  explainer quiz.
 - Enforced mechanically by `githooks/pre-push` — a tripwire, not a wall.
   A `--no-verify` bypass is an incident worth a LEARNINGS note.
 - When branch protection becomes available (Pro or public repo), turn on
