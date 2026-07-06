@@ -54,10 +54,10 @@ puts the human decision AFTER the clean-room CI evidence exists.
 - **Load-bearing PRs ship with an explainer, unprompted.** Immediately
   after opening a PR that touches product code, the sandbox boundary, or
   the supply chain, the agent runs `/explain-diff` on it and posts the
-  artifact URL — before any merge talk. The human passes the quiz before
-  merging (Storey: one human fully understands each change before it
-  ships). Housekeeping PRs (config one-liners, checklist comments) are
-  exempt.
+  artifact URL — before any merge talk. The human passes the quiz FULLY
+  before merging — a missed question means reread and retake (Storey:
+  one human fully understands each change before it ships).
+  Housekeeping PRs (config one-liners, checklist comments) are exempt.
 - Merge discipline is self-enforced until branch protection is available
   (see the ci.yml activation checklist): merge only on green, after
   reading the review — and for load-bearing PRs, after passing the
@@ -66,6 +66,46 @@ puts the human decision AFTER the clean-room CI evidence exists.
   A `--no-verify` bypass is an incident worth a LEARNINGS note.
 - When branch protection becomes available (Pro or public repo), turn on
   required checks; this routing rule itself does not change.
+
+## Finding unknowns (the map–territory protocol)
+
+The gap between the prompt and reality is the unknowns; surface them
+before they get expensive (Thariq Shihipar's framework). Route by
+quadrant first, then follow the phase rules.
+
+**By quadrant:**
+- *Unknown unknowns* (never considered) → `/blindspot` — codebase mode
+  or teach-me domain mode.
+- *Unknown knowns* ("I'll know it when I see it") → brainstorm +
+  throwaway HTML prototypes and design variants BEFORE wiring anything
+  (`superpowers:brainstorming`, `design-shotgun`, mock artifacts).
+- *Known unknowns* (questions you know to ask) → interview via
+  `grilling`: one question at a time, ordered by architectural blast
+  radius.
+- References beat descriptions: point at real source code (any
+  language) instead of explaining behavior in prose.
+
+**By phase:**
+- *Before:* plans are TWEAKABLE — lead with the decisions likeliest to
+  change (data models, type interfaces, anything user-facing), bury
+  mechanical work at the bottom, and mark degrees of freedom: where the
+  agent may improvise vs. must stop and ask. Implementation starts
+  fresh with the plan artifacts passed in.
+- *During:* keep an implementation-notes deviations log in the
+  scratchpad — per entry: what forced the deviation, the conservative
+  call taken, what to fold into attempt #2. Summarize under a
+  "Deviations" heading in the PR description and in the session
+  debrief.
+- *After:* explainer + quiz per Commit routing (merge only on a full
+  pass); `/pitch` when buy-in beyond yourself is needed.
+
+**Artifact medium:** anything meant to be READ — plans, explainers,
+reports, prototypes, debriefs — is an HTML artifact, not markdown:
+richer, actually read, shareable. Markdown remains for git-tracked
+prose (HANDOFF, LEARNINGS, this file) where diff reviewability wins.
+For anything painful to express in text (ordering, tuning, tagging,
+picking values), build a throwaway HTML editor with a "copy back as
+prompt/JSON" button — purpose-built, single-use, then discarded.
 
 ## Security posture: enterprise-grade, non-negotiable
 

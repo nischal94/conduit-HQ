@@ -120,6 +120,15 @@ Nothing. All session items closed and verified.
 
 ### Next task: policy engine v1 (spec §10.1–§10.2) — Phase 1 opener
 
+**New protocol applies (CLAUDE.md "Finding unknowns", added 2026-07-06):
+begin with a `/blindspot` codebase pass on spec §10 + the existing
+policy-adjacent code (risk.ts, PolicyRepository, execute.ts) BEFORE
+writing the plan; the plan is tweakable-format (likeliest-to-change
+first, degrees of freedom marked); keep a deviations log during the
+build; explainer + full-pass quiz before merge. New global skills:
+/blindspot, /pitch. Session debriefs + explainers are HTML artifacts;
+repo prose stays markdown.**
+
 The §5.3 pipeline's step 2. riskClass derivation exists (`risk.ts`,
 §10.1 pinned); the `PolicyRepository` exists with override-persistence
 pinned. Missing: the engine that seeds per-tool policies from riskClass
