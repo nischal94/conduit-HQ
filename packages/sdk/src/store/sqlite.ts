@@ -7,6 +7,7 @@ import type {
   JsonSchema,
   PendingApproval,
   Policy,
+  PolicyAction,
   RiskClass,
   Source,
   SourceSemantics,
@@ -53,15 +54,15 @@ const SCHEMA = [
     description TEXT,
     input_schema TEXT NOT NULL,
     output_schema TEXT NOT NULL,
-    risk_class TEXT NOT NULL,
+    risk_class TEXT NOT NULL CHECK (risk_class IN ('safe', 'review', 'destructive')),
     source_semantics TEXT NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS tools_namespace ON tools (namespace)`,
   `CREATE TABLE IF NOT EXISTS policies (
     tool_name TEXT PRIMARY KEY,
-    action TEXT NOT NULL,
-    seeded_from TEXT NOT NULL,
-    manual_override INTEGER NOT NULL
+    action TEXT NOT NULL CHECK (action IN ('allow', 'require_approval', 'block')),
+    seeded_from TEXT NOT NULL CHECK (seeded_from IN ('safe', 'review', 'destructive')),
+    manual_override INTEGER NOT NULL CHECK (manual_override IN (0, 1))
   )`,
   `CREATE TABLE IF NOT EXISTS executions (
     id TEXT PRIMARY KEY,
@@ -394,6 +395,20 @@ function maybeInteger(row: Row, column: string): number | undefined {
   return typeof value === "number" || typeof value === "bigint" ? Number(value) : undefined;
 }
 
+// Vocabulary guards: column values arrive from untrusted storage — a
+// divergent writer can hold any bytes, and TypeScript's unions stop at
+// compile time. The policy engine (policy.ts) fails closed on bad values
+// it SEES; this layer catches corruption the engine would never see (e.g.
+// manual_override 2 reshaped into an inert row, handing an operator's
+// manual block back to the derived default). Two independent layers —
+// do not merge or deduplicate them.
+const POLICY_ACTIONS: readonly PolicyAction[] = ["allow", "require_approval", "block"];
+const RISK_CLASSES: readonly RiskClass[] = ["safe", "review", "destructive"];
+
+function isOneOf<T extends string>(value: string, vocabulary: readonly T[]): value is T {
+  return (vocabulary as readonly string[]).includes(value);
+}
+
 function rowToSource(row: Row): Source {
   const source: Source = {
     id: text(row, "id"),
@@ -422,12 +437,19 @@ function rowToConnection(row: Row): Connection {
 }
 
 function rowToTool(row: Row): Tool {
+  const name = text(row, "name");
+  const riskClass = text(row, "risk_class");
+  if (!isOneOf(riskClass, RISK_CLASSES)) {
+    throw new Error(
+      `[SqliteStore] Failed to read tool: unrecognized risk_class ${JSON.stringify(riskClass)}. Context: { name: ${name} }`,
+    );
+  }
   const tool: Tool = {
-    name: text(row, "name"),
+    name,
     namespace: text(row, "namespace"),
     inputSchema: JSON.parse(text(row, "input_schema")) as JsonSchema,
     outputSchema: JSON.parse(text(row, "output_schema")) as JsonSchema,
-    riskClass: text(row, "risk_class") as RiskClass,
+    riskClass,
     sourceSemantics: JSON.parse(text(row, "source_semantics")) as SourceSemantics,
   };
   const description = maybeText(row, "description");
@@ -438,12 +460,26 @@ function rowToTool(row: Row): Tool {
 }
 
 function rowToPolicy(row: Row): Policy {
-  return {
-    toolName: text(row, "tool_name"),
-    action: text(row, "action") as Policy["action"],
-    seededFrom: text(row, "seeded_from") as Policy["seededFrom"],
-    manualOverride: integer(row, "manual_override") === 1,
-  };
+  const toolName = text(row, "tool_name");
+  const action = text(row, "action");
+  if (!isOneOf(action, POLICY_ACTIONS)) {
+    throw new Error(
+      `[SqliteStore] Failed to read policy: unrecognized action ${JSON.stringify(action)}. Context: { toolName: ${toolName} }`,
+    );
+  }
+  const seededFrom = text(row, "seeded_from");
+  if (!isOneOf(seededFrom, RISK_CLASSES)) {
+    throw new Error(
+      `[SqliteStore] Failed to read policy: unrecognized seeded_from ${JSON.stringify(seededFrom)}. Context: { toolName: ${toolName} }`,
+    );
+  }
+  const manualOverride = integer(row, "manual_override");
+  if (manualOverride !== 0 && manualOverride !== 1) {
+    throw new Error(
+      `[SqliteStore] Failed to read policy: manual_override must be 0 or 1. Context: { toolName: ${toolName}, got: ${manualOverride} }`,
+    );
+  }
+  return { toolName, action, seededFrom, manualOverride: manualOverride === 1 };
 }
 
 function rowToTraceEvent(row: Row): TraceEvent {
