@@ -440,8 +440,10 @@ function rowToTool(row: Row): Tool {
   const name = text(row, "name");
   const riskClass = text(row, "risk_class");
   if (!isOneOf(riskClass, RISK_CLASSES)) {
+    // Identifiers are stringified too: they come from the same untrusted
+    // row as the bad value, and raw control characters are log injection.
     throw new Error(
-      `[SqliteStore] Failed to read tool: unrecognized risk_class ${JSON.stringify(riskClass)}. Context: { name: ${name} }`,
+      `[SqliteStore] Failed to read tool: unrecognized risk_class ${JSON.stringify(riskClass)}. Context: { name: ${JSON.stringify(name)} }`,
     );
   }
   const tool: Tool = {
@@ -464,19 +466,19 @@ function rowToPolicy(row: Row): Policy {
   const action = text(row, "action");
   if (!isOneOf(action, POLICY_ACTIONS)) {
     throw new Error(
-      `[SqliteStore] Failed to read policy: unrecognized action ${JSON.stringify(action)}. Context: { toolName: ${toolName} }`,
+      `[SqliteStore] Failed to read policy: unrecognized action ${JSON.stringify(action)}. Context: { toolName: ${JSON.stringify(toolName)} }`,
     );
   }
   const seededFrom = text(row, "seeded_from");
   if (!isOneOf(seededFrom, RISK_CLASSES)) {
     throw new Error(
-      `[SqliteStore] Failed to read policy: unrecognized seeded_from ${JSON.stringify(seededFrom)}. Context: { toolName: ${toolName} }`,
+      `[SqliteStore] Failed to read policy: unrecognized seeded_from ${JSON.stringify(seededFrom)}. Context: { toolName: ${JSON.stringify(toolName)} }`,
     );
   }
   const manualOverride = integer(row, "manual_override");
   if (manualOverride !== 0 && manualOverride !== 1) {
     throw new Error(
-      `[SqliteStore] Failed to read policy: manual_override must be 0 or 1. Context: { toolName: ${toolName}, got: ${manualOverride} }`,
+      `[SqliteStore] Failed to read policy: manual_override must be 0 or 1. Context: { toolName: ${JSON.stringify(toolName)}, got: ${manualOverride} }`,
     );
   }
   return { toolName, action, seededFrom, manualOverride: manualOverride === 1 };
