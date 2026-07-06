@@ -3,6 +3,7 @@ import type { SecretBox } from "../secrets.js";
 import type {
   Connection,
   Execution,
+  ExecutionStatus,
   Integration,
   JsonSchema,
   PendingApproval,
@@ -32,7 +33,7 @@ export interface SqliteStoreOptions {
 const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS sources (
     id TEXT PRIMARY KEY,
-    type TEXT NOT NULL,
+    type TEXT NOT NULL CHECK (type IN ('openapi', 'graphql', 'mcp', 'custom_js')),
     namespace TEXT NOT NULL UNIQUE,
     location TEXT NOT NULL,
     base_url TEXT
@@ -67,7 +68,7 @@ const SCHEMA = [
   `CREATE TABLE IF NOT EXISTS executions (
     id TEXT PRIMARY KEY,
     code TEXT NOT NULL,
-    status TEXT NOT NULL,
+    status TEXT NOT NULL CHECK (status IN ('running', 'paused', 'completed', 'failed', 'expired')),
     seeds TEXT NOT NULL,
     paused_on TEXT,
     started_at INTEGER NOT NULL,
@@ -83,7 +84,7 @@ const SCHEMA = [
     output_summary TEXT,
     upstream_status INTEGER,
     latency_ms INTEGER,
-    policy_verdict TEXT NOT NULL,
+    policy_verdict TEXT NOT NULL CHECK (policy_verdict IN ('allow', 'require_approval', 'block')),
     at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS trace_execution ON trace_events (execution_id, seq)`,
@@ -290,10 +291,18 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         if (row === undefined) {
           return undefined;
         }
+        const status = text(row, "status");
+        if (!isOneOf(status, EXECUTION_STATUSES)) {
+          // An impossible status must never reach §5.5 pause/resume
+          // handling, where default-less switches would ignore it.
+          throw new Error(
+            `[SqliteStore] Failed to read execution: unrecognized status ${JSON.stringify(status)}. Context: { id: ${JSON.stringify(id)} }`,
+          );
+        }
         const execution: Execution = {
           id: text(row, "id"),
           code: text(row, "code"),
-          status: text(row, "status") as Execution["status"],
+          status,
           seeds: JSON.parse(text(row, "seeds")) as Execution["seeds"],
           startedAt: integer(row, "started_at"),
         };
@@ -404,15 +413,30 @@ function maybeInteger(row: Row, column: string): number | undefined {
 // do not merge or deduplicate them.
 const POLICY_ACTIONS: readonly PolicyAction[] = ["allow", "require_approval", "block"];
 const RISK_CLASSES: readonly RiskClass[] = ["safe", "review", "destructive"];
+const SOURCE_TYPES: readonly SourceType[] = ["openapi", "graphql", "mcp", "custom_js"];
+const EXECUTION_STATUSES: readonly ExecutionStatus[] = [
+  "running",
+  "paused",
+  "completed",
+  "failed",
+  "expired",
+];
 
 function isOneOf<T extends string>(value: string, vocabulary: readonly T[]): value is T {
   return (vocabulary as readonly string[]).includes(value);
 }
 
 function rowToSource(row: Row): Source {
+  const id = text(row, "id");
+  const type = text(row, "type");
+  if (!isOneOf(type, SOURCE_TYPES)) {
+    throw new Error(
+      `[SqliteStore] Failed to read source: unrecognized type ${JSON.stringify(type)}. Context: { id: ${JSON.stringify(id)} }`,
+    );
+  }
   const source: Source = {
-    id: text(row, "id"),
-    type: text(row, "type") as SourceType,
+    id,
+    type,
     namespace: text(row, "namespace"),
     location: text(row, "location"),
   };
@@ -485,13 +509,22 @@ function rowToPolicy(row: Row): Policy {
 }
 
 function rowToTraceEvent(row: Row): TraceEvent {
+  const callId = text(row, "call_id");
+  const policyVerdict = text(row, "policy_verdict");
+  if (!isOneOf(policyVerdict, POLICY_ACTIONS)) {
+    // The audit trail (spec §11): a corrupt verdict must fail the read,
+    // not surface in Trace views as a legitimate policy decision.
+    throw new Error(
+      `[SqliteStore] Failed to read trace event: unrecognized policy_verdict ${JSON.stringify(policyVerdict)}. Context: { callId: ${JSON.stringify(callId)} }`,
+    );
+  }
   const event: TraceEvent = {
-    callId: text(row, "call_id"),
+    callId,
     executionId: text(row, "execution_id"),
     toolName: text(row, "tool_name"),
     connectionPrefix: text(row, "connection_prefix"),
     input: JSON.parse(text(row, "input")),
-    policyVerdict: text(row, "policy_verdict") as TraceEvent["policyVerdict"],
+    policyVerdict,
     at: integer(row, "at"),
   };
   const outputSummary = maybeText(row, "output_summary");
