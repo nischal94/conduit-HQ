@@ -26,4 +26,4 @@ promise the product makes but does not yet enforce.
 | §11 — Trace stores no raw credentials; inputs redacted per policy | — | ⏳ awaits Trace redaction |
 | §16 — runaway executions interrupted (time / memory / output caps) | `packages/sdk/src/sandbox/quickjs.test.ts` | ✅ pinned |
 | §5.5 — pause/resume via deterministic replay (journaled results, seeded non-determinism) | — | ⏳ awaits execution manager (replay mechanism + seeds landed in sandbox, tested un-prefixed in `quickjs.test.ts`) |
-| §10.2 — policy defaults: safe→Allow, review/destructive→Require approval | — | ⏳ awaits policy engine |
+| §10.2 — policy defaults: safe→Allow, review/destructive→Require approval; block never seeded | `packages/sdk/src/policy.test.ts` | ✅ pinned |
