@@ -101,6 +101,8 @@ state changed; everything below remains accurate.
   safety. Both gates updated. Session-end protocol now also requires
   publishing the **session debrief artifact** (first one:
   claude.ai/code/artifact/4eae7e42-0e75-408d-b01e-316517906986).
+  Debrief #2 (2026-07-05/06, unknowns-framework arc):
+  claude.ai/code/artifact/e3c0ac41-4d0d-46c8-9824-a2b3405f9a9d
 - **RESOLVED 2026-07-04, session tail (PRs #6–#9, all merged green):**
   (1) `assets/` gitignored + untracked — the 7 screenshots stay on disk,
   human's personal reference (incident during the untrack: the merge
