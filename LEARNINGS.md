@@ -346,3 +346,44 @@ repo's main history by design. Pair the tripwire with
 protocol block), and treat "session ends with an open PR" as exactly
 the case where rewriting HANDOFF matters most — the PR's merge gate is
 a human obligation that otherwise lives nowhere except a chat log.
+
+## 2026-07-07 — PR #15: the remaining sqlite vocabularies (merge + close)
+
+### 22. A stacked PR does not follow its base to main — retarget before merging
+
+GitHub only retargets a stacked PR when the base branch is *deleted*;
+merging the base PR alone changes nothing. After #14 merged, PR #15
+still had `base: fix/sqlite-vocab-validation`, and `gh pr merge` would
+have "merged" it into the already-merged, now-dead feature branch —
+green checks, MERGED badge, and not one byte of it on main. The
+previous handoff had called retargeting "optional housekeeping"; it is
+a merge-correctness requirement. The move: `gh pr edit N --base main`,
+re-verify the shown diff is still just the stack's own commits and CI
+is green against the new base, then merge. (Deleting merged base
+branches would also prevent this — but branch deletion needs explicit
+human approval, so the retarget check is the layer the agent owns.)
+
+### 23. A pin test can check agreement among copies while pinning nothing to the source
+
+PR #15's exhaustiveness test round-tripped every vocabulary member and
+proved the production arrays and the CHECK constraints agreed — with
+the *test's own hand-copied list*. Nothing tied that list to the union
+in types.ts: a union gaining `"cancelled"` would compile everywhere,
+pass every test, and leave the new member unwritable until first use.
+The chain was union → (unchecked) → test list → (runtime-pinned) →
+array + CHECK. Fix: make the test list `Record<Union, true>`-keyed, so
+the compiler owns the unchecked link — and verify the negative
+(deleting a member must break the build; it did). General shape: when
+N copies of a fact must agree, count the links back to the source of
+truth — a test that only compares copies to each other rides along
+happily as they all drift together.
+
+### 24. `node_modules/` with a trailing slash ignores directories, not symlinks
+
+The worktree trick (symlink the main checkout's `node_modules` in,
+never install) collides with a gitignore subtlety: `node_modules/`
+matches *directories only*, and a symlink is not a directory, so the
+symlinks show up as untracked — one `git add -A` away from committing
+machine-local absolute-path links into the repo. In symlinked
+worktrees, stage files explicitly by path; treat `git add -A`/`.` as
+off-limits there.
