@@ -1,5 +1,7 @@
 .DS_Store
-node_modules/
+# No trailing slash: worktree sessions symlink node_modules from the main
+# checkout, and `node_modules/` matches directories only (LEARNINGS #24).
+node_modules
 .claude/settings.local.json
 # Personal reference material — stays on disk, never in the repo.
 assets/
