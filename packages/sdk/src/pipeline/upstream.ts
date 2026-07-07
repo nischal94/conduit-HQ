@@ -188,6 +188,14 @@ export function createMcpUpstreamCaller(
  * fall below the length floor and are never redacted. Longest first, so a
  * full value is replaced before its own sub-token can match a fragment.
  */
+// Auth-scheme words are not secrets; scanning for them would false-positive
+// on ordinary response text. Everything else in a header value is treated as
+// credential material down to a short floor (real tokens run 6+ chars; a
+// hostile server can echo just the bare token, so the floor must be low
+// enough to catch short ones without matching common English words).
+const AUTH_SCHEME_WORDS = new Set(["bearer", "basic", "token", "digest", "negotiate", "apikey"]);
+const MIN_TOKEN_LEN = 5;
+
 function credentialTokens(auth: UpstreamAuth): string[] {
   const tokens = new Set<string>();
   for (const value of Object.values(auth.headers)) {
@@ -196,7 +204,7 @@ function credentialTokens(auth: UpstreamAuth): string[] {
     }
     tokens.add(value);
     for (const segment of value.split(/\s+/)) {
-      if (segment.length >= 8) {
+      if (segment.length >= MIN_TOKEN_LEN && !AUTH_SCHEME_WORDS.has(segment.toLowerCase())) {
         tokens.add(segment);
       }
     }

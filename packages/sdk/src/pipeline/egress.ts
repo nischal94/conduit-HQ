@@ -65,8 +65,14 @@ export function isPrivateAddress(address: string): boolean {
   if (groups === undefined) {
     return true;
   }
+  // Both v4-mapped (::ffff:0:0/96) and NAT64 (64:ff9b::/96) embed an IPv4
+  // address in the low 32 bits; classify by the embedded v4 so a NAT64
+  // literal like 64:ff9b::a9fe:a9fe (169.254.169.254, the metadata endpoint)
+  // is blocked on NAT64-capable networks, not read as public.
   const isV4Mapped = groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff;
-  if (isV4Mapped) {
+  const isNat64 =
+    groups[0] === 0x0064 && groups[1] === 0xff9b && groups.slice(2, 6).every((g) => g === 0);
+  if (isV4Mapped || isNat64) {
     const hi = groups[6] ?? 0;
     const lo = groups[7] ?? 0;
     return isPrivateV4([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff]);

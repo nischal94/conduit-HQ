@@ -411,6 +411,41 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     expect(JSON.stringify(error)).not.toContain("ghp_invoker_secret");
   });
 
+  it("INVARIANT §9.2: refuses a short bare-token echo below the old 8-char floor (codex re-pass)", async () => {
+    // Adversarial (codex): a 7-char token echoed alone slipped the >=8 segment
+    // floor. The floor is now 5 (scheme words excluded), so a short bare token
+    // is caught.
+    const shortSecret = "Bearer abc1234"; // bare token is 7 chars
+    const { port } = await serve((_request, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: "1", result: { token: "abc1234" } }));
+    });
+    await expect(
+      caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: shortSecret } },
+        timeoutMs: 2_000,
+      }),
+    ).rejects.toThrow(/echoed the connection's credential/);
+  });
+
+  it("does not treat the auth scheme word alone as a credential (no over-redaction)", async () => {
+    // "Bearer" appearing in benign response text must not trip the scan.
+    const { port } = await serve((_request, res) =>
+      jsonRpcResult(res, { note: "Use a Bearer token to authenticate." }),
+    );
+    const outcome = await caller.call({
+      tool,
+      source: sourceAt(port),
+      input: {},
+      auth: { headers: { Authorization: "Bearer ghp_long_enough_secret_9z" } },
+      timeoutMs: 2_000,
+    });
+    expect(outcome.result).toEqual({ note: "Use a Bearer token to authenticate." });
+  });
+
   it("never serializes auth headers into the thrown error", async () => {
     // Hostile upstream: echoes the Authorization header back in a 401 body.
     const { port } = await serve((request, res) => {

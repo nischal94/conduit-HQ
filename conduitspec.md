@@ -623,6 +623,15 @@ name is stored in `sourceSemantics`. Other source types fail closed ("not yet ca
 6. **Per-connect egress pinning** (§9.3): the v1 guard resolves DNS and checks every
 address, then `fetch` re-resolves independently — a DNS-rebinding TOCTOU window. Closing it
 means resolving once and forcing the connection to the vetted IP — Phase 1.
+7. **UpstreamCaller as a trusted dependency** (§5.3, §9.2): the pipeline treats an
+injected `UpstreamCaller` as trusted infrastructure — the same posture it holds toward the
+store and policy engine — not as an adversary. So the invoker does NOT re-validate a custom caller's
+error name against its kind, nor re-scan a custom caller's success result for the credential; those
+defenses live in the built-in MCP caller. Rationale: a custom caller is host-side code the operator
+installs, and a hostile one already holds the secret in its own `call()` scope, so
+smuggling it back through the invoker buys an attacker nothing. If Conduit ever runs
+operator-untrusted caller plugins, this decision reopens and the invoker gains its own output/name
+validation. (Decided 2026-07-08 after a codex adversarial re-pass raised both as findings.)
 
 ---
 

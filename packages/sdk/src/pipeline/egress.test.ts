@@ -108,6 +108,15 @@ describe("egress guard (spec §9.3)", () => {
     expect(isPrivateAddress("8.8.8.8")).toBe(false); // still-public sanity
   });
 
+  it("INVARIANT §9.3: NAT64 (64:ff9b::/96) addresses are classified by their embedded IPv4 (codex re-pass)", () => {
+    // 64:ff9b::a9fe:a9fe embeds 169.254.169.254 — the cloud metadata endpoint.
+    // On NAT64 networks this routes to link-local; must not read as public.
+    expect(isPrivateAddress("64:ff9b::a9fe:a9fe")).toBe(true); // 169.254.169.254
+    expect(isPrivateAddress("64:ff9b::7f00:1")).toBe(true); // 127.0.0.1
+    expect(isPrivateAddress("64:ff9b::a00:1")).toBe(true); // 10.0.0.1
+    expect(isPrivateAddress("64:ff9b::5db8:d822")).toBe(false); // 93.184.216.34, public
+  });
+
   it("classifies unparseable addresses as private (fail closed)", () => {
     expect(isPrivateAddress("garbage")).toBe(true);
     expect(isPrivateAddress("1.2.3.4.5")).toBe(true);
