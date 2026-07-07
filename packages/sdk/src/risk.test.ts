@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import { deriveRiskClass } from "./risk.js";
+import type { SourceSemantics } from "./types.js";
 
 describe("deriveRiskClass (INVARIANT §10.1: default risk mapping)", () => {
   describe("openapi", () => {
@@ -53,6 +54,25 @@ describe("deriveRiskClass (INVARIANT §10.1: default risk mapping)", () => {
       expect(deriveRiskClass({ kind: "custom_js", declaredRisk: "destructive" })).toBe(
         "destructive",
       );
+    });
+  });
+
+  describe("fail-closed hardening (untyped storage reality)", () => {
+    // deriveRiskClass is exported public API and semantics can reach it
+    // from untyped storage: compile-time exhaustiveness alone would let
+    // an impossible kind fall off the switch and return undefined as a
+    // RiskClass. Same discipline as policy.ts's default arms.
+    it("classifies an unrecognized kind as destructive, never undefined", () => {
+      const semantics = { kind: "soap" } as unknown as SourceSemantics;
+      expect(deriveRiskClass(semantics)).toBe("destructive");
+    });
+
+    it("classifies custom_js with an out-of-vocabulary declaredRisk as destructive", () => {
+      const semantics = {
+        kind: "custom_js",
+        declaredRisk: "extreme",
+      } as unknown as SourceSemantics;
+      expect(deriveRiskClass(semantics)).toBe("destructive");
     });
   });
 });
