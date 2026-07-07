@@ -1,9 +1,18 @@
 import { createClient } from "@libsql/client";
 import { beforeEach, describe, expect, it } from "vitest";
 import { SecretBox } from "../secrets.js";
-import type { Tool } from "../types.js";
+import type { ExecutionStatus, PolicyAction, RiskClass, SourceType, Tool } from "../types.js";
 import { openSqliteStore } from "./sqlite.js";
 import type { ConduitStore } from "./store.js";
+
+/**
+ * Compiler-pinned vocabulary list: Record<T, true> demands every union
+ * member as a key, so growing a union in types.ts fails this file's
+ * compilation until the pin tests cover the new member too.
+ */
+function vocabulary<T extends string>(members: Record<T, true>): T[] {
+  return Object.keys(members) as T[];
+}
 
 function tool(overrides: Partial<Tool> & Pick<Tool, "name" | "namespace">): Tool {
   return {
@@ -237,6 +246,35 @@ describe("SqliteStore", () => {
             seeded_from TEXT NOT NULL,
             manual_override INTEGER NOT NULL
           )`,
+          `CREATE TABLE sources (
+            id TEXT PRIMARY KEY,
+            type TEXT NOT NULL,
+            namespace TEXT NOT NULL UNIQUE,
+            location TEXT NOT NULL,
+            base_url TEXT
+          )`,
+          `CREATE TABLE executions (
+            id TEXT PRIMARY KEY,
+            code TEXT NOT NULL,
+            status TEXT NOT NULL,
+            seeds TEXT NOT NULL,
+            paused_on TEXT,
+            started_at INTEGER NOT NULL,
+            ended_at INTEGER
+          )`,
+          `CREATE TABLE trace_events (
+            seq INTEGER PRIMARY KEY AUTOINCREMENT,
+            call_id TEXT NOT NULL UNIQUE,
+            execution_id TEXT NOT NULL,
+            tool_name TEXT NOT NULL,
+            connection_prefix TEXT NOT NULL,
+            input TEXT NOT NULL,
+            output_summary TEXT,
+            upstream_status INTEGER,
+            latency_ms INTEGER,
+            policy_verdict TEXT NOT NULL,
+            at INTEGER NOT NULL
+          )`,
         ],
         "write",
       );
@@ -316,11 +354,16 @@ describe("SqliteStore", () => {
       // POLICY_ACTIONS/RISK_CLASSES are compile-checked against out-of-union
       // members but not against MISSING ones — deleting "require_approval"
       // from the array would still compile and make every such row
-      // unreadable (and, via rows.map, fail list() wholesale). Round-trip
-      // each member through the fresh store so the constants and the CHECK
-      // constraints both stay exhaustive.
-      const actions = ["allow", "require_approval", "block"] as const;
-      const riskClasses = ["safe", "review", "destructive"] as const;
+      // unreadable (and, via rows.map, fail list() wholesale). The
+      // vocabulary() lists are compiler-pinned to the unions; round-tripping
+      // them keeps the production constants and CHECK constraints in
+      // agreement with the unions.
+      const actions = vocabulary<PolicyAction>({
+        allow: true,
+        require_approval: true,
+        block: true,
+      });
+      const riskClasses = vocabulary<RiskClass>({ safe: true, review: true, destructive: true });
       for (const [i, action] of actions.entries()) {
         for (const [j, seededFrom] of riskClasses.entries()) {
           const toolName = `vocab.a${i}s${j}`;
@@ -339,6 +382,96 @@ describe("SqliteStore", () => {
         await store.tools.replaceNamespace(namespace, [tool({ name, namespace, riskClass })]);
         expect((await store.tools.get(name))?.riskClass).toBe(riskClass);
       }
+    });
+
+    it("rejects a source row with an unrecognized type", async () => {
+      await legacy.execute({
+        sql: "INSERT INTO sources (id, type, namespace, location) VALUES (?, ?, ?, ?)",
+        args: ["src_1", "grpc", "petstore", "https://example.com/openapi.json"],
+      });
+      await expect(legacyStore.sources.get("src_1")).rejects.toThrow('unrecognized type "grpc"');
+      await expect(legacyStore.sources.list()).rejects.toThrow('unrecognized type "grpc"');
+    });
+
+    it("rejects an execution row with an unrecognized status", async () => {
+      // "pased" is one corrupt byte from "paused": deserialized as-is it
+      // reaches §5.5 pause/resume handling as an impossible status that
+      // default-less switches silently ignore.
+      await legacy.execute({
+        sql: `INSERT INTO executions (id, code, status, seeds, started_at)
+              VALUES (?, ?, ?, ?, ?)`,
+        args: ["exec_1", "return 1", "pased", '{"now":1,"random":0.5}', 1000],
+      });
+      await expect(legacyStore.executions.get("exec_1")).rejects.toThrow(
+        'unrecognized status "pased"',
+      );
+    });
+
+    it("rejects a trace event row with an unrecognized policy_verdict", async () => {
+      // The audit-trail surface: a corrupt verdict must never flow into
+      // Trace views looking like a legitimate policy decision.
+      await legacy.execute({
+        sql: `INSERT INTO trace_events
+                (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: ["call_1", "exec_1", "x.search", "x.acme.prod", "null", "permit", 1000],
+      });
+      await expect(legacyStore.trace.listByExecution("exec_1")).rejects.toThrow(
+        'unrecognized policy_verdict "permit"',
+      );
+    });
+
+    it("accepts every source type, execution status, and trace verdict (exhaustiveness pin)", async () => {
+      // Same rationale as the policy/tool pin above: the vocabulary()
+      // lists are compiler-pinned to the unions; round-tripping them keeps
+      // the production constants and CHECK constraints in agreement.
+      const sourceTypes = vocabulary<SourceType>({
+        openapi: true,
+        graphql: true,
+        mcp: true,
+        custom_js: true,
+      });
+      for (const [i, type] of sourceTypes.entries()) {
+        const id = `src_vocab_${i}`;
+        await store.sources.upsert({ id, type, namespace: `vocab${i}`, location: "https://x" });
+        expect((await store.sources.get(id))?.type).toBe(type);
+      }
+      const statuses = vocabulary<ExecutionStatus>({
+        running: true,
+        paused: true,
+        completed: true,
+        failed: true,
+        expired: true,
+      });
+      for (const [i, status] of statuses.entries()) {
+        const id = `exec_vocab_${i}`;
+        await store.executions.put({
+          id,
+          code: "return 1",
+          status,
+          seeds: { now: 1, random: 0.5 },
+          startedAt: 1000,
+        });
+        expect((await store.executions.get(id))?.status).toBe(status);
+      }
+      const verdicts = vocabulary<PolicyAction>({
+        allow: true,
+        require_approval: true,
+        block: true,
+      });
+      for (const [i, policyVerdict] of verdicts.entries()) {
+        await store.trace.append({
+          callId: `call_vocab_${i}`,
+          executionId: "exec_vocab_0",
+          toolName: "x.search",
+          connectionPrefix: "x.acme.prod",
+          input: null,
+          policyVerdict,
+          at: 1000 + i,
+        });
+      }
+      const events = await store.trace.listByExecution("exec_vocab_0");
+      expect(events.map((event) => event.policyVerdict)).toEqual(verdicts);
     });
 
     it("rejects a tool row with an unrecognized risk_class", async () => {
@@ -392,6 +525,36 @@ describe("SqliteStore", () => {
             sql: `INSERT INTO tools (name, namespace, input_schema, output_schema, risk_class, source_semantics)
                   VALUES (?, ?, ?, ?, ?, ?)`,
             args: ["t", "x", "{}", "{}", "extreme", '{"kind":"mcp"}'],
+          }),
+        ).rejects.toThrow(/check/i);
+      });
+
+      it("rejects writing an out-of-vocabulary source type", async () => {
+        await expect(
+          client.execute({
+            sql: "INSERT INTO sources (id, type, namespace, location) VALUES (?, ?, ?, ?)",
+            args: ["s", "grpc", "n", "https://x"],
+          }),
+        ).rejects.toThrow(/check/i);
+      });
+
+      it("rejects writing an out-of-vocabulary execution status", async () => {
+        await expect(
+          client.execute({
+            sql: `INSERT INTO executions (id, code, status, seeds, started_at)
+                  VALUES (?, ?, ?, ?, ?)`,
+            args: ["e", "return 1", "pased", "{}", 1000],
+          }),
+        ).rejects.toThrow(/check/i);
+      });
+
+      it("rejects writing an out-of-vocabulary trace policy_verdict", async () => {
+        await expect(
+          client.execute({
+            sql: `INSERT INTO trace_events
+                    (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at)
+                  VALUES (?, ?, ?, ?, ?, ?, ?)`,
+            args: ["c", "e", "x.search", "x.acme.prod", "null", "permit", 1000],
           }),
         ).rejects.toThrow(/check/i);
       });
