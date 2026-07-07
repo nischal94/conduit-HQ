@@ -78,12 +78,11 @@ at session start.
 
 ### Waiting on the human
 
-Nothing blocking. Open items: the in-flight sourceSemantics PR needs
-its quiz + explicit merge instruction when it lands; the leftover
-merged branch `feat/policy-engine-v1` predates the new auto-delete
-setting — delete on the human's say-so (remote branch deletion always
-needs explicit approval). Resolved 2026-07-07: the two sqlite-PR
-branches were deleted on explicit confirmation;
+Nothing blocking. Open item: the in-flight sourceSemantics PR needs
+its quiz + explicit merge instruction when it lands. Resolved
+2026-07-07: `feat/policy-engine-v1` deleted on the human's explicit
+yes (tip `7cf45d2` remains in main history) — origin now carries main
+only; the two sqlite-PR branches were deleted on explicit confirmation;
 `delete_branch_on_merge` is now ON repo-wide (verified live — PR #16's
 branch auto-deleted); PR #16 (gitignore symlink fix, LEARNINGS #24)
 merged and accepted by the human after the fact — see the new merge
