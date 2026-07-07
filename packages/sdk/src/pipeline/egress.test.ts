@@ -48,6 +48,17 @@ describe("egress guard (spec §9.3)", () => {
     await expect(assertEgressAllowed(new URL("http://[::ffff:10.0.0.1]/"))).rejects.toThrow();
   });
 
+  it("INVARIANT §9.3: IPv6 site-local fec0::/10 and multicast ff00::/8 are blocked", () => {
+    // Adversarial (codex): parity with the IPv4 >=224 block. fec0::/10 is
+    // deprecated but still routable on legacy nets; ff00::/8 is multicast.
+    expect(isPrivateAddress("fec0::1")).toBe(true);
+    expect(isPrivateAddress("feff:ffff::1")).toBe(true); // top of fec0::/10, still site-local
+    expect(isPrivateAddress("2001:db8::1")).toBe(false); // documentation range, globally-scoped form
+    expect(isPrivateAddress("ff02::1")).toBe(true); // link-local all-nodes multicast
+    expect(isPrivateAddress("ff0e::1")).toBe(true); // global multicast
+    expect(isPrivateAddress("2606:2800:220:1::1")).toBe(false); // public sanity
+  });
+
   it("INVARIANT §9.3: decimal-encoded IPv4 is blocked (URL normalizes http://2130706433/)", async () => {
     // Pins the WHATWG normalization the guard relies on: the encoded form
     // never reaches the checker as anything but dotted-quad.

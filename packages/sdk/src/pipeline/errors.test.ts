@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest";
 import {
   ConduitCallError,
   GUEST_ERROR_NAMES,
+  type GuestErrorName,
   infraError,
   NON_MEMOIZABLE_ERROR_NAMES,
   policyError,
@@ -61,12 +62,32 @@ describe("pipeline error vocabulary", () => {
   });
 
   it("the constructor's name parameter is closed over the guest vocabulary (compile-time pin)", () => {
-    // @ts-expect-error — arbitrary names must not cross the sandbox boundary
-    const rogue = new ConduitCallError("upstream", "MyVendorError", "nope");
-    // Runtime still constructs (the pin is compile-time); the four reserved
-    // names all pass.
-    expect(rogue).toBeInstanceOf(ConduitCallError);
     const legit = new ConduitCallError("upstream", GUEST_ERROR_NAMES.upstream, "HTTP 502");
     expect(legit.name).toBe("ConduitUpstreamError");
+  });
+
+  it("INVARIANT §9.2: a runtime-forged name outside the closed set is forced to infra", () => {
+    // Adversarial (codex): a custom UpstreamCaller is untrusted JS and can
+    // bypass the compile-time union with `as`. A forged name — especially a
+    // non-memoizable policy name on a non-policy error — must not cross into
+    // the sandbox or mis-drive §5.5 replay stripping.
+    const forged = new ConduitCallError("upstream", "TotallyMadeUp" as GuestErrorName, "x");
+    expect(forged.name).toBe(GUEST_ERROR_NAMES.infra);
+    const forgedPolicy = new ConduitCallError(
+      "upstream",
+      GUEST_ERROR_NAMES.policyBlocked, // real name, but this IS in the set → allowed
+      "x",
+    );
+    expect(forgedPolicy.name).toBe(GUEST_ERROR_NAMES.policyBlocked);
+  });
+
+  it("infra classification survives a throwing log sink (does not re-enter and escape)", () => {
+    const throwingLog = () => {
+      throw new Error("sink is down");
+    };
+    // Must not throw out of infraError itself.
+    const err = infraError(new Error("[SqliteStore] boom"), throwingLog);
+    expect(err.name).toBe(GUEST_ERROR_NAMES.infra);
+    expect(err.correlationId).toBeDefined();
   });
 });

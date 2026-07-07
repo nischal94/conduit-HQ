@@ -78,7 +78,12 @@ export function isPrivateAddress(address: string): boolean {
     return true; // ::1 loopback
   }
   const first = groups[0] ?? 0;
-  return (first & 0xfe00) === 0xfc00 || (first & 0xffc0) === 0xfe80; // fc00::/7, fe80::/10
+  return (
+    (first & 0xfe00) === 0xfc00 || // fc00::/7 unique-local
+    (first & 0xffc0) === 0xfe80 || // fe80::/10 link-local
+    (first & 0xffc0) === 0xfec0 || // fec0::/10 site-local (deprecated, still routable on legacy nets)
+    (first & 0xff00) === 0xff00 // ff00::/8 multicast (parity with the IPv4 >=224 block)
+  );
 }
 
 function isPrivateV4(octets: number[]): boolean {

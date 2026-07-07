@@ -131,22 +131,24 @@ export function createMcpUpstreamCaller(
           `Upstream returned HTTP ${response.status}. Context: { tool: ${request.tool.name} }`,
         );
       }
-      // §9.2, success-path twin of the error sanitizer: a response that
-      // contains the connection's own credential (full value OR a bare
-      // token segment) is a hostile echo. The secret must never cross into
-      // the sandbox, the journal, or Trace — so the call fails closed
-      // instead of delivering a redacted result.
-      if (credentialTokens(request.auth).some((token) => body.includes(token))) {
-        throw upstreamError(
-          `Upstream response echoed the connection's credential; refusing to deliver it. Context: { tool: ${request.tool.name} }`,
-        );
-      }
       let parsed: unknown;
       try {
         parsed = JSON.parse(body);
       } catch {
         throw upstreamError(
           `Upstream response is not valid JSON. Context: { tool: ${request.tool.name} }`,
+        );
+      }
+      // §9.2, success-path twin of the error sanitizer: a response that
+      // contains the connection's own credential (full value OR a bare
+      // token segment) is a hostile echo. The scan runs on the RE-SERIALIZED
+      // parsed structure, not the raw body: a hostile server can JSON-escape
+      // the secret (`ghp_x`) so the raw bytes miss the token while
+      // JSON.parse decodes it back to plaintext. Fail the call closed rather
+      // than deliver a redacted result.
+      if (containsCredential(JSON.stringify(parsed) ?? "", request.auth)) {
+        throw upstreamError(
+          `Upstream response echoed the connection's credential; refusing to deliver it. Context: { tool: ${request.tool.name} }`,
         );
       }
       // Validate the JSON-RPC envelope shape rather than trusting a cast: a
@@ -200,6 +202,13 @@ function credentialTokens(auth: UpstreamAuth): string[] {
     }
   }
   return [...tokens].sort((a, b) => b.length - a.length);
+}
+
+/** True if any credential token appears in `text`. Callers pass the
+ * re-serialized parsed structure so JSON-escaped echoes are caught after
+ * decode, not the raw wire bytes. */
+function containsCredential(text: string, auth: UpstreamAuth): boolean {
+  return credentialTokens(auth).some((token) => text.includes(token));
 }
 
 /**

@@ -382,6 +382,35 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     expect(error.message).not.toContain(SECRET);
   });
 
+  it("INVARIANT §9.2: refuses a JSON-escaped credential echo (raw-bytes scan bypass)", async () => {
+    // Adversarial (codex): a hostile server JSON-escapes the credential so
+    // the raw wire bytes miss the token, but JSON.parse decodes it to
+    // plaintext. The scan must run on the parsed structure, not the body.
+    const escaped = SECRET.replace(/_/g, "\\u005f"); // Bearer ghp_...
+    const { port } = await serve((_request, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(`{"jsonrpc":"2.0","id":"1","result":{"text":"${escaped}"}}`);
+    });
+
+    let thrown: unknown;
+    try {
+      await caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        timeoutMs: 2_000,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    const error = thrown as Error;
+    expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
+    expect(error.message).toMatch(/echoed the connection's credential/);
+    expect(error.message).not.toContain(SECRET);
+    expect(JSON.stringify(error)).not.toContain("ghp_invoker_secret");
+  });
+
   it("never serializes auth headers into the thrown error", async () => {
     // Hostile upstream: echoes the Authorization header back in a 401 body.
     const { port } = await serve((request, res) => {
