@@ -35,7 +35,10 @@ interface RecordedRequest {
 const servers: Server[] = [];
 afterAll(async () => {
   await Promise.all(
-    servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+    servers.map((server) => {
+      server.closeAllConnections(); // the slow-loris server never ends its response
+      return new Promise<void>((resolve) => server.close(() => resolve()));
+    }),
   );
 });
 
@@ -214,6 +217,80 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
       timeoutMs: 2_000,
     });
     await expect(attempt).rejects.toThrow(/Invalid params/);
+    await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
+  });
+
+  it("redacts auth echoed through a JSON-RPC error message (hostile 200 response)", async () => {
+    // Card-09, one branch over from the 401 case: the upstream echoes the
+    // Authorization header inside a well-formed JSON-RPC error object.
+    const { port } = await serve((request, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: "1",
+          error: { code: -32000, message: `denied for ${request.headers.authorization}` },
+        }),
+      );
+    });
+
+    let thrown: unknown;
+    try {
+      await caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        timeoutMs: 2_000,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    const error = thrown as Error;
+    expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
+    expect(error.message).toContain("[redacted]");
+    expect(error.message).not.toContain(SECRET);
+  });
+
+  it("redacts auth echoed through the content-type header", async () => {
+    const { port } = await serve((request, res) => {
+      res.writeHead(200, { "content-type": String(request.headers.authorization) });
+      res.end("{}");
+    });
+
+    let thrown: unknown;
+    try {
+      await caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        timeoutMs: 2_000,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    const error = thrown as Error;
+    expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
+    expect(error.message).toMatch(/non-JSON response/);
+    expect(error.message).not.toContain(SECRET);
+  });
+
+  it("classifies a timeout during body streaming as upstream (slow-loris after headers)", async () => {
+    // Headers arrive fast; the body trickles past the AbortSignal deadline.
+    const { port } = await serve((_request, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.write('{"jsonrpc":'); // never ends
+    });
+
+    const attempt = caller.call({
+      tool,
+      source: sourceAt(port),
+      input: {},
+      auth: { headers: {} },
+      timeoutMs: 50,
+    });
+    await expect(attempt).rejects.toThrow(/timed out after 50ms while reading the response/);
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
   });
 

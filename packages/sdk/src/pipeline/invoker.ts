@@ -65,7 +65,11 @@ export function createToolInvoker(
         throw infraError(cause, log);
       });
     if (verdict.action !== "allow" || tool === undefined) {
-      await appendTrace(deps, options, log, { path, input, verdict }); // audit the refusal too
+      // Audit the refusal too. Chosen semantic: unauditable is ALWAYS infra —
+      // if this append fails, the guest sees ConduitInternalError rather than
+      // the policy name, because a refusal we cannot record is a fault, not
+      // a verdict.
+      await appendTrace(deps, options, log, { path, input, verdict });
       throw policyError(verdict.action === "block" ? "block" : "require_approval", verdict.reason);
     }
 
@@ -95,6 +99,15 @@ export function createToolInvoker(
       );
     }
     const remaining = options.deadline?.() ?? Number.POSITIVE_INFINITY;
+    if (remaining <= 0) {
+      // A burnt §16 budget refuses BEFORE any credentialed bytes leave the
+      // host — never a 1ms token request. Traced per decision A3 (an
+      // allowed call that produced no result).
+      await appendTrace(deps, options, log, { path, input, verdict, connection });
+      throw upstreamError(
+        `Upstream call refused: the execution's wall-clock budget is exhausted (spec §16). Context: { tool: ${tool.name} }`,
+      );
+    }
     const timeoutMs = Math.max(1, Math.min(ceiling, remaining));
     let outcome: UpstreamOutcome;
     try {

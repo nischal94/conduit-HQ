@@ -12,16 +12,23 @@ export const GUEST_ERROR_NAMES = {
   infra: "ConduitInternalError",
 } as const;
 
+/** The closed vocabulary: the only error names that may cross the boundary. */
+export type GuestErrorName = (typeof GUEST_ERROR_NAMES)[keyof typeof GUEST_ERROR_NAMES];
+
 /** §5.5 contract: journal entries bearing these names are never memoized on replay. */
 export const NON_MEMOIZABLE_ERROR_NAMES: readonly string[] = [
   GUEST_ERROR_NAMES.policyDenied,
   GUEST_ERROR_NAMES.policyBlocked,
-];
+] satisfies readonly GuestErrorName[];
 
 export class ConduitCallError extends Error {
   readonly kind: CallErrorKind;
   readonly correlationId: string | undefined;
-  constructor(kind: CallErrorKind, name: string, message: string, correlationId?: string) {
+  // `name` is typed to the closed vocabulary: an UpstreamCaller implementer
+  // (the A5 extension point) cannot mint an arbitrary name that would cross
+  // into the sandbox and mis-drive §5.5 replay stripping. Prefer the
+  // factories below; they also pair kind and name correctly.
+  constructor(kind: CallErrorKind, name: GuestErrorName, message: string, correlationId?: string) {
     super(message);
     this.name = name;
     this.kind = kind;

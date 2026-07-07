@@ -105,6 +105,8 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(log).toHaveBeenCalledWith(expect.stringContaining("cred_gh"));
     expect(log).toHaveBeenCalledWith(expect.stringContaining(error.correlationId ?? "@no-id@"));
     expect(requests).toHaveLength(0);
+    // Infra faults are deliberately NOT traced — they live in the host log.
+    expect(await store.trace.listByExecution("exec_t")).toHaveLength(0);
   });
 
   it("denied calls throw ConduitPolicyDenied with the verdict reason and never reach upstream", async () => {
@@ -241,13 +243,52 @@ describe("createToolInvoker (spec §5.3)", () => {
     await unbounded("github.list_issues", {});
     expect(requests[2]?.timeoutMs).toBe(30_000);
 
-    const expired = createToolInvoker(deps(caller), {
+    const nearlyExpired = createToolInvoker(deps(caller), {
       executionId: "exec_t",
       log: vi.fn(),
-      deadline: () => -50, // §16 budget already burnt: clamp, never a negative timeout
+      deadline: () => 0.5, // sub-ms budget still clamps to a 1ms floor
     });
-    await expired("github.list_issues", {});
+    await nearlyExpired("github.list_issues", {});
     expect(requests[3]?.timeoutMs).toBe(1);
+  });
+
+  it("a burnt §16 budget refuses before any credentialed bytes leave the host", async () => {
+    const { caller, requests } = recordingUpstream();
+    const expired = createToolInvoker(deps(caller), {
+      executionId: "exec_budget",
+      log: vi.fn(),
+      deadline: () => -50,
+    });
+
+    await expect(expired("github.list_issues", {})).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+      message: expect.stringContaining("budget is exhausted"),
+    });
+    expect(requests).toHaveLength(0); // the upstream was never engaged
+    const trace = await store.trace.listByExecution("exec_budget");
+    expect(trace).toHaveLength(1); // decision A3: an allowed call with no result still audits
+    expect(trace[0]?.policyVerdict).toBe("allow");
+  });
+
+  it("a missing integration is an opaque infra fault (store drift)", async () => {
+    await store.tools.replaceNamespace("orphan", [
+      tool({ name: "orphan.ping", namespace: "orphan" }),
+    ]);
+    const { caller, requests } = recordingUpstream();
+    const log = vi.fn();
+    const invoke = createToolInvoker(deps(caller), { executionId: "exec_orphan", log });
+
+    let thrown: unknown;
+    try {
+      await invoke("orphan.ping", {});
+    } catch (error) {
+      thrown = error;
+    }
+    const error = thrown as Error;
+    expect(error.name).toBe(GUEST_ERROR_NAMES.infra);
+    expect(error.message).not.toContain("orphan"); // opaque to the guest
+    expect(log).toHaveBeenCalledWith(expect.stringContaining("orphan"));
+    expect(requests).toHaveLength(0);
   });
 
   it("a successful call appends one TraceEvent with output, latency, status, verdict allow", async () => {

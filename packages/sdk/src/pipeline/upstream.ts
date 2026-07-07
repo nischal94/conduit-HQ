@@ -1,7 +1,7 @@
 import type { UpstreamAuth } from "../credentials.js";
 import type { Source, Tool } from "../types.js";
 import { assertEgressAllowed, type EgressOptions } from "./egress.js";
-import { upstreamError } from "./errors.js";
+import { ConduitCallError, upstreamError } from "./errors.js";
 
 /**
  * Upstream caller seam (spec §5.3 step 4): the pipeline hands over a fully
@@ -95,12 +95,28 @@ export function createMcpUpstreamCaller(
       const contentType = response.headers.get("content-type") ?? "";
       if (!contentType.includes("application/json")) {
         throw upstreamError(
-          `Upstream returned a non-JSON response. Context: { status: ${response.status}, contentType: ${contentType || "none"} }`,
+          `Upstream returned a non-JSON response. Context: { status: ${response.status}, contentType: ${sanitizeUpstreamText(contentType, request.auth) || "none"} }`,
         );
       }
       // A 4xx/5xx body is still read (capped) to drain the socket, but its
       // content never reaches the error — hostile upstreams echo secrets.
-      const body = await readCapped(response, maxBytes);
+      // Read-phase failures (slow-loris body, mid-stream reset) classify as
+      // upstream, same as their pre-response siblings above.
+      let body: string;
+      try {
+        body = await readCapped(response, maxBytes);
+      } catch (cause) {
+        if (cause instanceof ConduitCallError) {
+          throw cause; // the size cap, already classified
+        }
+        const reason =
+          cause instanceof Error && (cause.name === "TimeoutError" || cause.name === "AbortError")
+            ? `timed out after ${request.timeoutMs}ms while reading the response`
+            : "connection failed while reading the response";
+        throw upstreamError(
+          `Upstream call failed: ${reason}. Context: { tool: ${request.tool.name} }`,
+        );
+      }
       if (!response.ok) {
         if (response.status === 401 || response.status === 403) {
           throw upstreamError(
@@ -120,13 +136,32 @@ export function createMcpUpstreamCaller(
         );
       }
       if (parsed.error !== undefined) {
+        // The JSON-RPC error message is upstream-controlled text headed for
+        // a guest-visible error: redact + sanitize before interpolating.
         throw upstreamError(
-          `Upstream tool call failed: ${parsed.error.message ?? "unknown error"}. Context: { code: ${parsed.error.code ?? "none"} }`,
+          `Upstream tool call failed: ${sanitizeUpstreamText(String(parsed.error.message ?? "unknown error"), request.auth)}. Context: { code: ${parsed.error.code ?? "none"} }`,
         );
       }
       return { result: parsed.result ?? null, status: response.status, latencyMs };
     },
   };
+}
+
+/**
+ * Upstream-controlled text that will cross into a guest-visible error:
+ * redact every auth-header value (a hostile upstream echoes what we sent),
+ * strip control characters, cap length — in that order, so truncation can
+ * never bisect a redaction.
+ */
+function sanitizeUpstreamText(raw: string, auth: UpstreamAuth): string {
+  let text = raw;
+  for (const value of Object.values(auth.headers)) {
+    if (value !== "") {
+      text = text.split(value).join("[redacted]");
+    }
+  }
+  const printable = [...text].filter((ch) => ch >= " " && ch !== "\u007f").join("");
+  return printable.length > 200 ? `${printable.slice(0, 200)}…` : printable;
 }
 
 async function readCapped(response: Response, maxBytes: number): Promise<string> {

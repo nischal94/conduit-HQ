@@ -1,5 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { lookup } from "node:dns/promises";
+import { describe, expect, it, vi } from "vitest";
 import { assertEgressAllowed, isPrivateAddress } from "./egress.js";
+
+// Real lookup by default (the "localhost" test depends on it); individual
+// tests override per-call to simulate attacker-controlled DNS.
+vi.mock("node:dns/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:dns/promises")>();
+  return { ...actual, lookup: vi.fn(actual.lookup) };
+});
 
 describe("egress guard (spec §9.3)", () => {
   it("INVARIANT §9.3: loopback egress is blocked by default", async () => {
@@ -53,6 +61,40 @@ describe("egress guard (spec §9.3)", () => {
     await expect(assertEgressAllowed(new URL("http://localhost:9/"))).rejects.toThrow(
       /loopback\/private egress/,
     );
+  });
+
+  it("INVARIANT §9.3: a hostname is blocked when ANY resolved address is private (rebinding posture)", async () => {
+    // Attacker-controlled DNS answering [public, private]: checking only
+    // the first address would reopen the classic DNS-pinning bypass.
+    vi.mocked(lookup).mockResolvedValueOnce([
+      { address: "93.184.216.34", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ] as never);
+    await expect(assertEgressAllowed(new URL("http://rebind.example/"))).rejects.toThrow(
+      /loopback\/private egress/,
+    );
+  });
+
+  it("fails closed with its own message when the hostname does not resolve", async () => {
+    vi.mocked(lookup).mockRejectedValueOnce(
+      Object.assign(new Error("getaddrinfo ENOTFOUND nope.example"), { code: "ENOTFOUND" }),
+    );
+    await expect(assertEgressAllowed(new URL("http://nope.example/"))).rejects.toThrow(
+      /hostname did not resolve/,
+    );
+  });
+
+  it("classifies unparseable addresses as private (fail closed)", () => {
+    expect(isPrivateAddress("garbage")).toBe(true);
+    expect(isPrivateAddress("1.2.3.4.5")).toBe(true);
+    expect(isPrivateAddress(":::1")).toBe(true);
+    expect(isPrivateAddress("")).toBe(true);
+  });
+
+  it("strips zone ids and classifies hex-form v4-mapped literals", () => {
+    expect(isPrivateAddress("fe80::1%eth0")).toBe(true);
+    expect(isPrivateAddress("::ffff:7f00:1")).toBe(true); // 127.0.0.1, WHATWG hex serialization
+    expect(isPrivateAddress("::ffff:5db8:d822")).toBe(false); // 93.184.216.34
   });
 
   it("INVARIANT §9.3: the opt-in flag allows private egress", async () => {

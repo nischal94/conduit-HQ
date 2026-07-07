@@ -490,6 +490,27 @@ describe("SqliteStore", () => {
       expect(event?.output).toEqual({ hits: 3 });
     });
 
+    it("re-opening an already-migrated legacy database is idempotent", async () => {
+      // The production upgrade path: the ALTER ran once in beforeEach; a
+      // second open must detect the column and not re-run it.
+      const reopened = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+      await reopened.trace.append({
+        callId: "call_reopen",
+        executionId: "exec_reopen",
+        toolName: "x.search",
+        connectionPrefix: "x.acme.prod",
+        input: null,
+        output: { ok: true },
+        policyVerdict: "allow",
+        at: 1000,
+      });
+      const [event] = await reopened.trace.listByExecution("exec_reopen");
+      expect(event?.output).toEqual({ ok: true });
+    });
+
     it("corrupt JSON in output fails loudly with the [SqliteStore] format", async () => {
       await legacy.execute({
         sql: `INSERT INTO trace_events

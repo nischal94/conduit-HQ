@@ -25,10 +25,21 @@ export async function assertEgressAllowed(target: URL, options: EgressOptions = 
     return;
   }
   const host = target.hostname.replace(/^\[|\]$/g, "");
-  const addresses =
-    isIP(host) !== 0
-      ? [host]
-      : (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address);
+  let addresses: string[];
+  if (isIP(host) !== 0) {
+    addresses = [host];
+  } else {
+    try {
+      addresses = (await lookup(host, { all: true, verbatim: true })).map((entry) => entry.address);
+    } catch (cause) {
+      // Fail closed with our own message: raw getaddrinfo errors are
+      // OS-flavored and this message may cross to the guest.
+      throw new Error(
+        `[EgressGuard] Blocked: hostname did not resolve for the egress check. Context: { host: ${target.hostname} }`,
+        { cause },
+      );
+    }
+  }
   for (const address of addresses) {
     if (isPrivateAddress(address)) {
       throw new Error(

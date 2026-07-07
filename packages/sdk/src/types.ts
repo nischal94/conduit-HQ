@@ -118,7 +118,9 @@ export interface TraceEvent {
   /**
    * Full upstream result for §5.5 replay, bounded by the pipeline's
    * response cap; absent for denied/failed calls. outputSummary remains
-   * the display projection.
+   * the display projection. Deliberately stored UNREDACTED for replay
+   * fidelity: the pending §11 Trace-redaction invariant must scope this
+   * field when it lands (redaction may not destroy the replay payload).
    */
   output?: unknown;
   upstreamStatus?: number;

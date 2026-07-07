@@ -24,11 +24,14 @@ export type {
 export { normalizeOpenApi } from "./normalize/openapi.js";
 export type { EgressOptions } from "./pipeline/egress.js";
 export { assertEgressAllowed, isPrivateAddress } from "./pipeline/egress.js";
-export type { CallErrorKind } from "./pipeline/errors.js";
+export type { CallErrorKind, GuestErrorName } from "./pipeline/errors.js";
 export {
   ConduitCallError,
   GUEST_ERROR_NAMES,
+  infraError,
   NON_MEMOIZABLE_ERROR_NAMES,
+  policyError,
+  upstreamError,
 } from "./pipeline/errors.js";
 export type { CreateToolInvokerOptions, ToolInvokerDeps } from "./pipeline/invoker.js";
 export { createToolInvoker } from "./pipeline/invoker.js";

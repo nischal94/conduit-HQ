@@ -59,4 +59,14 @@ describe("pipeline error vocabulary", () => {
     expect(err.name).toBe(GUEST_ERROR_NAMES.upstream);
     expect(err.correlationId).toBeUndefined();
   });
+
+  it("the constructor's name parameter is closed over the guest vocabulary (compile-time pin)", () => {
+    // @ts-expect-error — arbitrary names must not cross the sandbox boundary
+    const rogue = new ConduitCallError("upstream", "MyVendorError", "nope");
+    // Runtime still constructs (the pin is compile-time); the four reserved
+    // names all pass.
+    expect(rogue).toBeInstanceOf(ConduitCallError);
+    const legit = new ConduitCallError("upstream", GUEST_ERROR_NAMES.upstream, "HTTP 502");
+    expect(legit.name).toBe("ConduitUpstreamError");
+  });
 });
