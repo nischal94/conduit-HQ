@@ -1,7 +1,14 @@
 import { createClient } from "@libsql/client";
 import { beforeEach, describe, expect, it } from "vitest";
 import { SecretBox } from "../secrets.js";
-import type { ExecutionStatus, PolicyAction, RiskClass, SourceType, Tool } from "../types.js";
+import type {
+  ExecutionStatus,
+  PolicyAction,
+  RiskClass,
+  SourceSemantics,
+  SourceType,
+  Tool,
+} from "../types.js";
 import { openSqliteStore } from "./sqlite.js";
 import type { ConduitStore } from "./store.js";
 
@@ -484,6 +491,230 @@ describe("SqliteStore", () => {
         'unrecognized risk_class "extreme"',
       );
       await expect(legacyStore.tools.list()).rejects.toThrow('unrecognized risk_class "extreme"');
+    });
+
+    describe("source_semantics validation", () => {
+      // A JSON blob has no CHECK-constraint twin: even on a fresh schema
+      // the column is opaque TEXT, so this read-side guard is the ONLY
+      // enforcement layer. The blob smuggles three vocabularies past the
+      // column guards above — kind, graphql operation, and declaredRisk —
+      // and feeds deriveRiskClass, whose switch has no arm for an
+      // impossible kind.
+      async function insertToolRow(sourceSemantics: string, name = "x.search") {
+        await legacy.execute({
+          sql: `INSERT INTO tools (name, namespace, input_schema, output_schema, risk_class, source_semantics)
+                VALUES (?, ?, ?, ?, ?, ?)`,
+          args: [name, "x", "{}", "{}", "safe", sourceSemantics],
+        });
+      }
+
+      it("rejects semantics with an unrecognized kind", async () => {
+        await insertToolRow('{"kind":"soap","method":"GET","path":"/x"}');
+        await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+          'unrecognized source_semantics kind "soap"',
+        );
+        await expect(legacyStore.tools.list()).rejects.toThrow(
+          'unrecognized source_semantics kind "soap"',
+        );
+      });
+
+      it("rejects graphql semantics with an unrecognized operation", async () => {
+        // "subscription" is one plausible upstream addition away; loaded
+        // as-is it reaches deriveRiskClass's binary query/mutation branch.
+        await insertToolRow('{"kind":"graphql","operation":"subscription"}');
+        await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+          'unrecognized source_semantics operation "subscription"',
+        );
+      });
+
+      it("rejects custom_js semantics with an unrecognized declaredRisk", async () => {
+        // declaredRisk is a RiskClass inside the blob — the same vocabulary
+        // the risk_class column guard checks, one level deeper.
+        await insertToolRow('{"kind":"custom_js","declaredRisk":"extreme"}');
+        await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+          'unrecognized source_semantics declaredRisk "extreme"',
+        );
+      });
+
+      it("rejects openapi semantics missing method or path", async () => {
+        await insertToolRow('{"kind":"openapi","path":"/x"}');
+        await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+          "malformed openapi source_semantics",
+        );
+      });
+
+      it("rejects mcp semantics with non-boolean hints", async () => {
+        await insertToolRow('{"kind":"mcp","readOnlyHint":"yes"}');
+        await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+          "malformed mcp source_semantics",
+        );
+        // destructiveHint is guarded independently of readOnlyHint: a
+        // truthy string here would over-classify via deriveRiskClass, but
+        // any other consumer of Tool.sourceSemantics gets a type lie.
+        await insertToolRow('{"kind":"mcp","destructiveHint":"yes"}', "x.search2");
+        await expect(legacyStore.tools.get("x.search2")).rejects.toThrow(
+          "malformed mcp source_semantics",
+        );
+      });
+
+      it("drops unknown keys instead of carrying them into the typed object", async () => {
+        // The validator rebuilds field-by-field; a passthrough regression
+        // would let attacker-controlled extra keys ride into Tool.
+        await insertToolRow('{"kind":"mcp","extra":1}');
+        expect((await legacyStore.tools.get("x.search"))?.sourceSemantics).toStrictEqual({
+          kind: "mcp",
+        });
+      });
+
+      it("escapes untrusted identifiers in semantics read errors (no log injection)", async () => {
+        // Same pin as the policies path: the tool name travels from the
+        // same untrusted row as the bad blob and must reach logs escaped.
+        await insertToolRow('{"kind":"soap"}', "bad\u0007name");
+        await expect(legacyStore.tools.get("bad\u0007name")).rejects.toThrow(
+          'name: "bad\\u0007name"',
+        );
+      });
+
+      it("rejects semantics that parse to a non-object", async () => {
+        await insertToolRow('"mcp"');
+        await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+          "source_semantics is not an object",
+        );
+      });
+
+      it("rejects unparseable semantics with store context, not a bare SyntaxError", async () => {
+        await insertToolRow("{kind:");
+        await expect(legacyStore.tools.get("x.search")).rejects.toThrow(
+          "[SqliteStore] Failed to read tool: source_semantics is not valid JSON",
+        );
+      });
+
+      it("still reads valid semantics from a legacy schema", async () => {
+        await insertToolRow('{"kind":"graphql","operation":"mutation"}');
+        expect((await legacyStore.tools.get("x.search"))?.sourceSemantics).toEqual({
+          kind: "graphql",
+          operation: "mutation",
+        });
+      });
+
+      it("accepts every semantics variant end to end (exhaustiveness pin)", async () => {
+        // Same rationale as the vocabulary pins above, one level into the
+        // blob: kinds are compiler-pinned, and each variant round-trips
+        // with its boundary values. toStrictEqual pins that absent
+        // optional hints stay absent (exactOptionalPropertyTypes).
+        const kinds = vocabulary<SourceSemantics["kind"]>({
+          openapi: true,
+          graphql: true,
+          mcp: true,
+          custom_js: true,
+        });
+        const variants: SourceSemantics[] = [
+          { kind: "openapi", method: "GET", path: "/x" },
+          { kind: "graphql", operation: "query" },
+          { kind: "graphql", operation: "mutation" },
+          { kind: "mcp" },
+          { kind: "mcp", readOnlyHint: true },
+          { kind: "mcp", readOnlyHint: false, destructiveHint: true },
+          { kind: "custom_js", declaredRisk: "safe" },
+          { kind: "custom_js", declaredRisk: "review" },
+          { kind: "custom_js", declaredRisk: "destructive" },
+        ];
+        for (const kind of kinds) {
+          expect(variants.some((variant) => variant.kind === kind)).toBe(true);
+        }
+        for (const [i, sourceSemantics] of variants.entries()) {
+          const namespace = `sem${i}`;
+          const name = `${namespace}.tool`;
+          await store.tools.replaceNamespace(namespace, [
+            tool({ name, namespace, sourceSemantics }),
+          ]);
+          expect((await store.tools.get(name))?.sourceSemantics).toStrictEqual(sourceSemantics);
+        }
+      });
+    });
+
+    describe("JSON column integrity (a bare SyntaxError never escapes)", () => {
+      // Corrupt JSON anywhere in a row must fail with the same
+      // [SqliteStore] error format as the vocabulary guards — a bare
+      // SyntaxError carries neither the entity nor the row identity.
+      it("wraps invalid JSON in tool schema columns", async () => {
+        await legacy.execute({
+          sql: `INSERT INTO tools (name, namespace, input_schema, output_schema, risk_class, source_semantics)
+                VALUES (?, ?, ?, ?, ?, ?)`,
+          args: ["x.search", "x", "{oops", "{}", "safe", '{"kind":"mcp"}'],
+        });
+        // The wrap must keep the original SyntaxError as `cause`: the
+        // parse position is what locates corruption inside a large blob.
+        const error: unknown = await legacyStore.tools.get("x.search").then(
+          () => undefined,
+          (reason: unknown) => reason,
+        );
+        expect(error).toBeInstanceOf(Error);
+        expect((error as Error).message).toContain(
+          "[SqliteStore] Failed to read tool: input_schema is not valid JSON",
+        );
+        expect((error as Error).cause).toBeInstanceOf(SyntaxError);
+        // output_schema is a separate parse one line below — it can
+        // regress independently of input_schema.
+        await legacy.execute({
+          sql: `INSERT INTO tools (name, namespace, input_schema, output_schema, risk_class, source_semantics)
+                VALUES (?, ?, ?, ?, ?, ?)`,
+          args: ["x.search2", "x", "{}", "{oops", "safe", '{"kind":"mcp"}'],
+        });
+        await expect(legacyStore.tools.get("x.search2")).rejects.toThrow(
+          "[SqliteStore] Failed to read tool: output_schema is not valid JSON",
+        );
+      });
+
+      it("wraps invalid JSON in execution seeds", async () => {
+        await legacy.execute({
+          sql: `INSERT INTO executions (id, code, status, seeds, started_at)
+                VALUES (?, ?, ?, ?, ?)`,
+          args: ["exec_1", "return 1", "running", "{oops", 1000],
+        });
+        await expect(legacyStore.executions.get("exec_1")).rejects.toThrow(
+          "[SqliteStore] Failed to read execution: seeds is not valid JSON",
+        );
+      });
+
+      it("wraps invalid JSON in execution paused_on", async () => {
+        await legacy.execute({
+          sql: `INSERT INTO executions (id, code, status, seeds, paused_on, started_at)
+                VALUES (?, ?, ?, ?, ?, ?)`,
+          args: ["exec_1", "return 1", "paused", '{"now":1,"random":0.5}', "{oops", 1000],
+        });
+        await expect(legacyStore.executions.get("exec_1")).rejects.toThrow(
+          "[SqliteStore] Failed to read execution: paused_on is not valid JSON",
+        );
+      });
+
+      it("wraps invalid JSON in trace event input", async () => {
+        await legacy.execute({
+          sql: `INSERT INTO trace_events
+                  (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: ["call_1", "exec_1", "x.search", "x.acme.prod", "{oops", "allow", 1000],
+        });
+        await expect(legacyStore.trace.listByExecution("exec_1")).rejects.toThrow(
+          "[SqliteStore] Failed to read trace event: input is not valid JSON",
+        );
+      });
+
+      it("wraps invalid JSON in trace event output_summary", async () => {
+        // A separate code path from input: it only runs when the nullable
+        // column is present, so it can regress while the input test stays
+        // green.
+        await legacy.execute({
+          sql: `INSERT INTO trace_events
+                  (call_id, execution_id, tool_name, connection_prefix, input,
+                   output_summary, policy_verdict, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: ["call_1", "exec_1", "x.search", "x.acme.prod", "null", "{oops", "allow", 1000],
+        });
+        await expect(legacyStore.trace.listByExecution("exec_1")).rejects.toThrow(
+          "[SqliteStore] Failed to read trace event: output_summary is not valid JSON",
+        );
+      });
     });
 
     describe("CHECK constraints (fresh databases)", () => {
