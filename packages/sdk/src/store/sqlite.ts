@@ -303,23 +303,24 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             `[SqliteStore] Failed to read execution: unrecognized status ${JSON.stringify(status)}. Context: { id: ${JSON.stringify(id)} }`,
           );
         }
-        const executionReadError = (detail: string) =>
+        const executionReadError = (detail: string, cause?: unknown) =>
           new Error(
             `[SqliteStore] Failed to read execution: ${detail}. Context: { id: ${JSON.stringify(id)} }`,
+            cause === undefined ? undefined : { cause },
           );
         const execution: Execution = {
           id: text(row, "id"),
           code: text(row, "code"),
           status,
-          seeds: parseJson(text(row, "seeds"), () =>
-            executionReadError("seeds is not valid JSON"),
+          seeds: parseJson(text(row, "seeds"), (cause) =>
+            executionReadError("seeds is not valid JSON", cause),
           ) as Execution["seeds"],
           startedAt: integer(row, "started_at"),
         };
         const pausedOn = maybeText(row, "paused_on");
         if (pausedOn !== undefined) {
-          execution.pausedOn = parseJson(pausedOn, () =>
-            executionReadError("paused_on is not valid JSON"),
+          execution.pausedOn = parseJson(pausedOn, (cause) =>
+            executionReadError("paused_on is not valid JSON", cause),
           ) as PendingApproval;
         }
         const endedAt = maybeInteger(row, "ended_at");
@@ -448,20 +449,23 @@ function isOneOf<T extends string>(value: string, vocabulary: readonly T[]): val
 
 /** A bare SyntaxError carries neither the entity nor the row identity —
  * every JSON column parse routes through here so corruption fails with
- * the same [SqliteStore] error format as the vocabulary guards. */
-function parseJson(raw: string, onError: () => Error): unknown {
+ * the same [SqliteStore] error format as the vocabulary guards. The
+ * original error travels as `cause`: its parse position is what locates
+ * the corruption inside a large blob. */
+function parseJson(raw: string, onError: (cause: unknown) => Error): unknown {
   try {
     return JSON.parse(raw);
-  } catch {
-    throw onError();
+  } catch (cause) {
+    throw onError(cause);
   }
 }
 
 // Identifiers are stringified too: they come from the same untrusted
 // row as the bad value, and raw control characters are log injection.
-function toolReadError(name: string, detail: string): Error {
+function toolReadError(name: string, detail: string, cause?: unknown): Error {
   return new Error(
     `[SqliteStore] Failed to read tool: ${detail}. Context: { name: ${JSON.stringify(name)} }`,
+    cause === undefined ? undefined : { cause },
   );
 }
 
@@ -477,7 +481,9 @@ type McpSemantics = Extract<SourceSemantics, { kind: "mcp" }>;
  * loaded as a silently-reshaped SourceSemantics.
  */
 function parseSourceSemantics(raw: string, name: string): SourceSemantics {
-  const value = parseJson(raw, () => toolReadError(name, "source_semantics is not valid JSON"));
+  const value = parseJson(raw, (cause) =>
+    toolReadError(name, "source_semantics is not valid JSON", cause),
+  );
   if (typeof value !== "object" || value === null || Array.isArray(value)) {
     throw toolReadError(name, `source_semantics is not an object: ${JSON.stringify(value)}`);
   }
@@ -577,11 +583,11 @@ function rowToTool(row: Row): Tool {
   const tool: Tool = {
     name,
     namespace: text(row, "namespace"),
-    inputSchema: parseJson(text(row, "input_schema"), () =>
-      toolReadError(name, "input_schema is not valid JSON"),
+    inputSchema: parseJson(text(row, "input_schema"), (cause) =>
+      toolReadError(name, "input_schema is not valid JSON", cause),
     ) as JsonSchema,
-    outputSchema: parseJson(text(row, "output_schema"), () =>
-      toolReadError(name, "output_schema is not valid JSON"),
+    outputSchema: parseJson(text(row, "output_schema"), (cause) =>
+      toolReadError(name, "output_schema is not valid JSON", cause),
     ) as JsonSchema,
     riskClass,
     sourceSemantics: parseSourceSemantics(text(row, "source_semantics"), name),
@@ -626,23 +632,26 @@ function rowToTraceEvent(row: Row): TraceEvent {
       `[SqliteStore] Failed to read trace event: unrecognized policy_verdict ${JSON.stringify(policyVerdict)}. Context: { callId: ${JSON.stringify(callId)} }`,
     );
   }
-  const traceReadError = (detail: string) =>
+  const traceReadError = (detail: string, cause?: unknown) =>
     new Error(
       `[SqliteStore] Failed to read trace event: ${detail}. Context: { callId: ${JSON.stringify(callId)} }`,
+      cause === undefined ? undefined : { cause },
     );
   const event: TraceEvent = {
     callId,
     executionId: text(row, "execution_id"),
     toolName: text(row, "tool_name"),
     connectionPrefix: text(row, "connection_prefix"),
-    input: parseJson(text(row, "input"), () => traceReadError("input is not valid JSON")),
+    input: parseJson(text(row, "input"), (cause) =>
+      traceReadError("input is not valid JSON", cause),
+    ),
     policyVerdict,
     at: integer(row, "at"),
   };
   const outputSummary = maybeText(row, "output_summary");
   if (outputSummary !== undefined) {
-    event.outputSummary = parseJson(outputSummary, () =>
-      traceReadError("output_summary is not valid JSON"),
+    event.outputSummary = parseJson(outputSummary, (cause) =>
+      traceReadError("output_summary is not valid JSON", cause),
     );
   }
   const upstreamStatus = maybeInteger(row, "upstream_status");

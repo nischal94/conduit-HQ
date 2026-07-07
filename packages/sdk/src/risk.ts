@@ -15,6 +15,9 @@ const RISK_CLASSES: readonly RiskClass[] = ["safe", "review", "destructive"];
 export function deriveRiskClass(semantics: SourceSemantics): RiskClass {
   switch (semantics.kind) {
     case "openapi": {
+      if (typeof semantics.method !== "string") {
+        return "destructive";
+      }
       const method = semantics.method.toUpperCase();
       if (method === "GET" || method === "HEAD" || method === "OPTIONS") {
         return "safe";
@@ -27,14 +30,22 @@ export function deriveRiskClass(semantics: SourceSemantics): RiskClass {
     }
     case "graphql":
       return semantics.operation === "query" ? "safe" : "destructive";
-    case "mcp":
-      if (semantics.destructiveHint) {
+    case "mcp": {
+      const { readOnlyHint, destructiveHint } = semantics;
+      // Truthiness would fail OPEN here: an untyped caller's non-boolean
+      // hint (readOnlyHint: "false" is a truthy string) must never earn
+      // the least restrictive class.
+      if (!isOptionalBoolean(readOnlyHint) || !isOptionalBoolean(destructiveHint)) {
         return "destructive";
       }
-      if (semantics.readOnlyHint) {
+      if (destructiveHint) {
+        return "destructive";
+      }
+      if (readOnlyHint) {
         return "safe";
       }
       return "review";
+    }
     case "custom_js":
       // declaredRisk is author-supplied data inside the semantics blob —
       // the one branch where the answer is read, not derived.
@@ -50,4 +61,8 @@ export function deriveRiskClass(semantics: SourceSemantics): RiskClass {
 
 function isRiskClass(value: string): value is RiskClass {
   return (RISK_CLASSES as readonly string[]).includes(value);
+}
+
+function isOptionalBoolean(value: unknown): value is boolean | undefined {
+  return value === undefined || typeof value === "boolean";
 }

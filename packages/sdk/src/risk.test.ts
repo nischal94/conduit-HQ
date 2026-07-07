@@ -74,5 +74,22 @@ describe("deriveRiskClass (INVARIANT §10.1: default risk mapping)", () => {
       } as unknown as SourceSemantics;
       expect(deriveRiskClass(semantics)).toBe("destructive");
     });
+
+    it("never lets a truthy non-boolean readOnlyHint classify as safe", () => {
+      // The fail-OPEN trap: "false" is a truthy string, and a truthiness
+      // check would award the least restrictive class to corrupt data.
+      const semantics = { kind: "mcp", readOnlyHint: "false" } as unknown as SourceSemantics;
+      expect(deriveRiskClass(semantics)).toBe("destructive");
+    });
+
+    it("classifies mcp semantics with a non-boolean destructiveHint as destructive", () => {
+      const semantics = { kind: "mcp", destructiveHint: "yes" } as unknown as SourceSemantics;
+      expect(deriveRiskClass(semantics)).toBe("destructive");
+    });
+
+    it("classifies openapi semantics with a non-string method as destructive, never a TypeError", () => {
+      const semantics = { kind: "openapi", method: 5, path: "/x" } as unknown as SourceSemantics;
+      expect(deriveRiskClass(semantics)).toBe("destructive");
+    });
   });
 });
