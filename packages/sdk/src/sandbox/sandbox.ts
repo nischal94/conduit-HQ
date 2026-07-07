@@ -45,8 +45,8 @@ export interface ExecutionRequest {
  *
  * Entries whose error name is in NON_MEMOIZABLE_ERROR_NAMES
  * (pipeline/errors.ts) record a policy refusal, not a result; the §5.5
- * execution manager strips them before replay so an approved call
- * re-executes live instead of replaying its own denial.
+ * execution manager (pending — INVARIANTS.md) MUST strip them before replay
+ * so an approved call re-executes live instead of replaying its own denial.
  */
 export interface JournalEntry {
   op: "search" | "describe" | "call";

@@ -22,7 +22,7 @@ promise the product makes but does not yet enforce.
 | §9.2 — secrets encrypted at rest (master key) | `packages/sdk/src/store/sqlite.test.ts` + `secrets.test.ts` | ✅ pinned |
 | §4.2 — execute surface ≈ 1 tool / ~1,044 tokens | `packages/sdk/src/execute.test.ts` | ✅ pinned |
 | §9.2 — a secret never enters sandbox heap / agent code / agent / model | `packages/sdk/src/credentials.test.ts` | ✅ pinned |
-| §9.3 — loopback/private egress off by default | `packages/sdk/src/pipeline/egress.test.ts` (redirect-hop refusal pinned in `pipeline/upstream.test.ts`) | ✅ pinned |
+| §9.3 — loopback/private egress off by default | `packages/sdk/src/pipeline/egress.test.ts` (redirect refusal covered in `pipeline/upstream.test.ts`) | ✅ pinned |
 | §11 — Trace stores no raw credentials; inputs redacted per policy | — | ⏳ awaits Trace redaction (scope includes `TraceEvent.output`, which persists full upstream results unredacted for §5.5 replay) |
 | §16 — runaway executions interrupted (time / memory / output caps) | `packages/sdk/src/sandbox/quickjs.test.ts` | ✅ pinned |
 | §5.5 — pause/resume via deterministic replay (journaled results, seeded non-determinism) | — | ⏳ awaits execution manager (replay mechanism + seeds landed in sandbox, tested un-prefixed in `quickjs.test.ts`) |

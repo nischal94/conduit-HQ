@@ -816,7 +816,12 @@ parameter from day one (unused in v1) so real addressing arrives without an inte
 <li><strong>Trace as replay log:</strong> ✅ <strong><code>TraceEvent.output</code> carries the full
 (response-capped) call result</strong> (§5.5, §11) — the Trace store doubles as the durable replay
 journal for <code>call</code> ops; <code>outputSummary</code> is a display projection. Persisting
-<code>search</code>/<code>describe</code> journal entries is deferred to the §5.5 execution-manager work.</li>
+<code>search</code>/<code>describe</code> journal entries is deferred to the §5.5 execution-manager work.
+<strong>Audit semantics:</strong> refusals (policy-denied, blocked) and allowed calls that reached the
+upstream caller and failed are traced (the latter with the allow verdict and no output); pre-flight
+refusals (no connection, unsupported source type, exhausted budget) and infra faults are not traced —
+infra faults live host-side under a correlation id. A failed trace append fails the call: an
+unauditable call must not silently succeed.</li>
 <li><strong>Upstream scope (v1):</strong> ✅ <strong>MCP-only, behind a per-source-type seam</strong> (§5.3) —
 JSON-RPC 2.0 <code>tools/call</code> with the namespace prefix stripped to recover the upstream tool
 name. Known limitation: MCP names the normalizer transformed don't round-trip until the original
@@ -829,6 +834,9 @@ name is stored in <code>sourceSemantics</code>. Other source types fail closed (
 <li><strong>npm allowlist contents</strong>: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.</li>
 <li><strong>Pricing shape</strong> for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.</li>
 <li><strong>Approval push notifications</strong> (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.</li>
+<li><strong>Per-connect egress pinning</strong> (§9.3): the v1 guard resolves DNS and checks every
+address, then <code>fetch</code> re-resolves independently — a DNS-rebinding TOCTOU window. Closing it
+means resolving once and forcing the connection to the vetted IP — Phase 1.</li>
 </ol>
 <hr>
 <h2 id="19-branding-naming">19. Branding / naming</h2>

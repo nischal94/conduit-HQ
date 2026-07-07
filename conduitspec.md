@@ -603,6 +603,11 @@ parameter from day one (unused in v1) so real addressing arrives without an inte
 (response-capped) call result** (§5.5, §11) — the Trace store doubles as the durable replay
 journal for `call` ops; `outputSummary` is a display projection. Persisting
 `search`/`describe` journal entries is deferred to the §5.5 execution-manager work.
+**Audit semantics:** refusals (policy-denied, blocked) and allowed calls that reached the
+upstream caller and failed are traced (the latter with the allow verdict and no output); pre-flight
+refusals (no connection, unsupported source type, exhausted budget) and infra faults are not traced —
+infra faults live host-side under a correlation id. A failed trace append fails the call: an
+unauditable call must not silently succeed.
 - **Upstream scope (v1):** ✅ **MCP-only, behind a per-source-type seam** (§5.3) —
 JSON-RPC 2.0 `tools/call` with the namespace prefix stripped to recover the upstream tool
 name. Known limitation: MCP names the normalizer transformed don't round-trip until the original
@@ -615,6 +620,9 @@ name is stored in `sourceSemantics`. Other source types fail closed ("not yet ca
 3. **npm allowlist contents**: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.
 4. **Pricing shape** for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.
 5. **Approval push notifications** (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.
+6. **Per-connect egress pinning** (§9.3): the v1 guard resolves DNS and checks every
+address, then `fetch` re-resolves independently — a DNS-rebinding TOCTOU window. Closing it
+means resolving once and forcing the connection to the vetted IP — Phase 1.
 
 ---
 
