@@ -27,10 +27,10 @@ at session start.
 
 ### Where things stand
 
-- **PR #18 is OPEN, waiting only on the human's quiz + merge** —
+- **sourceSemantics boundary validation COMPLETE — PR #18 merged
+  (`95f325b`, quiz passed + merge named by the human 2026-07-07).**
   `fix: validate stored source_semantics at the sqlite boundary`
-  (branch `fix/sqlite-source-semantics-validation`, commits `c0c0eb4` +
-  `4561730` + `bd3669d`, base = main). This closes the highest-priority
+  (commits `c0c0eb4` + `4561730` + `bd3669d`). This closed the highest-priority
   residual gap from PR #15's Tier 2 review: `rowToTool`'s
   `JSON.parse(...) as SourceSemantics` blind cast smuggled three
   vocabularies (`kind`, graphql `operation`, custom_js `declaredRisk`)
@@ -52,12 +52,10 @@ at session start.
   classify "safe"; fixed + pinned same day, LEARNINGS #25); explainer +
   quiz artifact posted
   (claude.ai/code/artifact/90242521-9530-4617-bbc4-6ce680d21a39).
-  151/151 tests, tsc + Biome clean. **Do not merge without the human
-  passing the quiz fully and naming the merge** (CLAUDE.md merge
-  authority).
-- **main is `fa4ef50`** — 130/130 tests, INVARIANTS.md unchanged:
+  151/151 tests, tsc + Biome clean.
+- **main is `95f325b`** — 151/151 tests, INVARIANTS.md unchanged:
   9 pinned ✅, 3 ⏳ (§9.3 egress, §11 Trace redaction, §5.5 execution
-  manager). PR #18 hardens an existing layer; no ledger row flips.
+  manager). PR #18 hardened an existing layer; no ledger row flipped.
 - **Follow-ups spawned by PR #18's Tier 2 (listed in the PR comment,
   deliberately out of scope):** (1) `seeds`/`pausedOn` shape validators
   mirroring `parseSourceSemantics` — corrupt seeds silently diverge
@@ -79,19 +77,16 @@ at session start.
 
 ### Waiting on the human
 
-**PR #18's merge gate — this blocks the store-hardening thread only.**
-Read the CodeRabbit review, pass the explainer quiz FULLY (a missed
-question means reread and retake), then name the merge. The §5.3
-pipeline task below does not depend on PR #18's diff and may start
-from origin/main regardless — but check `gh pr list` first and never
-stack on the open branch.
+Nothing blocking. PR #18's full gate closed 2026-07-07: CI 8/8,
+Tier 2 findings resolved, explainer quiz passed, merge named
+explicitly, merged as `95f325b` (branch auto-deleted).
 
 ### Next task: §5.3 ToolInvoker pipeline v1 (with §9.3 egress defaults)
 
 Unchanged — the sqlite PRs were review follow-ups, not roadmap steps.
 Every part exists as a seam: resolver (§9.2 ✓), policy engine
 (§10.2 ✓), store ✓ (all vocabulary reads guarded, semantics blob
-included once #18 lands), sandbox + execute mount point ✓. The
+included), sandbox + execute mount point ✓. The
 pipeline is the connective tissue: resolve connection → enforce policy
 → attach credentials host-side → call upstream → append Trace event →
 return.
@@ -159,10 +154,9 @@ Acceptance criteria (refine after the blindspot pass):
 
 > Continue building Conduit in ~/projects/conduit-HQ. Start by reading
 > HANDOFF.md and follow its protocol — including the PR check the
-> tripwire can't do: `gh pr list --state all --limit 5`. First check
-> PR #18 (sourceSemantics validation): if still open it waits on the
-> human's quiz + explicit merge naming — do not merge it yourself and
-> do not redo its work. Then the current task: §5.3 ToolInvoker
+> tripwire can't do: `gh pr list --state all --limit 5` (PR #18,
+> sourceSemantics validation, merged 2026-07-07 — do not redo its
+> work). Then the current task: §5.3 ToolInvoker
 > pipeline v1 with §9.3 egress defaults. The blindspot pass for this
 > task has NOT been run yet: run /blindspot first, then the tweakable
 > plan, then implement. Work autonomously per the project's memory:
