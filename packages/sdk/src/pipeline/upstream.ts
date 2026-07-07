@@ -38,8 +38,18 @@ export function createMcpUpstreamCaller(
   const maxBytes = options.maxResponseBytes ?? DEFAULT_MAX_RESPONSE_BYTES;
   return {
     async call(request: UpstreamRequest): Promise<UpstreamOutcome> {
-      const target = new URL(request.source.location);
-      await assertEgressAllowed(target, options.egress ?? {});
+      let target: URL;
+      try {
+        target = new URL(request.source.location);
+        await assertEgressAllowed(target, options.egress ?? {});
+      } catch (cause) {
+        // Egress refusals cross as upstream errors, not opaque infra: the
+        // guard's message is ref-free and tells the agent exactly which
+        // §9.3 default fired.
+        throw upstreamError(
+          cause instanceof Error ? cause.message : "Upstream URL failed the egress check.",
+        );
+      }
       // Decision A5: upstream MCP name = tool name minus the namespace
       // prefix the normalizer added. Known limitation (documented in §18):
       // wrong for MCP names the normalizer had to transform.
