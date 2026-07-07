@@ -465,3 +465,41 @@ it only because it traced the call path end-to-end asking "where does
 each input come from?". When auditing a decisions list, test each ✅ by
 asking what a caller would concretely do, not whether the row's topic
 sounds covered.
+
+### 30. Flagging a blocker is half a response; the fix is the deliverable
+
+During the §5.3 gate, the Codex CLI wouldn't run (its native binary was
+missing). I reported "the adversarial pass could not run" and moved on —
+leaving the user holding a dead end. The user's correction was sharp and
+repeated: never end on an open-ended blocker; always hand over the way
+forward. And the fix must be a *mechanism*, not a one-time apology —
+because the same shape recurs on every future snag, in any project.
+
+What we built (permanent, global, not project-specific):
+- `~/.claude/rules/no-dead-ends.md` — loads every session. Redefines
+  "done": a turn may not end on an unresolved blocker without a concrete
+  way forward. Crucially, that way forward is NOT limited to a terminal
+  command — it's whichever actually clears the block: a command, a code
+  change I make, a workaround/alternative route, an escalation that names
+  who/what resolves it, or 2–3 options with a recommendation when it's
+  the user's call. Root cause before remedy, always (verify, don't
+  guess).
+- `~/.claude/hooks/no-dead-ends-check.sh` — a Stop-hook tripwire that
+  scans my closing text for blocker-language with no way-forward signal
+  and nudges me to finish. The rule changes intent; the hook catches the
+  lapse when intent fails — which is exactly what happened, so the
+  pairing is the point.
+
+Two meta-lessons the same episode taught, both about talking to the user
+rather than about code:
+- **Don't ask permission for the obviously-right thing.** I kept asking
+  "want me to also…?" for actions I should have just taken (recording
+  this incident; deciding a global rule needs no per-project pointer).
+  Asking is itself a mini dead-end — it hands the user a decision that
+  isn't theirs to make. Decide and state it.
+- **Jargon is a dead end too.** "The reinstall command is staged," "not
+  a code finding," "this catches blockers I name" — each left the user
+  parsing my hedge instead of understanding the state. Say the plain
+  thing: what's broken, in one sentence, and the exact next action.
+
+This entry is history; the enforcement lives in the rule + hook above.
