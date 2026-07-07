@@ -6,7 +6,7 @@ import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
 import type { Tool } from "../types.js";
-import { GUEST_ERROR_NAMES } from "./errors.js";
+import { GUEST_ERROR_NAMES, upstreamError } from "./errors.js";
 import { createToolInvoker, type ToolInvokerDeps } from "./invoker.js";
 import type { UpstreamCaller, UpstreamRequest } from "./upstream.js";
 
@@ -269,6 +269,25 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(event?.upstreamStatus).toBe(200);
     expect(event?.latencyMs).toBe(7);
     expect(event?.policyVerdict).toBe("allow");
+  });
+
+  it("an allowed call whose upstream fails is still traced (decision A3)", async () => {
+    const failingUpstream: UpstreamCaller = {
+      call: () => Promise.reject(upstreamError("Upstream returned HTTP 502.")),
+    };
+    const invoke = createToolInvoker(deps(failingUpstream), {
+      executionId: "exec_t",
+      log: vi.fn(),
+    });
+
+    await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+    });
+    const trace = await store.trace.listByExecution("exec_t");
+    expect(trace).toHaveLength(1);
+    expect(trace[0]?.policyVerdict).toBe("allow"); // the call WAS allowed…
+    expect(trace[0] && "output" in trace[0]).toBe(false); // …but produced no result
+    expect(trace[0]?.connectionPrefix).toBe(PREFIX);
   });
 
   it("trace-append failure fails the call (audit is load-bearing, decision A3)", async () => {

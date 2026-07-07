@@ -96,11 +96,20 @@ export function createToolInvoker(
     }
     const remaining = options.deadline?.() ?? Number.POSITIVE_INFINITY;
     const timeoutMs = Math.max(1, Math.min(ceiling, remaining));
-    const outcome = await deps.upstream
-      .call({ tool, source, input, auth, timeoutMs })
-      .catch((cause) => {
-        throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
-      });
+    let outcome: UpstreamOutcome;
+    try {
+      outcome = await deps.upstream.call({ tool, source, input, auth, timeoutMs });
+    } catch (cause) {
+      const error = cause instanceof ConduitCallError ? cause : infraError(cause, log);
+      if (error.kind === "upstream") {
+        // Decision A3: allowed + upstream-failure is an auditable outcome —
+        // the row carries the allow verdict and no output. Infra faults are
+        // deliberately NOT traced; they live in the host log under their
+        // correlation id.
+        await appendTrace(deps, options, log, { path, input, verdict, connection });
+      }
+      throw error;
+    }
 
     // 6. Trace, then return. Fail closed if the audit row can't be written
     //    (decision A3): an unauditable call must not silently succeed.
