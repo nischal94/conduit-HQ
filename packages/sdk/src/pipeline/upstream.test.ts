@@ -197,6 +197,65 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
   });
 
+  it("rejects a well-formed but non-JSON-RPC 200 body (no result, no error)", async () => {
+    for (const shape of ["42", "[]", "{}", "null", '"ok"']) {
+      const { port } = await serve((_request, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(shape);
+      });
+      const attempt = caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: {} },
+        timeoutMs: 2_000,
+      });
+      // Never a { result: null } success, never a raw TypeError-as-infra.
+      await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
+    }
+  });
+
+  it("treats a null JSON-RPC error as no error, then requires a result", async () => {
+    const { port } = await serve((_request, res) => {
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: "1", error: null }));
+    });
+    await expect(
+      caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: {} },
+        timeoutMs: 2_000,
+      }),
+    ).rejects.toThrow(/neither a result nor an error/);
+  });
+
+  it("redacts a bare-token echo through sanitizeUpstreamText (secret without its Bearer scheme)", async () => {
+    const bareToken = SECRET.split(" ")[1] ?? SECRET;
+    const { port } = await serve((_request, res) => {
+      // Non-JSON content type carrying the bare token → sanitizer runs on it.
+      res.writeHead(200, { "content-type": `text/plain; token=${bareToken}` });
+      res.end("nope");
+    });
+    let thrown: unknown;
+    try {
+      await caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        timeoutMs: 2_000,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    const error = thrown as Error;
+    expect(error.message).toMatch(/non-JSON response/);
+    expect(error.message).toContain("[redacted]");
+    expect(error.message).not.toContain(bareToken);
+  });
+
   it("maps JSON-RPC error objects to ConduitUpstreamError", async () => {
     const { port } = await serve((_request, res) => {
       res.writeHead(200, { "content-type": "application/json" });
@@ -248,7 +307,9 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     }
     const error = thrown as Error;
     expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
-    expect(error.message).toContain("[redacted]");
+    // The full-body credential scan fires first and fails the call closed —
+    // stronger than redact-and-deliver. The secret reaches nothing.
+    expect(error.message).toMatch(/echoed the connection's credential/);
     expect(error.message).not.toContain(SECRET);
   });
 
@@ -292,6 +353,33 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     });
     await expect(attempt).rejects.toThrow(/timed out after 50ms while reading the response/);
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
+  });
+
+  it("INVARIANT §9.2: a 200 result echoing the credential is refused, not delivered", async () => {
+    // The success-path twin of the hostile-echo cases: a compromised or
+    // header-reflecting upstream returns the Authorization header inside a
+    // well-formed result. Delivering it would put the secret in the sandbox
+    // heap, the journal, and Trace — the call must fail closed instead.
+    const { port } = await serve((request, res) =>
+      jsonRpcResult(res, { echoed: request.headers.authorization }),
+    );
+
+    let thrown: unknown;
+    try {
+      await caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        timeoutMs: 2_000,
+      });
+    } catch (error) {
+      thrown = error;
+    }
+    const error = thrown as Error;
+    expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
+    expect(error.message).toMatch(/echoed the connection's credential/);
+    expect(error.message).not.toContain(SECRET);
   });
 
   it("never serializes auth headers into the thrown error", async () => {

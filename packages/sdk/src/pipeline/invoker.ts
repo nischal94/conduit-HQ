@@ -18,9 +18,16 @@ import type { UpstreamCaller, UpstreamOutcome } from "./upstream.js";
  * → return. Mounts at the ToolInvoker seam the sandbox's ToolHost calls
  * through; everything here runs host-side, outside the sandbox (spec §9.2).
  *
+ * Policy is deliberately evaluated BEFORE connection resolution (spec §5.3
+ * lists them in the other order) so a denied or unknown tool never engages
+ * the connection or credential machinery.
+ *
  * Every failure is classified at this boundary (pipeline/errors.ts): only
- * the four guest-safe names cross into the sandbox, so quickjs.ts's
- * error pass-through is safe by construction.
+ * the four guest-safe names cross into the sandbox. An outermost catch
+ * makes that structural — any throw not already a ConduitCallError (e.g. a
+ * non-serializable result from a custom UpstreamCaller) becomes an opaque
+ * infra error rather than crossing raw — so quickjs.ts's error pass-through
+ * is safe by construction.
  */
 export interface ToolInvokerDeps {
   store: ConduitStore;
@@ -49,86 +56,128 @@ export function createToolInvoker(
   const ceiling = options.upstreamTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS;
 
   return async (path: string, input: unknown): Promise<unknown> => {
-    // 1. Look up the tool (catalog-of-record: the store, not the in-memory catalog).
-    const tool = await deps.store.tools.get(path).catch((cause) => {
-      throw infraError(cause, log);
-    });
-
-    // 2. Policy. Allow-list discipline (policy.ts contract): proceed ONLY on
-    //    "allow"; a store rejection is a failed call, never a verdict.
-    const verdict = await deps.policy
-      .evaluate({
-        target: tool !== undefined ? { kind: "known", tool } : { kind: "unknown", toolName: path },
-        input,
-      })
-      .catch((cause) => {
-        throw infraError(cause, log);
-      });
-    if (verdict.action !== "allow" || tool === undefined) {
-      // Audit the refusal too. Chosen semantic: unauditable is ALWAYS infra —
-      // if this append fails, the guest sees ConduitInternalError rather than
-      // the policy name, because a refusal we cannot record is a fault, not
-      // a verdict.
-      await appendTrace(deps, options, log, { path, input, verdict });
-      throw policyError(verdict.action === "block" ? "block" : "require_approval", verdict.reason);
-    }
-
-    // 3. Resolve connection (decision A1: single connection per namespace;
-    //    the prefix parameter is reserved on the seam for per-call addressing).
-    const connection = await resolveConnection(deps, tool.namespace, undefined).catch((cause) => {
-      throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
-    });
-
-    // 4. Credentials — host-side, fresh per call (spec §9.2). Resolver
-    //    failures carry the prefix and credentialRef in their message;
-    //    they cross the boundary only as opaque infra errors.
-    const auth = await deps.credentials.resolve(connection).catch((cause) => {
-      throw infraError(cause, log);
-    });
-
-    // 5. Upstream, time-bounded by the remaining §16 budget.
-    const source = await deps.store.sources.getByNamespace(tool.namespace).catch((cause) => {
-      throw infraError(cause, log);
-    });
-    if (source === undefined) {
-      throw infraError(new Error(`source missing for namespace ${tool.namespace}`), log);
-    }
-    if (tool.sourceSemantics.kind !== "mcp") {
-      throw upstreamError(
-        `Source type "${tool.sourceSemantics.kind}" is not yet callable; MCP only in v1. Context: { tool: ${tool.name} }`,
-      );
-    }
-    const remaining = options.deadline?.() ?? Number.POSITIVE_INFINITY;
-    if (remaining <= 0) {
-      // A burnt §16 budget refuses BEFORE any credentialed bytes leave the
-      // host — never a 1ms token request. Traced per decision A3 (an
-      // allowed call that produced no result).
-      await appendTrace(deps, options, log, { path, input, verdict, connection });
-      throw upstreamError(
-        `Upstream call refused: the execution's wall-clock budget is exhausted (spec §16). Context: { tool: ${tool.name} }`,
-      );
-    }
-    const timeoutMs = Math.max(1, Math.min(ceiling, remaining));
-    let outcome: UpstreamOutcome;
     try {
-      outcome = await deps.upstream.call({ tool, source, input, auth, timeoutMs });
+      return await runCall(deps, options, log, ceiling, path, input);
     } catch (cause) {
-      const error = cause instanceof ConduitCallError ? cause : infraError(cause, log);
-      if (error.kind === "upstream") {
-        // Decision A3: allowed + upstream-failure is an auditable outcome —
-        // the row carries the allow verdict and no output. Infra faults are
-        // deliberately NOT traced; they live in the host log under their
-        // correlation id.
-        await appendTrace(deps, options, log, { path, input, verdict, connection });
-      }
-      throw error;
+      // Outermost classification: anything a step already threw as a
+      // ConduitCallError passes through; anything else (a bug, a custom
+      // caller's non-serializable result, a throwing deadline()) becomes an
+      // opaque infra error. Nothing raw crosses into the sandbox.
+      throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
     }
-
-    // 6. Trace, then return. Fail closed if the audit row can't be written
-    //    (decision A3): an unauditable call must not silently succeed.
-    await appendTrace(deps, options, log, { path, input, verdict, connection, outcome });
-    return outcome.result;
   };
+}
+
+async function runCall(
+  deps: ToolInvokerDeps,
+  options: CreateToolInvokerOptions,
+  log: (message: string) => void,
+  ceiling: number,
+  path: string,
+  input: unknown,
+): Promise<unknown> {
+  // 1. Look up the tool (catalog-of-record: the store, not the in-memory catalog).
+  const tool = await deps.store.tools.get(path).catch((cause) => {
+    throw infraError(cause, log);
+  });
+
+  // 2. Policy. Allow-list discipline (policy.ts contract): proceed ONLY on
+  //    "allow"; a store rejection is a failed call, never a verdict.
+  const verdict = await deps.policy
+    .evaluate({
+      target: tool !== undefined ? { kind: "known", tool } : { kind: "unknown", toolName: path },
+      input,
+    })
+    .catch((cause) => {
+      throw infraError(cause, log);
+    });
+  // Unknown tool: fail closed as blocked regardless of the verdict. The
+  // built-in engine returns block/unknown_tool here; a custom engine that
+  // returns "allow" for a tool absent from the catalog still cannot proceed
+  // (there is nothing to call), and must not surface an allow reason under a
+  // denial name — which would also mis-drive §5.5 replay stripping.
+  if (tool === undefined) {
+    const blocked: PolicyVerdict = {
+      action: "block",
+      reason:
+        verdict.action === "allow"
+          ? `Unknown tool "${path}": not in the catalog, so it is blocked.`
+          : verdict.reason,
+      source: verdict.source,
+    };
+    await appendTrace(deps, options, log, { path, input, verdict: blocked });
+    throw policyError("block", blocked.reason);
+  }
+  if (verdict.action !== "allow") {
+    // Audit the refusal too. Chosen semantic: unauditable is ALWAYS infra —
+    // if this append fails, the guest sees ConduitInternalError rather than
+    // the policy name, because a refusal we cannot record is a fault, not
+    // a verdict.
+    await appendTrace(deps, options, log, { path, input, verdict });
+    throw policyError(verdict.action === "block" ? "block" : "require_approval", verdict.reason);
+  }
+
+  // 3. Resolve connection (decision A1: single connection per namespace;
+  //    the prefix parameter is reserved on the seam for per-call addressing).
+  const connection = await resolveConnection(deps, tool.namespace, undefined).catch((cause) => {
+    throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
+  });
+
+  // 4. Credentials — host-side, fresh per call (spec §9.2). Resolver
+  //    failures carry the prefix and credentialRef in their message;
+  //    they cross the boundary only as opaque infra errors.
+  const auth = await deps.credentials.resolve(connection).catch((cause) => {
+    throw infraError(cause, log);
+  });
+
+  // 5. Upstream, time-bounded by the remaining §16 budget.
+  const source = await deps.store.sources.getByNamespace(tool.namespace).catch((cause) => {
+    throw infraError(cause, log);
+  });
+  if (source === undefined) {
+    throw infraError(new Error(`source missing for namespace ${tool.namespace}`), log);
+  }
+  if (tool.sourceSemantics.kind !== "mcp") {
+    throw upstreamError(
+      `Source type "${tool.sourceSemantics.kind}" is not yet callable; MCP only in v1. Context: { tool: ${tool.name} }`,
+    );
+  }
+  const remaining = options.deadline?.() ?? Number.POSITIVE_INFINITY;
+  if (remaining <= 0) {
+    // A burnt §16 budget refuses BEFORE any credentialed bytes leave the
+    // host — never a 1ms token request. Traced per decision A3 (an
+    // allowed call that produced no result).
+    await appendTrace(deps, options, log, { path, input, verdict, connection });
+    throw upstreamError(
+      `Upstream call refused: the execution's wall-clock budget is exhausted (spec §16). Context: { tool: ${tool.name} }`,
+    );
+  }
+  const timeoutMs = Math.max(1, Math.min(ceiling, remaining));
+  let outcome: UpstreamOutcome;
+  try {
+    outcome = await deps.upstream.call({ tool, source, input, auth, timeoutMs });
+  } catch (cause) {
+    const error = cause instanceof ConduitCallError ? cause : infraError(cause, log);
+    if (error.kind === "upstream") {
+      // Decision A3: an allowed call that reached the upstream caller and
+      // failed is an auditable outcome — the row carries the allow verdict
+      // and no output. Infra faults are deliberately NOT traced; they live
+      // in the host log under their correlation id. If the audit write
+      // itself fails, log the superseded upstream error so it is not lost.
+      try {
+        await appendTrace(deps, options, log, { path, input, verdict, connection });
+      } catch (auditCause) {
+        log(`[ToolInvoker] Upstream failure not audited: ${error.message}`);
+        throw auditCause instanceof ConduitCallError ? auditCause : infraError(auditCause, log);
+      }
+    }
+    throw error;
+  }
+
+  // 6. Trace, then return. Fail closed if the audit row can't be written
+  //    (decision A3): an unauditable call must not silently succeed.
+  await appendTrace(deps, options, log, { path, input, verdict, connection, outcome });
+  return outcome.result;
 }
 
 /**

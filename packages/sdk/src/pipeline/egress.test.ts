@@ -84,6 +84,19 @@ describe("egress guard (spec §9.3)", () => {
     );
   });
 
+  it("INVARIANT §9.3: CGNAT, IETF-protocol, benchmarking, and multicast ranges are blocked", () => {
+    expect(isPrivateAddress("100.64.0.1")).toBe(true); // RFC6598 CGNAT
+    expect(isPrivateAddress("100.127.255.255")).toBe(true);
+    expect(isPrivateAddress("100.63.0.1")).toBe(false); // just below the /10
+    expect(isPrivateAddress("100.128.0.1")).toBe(false); // just above
+    expect(isPrivateAddress("192.0.0.1")).toBe(true); // RFC6890 protocol assignments
+    expect(isPrivateAddress("198.18.0.1")).toBe(true); // RFC2544 benchmarking
+    expect(isPrivateAddress("198.19.255.255")).toBe(true);
+    expect(isPrivateAddress("224.0.0.1")).toBe(true); // multicast
+    expect(isPrivateAddress("255.255.255.255")).toBe(true); // broadcast
+    expect(isPrivateAddress("8.8.8.8")).toBe(false); // still-public sanity
+  });
+
   it("classifies unparseable addresses as private (fail closed)", () => {
     expect(isPrivateAddress("garbage")).toBe(true);
     expect(isPrivateAddress("1.2.3.4.5")).toBe(true);

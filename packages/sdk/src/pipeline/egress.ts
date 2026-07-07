@@ -82,14 +82,18 @@ export function isPrivateAddress(address: string): boolean {
 }
 
 function isPrivateV4(octets: number[]): boolean {
-  const [a = 0, b = 0] = octets;
+  const [a = 0, b = 0, c = 0] = octets;
   return (
-    a === 127 ||
-    a === 10 ||
-    a === 0 ||
-    (a === 172 && b >= 16 && b <= 31) ||
-    (a === 192 && b === 168) ||
-    (a === 169 && b === 254)
+    a === 127 || // loopback
+    a === 10 || // RFC1918
+    a === 0 || // "this network"
+    (a === 172 && b >= 16 && b <= 31) || // RFC1918
+    (a === 192 && b === 168) || // RFC1918
+    (a === 169 && b === 254) || // link-local (cloud metadata)
+    (a === 100 && b >= 64 && b <= 127) || // RFC6598 carrier-grade NAT
+    (a === 192 && b === 0 && c === 0) || // RFC6890 IETF protocol assignments
+    (a === 198 && (b === 18 || b === 19)) || // RFC2544 benchmarking
+    a >= 224 // 224/4 multicast + 240/4 reserved + 255.255.255.255 broadcast
   );
 }
 

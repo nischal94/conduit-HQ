@@ -150,6 +150,56 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(trace.map((event) => event.policyVerdict)).toEqual(["block", "block"]);
   });
 
+  it("an unknown tool fails closed as blocked even if a custom engine allows it (M4)", async () => {
+    // A seam that returns allow for a tool absent from the catalog must not
+    // surface an allow reason under a denial name, nor trace it as allowed.
+    const permissivePolicy = {
+      evaluate: () =>
+        Promise.resolve({
+          action: "allow" as const,
+          reason: "allowed by default",
+          source: "default" as const,
+        }),
+    };
+    const { caller, requests } = recordingUpstream();
+    const invoke = createToolInvoker(deps(caller, { policy: permissivePolicy }), {
+      executionId: "exec_unknown",
+      log: vi.fn(),
+    });
+
+    const attempt = invoke("github.ghost_tool", {});
+    await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyBlocked });
+    await expect(attempt).rejects.toThrow(/not in the catalog/);
+    expect(requests).toHaveLength(0);
+    const trace = await store.trace.listByExecution("exec_unknown");
+    expect(trace).toHaveLength(1);
+    expect(trace[0]?.policyVerdict).toBe("block"); // honest audit, not "allow"
+  });
+
+  it("a non-serializable result from a custom caller becomes infra, never a raw throw (H1)", async () => {
+    // The A5 extension seam: a caller returning a circular structure makes
+    // JSON.stringify throw. The outermost classification must catch it so no
+    // raw TypeError crosses into the sandbox.
+    const circular: Record<string, unknown> = {};
+    circular.self = circular;
+    const badCaller: UpstreamCaller = {
+      call: () => Promise.resolve({ result: circular, status: 200, latencyMs: 1 }),
+    };
+    const log = vi.fn();
+    const invoke = createToolInvoker(deps(badCaller), { executionId: "exec_h1", log });
+
+    let thrown: unknown;
+    try {
+      await invoke("github.list_issues", {});
+    } catch (error) {
+      thrown = error;
+    }
+    const error = thrown as Error;
+    expect(error.name).toBe(GUEST_ERROR_NAMES.infra);
+    expect(error.message).not.toMatch(/circular/i); // structure detail stays host-side
+    expect(log).toHaveBeenCalled();
+  });
+
   it("proceeds only on allow — a policy-store rejection fails the call as infra, not a verdict", async () => {
     const { caller, requests } = recordingUpstream();
     const rejectingPolicy = {

@@ -1,3 +1,5 @@
+import { inspect } from "node:util";
+
 /**
  * Pipeline error boundary (spec §5.3, §9.2): the ONLY error shapes allowed
  * to cross into the sandbox. Infra causes ([SqliteStore]/[CredentialResolver]
@@ -51,7 +53,11 @@ export function upstreamError(message: string): ConduitCallError {
 
 export function infraError(cause: unknown, log: (message: string) => void): ConduitCallError {
   const correlationId = crypto.randomUUID();
-  const detail = cause instanceof Error ? `${cause.name}: ${cause.message}` : String(cause);
+  // inspect() keeps the stack and the walked `cause` chain (egress and
+  // [SqliteStore] read errors attach `{ cause }`): the correlation id is
+  // the ONLY host-side pointer to the real fault, so it must not degrade
+  // to "[object Object]".
+  const detail = inspect(cause, { depth: 5 });
   log(`[ToolInvoker] Infra failure ${correlationId}: ${detail}`);
   return new ConduitCallError(
     "infra",
