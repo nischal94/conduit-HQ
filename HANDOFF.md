@@ -55,8 +55,7 @@ at session start.
   151/151 tests, tsc + Biome clean. **Do not merge without the human
   passing the quiz fully and naming the merge** (CLAUDE.md merge
   authority).
-- **main is `fa4ef50`** — 132/132 tests (the previous handoff's 130
-  predates PR #15's final test commit), INVARIANTS.md unchanged:
+- **main is `fa4ef50`** — 130/130 tests, INVARIANTS.md unchanged:
   9 pinned ✅, 3 ⏳ (§9.3 egress, §11 Trace redaction, §5.5 execution
   manager). PR #18 hardens an existing layer; no ledger row flips.
 - **Follow-ups spawned by PR #18's Tier 2 (listed in the PR comment,
