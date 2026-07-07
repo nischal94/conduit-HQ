@@ -196,6 +196,39 @@ describe("SqliteStore", () => {
       const events = await store.trace.listByExecution("exec_1");
       expect(events.map((e) => e.toolName)).toEqual(["a.first", "a.second", "a.third"]);
     });
+
+    it("round-trips TraceEvent.output through the trace table", async () => {
+      await store.trace.append({
+        callId: "call_out",
+        executionId: "exec_out",
+        toolName: "a.tool",
+        connectionPrefix: "a.org.main",
+        input: { q: 1 },
+        output: { issues: [{ id: 1, title: "Fix login bug" }] },
+        outputSummary: { truncated: true },
+        upstreamStatus: 200,
+        latencyMs: 12,
+        policyVerdict: "allow",
+        at: 1,
+      });
+      const [event] = await store.trace.listByExecution("exec_out");
+      expect(event?.output).toEqual({ issues: [{ id: 1, title: "Fix login bug" }] });
+      expect(event?.outputSummary).toEqual({ truncated: true });
+    });
+
+    it("omits output on rows that never had one (denied/failed calls)", async () => {
+      await store.trace.append({
+        callId: "call_denied",
+        executionId: "exec_denied",
+        toolName: "a.tool",
+        connectionPrefix: "a.org.main",
+        input: null,
+        policyVerdict: "require_approval",
+        at: 1,
+      });
+      const [event] = await store.trace.listByExecution("exec_denied");
+      expect(event && "output" in event).toBe(false);
+    });
   });
 
   describe("secrets", () => {
@@ -425,6 +458,56 @@ describe("SqliteStore", () => {
       });
       await expect(legacyStore.trace.listByExecution("exec_1")).rejects.toThrow(
         'unrecognized policy_verdict "permit"',
+      );
+    });
+
+    it("opens a legacy database created without the output column and reads NULL as absent", async () => {
+      // The legacy fixture's trace_events predates TraceEvent.output;
+      // openSqliteStore's ALTER-if-missing migration ran in beforeEach.
+      await legacy.execute({
+        sql: `INSERT INTO trace_events
+                (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at)
+              VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        args: ["call_legacy", "exec_legacy", "x.search", "x.acme.prod", "null", "allow", 1000],
+      });
+      const [event] = await legacyStore.trace.listByExecution("exec_legacy");
+      expect(event?.callId).toBe("call_legacy");
+      expect(event && "output" in event).toBe(false);
+    });
+
+    it("migrates the legacy trace table so new appends can store output", async () => {
+      await legacyStore.trace.append({
+        callId: "call_migrated",
+        executionId: "exec_migrated",
+        toolName: "x.search",
+        connectionPrefix: "x.acme.prod",
+        input: null,
+        output: { hits: 3 },
+        policyVerdict: "allow",
+        at: 1000,
+      });
+      const [event] = await legacyStore.trace.listByExecution("exec_migrated");
+      expect(event?.output).toEqual({ hits: 3 });
+    });
+
+    it("corrupt JSON in output fails loudly with the [SqliteStore] format", async () => {
+      await legacy.execute({
+        sql: `INSERT INTO trace_events
+                (call_id, execution_id, tool_name, connection_prefix, input, output, policy_verdict, at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          "call_bad",
+          "exec_bad",
+          "x.search",
+          "x.acme.prod",
+          "null",
+          "{not json",
+          "allow",
+          1000,
+        ],
+      });
+      await expect(legacyStore.trace.listByExecution("exec_bad")).rejects.toThrow(
+        /\[SqliteStore\] Failed to read trace event: output is not valid JSON/,
       );
     });
 

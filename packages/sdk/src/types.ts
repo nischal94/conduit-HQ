@@ -115,6 +115,12 @@ export interface TraceEvent {
   /** Redacted per policy before storage; never contains raw credentials (spec §11). */
   input: unknown;
   outputSummary?: unknown;
+  /**
+   * Full upstream result for §5.5 replay, bounded by the pipeline's
+   * response cap; absent for denied/failed calls. outputSummary remains
+   * the display projection.
+   */
+  output?: unknown;
   upstreamStatus?: number;
   latencyMs?: number;
   policyVerdict: PolicyAction;
