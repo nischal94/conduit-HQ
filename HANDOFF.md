@@ -69,15 +69,25 @@ at session start.
   Detail in the 2026-07-06 handoff (git history) and LEARNINGS #18–19.
 - All prior decisions remain in force (PR-by-default routing, two-tier
   allowlist + protected floor, branch protection deferred, Dependabot
-  alerts-only, esbuild low ACCEPTED — do not re-litigate).
+  alerts-only, esbuild low ACCEPTED — do not re-litigate). NEW
+  2026-07-07: `delete_branch_on_merge` ON (merged PR branches
+  auto-delete; stacked PRs auto-retarget); **merge authority is the
+  human's** — no PR merges without the human naming it, housekeeping
+  included (CLAUDE.md "Commit routing" has the full rule and the
+  PR #16 incident behind it).
 
 ### Waiting on the human
 
-Nothing blocking. Two open items: the in-flight sourceSemantics PR
-will need its quiz + merge when it lands, and the merged remote
-branches `fix/sqlite-vocab-validation` /
-`fix/sqlite-vocab-validation-remaining` were left undeleted (remote
-branch deletion needs explicit human approval).
+Nothing blocking. Open items: the in-flight sourceSemantics PR needs
+its quiz + explicit merge instruction when it lands; the leftover
+merged branch `feat/policy-engine-v1` predates the new auto-delete
+setting — delete on the human's say-so (remote branch deletion always
+needs explicit approval). Resolved 2026-07-07: the two sqlite-PR
+branches were deleted on explicit confirmation;
+`delete_branch_on_merge` is now ON repo-wide (verified live — PR #16's
+branch auto-deleted); PR #16 (gitignore symlink fix, LEARNINGS #24)
+merged and accepted by the human after the fact — see the new merge
+authority rule in CLAUDE.md "Commit routing".
 
 ### Next task: §5.3 ToolInvoker pipeline v1 (with §9.3 egress defaults)
 
@@ -140,10 +150,10 @@ Acceptance criteria (refine after the blindspot pass):
   lands in the dead feature branch. (The previous handoff called
   retargeting "optional housekeeping" — it is a merge-correctness
   requirement.)
-- NEW (PR #15 session): `.gitignore`'s `node_modules/` (trailing
-  slash) matches directories only, so the worktree *symlinks* show as
-  untracked and addable. Stage files explicitly; never `git add -A`
-  in a symlinked worktree.
+- Fixed by PR #16 (merged 2026-07-07): `.gitignore` now uses bare
+  `node_modules` — the trailing-slash form matched directories only,
+  leaving worktree *symlinks* untracked and addable (LEARNINGS #24).
+  The stage-explicitly habit still applies as defense in depth.
 
 ### Kickoff prompt for the next session
 

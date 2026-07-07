@@ -62,6 +62,14 @@ puts the human decision AFTER the clean-room CI evidence exists.
   (see the ci.yml activation checklist): merge only on green, after
   reading the review — and for load-bearing PRs, after passing the
   explainer quiz.
+- **Merge authority is separate from review, and it is the human's.**
+  The agent never merges a PR the human has not explicitly named for
+  merging — housekeeping included. Review can be delegated to agents
+  and CI; the decision to land on main cannot. A general "wrap things
+  up" or "decide what's best" is not a per-PR merge instruction.
+  (Added 2026-07-07 after the agent merged housekeeping PR #16 on the
+  tier exemption alone; the review was adequate, the authorization was
+  not.)
 - Enforced mechanically by `githooks/pre-push` — a tripwire, not a wall.
   A `--no-verify` bypass is an incident worth a LEARNINGS note.
 - When branch protection becomes available (Pro or public repo), turn on
