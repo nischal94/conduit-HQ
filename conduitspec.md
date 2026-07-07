@@ -595,6 +595,18 @@ only; all egress through proxy/policy.
 in Trace; resume re-runs code against memoized results; no VM snapshots.
 - **Tech stack:** ✅ locked for Phase 0 (§20) — TypeScript/ESM, pnpm workspaces,
 quickjs-emscripten, Ajv + Zod, Vitest, libSQL.
+- **Connection addressing (v1):** ✅ **Single connection per namespace** (§5.3) — a
+namespace resolves to its one configured connection; multiple connections for an integration fail
+closed until per-call addressing ships. The pipeline's resolver seam accepts a `prefix`
+parameter from day one (unused in v1) so real addressing arrives without an interface change.
+- **Trace as replay log:** ✅ **`TraceEvent.output` carries the full
+(response-capped) call result** (§5.5, §11) — the Trace store doubles as the durable replay
+journal for `call` ops; `outputSummary` is a display projection. Persisting
+`search`/`describe` journal entries is deferred to the §5.5 execution-manager work.
+- **Upstream scope (v1):** ✅ **MCP-only, behind a per-source-type seam** (§5.3) —
+JSON-RPC 2.0 `tools/call` with the namespace prefix stripped to recover the upstream tool
+name. Known limitation: MCP names the normalizer transformed don't round-trip until the original
+name is stored in `sourceSemantics`. Other source types fail closed ("not yet callable").
 
 **Deferred (future phases — none block v0.1 / Phase 0):**
 
