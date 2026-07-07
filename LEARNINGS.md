@@ -387,3 +387,50 @@ symlinks show up as untracked — one `git add -A` away from committing
 machine-local absolute-path links into the repo. In symlinked
 worktrees, stage files explicitly by path; treat `git add -A`/`.` as
 off-limits there.
+
+## 2026-07-07 — PR #18: source_semantics validation (the blob past the columns)
+
+### 25. A fail-closed guarantee is only as strong as its weakest arm
+
+The whole point of this PR was fail-closed discipline, and the first
+version of it contained a fail-OPEN path: the mcp arm of
+`deriveRiskClass` kept its truthiness checks
+(`if (semantics.readOnlyHint) return "safe"`), so an untyped caller
+passing `readOnlyHint: "false"` — a truthy *string*, exactly the
+corruption class the PR is about — earned the least restrictive class
+from the very function whose new doc comment advertised "values
+outside the compile-time unions fail closed to destructive." The
+PR's own Tier 2 pass caught it (silent-failure-hunter, MEDIUM).
+Lesson: when you write a comment that promises a guarantee, audit
+every arm of the code beneath it against that promise before
+believing your own diff — truthiness on a `boolean | undefined` field
+is compile-time-sound and runtime-open. And run the review even when
+the diff is "just hardening"; hardening code is where fail-open bugs
+hide best, because every reader is primed to see safety.
+
+### 26. A JSON blob smuggles vocabularies that CHECK constraints can never see
+
+Vocabulary columns got two layers in PRs #14/#15 (read-side guards +
+CHECK twins). `source_semantics` carried three vocabularies —
+`kind`, graphql `operation`, custom_js `declaredRisk` — inside a JSON
+TEXT column, where SQLite CHECK cannot reach. Structural consequence:
+the read-side guard is not defense-in-depth there, it is the ONLY
+layer, on fresh schemas as much as legacy ones. When auditing a
+schema for enum-shaped data, grep the *serialized* shapes too; a
+column-by-column audit will systematically miss vocabularies nested
+in blobs, and those are precisely the ones with no write-side twin.
+Corollary on the fix shape: validate by REBUILDING the value
+field-by-field (unknown keys drop, absent optionals stay absent),
+never by blessing the parsed object with a cast.
+
+### 27. Wrap errors without discarding them — the cause chain is free
+
+First version of `parseJson` did `catch { throw onError(); }` — the
+classic wrap-and-destroy: the new error gained entity + row identity
+but silently discarded the SyntaxError's parse position, the one
+datum that locates corruption inside a multi-KB blob. ES2022's
+`new Error(msg, { cause })` makes keeping it free, and Node prints
+the chain. Rule of thumb: a `catch` that throws a fresh error must
+pass the original as `cause` unless there is a stated reason not to
+(e.g. the original could carry secrets). Cheap to pin:
+`expect(err.cause).toBeInstanceOf(SyntaxError)`.

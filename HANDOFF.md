@@ -23,79 +23,79 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-07 (PR #15 merge + handoff refresh)
+## Current handoff — written 2026-07-07 (sourceSemantics validation session)
 
 ### Where things stand
 
-- **Sqlite vocabulary hardening COMPLETE — PR #14 (`d2001dc`) and
-  PR #15 (`9b1bbc2`) both merged.** Every enum-shaped TEXT column in
-  `packages/sdk/src/store/sqlite.ts` is now double-gated: read-side
-  `isOneOf` guards (throw `[SqliteStore] Failed to read ...` with the
-  stringified bad value + row identity) and write-side CHECK
-  constraints. CHECKs bind fresh schemas only — `CREATE TABLE IF NOT
-  EXISTS` never retrofits, so the read guards are the enforcement
-  layer for legacy files; sqlite.ts now says so above `SCHEMA`.
-  PR #15 covered the last three casts: `sources.type`,
-  `executions.status` (feeds §5.5 pause/resume), and
-  `trace_events.policy_verdict` (the §11 audit surface; it reuses
-  `POLICY_ACTIONS` because `TraceEvent["policyVerdict"]` IS
-  `PolicyAction` — one constant, no drift). Exhaustiveness pins are
-  now compiler-checked: the test lists are `Record<Union, true>`-keyed
-  (`vocabulary()` helper in sqlite.test.ts), so union growth fails the
-  test file's compilation. Gates passed: Tier 2 ×3 agents (no
-  must-fix; the two applied considers landed as `f97df15`), CI 8/8,
-  explainer + quiz
-  (claude.ai/code/artifact/db3b3b3b-03eb-4889-8682-9c0523faa3b8)
-  passed in full by the human; merged on the human's explicit
-  instruction after retargeting base to main.
-- **main is `9b1bbc2`** — 130/130 tests, INVARIANTS.md unchanged:
+- **PR #18 is OPEN, waiting only on the human's quiz + merge** —
+  `fix: validate stored source_semantics at the sqlite boundary`
+  (branch `fix/sqlite-source-semantics-validation`, commits `c0c0eb4` +
+  `4561730` + `bd3669d`, base = main). This closes the highest-priority
+  residual gap from PR #15's Tier 2 review: `rowToTool`'s
+  `JSON.parse(...) as SourceSemantics` blind cast smuggled three
+  vocabularies (`kind`, graphql `operation`, custom_js `declaredRisk`)
+  past the #14/#15 column guards. A JSON blob has no CHECK twin —
+  SQLite can't see inside it — so the new `parseSourceSemantics`
+  read-side guard is the ONLY enforcement layer for those, fresh
+  schemas included. It rebuilds the union field-by-field (unknown keys
+  drop; absent mcp hints stay absent). All six JSON columns now route
+  through `parseJson`, which wraps corruption in the `[SqliteStore]`
+  format and carries the original SyntaxError as `cause` (its parse
+  position locates corruption in a large blob). `deriveRiskClass`
+  (risk.ts, exported public API) fails closed: never-bound `default`
+  arm, `declaredRisk` vocabulary check, boolean-or-absent mcp hints,
+  string-checked openapi method — all → `"destructive"` on garbage.
+- **PR #18 gate status:** CI 8/8 green on `bd3669d`; Tier 2 ran
+  (3 agents; findings + resolutions posted as a PR comment — the
+  review caught a real fail-OPEN defect in my own first version:
+  truthiness mcp hints let `readOnlyHint: "false"`, a truthy string,
+  classify "safe"; fixed + pinned same day, LEARNINGS #25); explainer +
+  quiz artifact posted
+  (claude.ai/code/artifact/90242521-9530-4617-bbc4-6ce680d21a39).
+  151/151 tests, tsc + Biome clean. **Do not merge without the human
+  passing the quiz fully and naming the merge** (CLAUDE.md merge
+  authority).
+- **main is `fa4ef50`** — 132/132 tests (the previous handoff's 130
+  predates PR #15's final test commit), INVARIANTS.md unchanged:
   9 pinned ✅, 3 ⏳ (§9.3 egress, §11 Trace redaction, §5.5 execution
-  manager). Both PRs harden an existing layer; no ledger row flips.
-- **IN FLIGHT: sourceSemantics boundary validation** — a spawned
-  follow-up session (from PR #15's Tier 2 findings) is running
-  independently in its own worktree. Scope: `rowToTool`'s
-  `JSON.parse(...) as SourceSemantics` blob smuggles three vocabulary
-  strings (`kind`, `operation`, `declaredRisk`) past the new guards
-  and feeds `deriveRiskClass`'s default-less switch (risk.ts); plus,
-  if cheap: the `seeds`/`pausedOn` casts, `maybeText`/`maybeInteger`
-  conflating NULL with type corruption (reviewer-rated must-fix before
-  §5.5 resume ships), the `status === "paused"` ⟺ `paused_on IS NOT
-  NULL` invariant, and `[SqliteStore]` context on `JSON.parse` throws.
-  Expect a PR needing the full merge gate. Check `gh pr list` before
-  assuming its state.
-- Policy engine v1 (PR #13, `f5e0e8a`) and its consumption discipline
-  are unchanged — proceed only on `action === "allow"`; catalog lookup
-  stays with the caller; store failures propagate as rejections.
-  Detail in the 2026-07-06 handoff (git history) and LEARNINGS #18–19.
+  manager). PR #18 hardens an existing layer; no ledger row flips.
+- **Follow-ups spawned by PR #18's Tier 2 (listed in the PR comment,
+  deliberately out of scope):** (1) `seeds`/`pausedOn` shape validators
+  mirroring `parseSourceSemantics` — corrupt seeds silently diverge
+  §5.5 replay, and `"null"` in `paused_on` loads as a null
+  `PendingApproval`; must-fix before §5.5 resume ships, together with
+  (2) `maybeText`/`maybeInteger` NULL-vs-corruption conflation and
+  (3) the unenforced `status === "paused"` ⟺ `paused_on IS NOT NULL`
+  invariant. NEW: (4) cross-field drift — `risk_class = "safe"` beside
+  `declaredRisk = "destructive"` passes both guards independently;
+  consider re-deriving on read. (5) LOW, pre-existing: a corrupt
+  identity column throws without row identity.
+- Policy engine v1 (PR #13) consumption discipline unchanged — proceed
+  only on `action === "allow"`; catalog lookup stays with the caller;
+  store failures propagate as rejections (LEARNINGS #18–19).
 - All prior decisions remain in force (PR-by-default routing, two-tier
   allowlist + protected floor, branch protection deferred, Dependabot
-  alerts-only, esbuild low ACCEPTED — do not re-litigate). NEW
-  2026-07-07: `delete_branch_on_merge` ON (merged PR branches
-  auto-delete; stacked PRs auto-retarget); **merge authority is the
-  human's** — no PR merges without the human naming it, housekeeping
-  included (CLAUDE.md "Commit routing" has the full rule and the
-  PR #16 incident behind it).
+  alerts-only, esbuild low ACCEPTED, `delete_branch_on_merge` ON,
+  merge authority is the human's — do not re-litigate).
 
 ### Waiting on the human
 
-Nothing blocking. Open item: the in-flight sourceSemantics PR needs
-its quiz + explicit merge instruction when it lands. Resolved
-2026-07-07: `feat/policy-engine-v1` deleted on the human's explicit
-yes (tip `7cf45d2` remains in main history) — origin now carries main
-only; the two sqlite-PR branches were deleted on explicit confirmation;
-`delete_branch_on_merge` is now ON repo-wide (verified live — PR #16's
-branch auto-deleted); PR #16 (gitignore symlink fix, LEARNINGS #24)
-merged and accepted by the human after the fact — see the new merge
-authority rule in CLAUDE.md "Commit routing".
+**PR #18's merge gate — this blocks the store-hardening thread only.**
+Read the CodeRabbit review, pass the explainer quiz FULLY (a missed
+question means reread and retake), then name the merge. The §5.3
+pipeline task below does not depend on PR #18's diff and may start
+from origin/main regardless — but check `gh pr list` first and never
+stack on the open branch.
 
 ### Next task: §5.3 ToolInvoker pipeline v1 (with §9.3 egress defaults)
 
 Unchanged — the sqlite PRs were review follow-ups, not roadmap steps.
 Every part exists as a seam: resolver (§9.2 ✓), policy engine
-(§10.2 ✓), store ✓ (all vocabulary reads guarded), sandbox + execute
-mount point ✓. The pipeline is the connective tissue: resolve
-connection → enforce policy → attach credentials host-side → call
-upstream → append Trace event → return.
+(§10.2 ✓), store ✓ (all vocabulary reads guarded, semantics blob
+included once #18 lands), sandbox + execute mount point ✓. The
+pipeline is the connective tissue: resolve connection → enforce policy
+→ attach credentials host-side → call upstream → append Trace event →
+return.
 
 **Protocol first (CLAUDE.md "Finding unknowns"): the blindspot pass
 for this task has still NOT been run.** Run `/blindspot` before
@@ -136,41 +136,42 @@ Acceptance criteria (refine after the blindspot pass):
   from repo root); sandbox override needed for git writes and `gh`;
   "certificate-25291" stderr noise is environmental; zsh eats `=`-prefixed
   words; quickjs ground truth is the shipped dist (LEARNINGS #9).
-- Write-tool control bytes: after writing source with `\uXXXX`-class
-  content, verify with `cat -v`; repair via a python script file.
+- Write-tool control bytes: the Edit tool can materialize a `\uXXXX`
+  escape you *typed as text* into a raw control byte — even in a plain
+  test-string edit. Verify with `cat -v` after any edit meant to
+  contain escape sequences; repair via a python script file.
 - `gh pr checks` polling: background `until` loop (foreground `sleep`
   chains are blocked by the harness).
 - A fresh worktree lacks `node_modules` — symlink the main checkout's
   install in rather than running installs. libsql's types reject the
   `{ sql }` object form for raw statements — use parameterized `args`.
-- NEW (PR #15 session): GitHub does NOT retarget a stacked PR when its
-  base PR merges unless the base branch is deleted — `gh pr edit N
-  --base main`, re-verify diff + CI, then merge; otherwise the merge
-  lands in the dead feature branch. (The previous handoff called
-  retargeting "optional housekeeping" — it is a merge-correctness
-  requirement.)
-- Fixed by PR #16 (merged 2026-07-07): `.gitignore` now uses bare
-  `node_modules` — the trailing-slash form matched directories only,
-  leaving worktree *symlinks* untracked and addable (LEARNINGS #24).
-  The stage-explicitly habit still applies as defense in depth.
+- Stacked-PR retargeting (LEARNINGS #22) has a cheap degenerate case:
+  if a task must start while its base PR is open, branch from the base
+  PR's head but DELAY committing; if the base merges first, a single
+  `git merge --ff-only origin/main` moves the commit-less branch onto
+  main and the stack dissolves — the PR opens against main directly.
+- Session-end docs from a feature-branch worktree: `scripts/push-docs`
+  requires being ON main — write HANDOFF/LEARNINGS in the main
+  checkout (`~/projects/conduit-HQ`), not the worktree branch, or the
+  handoff itself becomes invisible to the tripwire (LEARNINGS #21's
+  exact failure mode).
 
 ### Kickoff prompt for the next session
 
 > Continue building Conduit in ~/projects/conduit-HQ. Start by reading
 > HANDOFF.md and follow its protocol — including the PR check the
 > tripwire can't do: `gh pr list --state all --limit 5`. First check
-> whether the in-flight sourceSemantics-validation session landed its
-> PR: if open, it needs the full merge gate (Tier 2 + explainer +
-> quiz) before merging; do not redo its work. Then the current task:
-> §5.3 ToolInvoker pipeline v1 with §9.3 egress defaults. The
-> blindspot pass for this task has NOT been run yet: run /blindspot
-> first, then the tweakable plan, then implement. Work autonomously
-> per the project's memory: decide commonsensical things yourself;
-> confirm only destructive, outward-facing, or scope-changing actions.
-> Interface first, invariant tests in the same commit as the code that
-> earns them, INVARIANTS.md rows flip in that commit, conventional
-> commits, hook must stay green. Feature work runs on a branch from
-> origin/main and lands by PR per CLAUDE.md "Commit routing"; Tier 2
-> review + explainer + full-pass quiz before merge. At session end,
-> rewrite HANDOFF.md, append LEARNINGS.md, and publish the session
-> debrief artifact.
+> PR #18 (sourceSemantics validation): if still open it waits on the
+> human's quiz + explicit merge naming — do not merge it yourself and
+> do not redo its work. Then the current task: §5.3 ToolInvoker
+> pipeline v1 with §9.3 egress defaults. The blindspot pass for this
+> task has NOT been run yet: run /blindspot first, then the tweakable
+> plan, then implement. Work autonomously per the project's memory:
+> decide commonsensical things yourself; confirm only destructive,
+> outward-facing, or scope-changing actions. Interface first, invariant
+> tests in the same commit as the code that earns them, INVARIANTS.md
+> rows flip in that commit, conventional commits, hook must stay green.
+> Feature work runs on a branch from origin/main and lands by PR per
+> CLAUDE.md "Commit routing"; Tier 2 review + explainer + full-pass
+> quiz before merge. At session end, rewrite HANDOFF.md, append
+> LEARNINGS.md, and publish the session debrief artifact.
