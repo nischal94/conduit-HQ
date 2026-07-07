@@ -434,3 +434,34 @@ the chain. Rule of thumb: a `catch` that throws a fresh error must
 pass the original as `cause` unless there is a stated reason not to
 (e.g. the original could carry secrets). Cheap to pin:
 `expect(err.cause).toBeInstanceOf(SyntaxError)`.
+
+### 28. Unit-green everywhere still says nothing about the seams agreeing
+
+Every module was individually tested (151/151) and Tier-2 reviewed, yet
+the system had never once been composed and run. The verification pause
+produced an e2e smoke test that passed on the FIRST run — the seam
+discipline (interface-first, vocabulary policing in review) is what made
+that possible. But the same session's blindspot pass then found two
+cross-module semantic violations that no amount of composition-wiring
+tests would catch: credentials.ts's helpful error message (carrying the
+credentialRef) meets quickjs.ts's honest error forwarding, and together
+they violate §9.2 — each side individually correct and reviewed. Two
+lessons in one: (a) add the composition smoke test EARLY, it's cheap
+insurance and becomes the harness the next feature slots into; (b)
+integration tests catch wiring mismatches, but *reading two modules'
+contracts side by side* is what catches semantic interactions — budget
+for both, they are not substitutes.
+
+### 29. "Resolved" in a decisions ledger can mean the grammar, not the decision
+
+Spec §18 lists "Connection-prefix grammar: ✅ resolved" — and that
+reads like connection addressing is settled. It isn't: the grammar of
+prefixes is locked, but HOW a guest call (which carries only a
+namespace) selects among multiple connections of one integration is
+nowhere decided; §5.3 step 1 says "by namespace + connection prefix"
+without saying where the prefix comes from. A checked-off ledger row
+adjacent to an unmade decision is camouflage — the blindspot pass caught
+it only because it traced the call path end-to-end asking "where does
+each input come from?". When auditing a decisions list, test each ✅ by
+asking what a caller would concretely do, not whether the row's topic
+sounds covered.

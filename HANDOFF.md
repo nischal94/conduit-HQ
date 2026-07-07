@@ -23,148 +23,135 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-07 (sourceSemantics validation session)
+## Current handoff — written 2026-07-07 (verification-pause + §5.3 planning session)
 
 ### Where things stand
 
-- **sourceSemantics boundary validation COMPLETE — PR #18 merged
-  (`95f325b`, quiz passed + merge named by the human 2026-07-07).**
-  `fix: validate stored source_semantics at the sqlite boundary`
-  (commits `c0c0eb4` + `4561730` + `bd3669d`). This closed the highest-priority
-  residual gap from PR #15's Tier 2 review: `rowToTool`'s
-  `JSON.parse(...) as SourceSemantics` blind cast smuggled three
-  vocabularies (`kind`, graphql `operation`, custom_js `declaredRisk`)
-  past the #14/#15 column guards. A JSON blob has no CHECK twin —
-  SQLite can't see inside it — so the new `parseSourceSemantics`
-  read-side guard is the ONLY enforcement layer for those, fresh
-  schemas included. It rebuilds the union field-by-field (unknown keys
-  drop; absent mcp hints stay absent). All six JSON columns now route
-  through `parseJson`, which wraps corruption in the `[SqliteStore]`
-  format and carries the original SyntaxError as `cause` (its parse
-  position locates corruption in a large blob). `deriveRiskClass`
-  (risk.ts, exported public API) fails closed: never-bound `default`
-  arm, `declaredRisk` vocabulary check, boolean-or-absent mcp hints,
-  string-checked openapi method — all → `"destructive"` on garbage.
-- **PR #18 gate status:** CI 8/8 green on `bd3669d`; Tier 2 ran
-  (3 agents; findings + resolutions posted as a PR comment — the
-  review caught a real fail-OPEN defect in my own first version:
-  truthiness mcp hints let `readOnlyHint: "false"`, a truthy string,
-  classify "safe"; fixed + pinned same day, LEARNINGS #25); explainer +
-  quiz artifact posted
-  (claude.ai/code/artifact/90242521-9530-4617-bbc4-6ce680d21a39).
-  151/151 tests, tsc + Biome clean.
-- **main is `95f325b`** — 151/151 tests, INVARIANTS.md unchanged:
-  9 pinned ✅, 3 ⏳ (§9.3 egress, §11 Trace redaction, §5.5 execution
-  manager). PR #18 hardened an existing layer; no ledger row flipped.
-- **Follow-ups spawned by PR #18's Tier 2 (listed in the PR comment,
-  deliberately out of scope):** (1) `seeds`/`pausedOn` shape validators
-  mirroring `parseSourceSemantics` — corrupt seeds silently diverge
-  §5.5 replay, and `"null"` in `paused_on` loads as a null
-  `PendingApproval`; must-fix before §5.5 resume ships, together with
-  (2) `maybeText`/`maybeInteger` NULL-vs-corruption conflation and
-  (3) the unenforced `status === "paused"` ⟺ `paused_on IS NOT NULL`
-  invariant. NEW: (4) cross-field drift — `risk_class = "safe"` beside
-  `declaredRisk = "destructive"` passes both guards independently;
-  consider re-deriving on read. (5) LOW, pre-existing: a corrupt
-  identity column throws without row identity.
-- Policy engine v1 (PR #13) consumption discipline unchanged — proceed
-  only on `action === "allow"`; catalog lookup stays with the caller;
-  store failures propagate as rejections (LEARNINGS #18–19).
+- **Verification pause COMPLETE — the user called a stop-and-verify
+  before §5.3, and it paid.** Baseline re-proven on-machine (151/151,
+  tsc, Biome), then an end-to-end smoke test was written composing every
+  shipped module across its real seams: normalize → sqlite on disk →
+  reopen → catalog rehydrate → policy + credentials + QuickJS sandbox
+  through an inline ToolInvoker stand-in. It passed on the first run —
+  seam discipline held. **PR #19 merged (`bbe7726`, merge named by the
+  human 2026-07-07):** `test: add end-to-end smoke test composing all
+  modules across their seams` (`56f265c`). Gate: CI 8/8, CodeRabbit
+  clean, Tier 1 agent review pass (findings comment on the PR). Main is
+  **`bbe7726`** — 152/152 tests. The smoke test is now the standing
+  integration guard; **the §5.3 PR's acceptance criterion is to replace
+  its inline stub with the real pipeline and keep every assertion
+  green.**
+- **INVARIANTS.md unchanged:** 9 pinned ✅, 3 ⏳ (§9.3 egress — flips
+  with the §5.3 PR, §11 Trace redaction, §5.5 execution manager).
+- **Blindspot pass for §5.3 RUN (protocol debt cleared).** Artifact:
+  claude.ai/code/artifact/3c6b05e7-ac8c-47a9-a385-1d92dde85097 — nine
+  cards, file:line evidence. Sharpest findings: (1) `credentials.ts:63`
+  interpolates the credentialRef into its own error message and
+  `quickjs.ts:254` forwards any host error to the guest + journal — a
+  §9.2 zone violation the moment the pipeline wires `resolve()` in;
+  (2) journaling a policy denial as `{ok:false}` would poison §5.5
+  replay (memoized denial survives approval).
+- **Tweakable plan WRITTEN and decisions LOCKED (human delegated).**
+  Artifact: claude.ai/code/artifact/9f539fdb-cd1a-4904-9c63-d628cc4ef9ba
+  — decisions A1–A7 first, file map, tasks T1–T7 (TDD, one commit each).
+  Locked: A1 connection addressing v1 = single-connection-per-namespace,
+  fail closed on multiple, prefix param reserved on the seam; A3
+  TraceEvent gains capped `output` field, Trace = durable replay log for
+  call ops, search/describe persistence deferred to §5.5; A5 MCP-only
+  upstream behind a per-source-type seam, prefix-stripped names (known
+  limitation documented). Error vocabulary: ConduitPolicyDenied /
+  ConduitPolicyBlocked (non-memoizable, §5.5 contract) /
+  ConduitUpstreamError / ConduitInternalError (opaque + correlation id).
+  These three decisions land in spec §18 in the §5.3 PR (plan task T7).
+- **PR-review tiering rules were updated mid-session (global CLAUDE.md +
+  memory, re-read from disk 2026-07-07):** Tier 2 splits along the PR
+  lifecycle (`/pr-review-toolkit:review-pr all parallel` pre-PR;
+  `code-review:code-review <PR#>` post-PR), `aikido:scan` +
+  `/security-review` on security-touching PRs, `/codex:adversarial-review`
+  cross-model rung on the highest-stakes, `/code-review ultra` NOT in the
+  default ladder. The §5.3 PR is highest-stakes: all rungs apply, plus
+  explainer + quiz.
+- **PR #18 follow-ups still open** (listed in that PR's Tier 2 comment):
+  seeds/pausedOn shape validators (must-fix before §5.5 resume),
+  maybeText/maybeInteger NULL-vs-corruption conflation, the
+  status⟺paused_on invariant, cross-field risk_class/declaredRisk drift,
+  corrupt-identity-column row identity. None block §5.3.
+- Housekeeping: local branch `test/e2e-smoke` still exists (deletion
+  needs the human's confirmation per git-safety rules); remote branch
+  auto-deleted.
 - All prior decisions remain in force (PR-by-default routing, two-tier
-  allowlist + protected floor, branch protection deferred, Dependabot
-  alerts-only, esbuild low ACCEPTED, `delete_branch_on_merge` ON,
-  merge authority is the human's — do not re-litigate).
+  allowlist + protected floor, Dependabot alerts-only, merge authority
+  is the human's — do not re-litigate).
 
 ### Waiting on the human
 
-Nothing blocking. PR #18's full gate closed 2026-07-07: CI 8/8,
-Tier 2 findings resolved, explainer quiz passed, merge named
-explicitly, merged as `95f325b` (branch auto-deleted).
+Nothing blocking. The plan is approved-by-delegation ("decide what you
+think is best"); execution route chosen: fresh session.
 
-### Next task: §5.3 ToolInvoker pipeline v1 (with §9.3 egress defaults)
+### Next task: EXECUTE the §5.3 plan (T1–T7)
 
-Unchanged — the sqlite PRs were review follow-ups, not roadmap steps.
-Every part exists as a seam: resolver (§9.2 ✓), policy engine
-(§10.2 ✓), store ✓ (all vocabulary reads guarded, semantics blob
-included), sandbox + execute mount point ✓. The
-pipeline is the connective tissue: resolve connection → enforce policy
-→ attach credentials host-side → call upstream → append Trace event →
-return.
+The thinking is done — do not re-plan. Read the plan artifact, run its
+Ground-truth checks, then execute in order:
 
-**Protocol first (CLAUDE.md "Finding unknowns"): the blindspot pass
-for this task has still NOT been run.** Run `/blindspot` before
-planning — likely unknown-unknowns: upstream HTTP client choice
-(fetch, timeouts per CLAUDE.md security), §9.3 SSRF defaults
-(loopback/private egress OFF — this ⏳ invariant should flip with the
-pipeline), what a require_approval verdict does pre-§5.5 (probably:
-fail the call with the reason; pause/resume comes with the execution
-manager), Trace event shape vs §11 redaction (redaction is its own ⏳
-row — don't accidentally claim it), streaming/binary upstream
-responses, retry semantics.
+- T1 `pipeline/errors.ts` — guest-safe error vocabulary.
+- T2 `pipeline/egress.ts` — §9.3 guard; INVARIANT test + ledger flip in
+  the same commit.
+- T3 `pipeline/upstream.ts` — MCP caller: egress-guarded fetch, manual
+  redirects (refused v1), AbortSignal timeout, stream-capped JSON-only
+  responses.
+- T4 TraceEvent.output + sqlite column (ALTER-if-missing migration).
+- T5 `pipeline/invoker.ts` — the §5.3 composition; §9.2 leak tests
+  (failing reveal leaks nothing).
+- T6 wire-up: exports, sandbox.ts non-memoizable doc note, smoke-test
+  stub → real pipeline (+ §9.3-blocks-by-default, 401-echo, and
+  denied-journal-name tests).
+- T7 spec §18 decisions + `python3 html2md.py` + PR bookkeeping.
 
-**Carried from PR #14's Tier 2 review (silent-failure finding,
-deferred to this PR):** when the pipeline wires the policy engine into
-a ToolInvoker, `quickjs.ts` `perform()`'s broad catch needs
-infra-vs-upstream error classification — store-corruption rejections
-(the `[SqliteStore]` guard throws) must be logged host-side and must
-NOT leak `[SqliteStore]` internals to guest code.
+Stop-and-ask triggers (from the plan): any new dependency, any change to
+parseSourceSemantics or the ToolInvoker signature, any softening of a
+fail-closed default.
 
-Acceptance criteria (refine after the blindspot pass):
-- Pipeline behind a seam, composing the existing interfaces; mounted as
-  the ToolInvoker callback (`execute.ts`).
-- Policy enforced via the engine; allow-list consumption discipline
-  (proceed only on `action === "allow"` — documented in policy.ts).
-- §9.3 egress defaults implemented + INVARIANT §9.3 test in the same
-  commit; ledger row flips.
-- Trace events appended per call (§11 fields as data; redaction stays ⏳
-  and honestly marked).
-- Infra-vs-upstream error classification at the sandbox boundary (see
-  the carried finding above).
-- Same routing: branch from origin/main, PR, Tier 2 review (load-bearing),
-  explainer + quiz before merge.
+Gate: branch `feat/tool-invoker-pipeline` from origin/main; PR; Tier 2
+per the updated lifecycle split + aikido + /security-review +
+/codex:adversarial-review; /explain-diff + full-pass quiz; merge only
+when the human names it.
 
 ### Session quirks worth inheriting
 
-- Everything from the 2026-07-03/04 list still applies: direct binaries
+- Everything from prior lists still applies: direct binaries
   (`packages/sdk/node_modules/.bin/{tsc,vitest}`, `node_modules/.bin/biome`
-  from repo root); sandbox override needed for git writes and `gh`;
-  "certificate-25291" stderr noise is environmental; zsh eats `=`-prefixed
-  words; quickjs ground truth is the shipped dist (LEARNINGS #9).
-- Write-tool control bytes: the Edit tool can materialize a `\uXXXX`
-  escape you *typed as text* into a raw control byte — even in a plain
-  test-string edit. Verify with `cat -v` after any edit meant to
-  contain escape sequences; repair via a python script file.
+  from repo root); sandbox override needed for git network ops and `gh`;
+  "certificate-25291" stderr noise is environmental (pipe through
+  `grep -v certificate-25291`); zsh eats `=`-prefixed words; quickjs
+  ground truth is the shipped dist (LEARNINGS #9); fresh worktrees lack
+  node_modules — symlink, don't install; libsql rejects `{ sql }` object
+  form — use parameterized `args`.
+- The pre-commit hook runs the full suite + Biome; a commit doubles as a
+  verification run.
 - `gh pr checks` polling: background `until` loop (foreground `sleep`
-  chains are blocked by the harness).
-- A fresh worktree lacks `node_modules` — symlink the main checkout's
-  install in rather than running installs. libsql's types reject the
-  `{ sql }` object form for raw statements — use parameterized `args`.
-- Stacked-PR retargeting (LEARNINGS #22) has a cheap degenerate case:
-  if a task must start while its base PR is open, branch from the base
-  PR's head but DELAY committing; if the base merges first, a single
-  `git merge --ff-only origin/main` moves the commit-less branch onto
-  main and the stack dissolves — the PR opens against main directly.
+  chains are blocked).
 - Session-end docs from a feature-branch worktree: `scripts/push-docs`
-  requires being ON main — write HANDOFF/LEARNINGS in the main
-  checkout (`~/projects/conduit-HQ`), not the worktree branch, or the
-  handoff itself becomes invisible to the tripwire (LEARNINGS #21's
-  exact failure mode).
+  requires being ON main — write HANDOFF/LEARNINGS in the main checkout.
 
 ### Kickoff prompt for the next session
 
 > Continue building Conduit in ~/projects/conduit-HQ. Start by reading
-> HANDOFF.md and follow its protocol — including the PR check the
-> tripwire can't do: `gh pr list --state all --limit 5` (PR #18,
-> sourceSemantics validation, merged 2026-07-07 — do not redo its
-> work). Then the current task: §5.3 ToolInvoker
-> pipeline v1 with §9.3 egress defaults. The blindspot pass for this
-> task has NOT been run yet: run /blindspot first, then the tweakable
-> plan, then implement. Work autonomously per the project's memory:
-> decide commonsensical things yourself; confirm only destructive,
-> outward-facing, or scope-changing actions. Interface first, invariant
-> tests in the same commit as the code that earns them, INVARIANTS.md
-> rows flip in that commit, conventional commits, hook must stay green.
-> Feature work runs on a branch from origin/main and lands by PR per
-> CLAUDE.md "Commit routing"; Tier 2 review + explainer + full-pass
-> quiz before merge. At session end, rewrite HANDOFF.md, append
-> LEARNINGS.md, and publish the session debrief artifact.
+> HANDOFF.md and follow its protocol — including
+> `gh pr list --state all --limit 5` (PR #19, e2e smoke test, merged
+> 2026-07-07 — do not redo its work). Then the current task: EXECUTE the
+> §5.3 ToolInvoker pipeline plan — the blindspot pass and tweakable plan
+> are DONE, decisions A1–A7 are locked, do not re-plan. Plan artifact:
+> claude.ai/code/artifact/9f539fdb-cd1a-4904-9c63-d628cc4ef9ba (blindspot
+> companion: claude.ai/code/artifact/3c6b05e7-ac8c-47a9-a385-1d92dde85097).
+> Run the plan's Ground-truth checks, then tasks T1→T7 in order — TDD,
+> one commit per task, INVARIANT §9.3 test + ledger flip in T2's commit,
+> smoke-test stub replaced in T6 with every assertion green. Stop and ask
+> before: any new dependency, any change to parseSourceSemantics or the
+> ToolInvoker signature, any softening of a fail-closed default. Keep a
+> deviations log in the scratchpad from T1 onward. Branch
+> feat/tool-invoker-pipeline from origin/main; PR per commit routing;
+> Tier 2 (review-pr pre-PR, code-review:code-review post-PR) + aikido +
+> /security-review + /codex:adversarial-review at the gate; /explain-diff
+> + full-pass quiz before merge; merge only when the human names it. At
+> session end, rewrite HANDOFF.md, append LEARNINGS.md, and publish the
+> session debrief artifact.
