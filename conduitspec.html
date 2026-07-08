@@ -826,6 +826,13 @@ unauditable call must not silently succeed.</li>
 JSON-RPC 2.0 <code>tools/call</code> with the namespace prefix stripped to recover the upstream tool
 name. Known limitation: MCP names the normalizer transformed don't round-trip until the original
 name is stored in <code>sourceSemantics</code>. Other source types fail closed ("not yet callable").</li>
+<li><strong>Desktop app — OUT of launch/MVP scope:</strong> ✅ the Phase-3 desktop shell
+(§13.2) is explicitly NOT part of the initial launch. The launch surfaces are the CLI and web
+console (§12); the desktop app is a thin native shell over the <em>same</em> local service (§13.2,
+"a companion to the CLI … not a second runtime"), so deferring it removes a UI surface, not a
+capability, and strands no downstream work — Phases 4–5 (Cloud, self-host) do not depend on it. It
+remains a post-launch option enabled by the surface-agnostic core; picking it up later needs no
+rework. (Decided 2026-07-08.)</li>
 </ul>
 <p><strong>Deferred (future phases — none block v0.1 / Phase 0):</strong></p>
 <ol>
@@ -834,9 +841,11 @@ name is stored in <code>sourceSemantics</code>. Other source types fail closed (
 <li><strong>npm allowlist contents</strong>: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.</li>
 <li><strong>Pricing shape</strong> for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.</li>
 <li><strong>Approval push notifications</strong> (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.</li>
-<li><strong>Per-connect egress pinning</strong> (§9.3): the v1 guard resolves DNS and checks every
-address, then <code>fetch</code> re-resolves independently — a DNS-rebinding TOCTOU window. Closing it
-means resolving once and forcing the connection to the vetted IP — Phase 1.</li>
+<li><strong>Per-connect egress pinning</strong> (§9.3): ✅ <strong>SHIPPED</strong> 2026-07-08
+(Issue #21 / PR #22, merged early — was slated Phase 1). <code>createPinnedLookup</code> resolves
+once and forces the connection to the vetted resolved IP (canonicalize-then-check), closing both the
+address-encoding bypass and the DNS-rebinding TOCTOU. Pinned by <code>pipeline/egress.test.ts</code>
+(INVARIANTS.md §9.3).</li>
 <li><strong>UpstreamCaller as a trusted dependency</strong> (§5.3, §9.2): the pipeline treats an
 injected <code>UpstreamCaller</code> as trusted infrastructure — the same posture it holds toward the
 store and policy engine — not as an adversary. So the invoker does NOT re-validate a custom caller's
