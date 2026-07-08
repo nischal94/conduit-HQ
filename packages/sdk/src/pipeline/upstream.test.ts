@@ -1,9 +1,22 @@
+import { lookup as lookupCb } from "node:dns";
+import { lookup as lookupPromises } from "node:dns/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
-import { afterAll, describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it, vi } from "vitest";
 import type { Source, Tool } from "../types.js";
 import { GUEST_ERROR_NAMES } from "./errors.js";
 import { createMcpUpstreamCaller } from "./upstream.js";
+
+// Real by default; the rebinding test overrides both DNS entry points to make
+// the pre-flight (node:dns/promises) and the pinned lookup (node:dns) disagree.
+vi.mock("node:dns/promises", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:dns/promises")>();
+  return { ...actual, lookup: vi.fn(actual.lookup) };
+});
+vi.mock("node:dns", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:dns")>();
+  return { ...actual, lookup: vi.fn(actual.lookup) };
+});
 
 const SECRET = "Bearer ghp_upstream_secret_1a2b";
 
@@ -119,6 +132,43 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
       }),
     ).rejects.toThrow(/loopback\/private egress/);
     expect(requests).toHaveLength(0); // blocked before any bytes left the host
+  });
+
+  it("INVARIANT §9.3: the pinned lookup blocks a hostname that rebinds public→private at connect time", async () => {
+    // The authoritative TOCTOU-free path, end-to-end through the caller: the
+    // pre-flight (node:dns/promises) sees a PUBLIC address and passes, but the
+    // connect-time pinned lookup (node:dns) resolves the same host to a PRIVATE
+    // address — the classic DNS-rebinding window. The pinned lookup must fail
+    // closed so no socket ever connects to the private address.
+    const { port, requests } = await serve((_request, res) => jsonRpcResult(res, {}));
+    const rebindSource: Source = {
+      id: "src_rebind",
+      type: "mcp",
+      namespace: "github",
+      location: `http://rebind.example:${port}/mcp`,
+    };
+    // Pre-flight resolves public → passes.
+    vi.mocked(lookupPromises).mockResolvedValueOnce([
+      { address: "93.184.216.34", family: 4 },
+    ] as never);
+    // Connect-time pinned lookup resolves private → must be refused.
+    vi.mocked(lookupCb).mockImplementationOnce(((_host: string, _opts: unknown, cb: unknown) => {
+      (cb as (e: NodeJS.ErrnoException | null, a: { address: string; family: number }[]) => void)(
+        null,
+        [{ address: "127.0.0.1", family: 4 }],
+      );
+    }) as never);
+
+    await expect(
+      createMcpUpstreamCaller().call({
+        tool,
+        source: rebindSource,
+        input: {},
+        auth: { headers: {} },
+        timeoutMs: 2_000,
+      }),
+    ).rejects.toThrow(/loopback\/private/);
+    expect(requests).toHaveLength(0); // the socket never reached the server
   });
 
   it("refuses redirects (3xx → ConduitUpstreamError, no second request)", async () => {

@@ -184,3 +184,26 @@ Its own supply chain and code must hold the same bar it sells.
 - No secrets in the repo, ever — env vars only; `.env*` is gitignored.
 - Timeouts on every external call; parameterized queries only; validate at
   system boundaries.
+
+### Adversarial review has a stop line
+
+An adversarial/cross-model pass (§18: `codex exec` per
+`~/.claude/rules/codex-one-path.md`) is NOT an open-ended loop. It has
+**converged** — ship — when every finding it returns is either (a)
+out-of-scope by a documented spec §18 decision, or (b) against a layer
+explicitly labeled best-effort defense-in-depth. A genuine in-scope boundary
+break has NOT converged: fix it and re-run once. Full criterion:
+`~/.claude/rules/adversarial-convergence.md`.
+
+- **Do not extend a denylist-shaped check per finding.** If a pass keeps
+  finding the same *class* (another address encoding, another way to spell the
+  secret), the check is a denylist over unbounded input and will never
+  converge. Fix the SHAPE, not the spelling: **canonicalize-then-check** (the
+  §9.3 egress guard resolves once via `createPinnedLookup` and checks the
+  resolved binary IP — spec §18 Phase-1, closes DNS-rebinding too), or
+  **relabel as best-effort** (the §9.2 credential-echo scan in
+  `pipeline/upstream.ts` is a tripwire, not a boundary; the real guarantee is
+  request-scope-only credentials + §11 at-rest redaction).
+- Codified after Issue #21 (2026-07-08): two passes each found encoding
+  bypasses of these two checks — same class, dropping severity. The fix was
+  the shape change above, not more patterns.
