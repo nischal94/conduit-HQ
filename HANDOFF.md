@@ -23,14 +23,21 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-08 (Issue #21 MERGED; §5.5 execution manager is next)
+## Current handoff — written 2026-07-08 (Issue #21 MERGED; next target = the walking-skeleton MVP)
 
 ### Where things stand
 
-- **Main is `64f6553`, 228/228 green, in sync with origin.** Issue #21
+- **Main is `e1a26f4`, 228/228 green, in sync with origin.** Issue #21
   (per-connect IP pinning) is DONE — **PR #22 MERGED** (squash) 2026-07-08,
-  human-named for merge + quiz passed; **Issue #21 CLOSED**. No open PRs,
-  no stray branches, no stashes — repo is clean.
+  human-named for merge + quiz passed; **Issue #21 CLOSED**. Four PRs
+  merged this session: #22 (pinning), #23 (spec: desktop out of launch),
+  #24 (spec: MVP checkpoint). No open PRs, no stray branches, no stashes —
+  repo is clean.
+- **Two product decisions locked in the spec this session** (§18 + §17):
+  (1) the **desktop app is OUT of launch scope** (§18) — a UI surface, not
+  a capability; Phases 4–5 don't depend on it. (2) The **MVP Prototype
+  Checkpoint** (§17, the "walking skeleton") is now a named milestone —
+  the next build target. See the completion-map artifact + §17.
 - **What landed (PR #22):** egress converted denylist → canonical-form.
   `createPinnedLookup` in `packages/sdk/src/pipeline/egress.ts` resolves
   once and hands the socket only §9.3-vetted IPs (spec §18 Phase-1; closes
@@ -71,13 +78,41 @@ at session start.
   run `git branch -D <a-merged-branch>` and confirm it auto-approves with
   no prompt. (LEARNINGS #37.)
 
-### Next task: §5.5 execution manager
+### Next task: BUILD THE WALKING-SKELETON MVP (spec §17 milestone)
 
-The biggest unbuilt piece. Replay stripping of non-memoizable journal
-entries (`search`/`describe`), the approval queue, seeds/pausedOn
-validators (PR #18 follow-ups). §11 Trace redaction still ⏳ and its scope
-names `TraceEvent.output` (persisted unredacted for §5.5 replay). Both
-§5.5 rows in INVARIANTS.md still ⏳.
+The goal is the thinnest slice testable AS A PRODUCT: a real MCP agent
+(Claude Desktop / Cursor) drives a real tool call through the real
+§9.2/§9.3 boundary. **Read spec §17 "MVP Prototype Checkpoint" first — it
+is the authoritative definition (scope, what's deferred, the two-gate
+done).** Build order (each is a candidate PR; the security surface still
+gets Tier 2 + /security-review + an adversarial pass):
+
+1. **Finish Phase 0 — §5.5 execution manager.** The biggest unbuilt piece
+   and the prerequisite for safe multi-step agent code. Replay stripping
+   of non-memoizable journal entries (`search`/`describe`), the approval
+   queue, seeds/pausedOn validators (PR #18 follow-ups). Flips one §5.5
+   INVARIANTS row.
+2. **Finish Phase 0 — §11 Trace redaction.** Scope names `TraceEvent.output`
+   (persisted unredacted for §5.5 replay). Flips the §11 INVARIANTS row.
+   (After 1+2, all 13 invariants are ✅ and Phase 0 is complete.)
+3. **`/mcp` server — stdio transport first** (the form Claude Desktop /
+   Cursor use; HTTP streamable is a later add). This is the front door.
+4. **Minimal `conduit` CLI** — `serve`, `add-mcp`, add a source +
+   connection. Enough to set up and drive without a UI.
+5. **The §4.2 before/after token demo** — the spec's designated QA
+   artifact (~1,600 tools → 1 tool / ~1,044 tokens).
+
+**Deferred OUT of the MVP** (do NOT build yet): web console, FTS5/BM25
+search, Trace viewer/export, all of Phases 2–5.
+
+**MVP definition of done — BOTH gates (spec §17):** (1) Built — the
+skeleton runs end-to-end through the front door; (2) Verified — a
+deliberate edge-case / adversarial pass on the RUNNING skeleton has
+converged (malformed schemas, hostile upstream echoes, credential 401s,
+tool-call timeouts, resume-after-pause, redaction paths, the §14
+startup-reload UX caveat — each handled or documented out-of-scope). The
+happy path is the entry ticket to the test phase, not the finish line.
+Build the rest of the product only AFTER both gates pass.
 
 ### Session quirks worth inheriting
 
@@ -115,17 +150,22 @@ names `TraceEvent.output` (persisted unredacted for §5.5 replay). Both
 
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
 > first and follow its protocol — including `gh pr list --state all
-> --limit 5`. **Issue #21 (per-connect IP pinning) is DONE — PR #22 MERGED
-> 2026-07-08, main is `64f6553`, 228/228 green. Do NOT redo it.** Next
-> task: **the §5.5 execution manager** — replay stripping of
-> non-memoizable journal entries (`search`/`describe`), the approval
-> queue, seeds/pausedOn validators (PR #18 follow-ups), and §11 Trace
-> redaction (scope includes `TraceEvent.output`, persisted unredacted for
-> §5.5 replay). Both §5.5 rows in INVARIANTS.md are ⏳. Branch from
+> --limit 5`. **Issue #21 is DONE (PR #22 merged); main is `e1a26f4`,
+> 228/228 green. Do NOT redo it.** Next target: **build the
+> walking-skeleton MVP** — read spec §17 "MVP Prototype Checkpoint" for
+> the authoritative scope/done-definition, then build in order: (1) §5.5
+> execution manager, (2) §11 Trace redaction [these two finish Phase 0 and
+> flip the last ⏳ invariants], (3) `/mcp` server (stdio first), (4)
+> minimal `conduit` CLI, (5) the §4.2 before/after token demo. Do NOT
+> build the web console, FTS5, Trace viewer, or Phases 2–5 yet. The MVP is
+> done only when BOTH gates pass: built (a real MCP agent drives a real
+> tool call through the boundary) AND verified (a deliberate edge-case pass
+> on the running skeleton has converged). Each step: branch from
 > origin/main; PR per commit routing; Tier 2 + /security-review on the
 > security surface; ONE adversarial pass as the convergence gate (real
 > `codex exec` if quota is back post-Aug-1, else the sub-agent stand-in);
 > /explain-diff + full-pass quiz before merge; merge only when the human
-> names it. Optional retroactive carry-over: the Codex cross-model pass on
-> Issue #21 can still run after Aug 1 if wanted. At session end, rewrite
-> HANDOFF, append LEARNINGS, publish the debrief artifact.
+> names it. Before starting, consider `superpowers:brainstorming` /
+> `writing-plans` for the MVP build sequence — it's a multi-step feature,
+> not a one-shot. At session end, rewrite HANDOFF, append LEARNINGS,
+> publish the debrief artifact.
