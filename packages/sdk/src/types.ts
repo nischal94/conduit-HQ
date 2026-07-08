@@ -112,9 +112,20 @@ export interface TraceEvent {
   /** `namespace.tool` */
   toolName: string;
   connectionPrefix: string;
-  /** Redacted per policy before storage; never contains raw credentials (spec §11). */
+  /**
+   * Stored as received in v1; §11 policy redaction is a pending invariant
+   * (INVARIANTS.md) that must scope this field — it is NOT redacted yet.
+   */
   input: unknown;
   outputSummary?: unknown;
+  /**
+   * Full upstream result for §5.5 replay, bounded by the MCP caller's
+   * response cap; absent for denied/failed calls. outputSummary remains
+   * the display projection. Deliberately stored UNREDACTED for replay
+   * fidelity: the pending §11 Trace-redaction invariant must scope this
+   * field when it lands (redaction may not destroy the replay payload).
+   */
+  output?: unknown;
   upstreamStatus?: number;
   latencyMs?: number;
   policyVerdict: PolicyAction;

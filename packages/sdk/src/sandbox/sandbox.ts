@@ -42,6 +42,11 @@ export interface ExecutionRequest {
  * code + seeds + journal — so pause/resume survives restarts and needs no
  * VM snapshot. Entries are consumed in call order; deterministic code
  * (enforced by the seeds) makes that order stable across replays.
+ *
+ * Entries whose error name is in NON_MEMOIZABLE_ERROR_NAMES
+ * (pipeline/errors.ts) record a policy refusal, not a result; the §5.5
+ * execution manager (pending — INVARIANTS.md) MUST strip them before replay
+ * so an approved call re-executes live instead of replaying its own denial.
  */
 export interface JournalEntry {
   op: "search" | "describe" | "call";

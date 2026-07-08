@@ -1,19 +1,22 @@
 import { mkdtempSync } from "node:fs";
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { afterAll, describe, expect, it } from "vitest";
 import { InMemoryCatalog } from "./catalog.js";
 import { createStoreCredentialResolver } from "./credentials.js";
-import type { ToolInvoker } from "./execute.js";
 import { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execute.js";
 import { normalizeMcp } from "./normalize/mcp.js";
+import { GUEST_ERROR_NAMES, NON_MEMOIZABLE_ERROR_NAMES } from "./pipeline/errors.js";
+import { createToolInvoker } from "./pipeline/invoker.js";
+import { createMcpUpstreamCaller } from "./pipeline/upstream.js";
 import { createStorePolicyEngine } from "./policy.js";
 import { QuickJSSandbox } from "./sandbox/quickjs.js";
 import { SecretBox } from "./secrets.js";
 import { openSqliteStore } from "./store/sqlite.js";
 import type { ConduitStore } from "./store/store.js";
-import type { TraceEvent } from "./types.js";
 
 /**
  * END-TO-END SMOKE (verification pass, 2026-07-07 — not a unit suite).
@@ -21,11 +24,11 @@ import type { TraceEvent } from "./types.js";
  * Composes every shipped module across its real seam, the way the product
  * will: normalize an MCP source → persist to SQLite on disk → reopen the
  * store (fresh process simulation) → rehydrate the catalog → policy engine
- * + credential resolver + QuickJS sandbox wired through a ToolInvoker.
- *
- * The ONLY stand-in is the invoker itself: §5.3 is unbuilt, so a minimal
- * inline pipeline (policy → credentials → stubbed upstream → trace) mounts
- * at the seam the real one will occupy. Everything else is shipped code.
+ * + credential resolver + QuickJS sandbox wired through the REAL §5.3
+ * pipeline (createToolInvoker + createMcpUpstreamCaller) against a local
+ * node:http MCP server. Nothing in the call path is a stand-in anymore;
+ * PR #19's acceptance criterion — replace the inline stub, keep every
+ * assertion green — is discharged here.
  */
 
 const SECRET = "Bearer ghp_smoke_secret_do_not_leak_9f2c";
@@ -59,10 +62,55 @@ const mcpToolsList = [
   },
 ];
 
+const ISSUES_RESULT = { issues: [{ id: 1, title: "Fix login bug" }] };
+
 interface UpstreamCall {
-  path: string;
-  input: unknown;
+  name: string;
+  arguments: unknown;
   sawAuthHeader: boolean;
+}
+
+/**
+ * A live MCP server on loopback. `/mcp` answers tools/call with the issues
+ * fixture and records what it saw; `/echo401` plays a hostile upstream that
+ * rejects auth AND echoes the Authorization header back in its body
+ * (blindspot card 09 — the echoed secret must go nowhere).
+ */
+function startMcpServer(): Promise<{
+  server: Server;
+  port: number;
+  upstreamCalls: UpstreamCall[];
+}> {
+  const upstreamCalls: UpstreamCall[] = [];
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      if (req.url === "/echo401") {
+        res.writeHead(401, { "content-type": "application/json" });
+        res.end(JSON.stringify({ error: "bad token", echoed: req.headers.authorization }));
+        return;
+      }
+      const payload = JSON.parse(body) as {
+        id: string;
+        params: { name: string; arguments: unknown };
+      };
+      upstreamCalls.push({
+        name: payload.params.name,
+        arguments: payload.params.arguments,
+        sawAuthHeader: req.headers.authorization === SECRET,
+      });
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: ISSUES_RESULT }));
+    });
+  });
+  return new Promise((resolve) => {
+    server.listen(0, "127.0.0.1", () => {
+      resolve({ server, port: (server.address() as AddressInfo).port, upstreamCalls });
+    });
+  });
 }
 
 async function openStore(): Promise<{
@@ -79,13 +127,25 @@ async function openStore(): Promise<{
 
 describe("e2e smoke: ingest → persist → reopen → policy → sandbox → invoke", () => {
   const clients: ReturnType<typeof createClient>[] = [];
-  afterAll(() => {
+  let mcpServer: Server | undefined;
+  afterAll(async () => {
     for (const c of clients) {
       c.close();
     }
+    await new Promise<void>((resolve) => {
+      if (mcpServer === undefined) {
+        resolve();
+        return;
+      }
+      mcpServer.close(() => resolve());
+    });
   });
 
   it("runs the whole prototype flow with no secret leakage", async () => {
+    const { server, port, upstreamCalls } = await startMcpServer();
+    mcpServer = server;
+    const mcpLocation = `http://127.0.0.1:${port}/mcp`;
+
     // ── Phase 1: ingest and persist (first "process") ──────────────────
     const first = await openStore();
     clients.push(first.client);
@@ -101,7 +161,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       id: "src_gh",
       type: "mcp",
       namespace: "github",
-      location: "https://mcp.example.com/github",
+      location: mcpLocation,
     });
     await first.store.integrations.upsert({
       id: "int_gh",
@@ -154,45 +214,22 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     });
     expect(estimateTokens(definition)).toBeLessThanOrEqual(1044);
 
-    // ── Phase 4: minimal §5.3 stand-in mounted at the ToolInvoker seam ──
+    // ── Phase 4: the REAL §5.3 pipeline mounted at the ToolInvoker seam ──
     const policyEngine = createStorePolicyEngine(store.policies);
     const resolver = createStoreCredentialResolver(store.secrets);
-    const upstreamCalls: UpstreamCall[] = [];
-    const traceRows: TraceEvent[] = [];
+    const hostLog: string[] = [];
 
-    const invoke: ToolInvoker = async (path, input) => {
-      const tool = await store.tools.get(path);
-      const verdict = await policyEngine.evaluate({
-        target: tool ? { kind: "known", tool } : { kind: "unknown", toolName: path },
-        input,
-      });
-      // Allow-list discipline (policy.ts): proceed ONLY on "allow".
-      if (verdict.action !== "allow") {
-        throw new Error(verdict.reason);
-      }
-      const connection = await store.connections.getByPrefix(PREFIX);
-      if (connection === undefined) {
-        throw new Error("smoke: connection missing");
-      }
-      const auth = await resolver.resolve(connection);
-      upstreamCalls.push({
-        path,
-        input,
-        sawAuthHeader: auth.headers.Authorization === SECRET,
-      });
-      const event: TraceEvent = {
-        callId: `call_${upstreamCalls.length}`,
-        executionId: "exec_smoke",
-        toolName: path,
-        connectionPrefix: PREFIX,
-        input,
-        policyVerdict: verdict.action,
-        at: Date.now(),
-      };
-      await store.trace.append(event);
-      traceRows.push(event);
-      return { issues: [{ id: 1, title: "Fix login bug" }] };
-    };
+    const invoke = createToolInvoker(
+      {
+        store,
+        policy: policyEngine,
+        credentials: resolver,
+        // The test upstream lives on loopback, so the trusted-code opt-in
+        // applies here; Phase 9 proves the default blocks it.
+        upstream: createMcpUpstreamCaller({ egress: { allowPrivate: true } }),
+      },
+      { executionId: "exec_smoke", log: (message) => hostLog.push(message) },
+    );
 
     const host = createCatalogToolHost(catalog, invoke);
     const sandbox = new QuickJSSandbox();
@@ -213,11 +250,13 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       expect(happy.value).toEqual({
         path: "github.list_issues",
         gotSchema: true,
-        result: { issues: [{ id: 1, title: "Fix login bug" }] },
+        result: ISSUES_RESULT,
       });
     }
+    // The wire request the upstream actually saw: prefix-stripped name
+    // (decision A5), original arguments, authenticated.
     expect(upstreamCalls).toEqual([
-      { path: "github.list_issues", input: { owner: "acme", repo: "site" }, sawAuthHeader: true },
+      { name: "list_issues", arguments: { owner: "acme", repo: "site" }, sawAuthHeader: true },
     ]);
 
     // ── Phase 6: policy stops a destructive call inside the sandbox ─────
@@ -227,16 +266,30 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
           await tools.github.delete_repo({ repo: "site" });
           return "UNREACHABLE";
         } catch (error) {
-          return String(error.message ?? error);
+          return { name: error.name, message: String(error.message ?? error) };
         }
       `,
       tools: host,
     });
     expect(blocked.status).toBe("completed");
     if (blocked.status === "completed") {
-      expect(String(blocked.value)).toContain("requires approval");
+      const value = blocked.value as { name: string; message: string };
+      expect(value.name).toBe(GUEST_ERROR_NAMES.policyDenied);
+      expect(value.message).toContain("requires approval");
     }
     expect(upstreamCalls).toHaveLength(1); // upstream never touched
+
+    // The journal entry pins the §5.5 contract end-to-end: the denial is
+    // recorded under its non-memoizable name, so the execution manager can
+    // strip it before replay (an approved call must re-execute live).
+    expect(blocked.journal).toHaveLength(1);
+    const deniedEntry = blocked.journal[0];
+    expect(deniedEntry?.op).toBe("call");
+    expect(deniedEntry?.outcome.ok).toBe(false);
+    if (deniedEntry && deniedEntry.outcome.ok === false) {
+      expect(deniedEntry.outcome.error.name).toBe(GUEST_ERROR_NAMES.policyDenied);
+      expect(NON_MEMOIZABLE_ERROR_NAMES).toContain(deniedEntry.outcome.error.name);
+    }
 
     // Unknown tool fails closed with the catalog-miss vocabulary.
     const unknown = await sandbox.execute({
@@ -245,14 +298,16 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
           await tools.github.no_such_tool({});
           return "UNREACHABLE";
         } catch (error) {
-          return String(error.message ?? error);
+          return { name: error.name, message: String(error.message ?? error) };
         }
       `,
       tools: host,
     });
     expect(unknown.status).toBe("completed");
     if (unknown.status === "completed") {
-      expect(String(unknown.value)).toContain("blocked");
+      const value = unknown.value as { name: string; message: string };
+      expect(value.name).toBe(GUEST_ERROR_NAMES.policyBlocked);
+      expect(value.message).toContain("blocked");
     }
 
     // ── Phase 7: operator override is live on the next call (no cache) ──
@@ -268,14 +323,16 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
           await tools.github.list_issues({ owner: "acme", repo: "site" });
           return "UNREACHABLE";
         } catch (error) {
-          return String(error.message ?? error);
+          return { name: error.name, message: String(error.message ?? error) };
         }
       `,
       tools: host,
     });
     expect(overridden.status).toBe("completed");
     if (overridden.status === "completed") {
-      expect(String(overridden.value)).toContain("operator blocked");
+      const value = overridden.value as { name: string; message: string };
+      expect(value.name).toBe(GUEST_ERROR_NAMES.policyBlocked);
+      expect(value.message).toContain("operator blocked");
     }
 
     // ── Phase 8: §9.2 — nothing sandbox-visible ever carried the secret ─
@@ -292,11 +349,92 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     expect(everythingGuestVisible).not.toContain("ghp_smoke");
     expect(everythingGuestVisible).not.toContain("cred_gh"); // even the ref stays host-side
 
-    // Trace persisted in call order.
+    // Trace persisted in call order — the §5.3 pipeline audits refusals
+    // too (decision A3), so the journal-of-record now carries them all.
     const persistedTrace = await store.trace.listByExecution("exec_smoke");
-    expect(persistedTrace).toHaveLength(1);
-    expect(persistedTrace[0]?.toolName).toBe("github.list_issues");
-    expect(persistedTrace[0]?.policyVerdict).toBe("allow");
+    expect(persistedTrace.map((e) => [e.toolName, e.policyVerdict])).toEqual([
+      ["github.list_issues", "allow"],
+      ["github.delete_repo", "require_approval"],
+      ["github.no_such_tool", "block"],
+      ["github.list_issues", "block"],
+    ]);
+    expect(persistedTrace[0]?.connectionPrefix).toBe(PREFIX);
+    expect(persistedTrace[0]?.output).toEqual(ISSUES_RESULT); // §5.5 replay payload
+    expect(persistedTrace[0]?.upstreamStatus).toBe(200);
     expect(JSON.stringify(persistedTrace)).not.toContain("ghp_smoke");
+
+    // ── Phase 9: §9.3 default — the same pipeline WITHOUT the opt-in flag
+    // refuses the loopback upstream before a single byte leaves the host ──
+    await store.policies.upsert({
+      toolName: "github.list_issues",
+      action: "allow",
+      seededFrom: "safe",
+      manualOverride: true, // operator re-allows; change is live immediately
+    });
+    const guardedInvoke = createToolInvoker(
+      {
+        store,
+        policy: policyEngine,
+        credentials: resolver,
+        upstream: createMcpUpstreamCaller(), // §9.3 defaults: no allowPrivate
+      },
+      { executionId: "exec_egress", log: (message) => hostLog.push(message) },
+    );
+    const guardedHost = createCatalogToolHost(catalog, guardedInvoke);
+    const egressBlocked = await sandbox.execute({
+      code: `
+        try {
+          await tools.github.list_issues({ owner: "acme", repo: "site" });
+          return "UNREACHABLE";
+        } catch (error) {
+          return { name: error.name, message: String(error.message ?? error) };
+        }
+      `,
+      tools: guardedHost,
+    });
+    expect(egressBlocked.status).toBe("completed");
+    if (egressBlocked.status === "completed") {
+      const value = egressBlocked.value as { name: string; message: string };
+      expect(value.name).toBe(GUEST_ERROR_NAMES.upstream);
+      expect(value.message).toContain("loopback/private egress is off by default");
+    }
+    expect(upstreamCalls).toHaveLength(1); // still only the Phase-5 call
+
+    // ── Phase 10: hostile upstream echoes the secret back (card 09) —
+    // the echo goes nowhere: not the error, not the journal, not Trace ──
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: "github",
+      location: `http://127.0.0.1:${port}/echo401`,
+    });
+    const rejected = await sandbox.execute({
+      code: `
+        try {
+          await tools.github.list_issues({ owner: "acme", repo: "site" });
+          return "UNREACHABLE";
+        } catch (error) {
+          return { name: error.name, message: String(error.message ?? error) };
+        }
+      `,
+      tools: host, // the exec_smoke invoker: allowPrivate, live source lookup
+    });
+    expect(rejected.status).toBe("completed");
+    if (rejected.status === "completed") {
+      const value = rejected.value as { name: string; message: string };
+      expect(value.name).toBe(GUEST_ERROR_NAMES.upstream);
+      expect(value.message).toContain("401");
+    }
+    expect(JSON.stringify(rejected)).not.toContain(SECRET); // result + journal
+    const traceAfter401 = await store.trace.listByExecution("exec_smoke");
+    expect(traceAfter401).toHaveLength(5); // A3: allowed + upstream-failure traces
+    const failureRow = traceAfter401[4];
+    expect(failureRow?.policyVerdict).toBe("allow");
+    expect(failureRow && "output" in failureRow).toBe(false);
+    expect(JSON.stringify(traceAfter401)).not.toContain(SECRET);
+    expect(JSON.stringify(traceAfter401)).not.toContain("ghp_smoke");
+    // The host-side log never saw it either: the secret lived only in the
+    // fetch argument scope (spec §9.2).
+    expect(hostLog.join("\n")).not.toContain(SECRET);
   });
 });

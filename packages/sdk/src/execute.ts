@@ -83,10 +83,10 @@ export function estimateTokens(definition: ExecuteToolDefinition): number {
 }
 
 /**
- * What the §5.3 pipeline will be: resolve connection, enforce policy,
- * attach credentials host-side, call upstream, record Trace. Phase 0
- * injects it as a callback so the sandbox and catalog land without
- * policy/credentials growing into the sandbox's vocabulary (spec §9.2).
+ * The §5.3 pipeline mounts here — see createToolInvoker in
+ * pipeline/invoker.ts. Injected as a callback so the sandbox and catalog
+ * land without policy/credentials growing into the sandbox's vocabulary
+ * (spec §9.2).
  */
 export type ToolInvoker = (path: string, input: unknown) => Promise<unknown>;
 
