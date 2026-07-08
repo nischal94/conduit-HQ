@@ -88,10 +88,15 @@ done).** Build order (each is a candidate PR; the security surface still
 gets Tier 2 + /security-review + an adversarial pass):
 
 1. **Finish Phase 0 — §5.5 execution manager.** The biggest unbuilt piece
-   and the prerequisite for safe multi-step agent code. Replay stripping
-   of non-memoizable journal entries (`search`/`describe`), the approval
-   queue, seeds/pausedOn validators (PR #18 follow-ups). Flips one §5.5
-   INVARIANTS row.
+   and the prerequisite for safe multi-step agent code. **START WITH A
+   BRAINSTORM + PLAN, do NOT jump to code** (`superpowers:brainstorming`
+   then `writing-plans`) — this is the largest and most design-heavy piece
+   in the whole MVP, so surface the unknowns first (replay determinism,
+   what's memoizable vs. must-re-run, the approval-queue state machine,
+   how pause/resume interacts with the §11 redaction in step 2). Then
+   build: replay stripping of non-memoizable journal entries
+   (`search`/`describe`), the approval queue, seeds/pausedOn validators
+   (PR #18 follow-ups). Flips one §5.5 INVARIANTS row.
 2. **Finish Phase 0 — §11 Trace redaction.** Scope names `TraceEvent.output`
    (persisted unredacted for §5.5 replay). Flips the §11 INVARIANTS row.
    (After 1+2, all 13 invariants are ✅ and Phase 0 is complete.)
