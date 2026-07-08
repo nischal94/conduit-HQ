@@ -78,6 +78,24 @@ export async function assertEgressAllowed(target: URL, options: EgressOptions = 
  * private upstream), matching {@link assertEgressAllowed}'s opt-in. Fails
  * closed: an all-private answer, or a resolver error, aborts the connect.
  */
+/**
+ * Structural marker on an egress-block error. The caller detects a §9.3
+ * refusal by this property, not by string-matching the message: a probe
+ * confirms Node passes a lookup-callback error object through to the request's
+ * `error` event with custom properties intact, but relying on the message text
+ * surviving unwrapped across Node versions is fragile — the tag is not.
+ */
+export const EGRESS_BLOCKED = Symbol.for("conduit.egressBlocked");
+
+/** True if `err` is a §9.3 egress refusal raised by the pinned lookup. */
+export function isEgressBlockedError(err: unknown): boolean {
+  return err instanceof Error && (err as { [EGRESS_BLOCKED]?: boolean })[EGRESS_BLOCKED] === true;
+}
+
+function egressBlockedError(message: string): Error {
+  return Object.assign(new Error(message), { [EGRESS_BLOCKED]: true });
+}
+
 export function createPinnedLookup(options: EgressOptions = {}): LookupFunction {
   return (hostname: string, opts: LookupOptions, callback): void => {
     // Always resolve with all:true so EVERY address is vetted, regardless of
@@ -94,10 +112,10 @@ export function createPinnedLookup(options: EgressOptions = {}): LookupFunction 
           ? resolved
           : resolved.filter((entry) => !isPrivateAddress(entry.address));
       if (vetted.length === 0) {
-        // Fail closed with our own message: the connect never happens. The
+        // Fail closed with a tagged error: the connect never happens. The
         // classifier already rejected every resolved address.
         callback(
-          new Error(
+          egressBlockedError(
             `[EgressGuard] Blocked: every resolved address is loopback/private (spec §9.3). Context: { host: ${hostname} }`,
           ),
           "",
@@ -109,8 +127,15 @@ export function createPinnedLookup(options: EgressOptions = {}): LookupFunction 
         callback(null, vetted);
         return;
       }
-      // Single-address shape: hand back the first vetted entry.
-      const [first] = vetted;
+      // Single-address shape: honor the caller's requested family (opts.family
+      // is 4 or 6 when the connect path pinned one; 0/undefined means any) so
+      // a family-constrained socket never gets a mismatched record.
+      const family = opts.family === 4 || opts.family === 6 ? opts.family : undefined;
+      const preferred = family === undefined ? vetted : vetted.filter((e) => e.family === family);
+      // If the filter emptied the set the caller asked for a family we can't
+      // satisfy; fall back to the first vetted entry (still §9.3-vetted) so the
+      // connect fails on family mismatch, not on an un-vetted address.
+      const [first] = preferred.length > 0 ? preferred : vetted;
       callback(null, first?.address ?? "", first?.family ?? 0);
     });
   };

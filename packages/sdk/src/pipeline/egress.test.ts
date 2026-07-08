@@ -2,7 +2,12 @@ import type { LookupAddress } from "node:dns";
 import { lookup as lookupCb } from "node:dns";
 import { lookup } from "node:dns/promises";
 import { describe, expect, it, vi } from "vitest";
-import { assertEgressAllowed, createPinnedLookup, isPrivateAddress } from "./egress.js";
+import {
+  assertEgressAllowed,
+  createPinnedLookup,
+  isEgressBlockedError,
+  isPrivateAddress,
+} from "./egress.js";
 
 // Real lookup by default (the "localhost" test depends on it); individual
 // tests override per-call to simulate attacker-controlled DNS.
@@ -235,6 +240,15 @@ describe("createPinnedLookup (spec §9.3 per-connect pinning)", () => {
     );
   });
 
+  it("tags the all-private rejection so the caller detects it structurally, not by message text", async () => {
+    stubResolver([{ address: "10.0.0.5", family: 4 }]);
+    const err = await pin(createPinnedLookup(), "allprivate.example").catch((e) => e);
+    expect(isEgressBlockedError(err)).toBe(true);
+    // A generic error is NOT flagged (no false positives).
+    expect(isEgressBlockedError(new Error("getaddrinfo ENOTFOUND"))).toBe(false);
+    expect(isEgressBlockedError(undefined)).toBe(false);
+  });
+
   it("INVARIANT §9.3: a NAT64-resolving name is blocked by the embedded-v4 classifier, not a text rule", async () => {
     // The resolver returns the canonical expanded form; the classifier reads
     // the embedded 169.254.169.254 (cloud metadata) and rejects it. No text
@@ -268,5 +282,25 @@ describe("createPinnedLookup (spec §9.3 per-connect pinning)", () => {
     const vetted = await pin(createPinnedLookup(), "mixed.example", false);
     // all:false → first vetted entry only; the private one is dropped first.
     expect(vetted).toEqual([{ address: "93.184.216.34", family: 4 }]);
+  });
+
+  it("honors opts.family in the single-address path (no mismatched record)", async () => {
+    // A family-constrained connect (all:false, family:4) must get an IPv4
+    // record even when a public IPv6 sorts first — never a mismatched family.
+    stubResolver([
+      { address: "2606:2800:220:1::1", family: 6 }, // public v6, sorts first
+      { address: "93.184.216.34", family: 4 }, // public v4, the requested family
+    ]);
+    const lookupFn = createPinnedLookup();
+    const got = await new Promise<{ address: string; family: number }[]>((resolve, reject) => {
+      lookupFn("dual.example", { all: false, family: 4 } as never, (err, address, family) => {
+        if (err !== null) {
+          reject(err);
+          return;
+        }
+        resolve([{ address: address as string, family: family ?? 0 }]);
+      });
+    });
+    expect(got).toEqual([{ address: "93.184.216.34", family: 4 }]);
   });
 });

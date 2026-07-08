@@ -2,7 +2,12 @@ import { request as httpRequest, type IncomingMessage } from "node:http";
 import { request as httpsRequest } from "node:https";
 import type { UpstreamAuth } from "../credentials.js";
 import type { Source, Tool } from "../types.js";
-import { assertEgressAllowed, createPinnedLookup, type EgressOptions } from "./egress.js";
+import {
+  assertEgressAllowed,
+  createPinnedLookup,
+  type EgressOptions,
+  isEgressBlockedError,
+} from "./egress.js";
 import { ConduitCallError, upstreamError } from "./errors.js";
 
 /**
@@ -91,25 +96,34 @@ export function createMcpUpstreamCaller(
           lookup: pinnedLookup,
         });
       } catch (cause) {
-        // A pre-response lookup rejection (every resolved address private, or
-        // NXDOMAIN) is an egress/upstream refusal, ref-free by construction.
         if (cause instanceof ConduitCallError) {
           throw cause;
+        }
+        // A §9.3 refusal from the pinned lookup (every resolved address private
+        // at connect time — the DNS-rebinding case) is detected structurally,
+        // not by string-matching: the tagged error's message is ref-free and
+        // crosses to the agent verbatim.
+        if (isEgressBlockedError(cause)) {
+          throw upstreamError((cause as Error).message);
         }
         const reason =
           cause instanceof Error && cause.name === "TimeoutError"
             ? `timed out after ${request.timeoutMs}ms`
-            : cause instanceof Error && cause.message.startsWith("[EgressGuard]")
-              ? cause.message
-              : "request failed before a response arrived";
+            : "request failed before a response arrived";
         throw upstreamError(
-          reason.startsWith("[EgressGuard]")
-            ? reason
-            : `Upstream call failed: ${reason}. Context: { tool: ${request.tool.name} }`,
+          `Upstream call failed: ${reason}. Context: { tool: ${request.tool.name} }`,
         );
       }
       const latencyMs = Date.now() - startedAt;
       const status = res.statusCode ?? 0;
+      if (status === 0) {
+        // No parsed status line (malformed response). Refuse with a clear
+        // reason rather than the confusing "HTTP 0".
+        res.destroy();
+        throw upstreamError(
+          `Upstream response had no valid status line. Context: { tool: ${request.tool.name} }`,
+        );
+      }
       if (status >= 300 && status < 400) {
         res.destroy(); // release the socket; the redirect is refused, never followed
         throw upstreamError(
@@ -306,11 +320,19 @@ function sendPinnedRequest(args: {
         headers: { ...headers, "content-length": String(Buffer.byteLength(payload)) },
         lookup,
       },
-      (res) => resolve(res),
+      (res) => {
+        // Headers arrived: the PRE-RESPONSE deadline is done. Disarm it so it
+        // cannot fire during the body-read phase — readCapped owns that
+        // deadline exclusively. Leaving it armed would race readCapped's timer
+        // and, if it won, destroy the socket with a plain "aborted" error that
+        // the caller mis-classifies as a connection failure, not a timeout.
+        req.setTimeout(0);
+        resolve(res);
+      },
     );
-    // One deadline governs the whole exchange; setTimeout fires if the socket
-    // is idle past it. Destroy with a TimeoutError so the caller's name check
-    // (mirrored from AbortSignal.timeout) classifies it as a timeout.
+    // The pre-response deadline: fires only until headers arrive. Destroy with
+    // a TimeoutError so the caller's name check (mirrored from
+    // AbortSignal.timeout) classifies it as a timeout.
     req.setTimeout(timeoutMs, () => {
       req.destroy(Object.assign(new Error("Upstream request timed out"), { name: "TimeoutError" }));
     });
