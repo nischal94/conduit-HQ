@@ -503,3 +503,56 @@ rather than about code:
   thing: what's broken, in one sentence, and the exact next action.
 
 This entry is history; the enforcement lives in the rule + hook above.
+
+### 31. The cross-model adversarial pass earns its rung — it catches a class the same-model reviewers can't
+
+Five specialized review agents plus a dedicated security sub-agent — all
+the same model family as the author — reviewed the §5.3 pipeline and
+passed it. The Codex adversarial pass (a different model) then found a
+HIGH §9.2 credential leak they all missed: a hostile MCP server
+JSON-escapes the credential (`ghp_x`), the raw-body echo scan
+misses the escaped bytes, and `JSON.parse` decodes it back to plaintext
+into the sandbox/journal/Trace. Verified exploitable with a harness
+before fixing. The lesson isn't "review more" — it's that a reviewer
+sharing the author's blind spots will systematically miss the same
+things the author missed. A genuinely DIFFERENT model is not redundancy;
+it covers a different region of the error space. Keep the cross-model
+rung; it paid for itself in one run. (Enforcement: it's a named rung in
+the global PR-review rule; the ONE invocation path is now
+`~/.claude/rules/codex-one-path.md`.)
+
+### 32. Repeated adversarial findings of the SAME class mean the check is the wrong shape, not that the product is broken
+
+Two adversarial passes each found encoding-bypasses of the egress guard
+and the credential-echo scan — JSON-escape, short-token, NAT64, plus the
+earlier hex-form and decimal-IP. It *felt* like the product was
+crumbling ("every pass finds bugs → everything is broken"). It wasn't.
+Two diagnostics separate rot from a bounded weakness: (a) severity
+trajectory — these DROPPED each pass (round 1 broke the boundary; round
+2 found narrow gaps in defenses already mostly working), a convergence
+signature, not a rot one; (b) class — every finding was ONE bug ("encode
+the dangerous value in a form the check doesn't recognize; it's decoded
+later"), which is a single design weakness in two checks, not N random
+defects. The root cause: both checks are **denylist-shaped** (scan for
+known-bad patterns) over an unbounded input space, so they never
+converge — there is always another spelling. The fix is to change the
+check SHAPE (canonicalize-then-check, e.g. per-connect IP pinning that
+checks the resolved binary address; or relabel an un-completable scan as
+best-effort defense-in-depth), NOT to add spellings. This also yields a
+STOP LINE for adversarial review — converged when every finding is
+out-of-scope or best-effort — which is what turns "infinite whack-a-mole"
+into a finite gate. (Enforcement: `~/.claude/rules/adversarial-convergence.md`;
+the concrete shape-fix is tracked in Issue #21.)
+
+### 33. Two-front git safety: a parallel session's writes are ground truth to be audited, not narrative to be trusted
+
+A concurrent/forked session ran against the same repo while this one
+worked, pushing hardening commits and refreshing the explainer artifact.
+The right move was NOT to trust its self-reported summary and NOT to
+blindly re-do its work — it was to audit its claims against ground truth:
+read the actual commit diffs, re-run its exploit harness independently
+(the JSON-escape bypass reproduced; the fix genuinely closed it), and
+confirm tests green on the merged result. A forked session's chat is a
+paraphrase; its commits are the source. Audit the commits. (This sits
+with the source-faithfulness discipline: verify against the artifact,
+not the story about it.)

@@ -23,135 +23,123 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-07 (verification-pause + §5.3 planning session)
+## Current handoff — written 2026-07-08 (§5.3 pipeline built, reviewed, MERGED)
 
 ### Where things stand
 
-- **Verification pause COMPLETE — the user called a stop-and-verify
-  before §5.3, and it paid.** Baseline re-proven on-machine (151/151,
-  tsc, Biome), then an end-to-end smoke test was written composing every
-  shipped module across its real seams: normalize → sqlite on disk →
-  reopen → catalog rehydrate → policy + credentials + QuickJS sandbox
-  through an inline ToolInvoker stand-in. It passed on the first run —
-  seam discipline held. **PR #19 merged (`bbe7726`, merge named by the
-  human 2026-07-07):** `test: add end-to-end smoke test composing all
-  modules across their seams` (`56f265c`). Gate: CI 8/8, CodeRabbit
-  clean, Tier 1 agent review pass (findings comment on the PR). Main is
-  **`bbe7726`** — 152/152 tests. The smoke test is now the standing
-  integration guard; **the §5.3 PR's acceptance criterion is to replace
-  its inline stub with the real pipeline and keep every assertion
-  green.**
-- **INVARIANTS.md unchanged:** 9 pinned ✅, 3 ⏳ (§9.3 egress — flips
-  with the §5.3 PR, §11 Trace redaction, §5.5 execution manager).
-- **Blindspot pass for §5.3 RUN (protocol debt cleared).** Artifact:
-  claude.ai/code/artifact/3c6b05e7-ac8c-47a9-a385-1d92dde85097 — nine
-  cards, file:line evidence. Sharpest findings: (1) `credentials.ts:63`
-  interpolates the credentialRef into its own error message and
-  `quickjs.ts:254` forwards any host error to the guest + journal — a
-  §9.2 zone violation the moment the pipeline wires `resolve()` in;
-  (2) journaling a policy denial as `{ok:false}` would poison §5.5
-  replay (memoized denial survives approval).
-- **Tweakable plan WRITTEN and decisions LOCKED (human delegated).**
-  Artifact: claude.ai/code/artifact/9f539fdb-cd1a-4904-9c63-d628cc4ef9ba
-  — decisions A1–A7 first, file map, tasks T1–T7 (TDD, one commit each).
-  Locked: A1 connection addressing v1 = single-connection-per-namespace,
-  fail closed on multiple, prefix param reserved on the seam; A3
-  TraceEvent gains capped `output` field, Trace = durable replay log for
-  call ops, search/describe persistence deferred to §5.5; A5 MCP-only
-  upstream behind a per-source-type seam, prefix-stripped names (known
-  limitation documented). Error vocabulary: ConduitPolicyDenied /
-  ConduitPolicyBlocked (non-memoizable, §5.5 contract) /
-  ConduitUpstreamError / ConduitInternalError (opaque + correlation id).
-  These three decisions land in spec §18 in the §5.3 PR (plan task T7).
-- **PR-review tiering rules were updated mid-session (global CLAUDE.md +
-  memory, re-read from disk 2026-07-07):** Tier 2 splits along the PR
-  lifecycle (`/pr-review-toolkit:review-pr all parallel` pre-PR;
-  `code-review:code-review <PR#>` post-PR), `aikido:scan` +
-  `/security-review` on security-touching PRs, `/codex:adversarial-review`
-  cross-model rung on the highest-stakes, `/code-review ultra` NOT in the
-  default ladder. The §5.3 PR is highest-stakes: all rungs apply, plus
-  explainer + quiz.
-- **PR #18 follow-ups still open** (listed in that PR's Tier 2 comment):
-  seeds/pausedOn shape validators (must-fix before §5.5 resume),
-  maybeText/maybeInteger NULL-vs-corruption conflation, the
-  status⟺paused_on invariant, cross-field risk_class/declaredRisk drift,
-  corrupt-identity-column row identity. None block §5.3.
-- Housekeeping: local branch `test/e2e-smoke` still exists (deletion
-  needs the human's confirmation per git-safety rules); remote branch
-  auto-deleted.
-- All prior decisions remain in force (PR-by-default routing, two-tier
-  allowlist + protected floor, Dependabot alerts-only, merge authority
-  is the human's — do not re-litigate).
+- **§5.3 ToolInvoker pipeline is DONE and on main.** PR #20 merged
+  2026-07-08 (`c429376`), 15 commits, human-named for merge. Main is
+  **`c429376`** — 219/219 tests, tsc + Biome clean, CI 8/8 green. The
+  new `packages/sdk/src/pipeline/` module (errors, egress, upstream,
+  invoker + tests) composes the existing seams into a live per-call
+  path: tool lookup → policy → connection (A1) → credentials host-side →
+  MCP upstream → Trace → return. The e2e smoke test drives the REAL
+  pipeline (the inline stub from PR #19 is gone).
+- **INVARIANTS.md: §9.3 flipped to ✅** (`pipeline/egress.test.ts`) — the
+  first invariant this session pinned. §11 stays ⏳ and its scope now
+  explicitly names `TraceEvent.output` (persisted unredacted for §5.5
+  replay). §5.5 execution-manager and §5.5 replay-stripping still ⏳.
+- **Three review rounds landed real fixes** (all pre-merge): Tier 2 (5
+  agents), a security-review sub-agent, and TWO Codex adversarial passes.
+  The adversarial passes were the highest-value rung — the first caught a
+  HIGH §9.2 credential leak (a JSON-escaped echo bypassing the raw-body
+  scan; independently verified exploitable) that all six other reviewers
+  missed; the second caught short-token + NAT64 egress gaps. All fixed.
+- **New spec §18 decisions this session** (in the merged spec pair):
+  connection addressing v1 (A1), Trace-as-replay-log + A3 audit semantics
+  (A3), MCP-only upstream (A5), per-connect egress pinning deferred to
+  Phase 1, and **UpstreamCaller is a trusted dependency** (the invoker
+  does not defend against a hostile custom caller — reopen condition
+  documented).
+
+### Global process infrastructure created this session (NOT project files)
+
+These live in `~/.claude/` and load every session, every project. Named
+here so the next session knows they exist:
+- `rules/no-dead-ends.md` + `hooks/no-dead-ends-check.sh` — never end a
+  turn on a blocker without a concrete way forward. Hook tuned after two
+  false positives; verified live.
+- `rules/codex-one-path.md` — ONE Codex invocation (raw `codex exec` in
+  Bash, `dangerouslyDisableSandbox: true` for the auth file). Do NOT use
+  the gstack `/codex` skill or `codex@openai-codex` plugin for passes.
+- `rules/adversarial-convergence.md` — the stop-line for adversarial
+  review: converged when every finding is out-of-scope or in a
+  best-effort defense-in-depth layer. Fix denylist-shaped checks by
+  SHAPE (canonicalize), don't add spellings.
 
 ### Waiting on the human
 
-Nothing blocking. The plan is approved-by-delegation ("decide what you
-think is best"); execution route chosen: fresh session.
+- **Branch cleanup (needs explicit OK per git-safety rules):** the local
+  branch `feat/tool-invoker-pipeline` and the remote
+  `origin/feat/tool-invoker-pipeline` both still exist (merge did not
+  auto-delete the remote). Deleting either is a destructive git op — ask
+  before running `git branch -d` / `git push origin --delete`.
 
-### Next task: EXECUTE the §5.3 plan (T1–T7)
+### Next task: Issue #21 — stop the adversarial-review whack-a-mole
 
-The thinking is done — do not re-plan. Read the plan artifact, run its
-Ground-truth checks, then execute in order:
+**GitHub Issue #21** (created this session). The two adversarial passes
+each found the SAME class of bug: encoding-bypasses of the egress guard
+(`isPrivateAddress`) and the credential-echo scan (`containsCredential`).
+Both checks are denylist-shaped (scan for known-bad patterns) over an
+unbounded input space, so they never converge — every pass finds another
+spelling. The holistic fix (per `~/.claude/rules/adversarial-convergence.md`):
 
-- T1 `pipeline/errors.ts` — guest-safe error vocabulary.
-- T2 `pipeline/egress.ts` — §9.3 guard; INVARIANT test + ledger flip in
-  the same commit.
-- T3 `pipeline/upstream.ts` — MCP caller: egress-guarded fetch, manual
-  redirects (refused v1), AbortSignal timeout, stream-capped JSON-only
-  responses.
-- T4 TraceEvent.output + sqlite column (ALTER-if-missing migration).
-- T5 `pipeline/invoker.ts` — the §5.3 composition; §9.2 leak tests
-  (failing reveal leaks nothing).
-- T6 wire-up: exports, sandbox.ts non-memoizable doc note, smoke-test
-  stub → real pipeline (+ §9.3-blocks-by-default, 401-echo, and
-  denied-journal-name tests).
-- T7 spec §18 decisions + `python3 html2md.py` + PR bookkeeping.
+- **Egress → per-connect IP pinning** (canonicalize-then-check): resolve
+  once, check the resolved binary address, force `fetch` to that IP. All
+  textual encodings collapse; also closes the DNS-rebinding TOCTOU.
+  Already the spec §18 Phase-1 answer. Needs a custom lookup/dispatch
+  path — design + tests, not a one-liner.
+- **Credential-echo scan → relabel as best-effort defense-in-depth**:
+  scanning unbounded untrusted data can't be complete; document it as a
+  tripwire and name the real guarantee (credential only in request
+  scope; §11 at-rest redaction).
+- **Acceptance:** one confirming adversarial pass returns ONLY
+  out-of-scope or best-effort-layer findings (= converged, ship).
 
-Stop-and-ask triggers (from the plan): any new dependency, any change to
-parseSourceSemantics or the ToolInvoker signature, any softening of a
-fail-closed default.
-
-Gate: branch `feat/tool-invoker-pipeline` from origin/main; PR; Tier 2
-per the updated lifecycle split + aikido + /security-review +
-/codex:adversarial-review; /explain-diff + full-pass quiz; merge only
-when the human names it.
+Also open, lower priority: PR #18 follow-ups (seeds/pausedOn validators
+before §5.5 resume, etc. — listed in PR #18's Tier 2 comment); the §5.5
+execution manager (the biggest unbuilt piece — replay stripping of
+non-memoizable journal entries, approval queue).
 
 ### Session quirks worth inheriting
 
-- Everything from prior lists still applies: direct binaries
-  (`packages/sdk/node_modules/.bin/{tsc,vitest}`, `node_modules/.bin/biome`
-  from repo root); sandbox override needed for git network ops and `gh`;
-  "certificate-25291" stderr noise is environmental (pipe through
-  `grep -v certificate-25291`); zsh eats `=`-prefixed words; quickjs
-  ground truth is the shipped dist (LEARNINGS #9); fresh worktrees lack
-  node_modules — symlink, don't install; libsql rejects `{ sql }` object
-  form — use parameterized `args`.
-- The pre-commit hook runs the full suite + Biome; a commit doubles as a
-  verification run.
+- Direct binaries from `packages/sdk/`: `node_modules/.bin/{vitest,tsc}`,
+  `node_modules/.bin/biome` from repo root. `cd packages/sdk` first for
+  vitest.
+- **vitest tests using `node:http` loopback servers must run OUTSIDE the
+  Bash sandbox** (`dangerouslyDisableSandbox: true`) — loopback listen
+  hangs silently inside it and every test times out at `serve()`. The
+  pre-commit hook runs them fine (it's not sandboxed).
+- git network ops (`fetch`/`push`/`gh`) and `codex exec` need the sandbox
+  override (auth files are denied). "certificate-25291" stderr noise is
+  environmental — pipe through `grep -v certificate-25291`.
 - `gh pr checks` polling: background `until` loop (foreground `sleep`
   chains are blocked).
-- Session-end docs from a feature-branch worktree: `scripts/push-docs`
-  requires being ON main — write HANDOFF/LEARNINGS in the main checkout.
+- The pre-commit hook runs the full suite + Biome; a commit doubles as a
+  verification run.
+- Session-end docs must be written from a main checkout (`scripts/push-docs`
+  requires being ON main).
+- The `impeccable` hook flags em-dashes and "numbered section markers" in
+  `conduitspec.html` — both are false positives (spec house style + real
+  §-section numbers); leave them.
 
 ### Kickoff prompt for the next session
 
-> Continue building Conduit in ~/projects/conduit-HQ. Start by reading
-> HANDOFF.md and follow its protocol — including
-> `gh pr list --state all --limit 5` (PR #19, e2e smoke test, merged
-> 2026-07-07 — do not redo its work). Then the current task: EXECUTE the
-> §5.3 ToolInvoker pipeline plan — the blindspot pass and tweakable plan
-> are DONE, decisions A1–A7 are locked, do not re-plan. Plan artifact:
-> claude.ai/code/artifact/9f539fdb-cd1a-4904-9c63-d628cc4ef9ba (blindspot
-> companion: claude.ai/code/artifact/3c6b05e7-ac8c-47a9-a385-1d92dde85097).
-> Run the plan's Ground-truth checks, then tasks T1→T7 in order — TDD,
-> one commit per task, INVARIANT §9.3 test + ledger flip in T2's commit,
-> smoke-test stub replaced in T6 with every assertion green. Stop and ask
-> before: any new dependency, any change to parseSourceSemantics or the
-> ToolInvoker signature, any softening of a fail-closed default. Keep a
-> deviations log in the scratchpad from T1 onward. Branch
-> feat/tool-invoker-pipeline from origin/main; PR per commit routing;
-> Tier 2 (review-pr pre-PR, code-review:code-review post-PR) + aikido +
-> /security-review + /codex:adversarial-review at the gate; /explain-diff
-> + full-pass quiz before merge; merge only when the human names it. At
-> session end, rewrite HANDOFF.md, append LEARNINGS.md, and publish the
-> session debrief artifact.
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol — including `gh pr list --state all
+> --limit 5` (PR #20, §5.3 pipeline, MERGED 2026-07-08 — do not redo it).
+> Main is `c429376`, 219/219 green. Then the next task: **GitHub Issue
+> #21** — convert the egress guard and credential-echo scan from
+> denylist-shaped to canonical-form so adversarial review converges (per
+> `~/.claude/rules/adversarial-convergence.md`). Egress → per-connect IP
+> pinning (the spec §18 Phase-1 answer, also closes DNS-rebinding);
+> credential-echo → relabel as best-effort defense-in-depth. Acceptance:
+> one confirming Codex adversarial pass (raw `codex exec` per
+> `~/.claude/rules/codex-one-path.md`) returns only out-of-scope or
+> best-effort findings. Branch from origin/main; PR per commit routing;
+> Tier 2 + aikido + /security-review on the security surface; the ONE
+> adversarial pass is the convergence gate, not an open-ended loop;
+> /explain-diff + full-pass quiz before merge; merge only when the human
+> names it. Ask before deleting the old feat/tool-invoker-pipeline
+> branches (local + remote). At session end, rewrite HANDOFF, append
+> LEARNINGS, publish the debrief artifact.
