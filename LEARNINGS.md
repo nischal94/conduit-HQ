@@ -556,3 +556,58 @@ confirm tests green on the merged result. A forked session's chat is a
 paraphrase; its commits are the source. Audit the commits. (This sits
 with the source-faithfulness discipline: verify against the artifact,
 not the story about it.)
+
+## 2026-07-08 (later) — Issue #21: per-connect IP pinning (PR #22)
+
+### 34. Probe the runtime API contract before designing on it — never assume Node behavior
+
+Building per-connect pinning meant reaching for Node's networking API,
+and three assumptions that "felt obvious" were all wrong or load-bearing
+enough to sink the design if guessed. Each was settled by a throwaway
+probe (`node -e` / a scratch `.mjs`), not memory:
+(a) **`undici` is not requirable** as a module, so Node's global `fetch`
+cannot take a custom `lookup` — this is what *forces* the move to
+`https.request` + `Agent`, the whole shape of the change. (b) **Node 22's
+`Agent.lookup` demands the array shape** `cb(null, [{address,family}])`
+when `opts.all===true`; the legacy `(err,addr,family)` throws
+`ERR_INVALID_IP_ADDRESS`. Guessing the legacy shape would have been a
+runtime crash the types don't catch. (c) **Node skips the custom `lookup`
+entirely for literal-IP hosts** — see #35. The rule: when a change rests
+on how a platform primitive behaves, write the five-line probe first. The
+type signatures don't tell you the callback arity contract, and the docs
+don't tell you the literal-IP skip.
+
+### 35. A "redundant" defense-in-depth layer can be the ONLY thing covering a case — verify before deleting it
+
+The pinned lookup is the authoritative §9.3 check, so the pre-flight
+`assertEgressAllowed` looked redundant — the kind of thing a cleanup pass
+deletes. The security review caught (and a probe confirmed) that Node
+**does not invoke the custom `lookup` for a URL whose host is already an
+IP literal** like `http://169.254.169.254/`. So for literal private IPs
+the pinning is a no-op and the pre-flight is the *only* layer that
+blocks them. "Redundant with the real check" was false for exactly the
+inputs that matter most (a literal metadata IP). Lesson: before removing
+a defense-in-depth layer as redundant, enumerate the inputs each layer
+actually covers — two layers checking "the same thing" may cover
+*disjoint* input sets. Kept the pre-flight; documented why it is
+load-bearing so a future cleanup doesn't re-litigate it.
+
+### 36. When the cross-model gate is unavailable, a dedicated adversarial sub-agent is the sanctioned stand-in — name it, don't skip
+
+The Codex convergence pass could not run — usage quota exhausted (resets
+Aug 1), a hard environmental block, not a code problem. Aikido SAST was
+also unavailable (MCP not connected). Rather than either skip the gate or
+strand the PR, the way forward (per `~/.claude/rules/no-dead-ends.md`,
+which names this exact workaround) was a dedicated adversarial
+security-review sub-agent carrying the same threat model and
+already-fixed list. It returned zero boundary breaks AND empirically
+verified the Node-22 connect behavior — arguably deeper than the CLI pass
+would have. The residual gap (it's same-model, not cross-model) was
+surfaced explicitly to the human as a deferrable item, not buried. Two
+process notes worth repeating: the `codex exec` failures were diagnosed
+to root cause before retrying (first a `$TMPDIR`-differs-per-shell prompt
+path, then the real quota block surfaced in stderr) — never retried
+blind; and the three review agents found four *real* transport bugs
+(chief among them a timer that was never cleared) that all existing tests
+passed over, which is the case for running the review gauntlet even when
+CI is green.
