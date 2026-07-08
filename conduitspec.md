@@ -612,6 +612,13 @@ unauditable call must not silently succeed.
 JSON-RPC 2.0 `tools/call` with the namespace prefix stripped to recover the upstream tool
 name. Known limitation: MCP names the normalizer transformed don't round-trip until the original
 name is stored in `sourceSemantics`. Other source types fail closed ("not yet callable").
+- **Desktop app — OUT of launch/MVP scope:** ✅ the Phase-3 desktop shell
+(§13.2) is explicitly NOT part of the initial launch. The launch surfaces are the CLI and web
+console (§12); the desktop app is a thin native shell over the *same* local service (§13.2,
+"a companion to the CLI … not a second runtime"), so deferring it removes a UI surface, not a
+capability, and strands no downstream work — Phases 4–5 (Cloud, self-host) do not depend on it. It
+remains a post-launch option enabled by the surface-agnostic core; picking it up later needs no
+rework. (Decided 2026-07-08.)
 
 **Deferred (future phases — none block v0.1 / Phase 0):**
 
@@ -620,9 +627,11 @@ name is stored in `sourceSemantics`. Other source types fail closed ("not yet ca
 3. **npm allowlist contents**: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.
 4. **Pricing shape** for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.
 5. **Approval push notifications** (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.
-6. **Per-connect egress pinning** (§9.3): the v1 guard resolves DNS and checks every
-address, then `fetch` re-resolves independently — a DNS-rebinding TOCTOU window. Closing it
-means resolving once and forcing the connection to the vetted IP — Phase 1.
+6. **Per-connect egress pinning** (§9.3): ✅ **SHIPPED** 2026-07-08
+(Issue #21 / PR #22, merged early — was slated Phase 1). `createPinnedLookup` resolves
+once and forces the connection to the vetted resolved IP (canonicalize-then-check), closing both the
+address-encoding bypass and the DNS-rebinding TOCTOU. Pinned by `pipeline/egress.test.ts`
+(INVARIANTS.md §9.3).
 7. **UpstreamCaller as a trusted dependency** (§5.3, §9.2): the pipeline treats an
 injected `UpstreamCaller` as trusted infrastructure — the same posture it holds toward the
 store and policy engine — not as an adversary. So the invoker does NOT re-validate a custom caller's
