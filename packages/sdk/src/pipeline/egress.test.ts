@@ -1,11 +1,21 @@
+import type { LookupAddress } from "node:dns";
+import { lookup as lookupCb } from "node:dns";
 import { lookup } from "node:dns/promises";
 import { describe, expect, it, vi } from "vitest";
-import { assertEgressAllowed, isPrivateAddress } from "./egress.js";
+import { assertEgressAllowed, createPinnedLookup, isPrivateAddress } from "./egress.js";
 
 // Real lookup by default (the "localhost" test depends on it); individual
 // tests override per-call to simulate attacker-controlled DNS.
 vi.mock("node:dns/promises", async (importOriginal) => {
   const actual = await importOriginal<typeof import("node:dns/promises")>();
+  return { ...actual, lookup: vi.fn(actual.lookup) };
+});
+
+// The pinned-lookup tests drive the callback-form dns.lookup directly so we
+// can simulate an attacker-controlled resolver at the exact seam the socket
+// uses. Real by default; overridden per-test.
+vi.mock("node:dns", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:dns")>();
   return { ...actual, lookup: vi.fn(actual.lookup) };
 });
 
@@ -154,5 +164,109 @@ describe("egress guard (spec §9.3)", () => {
     await expect(
       assertEgressAllowed(new URL("http://[2606:2800:220:1::1]/")),
     ).resolves.toBeUndefined();
+  });
+});
+
+// createPinnedLookup is the authoritative §9.3 check (spec §18 Phase-1): it
+// resolves once and hands the socket only vetted addresses, so a DNS-rebinding
+// answer cannot smuggle a private address past a prior text check. These tests
+// drive the lookup callback at the exact seam the http.Agent uses.
+describe("createPinnedLookup (spec §9.3 per-connect pinning)", () => {
+  // Promisify the callback so assertions read cleanly. all:true asks for the
+  // array shape (what a Node-22 Agent requests).
+  function pin(
+    lookupFn: ReturnType<typeof createPinnedLookup>,
+    host: string,
+    all = true,
+  ): Promise<{ address: string; family: number }[]> {
+    return new Promise((resolve, reject) => {
+      lookupFn(host, { all } as never, (err, address, family) => {
+        if (err !== null) {
+          reject(err);
+          return;
+        }
+        resolve(
+          Array.isArray(address)
+            ? (address as { address: string; family: number }[])
+            : [{ address: address as string, family: family ?? 0 }],
+        );
+      });
+    });
+  }
+
+  // dns.lookup is overloaded ~6 ways, so vi.mocked() can't infer the 3-arg
+  // (host, opts, cb) form we exercise. Narrow the mock to that one overload.
+  type LookupImpl = (
+    host: string,
+    opts: unknown,
+    cb: (err: NodeJS.ErrnoException | null, addrs: LookupAddress[]) => void,
+  ) => void;
+  const mockedLookup = vi.mocked(lookupCb) as unknown as {
+    mockImplementationOnce(impl: LookupImpl): unknown;
+  };
+
+  // Stub the callback-form dns.lookup to return a fixed set of resolved
+  // addresses, simulating an attacker-controlled resolver at the socket seam.
+  function stubResolver(addresses: LookupAddress[]): void {
+    mockedLookup.mockImplementationOnce((_host, _opts, cb) => {
+      cb(null, addresses);
+    });
+  }
+
+  it("INVARIANT §9.3: hands the socket only the public address when DNS answers [public, private] (rebinding closed)", async () => {
+    // The attacker-controlled resolver returns a private address alongside a
+    // public one. Pinning must drop the private one — the socket can only
+    // connect to what survives, so there is no rebinding window.
+    stubResolver([
+      { address: "93.184.216.34", family: 4 },
+      { address: "127.0.0.1", family: 4 },
+    ]);
+    const vetted = await pin(createPinnedLookup(), "rebind.example");
+    expect(vetted).toEqual([{ address: "93.184.216.34", family: 4 }]);
+  });
+
+  it("INVARIANT §9.3: fails closed when EVERY resolved address is private", async () => {
+    stubResolver([
+      { address: "10.0.0.5", family: 4 },
+      { address: "::1", family: 6 },
+    ]);
+    await expect(pin(createPinnedLookup(), "allprivate.example")).rejects.toThrow(
+      /every resolved address is loopback\/private/,
+    );
+  });
+
+  it("INVARIANT §9.3: a NAT64-resolving name is blocked by the embedded-v4 classifier, not a text rule", async () => {
+    // The resolver returns the canonical expanded form; the classifier reads
+    // the embedded 169.254.169.254 (cloud metadata) and rejects it. No text
+    // spelling is involved — this is the whole point of canonicalizing.
+    stubResolver([{ address: "64:ff9b::a9fe:a9fe", family: 6 }]);
+    await expect(pin(createPinnedLookup(), "nat64.example")).rejects.toThrow(
+      /every resolved address is loopback\/private/,
+    );
+  });
+
+  it("allowPrivate short-circuits the filter for trusted code", async () => {
+    stubResolver([{ address: "127.0.0.1", family: 4 }]);
+    const vetted = await pin(createPinnedLookup({ allowPrivate: true }), "localhost");
+    expect(vetted).toEqual([{ address: "127.0.0.1", family: 4 }]);
+  });
+
+  it("propagates a resolver error unchanged (fail closed on NXDOMAIN)", async () => {
+    mockedLookup.mockImplementationOnce((_host, _opts, cb) => {
+      cb(Object.assign(new Error("getaddrinfo ENOTFOUND nope.example"), { code: "ENOTFOUND" }), []);
+    });
+    await expect(pin(createPinnedLookup(), "nope.example")).rejects.toThrow(/ENOTFOUND/);
+  });
+
+  it("honors the single-address shape when the socket does not request all", async () => {
+    // Some connect paths call lookup with all:false; the pinned lookup must
+    // still resolve every address internally, vet, then return one.
+    stubResolver([
+      { address: "10.0.0.1", family: 4 },
+      { address: "93.184.216.34", family: 4 },
+    ]);
+    const vetted = await pin(createPinnedLookup(), "mixed.example", false);
+    // all:false → first vetted entry only; the private one is dropped first.
+    expect(vetted).toEqual([{ address: "93.184.216.34", family: 4 }]);
   });
 });

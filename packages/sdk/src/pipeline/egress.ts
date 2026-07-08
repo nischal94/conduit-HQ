@@ -1,5 +1,7 @@
+import type { LookupAddress, LookupOptions } from "node:dns";
+import { lookup as lookupCb } from "node:dns";
 import { lookup } from "node:dns/promises";
-import { isIP } from "node:net";
+import { isIP, type LookupFunction } from "node:net";
 
 /** §9.3: loopback/private egress OFF by default; opt-in only for trusted code. */
 export interface EgressOptions {
@@ -7,13 +9,20 @@ export interface EgressOptions {
 }
 
 /**
- * The §9.3 gate every outbound upstream URL passes through. Protocol is
- * checked unconditionally; the private-address check resolves hostnames
- * (WHATWG URL has already normalized encoded-IP forms like
- * `http://2130706433/` to dotted-quad) and rejects if ANY resolved address
- * is loopback, private, link-local, or unspecified. DNS-rebinding between
- * this check and the actual connect is a named residual risk — per-connect
- * pinning is a follow-up, not v1.
+ * The §9.3 PRE-FLIGHT gate every outbound upstream URL passes through before
+ * a request is built. Protocol is checked unconditionally (the pinned lookup
+ * governs only the DNS/IP layer, so a `file:`/`ftp:` URL must be rejected
+ * here). The private-address check resolves hostnames (WHATWG URL has already
+ * normalized encoded-IP forms like `http://2130706433/` to dotted-quad) and
+ * rejects if ANY resolved address is loopback, private, link-local, or
+ * unspecified — an early, clear failure for an obviously-private target.
+ *
+ * This is no longer the ONLY line of defense: the authoritative, TOCTOU-free
+ * check is {@link createPinnedLookup}, which resolves once at connect time and
+ * forces the socket to a vetted IP. Keeping this pre-flight is deliberate
+ * defense-in-depth (same canonical classifier, applied earlier), not a
+ * redundant denylist — it fast-fails without opening a socket and gives the
+ * agent a ref-free reason.
  */
 export async function assertEgressAllowed(target: URL, options: EgressOptions = {}): Promise<void> {
   if (target.protocol !== "http:" && target.protocol !== "https:") {
@@ -50,10 +59,75 @@ export async function assertEgressAllowed(target: URL, options: EgressOptions = 
 }
 
 /**
+ * §9.3 per-connect pinning (spec §18 Phase-1 answer). Returns a Node
+ * `lookup` callback for an http(s) Agent: it resolves the hostname ONCE and
+ * hands the socket only the addresses that pass {@link isPrivateAddress}, so
+ * the connection is forced to a vetted binary IP.
+ *
+ * This is the canonical-form fix for what used to be a denylist. The old
+ * split — guard resolves + checks, then `fetch` re-resolves independently —
+ * left two gaps that this closes together:
+ *   1. Encoding bypasses: every textual spelling of an address (decimal,
+ *      hex, v4-mapped, NAT64) resolves to the same bytes, which is what the
+ *      classifier now sees. There is no spelling left to add.
+ *   2. DNS-rebinding TOCTOU: there is no second, independent resolution to
+ *      disagree with the checked one — the socket connects to a member of
+ *      the vetted set (spec §18 item 6).
+ *
+ * `allowPrivate` short-circuits the filter for trusted code (self-host to a
+ * private upstream), matching {@link assertEgressAllowed}'s opt-in. Fails
+ * closed: an all-private answer, or a resolver error, aborts the connect.
+ */
+export function createPinnedLookup(options: EgressOptions = {}): LookupFunction {
+  return (hostname: string, opts: LookupOptions, callback): void => {
+    // Always resolve with all:true so EVERY address is vetted, regardless of
+    // what the socket's `opts` asked for; re-narrow to the requested shape
+    // only when handing the result back.
+    lookupCb(hostname, { ...opts, all: true, verbatim: true }, (err, addresses) => {
+      if (err !== null) {
+        callback(err, "", 0);
+        return;
+      }
+      const resolved = addresses as LookupAddress[];
+      const vetted =
+        options.allowPrivate === true
+          ? resolved
+          : resolved.filter((entry) => !isPrivateAddress(entry.address));
+      if (vetted.length === 0) {
+        // Fail closed with our own message: the connect never happens. The
+        // classifier already rejected every resolved address.
+        callback(
+          new Error(
+            `[EgressGuard] Blocked: every resolved address is loopback/private (spec §9.3). Context: { host: ${hostname} }`,
+          ),
+          "",
+          0,
+        );
+        return;
+      }
+      if (opts.all === true) {
+        callback(null, vetted);
+        return;
+      }
+      // Single-address shape: hand back the first vetted entry.
+      const [first] = vetted;
+      callback(null, first?.address ?? "", first?.family ?? 0);
+    });
+  };
+}
+
+/**
  * Classifies one literal address. IPv6 is fully expanded rather than
  * prefix-sniffed: WHATWG URL serializes v4-mapped literals to hex form
  * (`::ffff:7f00:1`), which a first-group check would misread as public.
  * Anything unparseable is private (fail closed).
+ *
+ * This is the canonical-form CLASSIFIER, not the egress boundary: it runs on
+ * addresses that DNS has already resolved to canonical dotted-quad / expanded
+ * IPv6 (via {@link createPinnedLookup}), never on raw URL hostnames. That is
+ * why it is not extended per textual encoding — the encodings collapse before
+ * they reach it (see {@link createPinnedLookup} and the §9.3 convergence note
+ * in CLAUDE.md / INVARIANTS.md).
  */
 export function isPrivateAddress(address: string): boolean {
   // Zone id (fe80::1%eth0) never changes the range classification.
