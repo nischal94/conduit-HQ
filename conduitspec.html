@@ -768,6 +768,32 @@ output-size cap (defaults 60s / 128 MB / 1 MB; operator-tunable). A runaway
 <li>QuickJS sandbox + the <code>execute</code> tool + 4-step workflow.</li>
 <li>Credential resolver + boundary invariant. SQLite storage. Secrets-at-rest.</li>
 </ul>
+<p><strong>⭑ MVP Prototype Checkpoint (the "walking skeleton") — STOP, test, find edge cases before building further</strong></p>
+<p>The thinnest slice that is testable <em>as a product</em>, not a library: the point where a
+real MCP agent drives a real tool call through the real boundary. Spans the end of Phase 0 plus a
+minimal runnable slice of Phase 1; deliberately excludes the web console, FTS5, and everything in
+Phases 2–5. Rationale: find breakages on a small surface before the full product is built on top of
+them, when they are cheap to fix.</p>
+<ul>
+<li><strong>In scope (must build):</strong> finish Phase 0 (§5.5 execution manager — pause/resume
+replay + approval queue; §11 Trace redaction — flips the last ⏳ invariant); the <code>/mcp</code>
+server (<strong>stdio transport first</strong>, the form Claude Desktop / Cursor use); a minimal
+<code>conduit</code> CLI (<code>serve</code>, <code>add-mcp</code>, add a source + connection); and
+the §4.2 before/after token demo (the spec's designated QA artifact).</li>
+<li><strong>Explicitly deferred out:</strong> web console, FTS5/BM25 search (the in-memory catalog
+suffices at demo scale), Trace viewer/export, and all of Phases 2–5. A UI is not needed to test the
+engine — the CLI + a real MCP client are.</li>
+<li><strong>Definition of done — TWO gates, both required:</strong> <em>(1) Built</em> — a real MCP
+client connects, sees one <code>execute</code> tool, and drives a real tool call against a real
+upstream MCP source through the §9.2/§9.3 boundary, with the token savings observable. <em>(2)
+Verified</em> — a deliberate edge-case / adversarial pass on the <em>running</em> skeleton has
+converged: malformed schemas, hostile upstream echoes, credential 401s, tool-call timeouts,
+resume-after-pause, redaction paths, and the §14 startup-reload UX caveat are each handled or
+documented out-of-scope. The happy path is the entry ticket to the test phase, not the finish
+line.</li>
+</ul>
+<p>Only after both gates pass does the build resume: the rest of Phase 1 (web console, FTS5), then
+Phases 2+. (Decided 2026-07-08.)</p>
 <p><strong>Phase 1 — Local runtime + CLI + MCP</strong></p>
 <ul>
 <li>Durable background service; <code>/mcp</code> streamable-HTTP + stdio; <code>conduit</code> CLI; <code>add-mcp</code>.</li>

@@ -551,6 +551,34 @@ output-size cap (defaults 60s / 128 MB / 1 MB; operator-tunable). A runaway
 - QuickJS sandbox + the `execute` tool + 4-step workflow.
 - Credential resolver + boundary invariant. SQLite storage. Secrets-at-rest.
 
+**⭑ MVP Prototype Checkpoint (the "walking skeleton") — STOP, test, find edge cases before building further**
+
+The thinnest slice that is testable *as a product*, not a library: the point where a
+real MCP agent drives a real tool call through the real boundary. Spans the end of Phase 0 plus a
+minimal runnable slice of Phase 1; deliberately excludes the web console, FTS5, and everything in
+Phases 2–5. Rationale: find breakages on a small surface before the full product is built on top of
+them, when they are cheap to fix.
+
+- **In scope (must build):** finish Phase 0 (§5.5 execution manager — pause/resume
+replay + approval queue; §11 Trace redaction — flips the last ⏳ invariant); the `/mcp`
+server (**stdio transport first**, the form Claude Desktop / Cursor use); a minimal
+`conduit` CLI (`serve`, `add-mcp`, add a source + connection); and
+the §4.2 before/after token demo (the spec's designated QA artifact).
+- **Explicitly deferred out:** web console, FTS5/BM25 search (the in-memory catalog
+suffices at demo scale), Trace viewer/export, and all of Phases 2–5. A UI is not needed to test the
+engine — the CLI + a real MCP client are.
+- **Definition of done — TWO gates, both required:** *(1) Built* — a real MCP
+client connects, sees one `execute` tool, and drives a real tool call against a real
+upstream MCP source through the §9.2/§9.3 boundary, with the token savings observable. *(2)
+Verified* — a deliberate edge-case / adversarial pass on the *running* skeleton has
+converged: malformed schemas, hostile upstream echoes, credential 401s, tool-call timeouts,
+resume-after-pause, redaction paths, and the §14 startup-reload UX caveat are each handled or
+documented out-of-scope. The happy path is the entry ticket to the test phase, not the finish
+line.
+
+Only after both gates pass does the build resume: the rest of Phase 1 (web console, FTS5), then
+Phases 2+. (Decided 2026-07-08.)
+
 **Phase 1 — Local runtime + CLI + MCP**
 
 - Durable background service; `/mcp` streamable-HTTP + stdio; `conduit` CLI; `add-mcp`.
