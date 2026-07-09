@@ -743,3 +743,80 @@ one survivor, which on inspection was the legitimate "we supersede X" quote in
 the new §18 text, not a missed edit. Plan structure is a scaffold; the design
 is the contract. When they conflict, verify the design is satisfied, not that
 the plan was obeyed.
+
+## 2026-07-10 — §5.5 execution manager: bot + real cross-model review round (PR #26)
+
+After the §5.5 manager was built + self-reviewed (per-task + whole-branch +
+/security-review) and opened as PR #26, CodeRabbit + Greptile + real `codex exec`
+cross-model passes reviewed it. They found issues the self-review pipeline missed;
+fixing them ran a fix→confirm loop that converged **9 → 3 → 1 → 1(P1) → 0** across
+5 commits. Final state: 284/284, both cross-model Codex and an independent reviewer
+returned zero in-scope findings.
+
+### 1. Cross-model review catches what same-model structurally cannot — the sharpest instance yet
+
+The decisive moment: my same-model stand-in reviewer (a Claude sub-agent, when
+Codex was down) verified a fix "clean, no double-exec window, tests preserve-intent"
+— competently, tracing carefully. The real cross-model Codex pass, on the same
+diff, found a **P1 the stand-in missed**: the `call_attempts` marker guarded a state
+(`paused` recovery) that the hazard it was built for (`running` process-crash) never
+lands in — an over-claim delivering nothing. The stand-in reasoned *within the
+author's framing* ("the marker protects against the crash"); Codex stepped outside
+and asked *which state the crash actually lands in*. **A reviewer sharing your model
+shares your blind spot about which question to ask.** That is why "cross-model" is a
+distinct signal, not just "one more reviewer." Corollary: the strongest convergence
+signal is not "a pass found nothing" but "cross-model and same-model AGREE on the
+exact axis they previously SPLIT on" — agreement after a tested disagreement.
+
+### 2. A safety mechanism must be reachable in the state the hazard occurs, or it's an over-claim
+
+The `call_attempts` marker was added (itself in response to an earlier Codex finding)
+to detect a fired-but-unjournaled side effect on recovery. But: a real crash leaves
+the row `running`; `resume()` only claims `paused` rows; the marker is only ever read
+during `paused` recovery. So the marker for a real side effect is **never read** — it
+guards a state that never occurs. The append-*throw* case it seemed to help was
+already handled by the live-drive catch. The right fix was **removal, not more
+mechanism**: a mechanism wired to an unreachable state isn't defense-in-depth, it's
+false confidence (the convergence rule's "relabel/remove the over-claim, don't pile
+on"). When reviewing a safety mechanism, always ask: *in the state where the hazard
+actually happens, does this code even run?*
+
+### 3. Honest scope-deferral beats a fake guarantee
+
+Process-crash recovery of `running` executions genuinely can't be done safely in a
+single-process MVP (you can't distinguish "crashed" from "legitimately running" without
+a heartbeat/lease — the deferred multi-worker infra). So the correct move was to
+**delete the over-claim and document the deferral**: the MVP guarantees no
+double-execution (a stranded `running` row is never re-run — `resume` only claims
+`paused`), NOT recovery. Building the "recovery sweep" would have been *worse* than
+nothing — a naive sweep terminalizes live executions. "We don't do X, here's why, and
+here's the weaker thing we DO guarantee" is a stronger position than machinery that
+pretends to do X.
+
+### 4. Codex CLI/model availability is a moving target — probe live, don't trust a prior claim
+
+Running the cross-model pass hit a three-layer obstacle course, each masquerading as
+the previous: (a) usage quota exhausted; (b) quota came back but the installed CLI
+(0.142.5) was too old for the account's new default model (`gpt-5.6-luna`/`terra` →
+400 "requires a newer version of Codex"); (c) the model-supporting CLI (0.144.0) was
+blocked by the user's own Socket Firewall `minimumReleaseAge` supply-chain gate (npm's
+published CLI was newer than the age cutoff). Each layer produced a *different* error;
+`codex exec` fails closed with the reason in stderr (usage-limit line vs. version-400
+vs. sfw ETARGET-with-date). **Lesson: probe the live signal, never trust a remembered
+"Codex is back."** And note the real tension in (c): a supply-chain age-gate correctly
+blocking a bleeding-edge CLI is the defense working — bypassing it (which the user did,
+deliberately, for one first-party install) is a human decision the agent hands over,
+never performs. Supersedes the 2026-07-09 #5 "quota is stateful" note with the fuller
+picture: quota is only one of three moving parts.
+
+### 5. The bot review gate earns its place even after an exhaustive self-review
+
+This PR went through per-task reviews (fresh implementer + independent reviewer each),
+a whole-branch review, and /security-review — genuinely rigorous — and STILL had 9
+findings when CodeRabbit/Greptile/Codex looked. Every self-review verifies the paths
+*it* considers; the misses were always in paths it didn't (an infra throw, a
+marker-store fault, a `Date()` function call, a state the mechanism can't reach). The
+bots/cross-model are not a formality after a thorough self-review — they are the
+independent-eyes layer that finds the class of bug self-review is structurally blind
+to. Budget for them to find real things; treat "opened the PR" as the START of review,
+not the end.
