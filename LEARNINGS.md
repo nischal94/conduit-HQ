@@ -647,3 +647,99 @@ not a proxy that offloads the judgment. Settings changes still need
 fresh-session verification: the hook proved live this session, but the
 durable confirm is a next-session `git branch -D <merged-branch>`
 auto-approving with no prompt.
+
+## 2026-07-09 — §5.5 execution manager: design → subagent-driven build → PR #26
+
+Shipped: the §5.5 execution manager (pause/resume by deterministic replay) —
+brainstormed + adversarially reviewed to convergence, then built via
+subagent-driven development (9-task plan), reviewed per-task + whole-branch,
+security-reviewed, opened as PR #26. 12 commits, 272 tests, INVARIANT §5.5 ✅.
+Not merged (human gate). Design doc + plan: `docs/superpowers/{specs,plans}/
+2026-07-09-execution-manager-*.md`; SDD ledger: `.superpowers/sdd/progress.md`.
+
+### 1. The whole-branch review catches a class per-task reviews structurally cannot
+
+Every one of the 8 tasks passed its own independent review. The final
+whole-branch review still found **two Important integration bugs** — a
+`describe({path})` replay-serialization divergence that would spuriously kill
+a resume, and a post-sandbox store-write that could strand an execution in
+`running`. Both share a signature: **correct against the task's own tests,
+wrong against a shape those tests didn't exercise.** Bug #1 hid behind an
+invariant test that used `includeSchemas: true` (the one input value where the
+buggy reconstruction coincided with the guest's bytes); bug #2 hid because the
+prior fix guarded the sandbox-throw path but not its sibling store-write path.
+The lesson: a per-task review verifies a task against *its own* contract; only
+a fresh pass over the integrated whole asks "what shape did none of the tests
+cover?" Budget for the whole-branch review to find real bugs even when every
+task is green — that's its job, not a formality. Two independent analyses
+(the reviewer + a local security sub-agent) converging on the same two bugs
+was the confidence signal they were real.
+
+### 2. A test that passes for the wrong reason is worse than no test
+
+Bug #1's invariant test asserted `describe`+approval+resume works — and passed
+— but only because `includeSchemas: true` was the single value where the
+reconstruction `{path, includeSchemas: false}` didn't diverge from the guest's
+`{path}`. The test gave false confidence in exactly the serialization that was
+broken. The fix added the **positive control** the plan's design already
+implied: a resume test with `describe({path})` (no `includeSchemas`) that
+*fails* without the fix. When a test exercises one value of a parameter that
+has a meaningfully different other value, test the other value too — the
+"happy" value can be the one that accidentally works.
+
+### 3. Serialization is a boundary; single-source it or it drifts
+
+Three separate concerns needed "are these two calls the same call?": the
+approval identity check (invoker), the journal reconstruction (manager), and
+the decision seam. Two subagents independently flagged that if these used
+different serializations, every approved resume would fail closed. The
+resolution that held: export ONE `identitiesMatch` and ONE
+`JSON.stringify(input)` convention and reuse it everywhere (Task 6 exported it
+visibility-only; the manager reuses it). Same lesson recurred for the
+credential scrub: it started as a *copy* of `upstream.ts`'s echo-scan and
+immediately diverged (missed bare-token echoes), fixed by extracting a shared
+`redactionTokens`/`redactTokens` primitive both call. **A copied security
+check is a divergence waiting to happen; a shared primitive makes divergence
+structurally impossible.** When two code paths must agree on a security-
+relevant comparison, don't write it twice — extract it once.
+
+### 4. A claimed resource must always reach a terminal state
+
+`claimForResume` flips a row to `running` (an atomic CAS). Any failure after
+that — sandbox throw OR store-write throw — must finalize a terminal state,
+or the row is stranded `running` and, because the claim only matches `paused`,
+permanently un-resumable. The first fix covered the sandbox path; the review
+found the store-write sibling. The general rule for any claim/CAS: the code
+between "claim the resource" and "settle it terminally" must have NO unguarded
+throw path — wrap all of them so a failure releases the resource to a visible
+terminal state. Fail-safe (stranded, visible, recoverable) beats fail-unsafe
+(double-executed, silent, irreversible), but "stranded forever with no way
+out" is its own bug worth closing.
+
+### 5. Codex quota status is not durable — verify it, don't trust a prior claim
+
+Mid-session the user said "Codex quota is back" (contradicting the prior
+HANDOFF's "resets Aug 1"). Acting on that, the design-phase `codex exec`
+passes ran fine (3 of them). But at the security-gate step the account was
+usage-limited again (now "resets ~Aug 8"). The lesson: an external quota/limit
+is stateful and can re-trigger; a claim that it's "back" is true at a moment,
+not durably. The `codex exec` invocation already fails closed with an auth/
+limit line in stderr — trust that live signal over any remembered status, and
+record the limit in HANDOFF so the next session doesn't assume availability.
+The local security-review sub-agent remained the sanctioned stand-in and
+independently reproduced the whole-branch bugs, so the cross-analysis signal
+wasn't lost.
+
+### 6. An implementer honoring the design over the plan is correct — verify completeness, not obedience
+
+Task 7's implementer folded Task 9's spec §18/§5.5 migration into its own
+commit (the plan had them separate), reasoning that the design §11 required
+the spec+code+invariant to land atomically or spec-drift CI would pass over a
+now-false claim. That was *right* — the design's correctness requirement beats
+the plan's organizational split, and the implementer flagged it rather than
+doing it silently. The controller's job there was NOT to enforce the plan's
+structure but to verify the fold was *complete*: a grep for "doubles as" found
+one survivor, which on inspection was the legitimate "we supersede X" quote in
+the new §18 text, not a missed edit. Plan structure is a scaffold; the design
+is the contract. When they conflict, verify the design is satisfied, not that
+the plan was obeyed.
