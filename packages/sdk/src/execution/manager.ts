@@ -306,13 +306,39 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       captured,
     );
 
-    const result: SandboxResult = await deps.sandbox.execute({
-      code: execution.code,
-      tools: host,
-      seeds: execution.seeds,
-      journal: prefix,
-      ...(limits !== undefined ? { limits } : {}),
-    });
+    let result: SandboxResult;
+    try {
+      result = await deps.sandbox.execute({
+        code: execution.code,
+        tools: host,
+        seeds: execution.seeds,
+        journal: prefix,
+        ...(limits !== undefined ? { limits } : {}),
+      });
+    } catch (cause) {
+      // An UNEXPECTED throw out of `sandbox.execute` — a bootstrap failure,
+      // a getQuickJS() failure, corrupt stored seeds surfacing as a RangeError,
+      // etc. — is an infra fault (design §8). Both `start` (row was just put
+      // `running`) and `resume` (claimForResume flipped the row to `running`)
+      // have already persisted a NON-terminal `running` row before reaching
+      // here. If we let this propagate untouched, that row is left permanently
+      // `running` with a stale `pausedOn`: un-settled AND un-resumable (a later
+      // resume's claimForResume WHERE status='paused' finds 0 rows → conflict),
+      // contradicting §6's state machine (running must reach a terminal) and §8
+      // ("the execution is not silently left half-transitioned"). Finalize a
+      // terminal `failed` — endedAt set, pausedOn cleared, the cause recorded —
+      // and persist it BEFORE re-throwing, so the row is never stranded in
+      // `running`. Not swallowed: the terminal state records the reason and the
+      // original error still surfaces to the caller.
+      await finish(execution, {
+        status: "failed",
+        error: {
+          name: "ConduitExecutionError",
+          message: `[ExecutionManager] Sandbox execution threw unexpectedly; execution finalized as failed. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+        },
+      });
+      throw cause;
+    }
 
     // Outcome-ambiguous barrier failure (design D8/F5): the wrapper threw a
     // `ConduitApprovalPause(true)` after a side effect completed but its

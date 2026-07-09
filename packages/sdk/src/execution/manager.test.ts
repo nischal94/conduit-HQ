@@ -13,6 +13,7 @@ import { createToolInvoker } from "../pipeline/invoker.js";
 import { createMcpUpstreamCaller } from "../pipeline/upstream.js";
 import { createStorePolicyEngine } from "../policy.js";
 import { QuickJSSandbox } from "../sandbox/quickjs.js";
+import type { Sandbox } from "../sandbox/sandbox.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
@@ -178,11 +179,58 @@ async function makeHarness(options?: { location?: string }): Promise<Harness> {
   };
 }
 
+/**
+ * A fresh, empty on-disk store with NO source/loopback wiring. Used by the
+ * stub-Sandbox tests (I-1), which drive the manager state machine directly and
+ * never reach upstream — so they run under the Bash-tool sandbox without EPERM.
+ */
+async function makeBareStore(): Promise<ConduitStore> {
+  const scratch = mkdtempSync(join(tmpdir(), "conduit-bare-"));
+  const client = createClient({ url: `file:${join(scratch, "bare.db")}` });
+  bareClients.push(client);
+  return openSqliteStore({
+    client,
+    secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+  });
+}
+const bareClients: ReturnType<typeof createClient>[] = [];
+
+/**
+ * Manager deps wired to a stub Sandbox. The invoker/host/decisions seams are
+ * present but never exercised in the I-1 tests, because the stub sandbox throws
+ * before it performs any tool call. `overrides` lets a test pin `newId` so the
+ * `start`-minted execution id is inspectable.
+ */
+function makeStubDeps(
+  store: ConduitStore,
+  sandbox: Sandbox,
+  overrides?: Partial<Pick<ExecutionManagerDeps, "newId" | "now">>,
+): ExecutionManagerDeps {
+  const unusedHost = {
+    search: () => Promise.reject(new Error("host must not be called when sandbox throws")),
+    describe: () => Promise.reject(new Error("host must not be called when sandbox throws")),
+    call: () => Promise.reject(new Error("host must not be called when sandbox throws")),
+  };
+  return {
+    store,
+    sandbox,
+    makeInvoker: () => () =>
+      Promise.reject(new Error("invoker must not be called when sandbox throws")),
+    makeToolHost: () => unusedHost,
+    makeDecisions: () => createInMemoryApprovalDecisions(),
+    ...(overrides?.newId !== undefined ? { newId: overrides.newId } : {}),
+    ...(overrides?.now !== undefined ? { now: overrides.now } : {}),
+  };
+}
+
 describe("§5.5 execution manager — pause/resume via deterministic replay", () => {
   let active: Harness | undefined;
   afterEach(async () => {
     await active?.cleanup();
     active = undefined;
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
   });
 
   it("INVARIANT §5.5: pause/resume via deterministic replay — approve resumes and runs the approved call live exactly once", async () => {
@@ -449,5 +497,222 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const journal = await h.store.replayJournal.listByExecution(outcome.executionId);
     expect(JSON.stringify(journal)).not.toContain("ghp_manager");
     expect(JSON.stringify(outcome)).not.toContain("ghp_manager");
+  });
+
+  it("§5.5 (F2): confused-deputy — an approval for tool A never authorizes tool B (fail closed)", async () => {
+    // End-to-end confused-deputy defense (design D6/F2, design §9). A run pauses
+    // on a DESTRUCTIVE call (delete_repo, tool B). Before resume, the persisted
+    // `pausedOn` is corrupted to look like a benign create_issue approval
+    // (tool A) — the identity a human "thought" they were approving. On resume
+    // the manager stages the approve decision bound to that A-identity, but the
+    // replay reaches the real first un-journaled call (delete_repo, B). The
+    // invoker's identity check (`take` no-match + `peek` staged) fails CLOSED:
+    // the approval for A does not authorize B, and delete_repo NEVER executes.
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+
+    const code = `
+      try {
+        const r = await tools.github.delete_repo({ repo: "prod" });
+        return { deleted: true, r };
+      } catch (error) {
+        return { deleted: false, name: error.name };
+      }
+    `;
+    const first = await manager.start(code);
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      return;
+    }
+    const id = first.executionId;
+    // It paused on the destructive call (tool B).
+    expect(first.pending.toolName).toBe("github.delete_repo");
+    // delete_repo did NOT reach upstream at pause time.
+    expect(h.calls.filter((c) => c.name === "delete_repo")).toHaveLength(0);
+
+    // Corrupt the persisted pausedOn to a DIFFERENT (benign) call identity —
+    // the crux of the confused-deputy scenario: the staged decision will be
+    // bound to create_issue (A), not to the delete_repo (B) the replay reaches.
+    const persisted = await manager.get(id);
+    if (persisted?.pausedOn === undefined) {
+      throw new Error("expected a persisted pausedOn to corrupt");
+    }
+    await h.store.executions.put({
+      ...persisted,
+      pausedOn: {
+        ...persisted.pausedOn,
+        toolName: "github.create_issue",
+        input: { title: "harmless" },
+      },
+    });
+
+    // Resume with approve. The staged approve is bound to create_issue (A);
+    // the first live call on replay is delete_repo (B) → identity mismatch →
+    // fail closed as ConduitPolicyBlocked. The guest catches it and reports.
+    const outcome = await manager.resume(id, { kind: "approve" });
+    expect(outcome.status).toBe("completed");
+    if (outcome.status === "completed") {
+      expect(outcome.value).toEqual({ deleted: false, name: "ConduitPolicyBlocked" });
+    }
+    // The wrong tool was NEVER executed: delete_repo (B) never reached upstream,
+    // and neither did create_issue (A) — the approval authorized nothing.
+    expect(h.calls.filter((c) => c.name === "delete_repo")).toHaveLength(0);
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(0);
+  });
+
+  it("§5.5 (F5): outcome-ambiguity — a replay-journal append failure after the side effect → terminal `failed`, not resumable", async () => {
+    // End-to-end outcome-ambiguity (design D8/F5). An approved call reaches
+    // upstream (the side effect fires), but the replay-journal append THEN
+    // throws. The barrier records the call as outcome-ambiguous: the execution
+    // becomes terminal `failed` (NON-resumable) and the side effect is not
+    // re-run on any later resume.
+    const h = await makeHarness();
+    active = h;
+
+    // Wrap the store so replayJournal.append throws for the APPROVED call only
+    // (the one whose serialized request names create_issue), AFTER upstream has
+    // already been hit. Every other append (the safe-read prefix) passes.
+    const realAppend = h.store.replayJournal.append.bind(h.store.replayJournal);
+    let poisoned = false;
+    const wrappedStore: ConduitStore = {
+      ...h.store,
+      replayJournal: {
+        ...h.store.replayJournal,
+        append: async (executionId, entry) => {
+          if (entry.request.includes("create_issue")) {
+            poisoned = true;
+            throw new Error("[test] simulated replay-journal append failure after side effect");
+          }
+          return realAppend(executionId, entry);
+        },
+      },
+    };
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      store: wrappedStore,
+      // The invoker/toolhost must use the SAME wrapped store so the real
+      // upstream side effect still fires through the loopback server.
+      makeInvoker: h.deps.makeInvoker,
+    };
+    const manager = createExecutionManager(deps);
+
+    const code = `
+      const before = await tools.github.list_issues({ owner: "acme", repo: "site" });
+      const created = await tools.github.create_issue({ title: "ambiguous" });
+      return { before, created };
+    `;
+    const first = await manager.start(code);
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      return;
+    }
+    const id = first.executionId;
+
+    // Resume with approve: create_issue reaches upstream (side effect fires),
+    // then its journal append throws → outcome-ambiguous terminal failed.
+    const outcome = await manager.resume(id, { kind: "approve" });
+    expect(poisoned).toBe(true);
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitOutcomeAmbiguous");
+    }
+    // The approved side effect DID fire exactly once (it is the ambiguity).
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(1);
+
+    // Terminal + NOT resumable: the row is `failed`, and a further resume is a
+    // no-op conflict (no `paused` row to claim) — the side effect is never re-run.
+    const settled = await manager.get(id);
+    expect(settled?.status).toBe("failed");
+    expect(settled?.pausedOn).toBeUndefined();
+    const retry = await manager.resume(id, { kind: "approve" });
+    expect(retry.status).toBe("conflict");
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(1);
+  });
+
+  // ── I-1: an unexpected sandbox throw on resume/start must not strand the
+  //         execution in `running`. It finalizes a terminal `failed`. ──────
+  //
+  // These tests inject a STUB Sandbox whose `execute` rejects, so they exercise
+  // the manager state machine WITHOUT a loopback server — they run directly
+  // under the Bash-tool sandbox (no EPERM), unlike the loopback tests above.
+
+  it("§5.5 (I-1): a resume-time sandbox throw finalizes terminal `failed`, never a stranded `running`", async () => {
+    // A store with no MCP/loopback wiring: this test never reaches upstream.
+    const store = await makeBareStore();
+    let calls = 0;
+    const throwingSandbox: Sandbox = {
+      execute() {
+        calls += 1;
+        // An infra fault out of the sandbox: bootstrap failure, getQuickJS()
+        // failure, or corrupt stored seeds surfacing as a RangeError.
+        return Promise.reject(new RangeError("Invalid stored seeds (corrupt replay state)"));
+      },
+    };
+    const deps = makeStubDeps(store, throwingSandbox);
+    const manager = createExecutionManager(deps);
+
+    // Seed a paused execution directly (no sandbox needed to reach a pause):
+    // status=paused with a pending approval and a one-row prefix journal.
+    const id = "exec_i1_resume";
+    const pausedOn = {
+      callId: "call_1",
+      toolName: "github.create_issue",
+      input: { title: "from agent" },
+      reason: "github.create_issue requires approval before it can run.",
+      expiresAt: Date.now() + 3_600_000,
+    };
+    await store.executions.put({
+      id,
+      code: "return await tools.github.create_issue({ title: 'from agent' });",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn,
+      startedAt: Date.now(),
+    });
+    await store.replayJournal.append(id, {
+      ordinal: 0,
+      op: "call",
+      request: JSON.stringify({ path: "github.list_issues", input: {} }),
+      outcome: { ok: true, value: { ok: true, tool: "list_issues" } },
+    });
+
+    // Resume must NOT swallow the throw, but it MUST finalize the row first.
+    await expect(manager.resume(id, { kind: "approve" })).rejects.toThrow("corrupt replay state");
+    expect(calls).toBe(1);
+
+    // The invariant: the row is terminal `failed`, NOT a stranded `running`.
+    const after = await manager.get(id);
+    expect(after?.status).toBe("failed");
+    expect(after?.endedAt).toBeDefined();
+    expect(after?.pausedOn).toBeUndefined();
+
+    // Consequence proof: because the row is terminal (not the pre-fix stranded
+    // `running`), a second resume returns `conflict` (claimForResume finds no
+    // `paused` row) rather than re-driving — the execution is settled, not
+    // half-transitioned.
+    const second = await manager.resume(id, { kind: "approve" });
+    expect(second.status).toBe("conflict");
+  });
+
+  it("§5.5 (I-1): a start-time sandbox throw finalizes terminal `failed`, never a stranded `running`", async () => {
+    const store = await makeBareStore();
+    const throwingSandbox: Sandbox = {
+      execute() {
+        return Promise.reject(new Error("getQuickJS() bootstrap failed"));
+      },
+    };
+    // Deterministic id so we can inspect the row `start` minted (id = exec_<newId>).
+    const deps = makeStubDeps(store, throwingSandbox, { newId: () => "start_i1" });
+    const manager = createExecutionManager(deps);
+
+    await expect(manager.start("return 1;")).rejects.toThrow("bootstrap failed");
+
+    // The row `start` persisted `running` must have been finalized to `failed` —
+    // not left stranded `running` by the propagating throw.
+    const row = await manager.get("exec_start_i1");
+    expect(row?.status).toBe("failed");
+    expect(row?.endedAt).toBeDefined();
+    expect(row?.pausedOn).toBeUndefined();
   });
 });
