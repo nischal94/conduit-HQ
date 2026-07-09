@@ -15,6 +15,20 @@ export type {
   ToolInvoker,
 } from "./execute.js";
 export { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execute.js";
+export type {
+  ApprovalDecision,
+  ApprovalDecisions,
+  PendingCallIdentity,
+} from "./execution/decisions.js";
+export { createInMemoryApprovalDecisions, identitiesMatch } from "./execution/decisions.js";
+export { matchesPending, toSandboxJournal } from "./execution/journal.js";
+export type {
+  ExecutionManager,
+  ExecutionManagerDeps,
+  ExecutionOutcome,
+} from "./execution/manager.js";
+export { createExecutionManager } from "./execution/manager.js";
+export { scrubCredential } from "./execution/scrub.js";
 export type { NormalizeMcpOptions } from "./normalize/mcp.js";
 export { normalizeMcp } from "./normalize/mcp.js";
 export type {

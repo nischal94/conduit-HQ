@@ -176,11 +176,15 @@ the catalog). Spec consumers should hold both views at once.
 ### 5.5 Pause/resume — deterministic replay (decided)
 
 Executions pause only at **tool-call boundaries** (a policy approval or an auth prompt).
-The mechanism is **deterministic replay**, not VM snapshotting: every tool call's result is
-**journaled** — the Trace store (§11) doubles as the replay log. On resume, the execution's
+The mechanism is **deterministic replay**, not VM snapshotting: every finalized tool call's
+result is **journaled** — into a dedicated **replay-journal projection**, distinct from
+the audit Trace (§11). On resume, the execution's
 code re-runs from the top; journaled calls return their **memoized results** without
-re-hitting upstream; the execution proceeds live from the first un-journaled call. **One
-mechanism powers both the audit differentiator and pause/resume correctness.**
+re-hitting upstream; the execution proceeds live from the first un-journaled call. A
+`require_approval` pause writes nothing to the replay journal (it is recorded on the
+Execution's pending approval), so the journal is a clean prefix by construction; the audit Trace still
+records the refusal. **The same durable-data model powers both the audit differentiator and
+pause/resume correctness.**
 
 - **Survives restarts:** a paused Execution is pure data (code + journal); the daemon can
 restart — or a different worker can pick it up — and resume it.
@@ -627,10 +631,17 @@ quickjs-emscripten, Ajv + Zod, Vitest, libSQL.
 namespace resolves to its one configured connection; multiple connections for an integration fail
 closed until per-call addressing ships. The pipeline's resolver seam accepts a `prefix`
 parameter from day one (unused in v1) so real addressing arrives without an interface change.
-- **Trace as replay log:** ✅ **`TraceEvent.output` carries the full
-(response-capped) call result** (§5.5, §11) — the Trace store doubles as the durable replay
-journal for `call` ops; `outputSummary` is a display projection. Persisting
-`search`/`describe` journal entries is deferred to the §5.5 execution-manager work.
+- **Replay journal as a dedicated projection (revised 2026-07-09, §5.5 execution-manager work):**
+✅ the durable replay journal is a **separate `replay_journal` table**, distinct from the
+audit Trace, holding `{ execution_id, ordinal, op, request, outcome }` for finalized
+`search`/`describe`/`call` ops. This supersedes the earlier "the Trace store
+doubles as the replay journal" decision: a cross-model review proved the audit Trace records the
+`require_approval` refusal row (polluting the replay prefix) and that `TraceEvent`
+cannot represent read-ops — so the two projections are split. The §18 rationale is preserved (durable-data
+replay over the SQLite store, no VM snapshots); only the "same table" detail changes. `TraceEvent.output`
+still carries the full (response-capped) call result for the §11 audit trail, with `outputSummary`
+as its display projection. Persisting `search`/`describe` journal entries — deferred here
+in the original decision — is discharged: they live in the new replay-journal table.
 **Audit semantics:** refusals (policy-denied, blocked) and allowed calls that reached the
 upstream caller and failed are traced (the latter with the allow verdict and no output); pre-flight
 refusals (no connection, unsupported source type, exhausted budget) and infra faults are not traced —
