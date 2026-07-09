@@ -73,6 +73,18 @@ export interface ExecutionRepository {
   get(id: string): Promise<Execution | undefined>;
   /** Atomic paused→running for a single resume. Returns true iff THIS caller won (design F4). */
   claimForResume(id: string, resumeAttemptId: string): Promise<boolean>;
+  /**
+   * Terminalize a row THIS resume claimed but could not finish preparing
+   * (design §8/F5, the stranded-running guard). A guarded
+   * `UPDATE ... status='failed', ended_at, paused_on=NULL WHERE id=? AND
+   * status='running'` — it only fires on a row currently `running`, so it can
+   * never stomp a row another actor already moved on. Unlike `put`, it needs
+   * NO parsed `Execution`: the very failure it recovers from can be that
+   * `get` returned corrupt/unparseable JSON, so there may be no Execution to
+   * spread. Returns nothing; a no-op (0 rows) means the row was already
+   * terminal or re-claimed, which is fine.
+   */
+  failClaimedResume(id: string, reason: string): Promise<void>;
 }
 
 export interface TraceRepository {
@@ -98,6 +110,24 @@ export interface ReplayJournalRow {
 export interface ReplayJournalRepository {
   append(executionId: string, entry: ReplayJournalRow): Promise<void>;
   listByExecution(executionId: string): Promise<ReplayJournalRow[]>;
+  /**
+   * Durable "an upstream `call` is about to fire" marker for one ordinal
+   * (design D8/F5). Written BEFORE the side effect reaches upstream; cleared
+   * once the outcome is durably journaled. If a process crashes in that
+   * window, the marker survives with NO finalized row at its ordinal — proof
+   * the side effect MAY have happened but its result was never recorded.
+   */
+  markAttempt(executionId: string, ordinal: number): Promise<void>;
+  /** Clear the attempt marker once the call's outcome is durably journaled. */
+  clearAttempt(executionId: string, ordinal: number): Promise<void>;
+  /**
+   * The ordinals of every attempt marker NOT yet cleared for this execution.
+   * On resume, a non-empty result means the prior drive crashed between an
+   * upstream side effect and its journal append → the execution is
+   * outcome-ambiguous and (absent an idempotency key, which v1 has not) must
+   * fail closed rather than re-run the side effect.
+   */
+  listAttempts(executionId: string): Promise<number[]>;
 }
 
 export interface SecretRepository {

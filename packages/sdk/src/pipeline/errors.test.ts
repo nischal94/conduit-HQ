@@ -1,11 +1,13 @@
 import { describe, expect, it, vi } from "vitest";
 import {
   ConduitCallError,
+  ConduitReplayDivergence,
   GUEST_ERROR_NAMES,
   type GuestErrorName,
   infraError,
   NON_MEMOIZABLE_ERROR_NAMES,
   policyError,
+  REPLAY_DIVERGENCE_ERROR_NAME,
   upstreamError,
 } from "./errors.js";
 
@@ -29,6 +31,15 @@ describe("pipeline error vocabulary", () => {
   it("upstream errors are memoizable — only policy refusals are stripped on replay", () => {
     expect(NON_MEMOIZABLE_ERROR_NAMES).not.toContain(GUEST_ERROR_NAMES.upstream);
     expect(NON_MEMOIZABLE_ERROR_NAMES).not.toContain(GUEST_ERROR_NAMES.infra);
+  });
+
+  it("ConduitReplayDivergence (F2) is NOT a guest-safe ConduitCallError name — it must bypass the guest vocabulary", () => {
+    const err = new ConduitReplayDivergence("first live call ≠ approved call");
+    expect(err.name).toBe(REPLAY_DIVERGENCE_ERROR_NAME);
+    expect(err).not.toBeInstanceOf(ConduitCallError);
+    // Its name is outside the closed guest-error vocabulary, so it can never be
+    // mistaken for a catchable policy/upstream/infra error at the boundary.
+    expect(Object.values(GUEST_ERROR_NAMES)).not.toContain(err.name);
   });
 
   it("infra errors log the real cause host-side and cross opaque", () => {

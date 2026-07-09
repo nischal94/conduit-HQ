@@ -543,11 +543,19 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(persisted?.status).toBe("expired");
   });
 
-  it("§5.5: no secret survives into the persisted replay journal or the outcome (F6, structural §9.2 guarantee)", async () => {
-    // Point the source at the hostile echo endpoint so an upstream 200-body
-    // echo of the credential would land in the journal if unscrubbed. The
-    // list_issues read fails (401) but is caught by the guest; the point is
-    // that NO secret material survives into the journal or the resumed value.
+  it("§5.5 (F6): the STRUCTURAL §9.2 guarantee — no credential material survives into the persisted replay journal or the returned value across a live call", async () => {
+    // What this test actually proves (and does NOT): it asserts the STRUCTURAL
+    // guarantee (design D7 / spec §9.2) — credentials are request-scoped and
+    // never persisted, so the replay journal and the returned outcome hold only
+    // host-classified upstream results, never credential material. It does NOT
+    // prove the best-effort scrub ran: the manager passes `secret: undefined`
+    // to the journaling wrapper (it deliberately does not resolve credentials —
+    // that stays in the pipeline, design D7), so `scrubCredential` is a no-op
+    // here. The secret's absence is structural (the /echo401 upstream returns
+    // the credential in its OWN response only on a path the guest's value never
+    // carries), not a consequence of scrubbing. The scrub logic itself — the
+    // best-effort defense-in-depth layer — is exercised directly with real
+    // secrets in scrub.test.ts, so its coverage does not depend on this test.
     const h = await makeHarness();
     active = h;
     // Repoint the source to the echo endpoint (live source lookup at call
@@ -577,15 +585,16 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(JSON.stringify(outcome)).not.toContain("ghp_manager");
   });
 
-  it("§5.5 (F2): confused-deputy — an approval for tool A never authorizes tool B (fail closed)", async () => {
-    // End-to-end confused-deputy defense (design D6/F2, design §9). A run pauses
-    // on a DESTRUCTIVE call (delete_repo, tool B). Before resume, the persisted
-    // `pausedOn` is corrupted to look like a benign create_issue approval
-    // (tool A) — the identity a human "thought" they were approving. On resume
-    // the manager stages the approve decision bound to that A-identity, but the
-    // replay reaches the real first un-journaled call (delete_repo, B). The
-    // invoker's identity check (`take` no-match + `peek` staged) fails CLOSED:
-    // the approval for A does not authorize B, and delete_repo NEVER executes.
+  it("§5.5 (F2): confused-deputy — an approval for tool A never authorizes tool B, and the divergence is TERMINAL (guest cannot catch-and-continue)", async () => {
+    // End-to-end confused-deputy defense (design D6/F2, design §9), now TERMINAL.
+    // A run pauses on a DESTRUCTIVE call (delete_repo, tool B). Before resume,
+    // the persisted `pausedOn` is corrupted to look like a benign create_issue
+    // approval (tool A) — the identity a human "thought" they were approving. On
+    // resume the manager stages the approve decision bound to that A-identity,
+    // but the replay reaches the real first un-journaled call (delete_repo, B).
+    // The invoker's identity check throws an uncatchable ConduitReplayDivergence:
+    // the guest's try/catch does NOT run (the interrupt is uncatchable), the
+    // execution is TERMINAL `failed`, and delete_repo NEVER executes.
     const h = await makeHarness();
     active = h;
     const manager = createExecutionManager(h.deps);
@@ -595,7 +604,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
         const r = await tools.github.delete_repo({ repo: "prod" });
         return { deleted: true, r };
       } catch (error) {
-        return { deleted: false, name: error.name };
+        // Under the TERMINAL model this catch must NOT run — the divergence is
+        // an uncatchable interrupt, so control never returns to guest code.
+        return { deleted: false, caughtAndContinued: true, name: error.name };
       }
     `;
     const first = await manager.start(code);
@@ -625,18 +636,27 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       },
     });
 
-    // Resume with approve. The staged approve is bound to create_issue (A);
-    // the first live call on replay is delete_repo (B) → identity mismatch →
-    // fail closed as ConduitPolicyBlocked. The guest catches it and reports.
+    // Resume with approve. The staged approve is bound to create_issue (A); the
+    // first live call on replay is delete_repo (B) → identity mismatch → TERMINAL
+    // replay-divergence. The guest CANNOT catch-and-continue; the execution fails.
     const outcome = await manager.resume(id, { kind: "approve" });
-    expect(outcome.status).toBe("completed");
-    if (outcome.status === "completed") {
-      expect(outcome.value).toEqual({ deleted: false, name: "ConduitPolicyBlocked" });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitReplayDivergence");
     }
     // The wrong tool was NEVER executed: delete_repo (B) never reached upstream,
     // and neither did create_issue (A) — the approval authorized nothing.
     expect(h.calls.filter((c) => c.name === "delete_repo")).toHaveLength(0);
     expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(0);
+
+    // TERMINAL + non-resumable: the row is `failed` with pausedOn cleared, and a
+    // later resume is a no-op conflict (no `paused` row to claim). The guest
+    // never regained control to invoke the approved tool.
+    const settled = await manager.get(id);
+    expect(settled?.status).toBe("failed");
+    expect(settled?.pausedOn).toBeUndefined();
+    const retry = await manager.resume(id, { kind: "approve" });
+    expect(retry.status).toBe("conflict");
   });
 
   it("§5.5 (F5): outcome-ambiguity — a replay-journal append failure after the side effect → terminal `failed`, not resumable", async () => {
@@ -883,5 +903,176 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(row?.status).toBe("failed");
     expect(row?.endedAt).toBeDefined();
     expect(row?.pausedOn).toBeUndefined();
+  });
+
+  it("§5.5 (I-3): a throw in the post-claim prep window (get returns corrupt data) terminalizes `failed`, never stranded `running`", async () => {
+    // (Fix 1 / F5) The window between a successful `claimForResume` (which flips
+    // paused→running) and `drive` taking over is fragile: `get` can surface
+    // CORRUPT stored JSON as a parse error. If that throw stranded the row
+    // `running`, a later resume's `claimForResume WHERE status='paused'` would
+    // find 0 rows → permanently un-resumable. The whole prep window must
+    // terminalize the claimed row `failed` (via the raw `failClaimedResume`,
+    // which needs no parsed Execution) before the fault propagates.
+    const store = await makeBareStore();
+
+    // Seed a real paused row so the (real) claimForResume succeeds…
+    const id = "exec_i3_corruptget";
+    await store.executions.put({
+      id,
+      code: "return await tools.github.create_issue({ title: 'x' });",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn: {
+        callId: "call_1",
+        toolName: "github.create_issue",
+        input: { title: "x" },
+        reason: "requires approval",
+        expiresAt: Date.now() + 3_600_000,
+      },
+      startedAt: Date.now(),
+    });
+
+    // …then make `get` throw AFTER the claim (as corrupt stored JSON would),
+    // while claimForResume/failClaimedResume stay the real guarded UPDATEs.
+    const wrappedStore: ConduitStore = {
+      ...store,
+      executions: {
+        ...store.executions,
+        get: async () => {
+          throw new Error("[SqliteStore] Failed to read execution: seeds is not valid JSON");
+        },
+      },
+    };
+    // A sandbox that must never run — the throw happens before drive.
+    const neverSandbox: Sandbox = {
+      execute: () => Promise.reject(new Error("sandbox must not run when prep throws")),
+    };
+    const manager = createExecutionManager(makeStubDeps(wrappedStore, neverSandbox));
+
+    // The fault surfaces (not swallowed), but the row is finalized first.
+    await expect(manager.resume(id, { kind: "approve" })).rejects.toThrow(/not valid JSON/);
+
+    // Invariant: terminal `failed`, NOT a stranded `running`. Read via the REAL
+    // store (the wrapped get throws).
+    const after = await store.executions.get(id);
+    expect(after?.status).toBe("failed");
+    expect(after?.pausedOn).toBeUndefined();
+
+    // Consequence: a later resume is a no-op conflict (no `paused` row to claim).
+    const retry = await manager.resume(id, { kind: "approve" });
+    expect(retry.status).toBe("conflict");
+  });
+
+  it("§5.5 (F5/I-5): a crash mid-call (attempt marker persisted, no outcome) → resume is terminal outcome-ambiguous, side effect NOT re-run", async () => {
+    // (Fix 3) The crash window between an upstream side effect and its journal
+    // append. Simulate the crash by seeding a paused row PLUS a lingering
+    // attempt marker at an ordinal with NO finalized replay_journal row. On
+    // resume, the recovery check sees the stranded marker and fails CLOSED —
+    // terminal `failed` (outcome-ambiguous), never re-running the side effect
+    // (the sandbox is never even driven). v1 has no idempotency key, so
+    // fail-closed is the correct default (design D8).
+    const store = await makeBareStore();
+    const id = "exec_f5_crash";
+    await store.executions.put({
+      id,
+      code: "return await tools.github.create_issue({ title: 'crashed' });",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.create_issue",
+        input: { title: "crashed" },
+        reason: "requires approval",
+        expiresAt: Date.now() + 3_600_000,
+      },
+      startedAt: Date.now(),
+    });
+    // A crash left an attempt marker at ordinal 0 with no finalized outcome.
+    await store.replayJournal.markAttempt(id, 0);
+
+    // A sandbox that must NEVER run — the recovery check fails closed before any
+    // drive, so the side effect is never re-issued.
+    let sandboxRuns = 0;
+    const neverSandbox: Sandbox = {
+      execute: () => {
+        sandboxRuns += 1;
+        return Promise.reject(new Error("sandbox must not run on an outcome-ambiguous recovery"));
+      },
+    };
+    const manager = createExecutionManager(makeStubDeps(store, neverSandbox));
+
+    const outcome = await manager.resume(id, { kind: "approve" });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitOutcomeAmbiguous");
+    }
+    // The side effect was NOT re-run: the sandbox was never driven.
+    expect(sandboxRuns).toBe(0);
+
+    // Terminal + non-resumable: the row is `failed`, pausedOn cleared, and a
+    // later resume is a no-op conflict.
+    const after = await store.executions.get(id);
+    expect(after?.status).toBe("failed");
+    expect(after?.pausedOn).toBeUndefined();
+    const retry = await manager.resume(id, { kind: "approve" });
+    expect(retry.status).toBe("conflict");
+  });
+
+  it("§5.5 (I-4): the corrupt-state branch (pausedOn undefined after claim) persists terminal `failed` before returning", async () => {
+    // (Fix 1) A paused row whose pausedOn is somehow absent after the claim is a
+    // corrupt state. The early-return must persist `failed` (not just return a
+    // failed OUTCOME while leaving the row `running`), or the row is stranded.
+    const store = await makeBareStore();
+    const id = "exec_i4_nopaused";
+    // Seed a `paused` row (so claimForResume succeeds) then strip pausedOn via a
+    // wrapped `get` that returns the row WITHOUT pausedOn — simulating the
+    // corrupt state the branch guards.
+    await store.executions.put({
+      id,
+      code: "return 1;",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.create_issue",
+        input: {},
+        reason: "r",
+        expiresAt: Date.now() + 3_600_000,
+      },
+      startedAt: Date.now(),
+    });
+    const wrappedStore: ConduitStore = {
+      ...store,
+      executions: {
+        ...store.executions,
+        get: async (getId) => {
+          const row = await store.executions.get(getId);
+          if (row === undefined) {
+            return undefined;
+          }
+          const { pausedOn: _drop, ...withoutPaused } = row;
+          return withoutPaused;
+        },
+      },
+    };
+    const neverSandbox: Sandbox = {
+      execute: () => Promise.reject(new Error("sandbox must not run in the corrupt-state branch")),
+    };
+    const manager = createExecutionManager(makeStubDeps(wrappedStore, neverSandbox));
+
+    const outcome = await manager.resume(id, { kind: "approve" });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitInternalError");
+      expect(outcome.error.message).toContain("no pending approval");
+    }
+
+    // The row was PERSISTED terminal `failed` (not left `running`): read the
+    // REAL store and confirm, then a later resume is a no-op conflict.
+    const after = await store.executions.get(id);
+    expect(after?.status).toBe("failed");
+    expect(after?.pausedOn).toBeUndefined();
+    const retry = await manager.resume(id, { kind: "approve" });
+    expect(retry.status).toBe("conflict");
   });
 });

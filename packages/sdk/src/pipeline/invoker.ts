@@ -6,6 +6,7 @@ import type { ConduitStore } from "../store/store.js";
 import type { Connection, TraceEvent } from "../types.js";
 import {
   ConduitCallError,
+  ConduitReplayDivergence,
   GUEST_ERROR_NAMES,
   infraError,
   policyError,
@@ -74,7 +75,16 @@ export function createToolInvoker(
       // ConduitCallError passes through; anything else (a bug, a custom
       // caller's non-serializable result, a throwing deadline()) becomes an
       // opaque infra error. Nothing raw crosses into the sandbox.
-      throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
+      //
+      // A ConduitReplayDivergence (§5.5/F2) also passes through UNCHANGED — it
+      // must NOT be laundered into a guest-catchable ConduitInternalError. The
+      // journaling wrapper recognizes it by name and turns it into a host-side
+      // terminal signal (the manager finalizes `failed`); the guest never gets
+      // to catch it, exactly like the sandbox's own nondeterminism interrupt.
+      if (cause instanceof ConduitReplayDivergence || cause instanceof ConduitCallError) {
+        throw cause;
+      }
+      throw infraError(cause, log);
     }
   };
 }
@@ -204,7 +214,7 @@ async function runCall(
 }
 
 /**
- * §5.5 design D6 — resolve the operator decision for this call into a
+ * §5.5 design D6/F2 — resolve the operator decision for this call into a
  * synthetic PolicyVerdict, or `undefined` to fall through to policy.
  *
  * The identity is `{ op: "call", toolName: path, request }`, where `request`
@@ -213,16 +223,21 @@ async function runCall(
  * into `request` (that would double-encode it and desync from how a decision
  * is staged). Whoever stages a decision MUST use the identical serialization.
  *
- * Three outcomes, all fail-closed by construction:
+ * Outcomes, all fail-closed by construction:
  *  - no decisions dep, or nothing staged for this execution → undefined
  *    (the policy path runs unchanged — the common resume case).
  *  - a decision staged for THIS exact identity → consume it (one-shot):
  *    approve → synthetic allow (skips policy); deny → synthetic block.
- *  - a decision staged but its identity DIVERGES from this call → block.
- *    `take` returned undefined (no match) yet `peek` shows one is staged:
- *    an approval for one call must never authorize another, so we refuse
- *    rather than fall through to policy (which might allow). This is the
- *    confused-deputy defense.
+ *  - a decision staged but its identity DIVERGES from this call → THROW a
+ *    ConduitReplayDivergence (NOT a block verdict). `take` returned undefined
+ *    (no match) yet `peek` shows one is staged: the first live call on resume
+ *    is not the call the human approved. A guest-catchable `block` would let
+ *    the guest catch it and continue past the divergence to later invoke the
+ *    originally-approved tool. Instead we terminate the execution: the
+ *    divergence is uncatchable (the wrapper turns it into a host-side terminal
+ *    signal), and the staged decision is DISCARDED so it can never be reused.
+ *    This both preserves the confused-deputy property (approval for A never
+ *    authorizes B) AND makes the divergence terminal.
  */
 function resolveDecisionVerdict(
   deps: ToolInvokerDeps,
@@ -238,13 +253,15 @@ function resolveDecisionVerdict(
   const decision = decisions.take(executionId, identity);
   if (decision === undefined) {
     // Nothing staged → normal policy path. Something staged but non-matching
-    // → resume divergence, fail closed (block-class, never allow).
+    // → resume divergence: terminate the execution, uncatchable by the guest.
     if (decisions.peek(executionId)) {
-      return {
-        action: "block",
-        reason: "resume divergence: approved call does not match the approved pending call",
-        source: "default",
-      };
+      // Discard the mismatched decision so it can never authorize a later call
+      // (belt-and-suspenders: the sandbox is interrupted after this throw, but
+      // a consumed decision cannot be reused under any control flow).
+      decisions.discard(executionId);
+      throw new ConduitReplayDivergence(
+        "resume divergence: the first live call does not match the approved pending call; execution terminated",
+      );
     }
     return undefined;
   }

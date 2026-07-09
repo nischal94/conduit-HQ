@@ -25,6 +25,32 @@ export const NON_MEMOIZABLE_ERROR_NAMES: readonly string[] = [
 
 const GUEST_ERROR_NAME_SET: ReadonlySet<string> = new Set(Object.values(GUEST_ERROR_NAMES));
 
+/**
+ * §5.5 design D6/F2 — a resume replay-divergence: the first live call on
+ * resume does NOT match the call the human approved (`pausedOn`). This is NOT
+ * a guest-catchable policy error. Continuing past a proven divergence would
+ * violate the invariant "the first live call on resume MUST be the paused
+ * call", so — like the sandbox's own nondeterminism guard — it must TERMINATE
+ * the execution, uncatchable by the guest.
+ *
+ * It is deliberately NOT a `ConduitCallError` (those carry guest-safe names the
+ * guest may catch). The invoker's outermost catch lets it pass through
+ * unchanged (rather than laundering it into an opaque `ConduitInternalError`
+ * the guest could catch); the journaling ToolHost wrapper then recognizes it
+ * by `name` and converts it into a host-side terminal signal (a
+ * `ConduitApprovalPause`, which the sandbox treats as an uncatchable
+ * interrupt), so the manager finalizes the execution `failed`
+ * (replay-divergence) instead of returning a catchable error to the guest.
+ */
+export const REPLAY_DIVERGENCE_ERROR_NAME = "ConduitReplayDivergence";
+
+export class ConduitReplayDivergence extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = REPLAY_DIVERGENCE_ERROR_NAME;
+  }
+}
+
 export class ConduitCallError extends Error {
   readonly kind: CallErrorKind;
   readonly correlationId: string | undefined;

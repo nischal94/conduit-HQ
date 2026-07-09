@@ -291,6 +291,46 @@ describe("SqliteStore", () => {
       await store.replayJournal.append("exec_2", row); // second write must not duplicate or throw
       expect(await store.replayJournal.listByExecution("exec_2")).toHaveLength(1);
     });
+
+    it("append REJECTS a conflicting ordinal that carries DIFFERENT content (corruption, not idempotent retry)", async () => {
+      // (F5) `ON CONFLICT DO NOTHING` silently kept the stale row even when the
+      // incoming row differed — diverging replay. A duplicate ordinal whose
+      // request/outcome differs is corruption and must fail loudly; the
+      // identical-content retry above must stay a no-op.
+      await store.replayJournal.append("exec_conflict", {
+        ordinal: 0,
+        op: "call",
+        request: '{"path":"a","input":null}',
+        outcome: { ok: true, value: { done: true } },
+      });
+      await expect(
+        store.replayJournal.append("exec_conflict", {
+          ordinal: 0,
+          op: "call",
+          request: '{"path":"b","input":null}', // different request at the same ordinal
+          outcome: { ok: true, value: { done: true } },
+        }),
+      ).rejects.toThrow(/append conflict/i);
+      // The original row is untouched — the mismatch did not overwrite it.
+      const rows = await store.replayJournal.listByExecution("exec_conflict");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.request).toBe('{"path":"a","input":null}');
+    });
+
+    it("attempt markers: mark, list, and clear round-trip (F5 crash window)", async () => {
+      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([]);
+      await store.replayJournal.markAttempt("exec_att", 3);
+      await store.replayJournal.markAttempt("exec_att", 1);
+      await store.replayJournal.markAttempt("exec_att", 3); // idempotent re-mark
+      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([1, 3]);
+      // Isolated by execution.
+      expect(await store.replayJournal.listAttempts("exec_other")).toEqual([]);
+      // Clearing one leaves the other.
+      await store.replayJournal.clearAttempt("exec_att", 1);
+      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([3]);
+      await store.replayJournal.clearAttempt("exec_att", 3);
+      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([]);
+    });
   });
 
   describe("secrets", () => {

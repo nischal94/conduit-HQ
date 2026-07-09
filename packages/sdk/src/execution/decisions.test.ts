@@ -51,4 +51,20 @@ describe("createInMemoryApprovalDecisions (§5.5 design D6)", () => {
     ).toBeUndefined();
     expect(d.take("exec_1", deleteRepo)).toEqual({ kind: "approve" });
   });
+
+  it("discard: drops a staged decision unconditionally so it can never be reused (F2)", () => {
+    const d = createInMemoryApprovalDecisions();
+    d.stage("exec_1", deleteRepo, { kind: "approve" });
+    expect(d.peek("exec_1")).toBe(true);
+    d.discard("exec_1");
+    // Gone: neither peek nor a matching take sees it after a divergence discard.
+    expect(d.peek("exec_1")).toBe(false);
+    expect(d.take("exec_1", deleteRepo)).toBeUndefined();
+  });
+
+  it("discard: is a no-op when nothing is staged", () => {
+    const d = createInMemoryApprovalDecisions();
+    expect(() => d.discard("exec_none")).not.toThrow();
+    expect(d.peek("exec_none")).toBe(false);
+  });
 });

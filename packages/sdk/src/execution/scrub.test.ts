@@ -52,4 +52,22 @@ describe("scrubCredential", () => {
     const fn = (): void => {};
     expect(scrubCredential(fn, "Bearer ghp_secret_123")).toBe(fn);
   });
+
+  it("scrubs a credential echoed inside a NESTED upstream result (the defense-in-depth layer, with a real secret)", () => {
+    // Direct coverage of the best-effort scrub as the layer design D7 documents:
+    // when a secret IS supplied to the wrapper, a naive echo nested inside an
+    // upstream response body is removed before the result is persisted/replayed.
+    // (The manager passes `secret: undefined` in v1 — see the F6 test in
+    // manager.test.ts — so this unit test is what keeps the scrub logic covered.)
+    const secret = "Bearer ghp_manager_secret_do_not_leak_7b3d";
+    const upstreamBody = {
+      jsonrpc: "2.0",
+      result: { ok: true, note: "auth was", header: secret, deep: { echoed: secret } },
+    };
+    const out = scrubCredential(upstreamBody, secret);
+    const serialized = JSON.stringify(out);
+    expect(serialized).not.toContain("ghp_manager_secret_do_not_leak_7b3d");
+    // Non-secret structure is preserved.
+    expect((out as { result: { ok: boolean } }).result.ok).toBe(true);
+  });
 });

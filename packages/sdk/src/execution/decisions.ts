@@ -59,6 +59,13 @@ export interface ApprovalDecisions {
   take(executionId: string, identity: PendingCallIdentity): ApprovalDecision | undefined;
   /** True iff a decision is currently staged for this execution (non-consuming). */
   peek(executionId: string): boolean;
+  /**
+   * Drop any staged decision for this execution unconditionally. Called on a
+   * resume replay-divergence (design F2): once the first live call proves it
+   * is not the approved call, the staged decision must never authorize a
+   * later call, so it is discarded rather than left in place.
+   */
+  discard(executionId: string): void;
 }
 
 interface StagedDecision {
@@ -108,6 +115,10 @@ export function createInMemoryApprovalDecisions(): ApprovalDecisions {
 
     peek(executionId) {
       return staged.has(executionId);
+    },
+
+    discard(executionId) {
+      staged.delete(executionId);
     },
   };
 }

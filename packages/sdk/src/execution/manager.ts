@@ -1,5 +1,5 @@
 import type { ToolInvoker } from "../execute.js";
-import { GUEST_ERROR_NAMES } from "../pipeline/errors.js";
+import { GUEST_ERROR_NAMES, REPLAY_DIVERGENCE_ERROR_NAME } from "../pipeline/errors.js";
 import type {
   JournalEntry,
   Sandbox,
@@ -119,19 +119,24 @@ function resolveApprovalTtlMs(): number {
  * structurally by `name === "ConduitApprovalPause"` (quickjs.ts `perform`);
  * it never sees the policy that produced it.
  *
- * The same class also carries the outcome-ambiguous escape (design D8/F5):
- * when a completed call's result cannot be journaled, the barrier throws this
- * with `ambiguous: true`. It shares the `ConduitApprovalPause` name so the
- * sandbox's `perform` still treats it as a non-result (never journaling the
- * call); the manager reads `captured.ambiguous` to finalize a terminal failed
- * state rather than a pause.
+ * The same class also carries the two TERMINAL escapes that must suspend the
+ * sandbox (so the guest cannot catch them) yet resolve to a terminal `failed`,
+ * never a real pause:
+ *  - **outcome-ambiguous** (design D8/F5): a completed call's result could not
+ *    be journaled (`captured.ambiguous`).
+ *  - **replay-divergence** (design D6/F2): the first live call on resume is not
+ *    the approved call (`captured.divergence`).
+ * Both share the `ConduitApprovalPause` name so the sandbox's `perform` treats
+ * them as a non-result (never journaling the call, and — being a
+ * suspend/interrupt — uncatchable in the guest); the manager reads the matching
+ * `captured` field to finalize a terminal failed state rather than a pause.
  */
 class ConduitApprovalPause extends Error {
-  readonly ambiguous: boolean;
-  constructor(ambiguous = false) {
-    super(ambiguous ? "execution outcome-ambiguous" : "execution paused awaiting approval");
+  readonly terminal: boolean;
+  constructor(terminal = false) {
+    super(terminal ? "execution terminated (non-resumable)" : "execution paused awaiting approval");
     this.name = "ConduitApprovalPause";
-    this.ambiguous = ambiguous;
+    this.terminal = terminal;
   }
 }
 
@@ -146,6 +151,21 @@ class ConduitApprovalPause extends Error {
 interface JournalingHostContext {
   executionId: string;
   secret: string | undefined;
+}
+
+/**
+ * The out-of-band signals the journaling wrapper hands back to `drive` for one
+ * sandbox drive. `pending` is a real approval pause; `ambiguous` and
+ * `divergence` are TERMINAL faults that the sandbox surfaces as a pause (via
+ * the shared `ConduitApprovalPause` name) but the manager finalizes as
+ * `failed` — never a resumable pause. At most one is set per drive.
+ */
+interface CapturedDriveState {
+  pending?: PendingApproval;
+  /** design D8/F5: a completed call's result could not be journaled. */
+  ambiguous?: SandboxError;
+  /** design D6/F2: the first live call on resume ≠ the approved call. */
+  divergence?: SandboxError;
 }
 
 export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionManager {
@@ -174,9 +194,42 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     inner: ToolHost,
     ctx: JournalingHostContext,
     prefixLength: number,
-    captured: { pending?: PendingApproval; ambiguous?: SandboxError },
+    captured: CapturedDriveState,
   ): ToolHost {
     let ordinal = prefixLength;
+
+    // The reason text of the most recent require_approval. Scoped to THIS
+    // wrapper (i.e. this drive) — not the ExecutionManager instance — so a
+    // second concurrent drive on the same manager can never read a reason set
+    // by another (design P2 / Fix 7). Single-pending-call model (design D3) →
+    // at most one is live per drive, set when the wrapper recognizes the
+    // invoker's ConduitPolicyDenied and consumed by assemblePending.
+    let lastApprovalReason: string | undefined;
+
+    function isRequireApproval(error: unknown): boolean {
+      if (!(error instanceof Error) || error.name !== GUEST_ERROR_NAMES.policyDenied) {
+        return false;
+      }
+      lastApprovalReason = error.message;
+      return true;
+    }
+
+    function isReplayDivergence(error: unknown): boolean {
+      return error instanceof Error && error.name === REPLAY_DIVERGENCE_ERROR_NAME;
+    }
+
+    function assemblePending(path: string, input: unknown): PendingApproval {
+      // reason/callId originate HOST-SIDE here (design C3) — never in the
+      // sandbox. The reason is the policy verdict's message, surfaced from the
+      // invoker's `ConduitPolicyDenied` throw and captured just above.
+      return {
+        callId: newId(),
+        toolName: path,
+        input,
+        reason: lastApprovalReason ?? `${path} requires approval before it can run.`,
+        expiresAt: now() + resolveApprovalTtlMs(),
+      };
+    }
 
     async function journal(
       op: "search" | "describe" | "call",
@@ -184,28 +237,71 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       run: () => Promise<unknown>,
       onApprovalPause: () => PendingApproval,
     ): Promise<unknown> {
+      // Attempt marker (design D8/F5) — ONLY for `call` (search/describe are
+      // reads with no side effect). Written at the ordinal this call's append
+      // will consume, BEFORE the side effect reaches upstream, so a process
+      // crash between the upstream call and its journal append leaves a durable
+      // "attempted but unrecorded" marker a later resume treats as
+      // outcome-ambiguous. `ordinal` is the counter appendBarrier will read;
+      // nothing runs between here and the append to shift it.
+      const attemptOrdinal = ordinal;
+      if (op === "call") {
+        await deps.store.replayJournal.markAttempt(ctx.executionId, attemptOrdinal);
+      }
+
       let value: unknown;
       try {
         value = await run();
       } catch (error) {
         if (isRequireApproval(error)) {
-          // Pause: assemble the host-side PendingApproval and suspend WITHOUT
-          // journaling (design D2/D4). Only a `call` can gate.
+          // Pause: no upstream side effect happened (policy refuses BEFORE
+          // upstream). Clear the attempt marker — nothing to be ambiguous
+          // about — then suspend WITHOUT journaling (design D2/D4).
+          await clearAttempt(op, attemptOrdinal);
           captured.pending = onApprovalPause();
           throw new ConduitApprovalPause();
         }
+        if (isReplayDivergence(error)) {
+          // Resume replay-divergence (design D6/F2): refused BEFORE upstream,
+          // like require_approval — no side effect. Clear the marker, then
+          // terminate the execution (uncatchable by the guest). The manager
+          // finalizes `failed`; do NOT journal it (not real guest control flow).
+          await clearAttempt(op, attemptOrdinal);
+          captured.divergence = {
+            name: REPLAY_DIVERGENCE_ERROR_NAME,
+            message: `[ExecutionManager] Resume replay-divergence; execution terminated (non-resumable). Context: { executionId: ${ctx.executionId} }`,
+          };
+          throw new ConduitApprovalPause(true);
+        }
         // Any other error (a `block`, a real upstream failure, a denied
         // resume resolving as ConduitPolicyBlocked) is a journaled failed
-        // outcome — catchable in the guest, exactly as today.
+        // outcome — catchable in the guest, exactly as today. The failed
+        // outcome IS durably recorded by appendBarrier, so the attempt is no
+        // longer ambiguous — clear the marker after the append.
         const outcome = { ok: false as const, error: toSandboxError(error) };
         await appendBarrier(op, request, outcome);
+        await clearAttempt(op, attemptOrdinal);
         // Re-throw so the guest sees the (guest-safe) error.
         throw error;
       }
       const scrubbed = scrubCredential(value, ctx.secret);
       const normalized = scrubbed === undefined ? null : scrubbed;
+      // Append the outcome FIRST (the durable barrier); only once it is durable
+      // do we clear the attempt marker. If appendBarrier throws (outcome
+      // could not be journaled), it terminalizes outcome-ambiguous and the
+      // marker is deliberately LEFT in place — the drive is terminal anyway.
       await appendBarrier(op, request, { ok: true as const, value: normalized });
+      await clearAttempt(op, attemptOrdinal);
       return normalized;
+    }
+
+    async function clearAttempt(
+      op: "search" | "describe" | "call",
+      attemptOrdinal: number,
+    ): Promise<void> {
+      if (op === "call") {
+        await deps.store.replayJournal.clearAttempt(ctx.executionId, attemptOrdinal);
+      }
     }
 
     async function appendBarrier(
@@ -278,32 +374,6 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     };
   }
 
-  function assemblePending(path: string, input: unknown): PendingApproval {
-    // reason/callId originate HOST-SIDE here (design C3) — never in the
-    // sandbox. The reason is the policy verdict's message, surfaced from the
-    // invoker's `ConduitPolicyDenied` throw and captured by the wrapper.
-    return {
-      callId: newId(),
-      toolName: path,
-      input,
-      reason: lastApprovalReason ?? `${path} requires approval before it can run.`,
-      expiresAt: now() + resolveApprovalTtlMs(),
-    };
-  }
-
-  // The reason text of the most recent require_approval. Set when the wrapper
-  // recognizes the invoker's ConduitPolicyDenied so assemblePending can carry
-  // it. Single-pending-call model (design D3) → at most one is live per drive.
-  let lastApprovalReason: string | undefined;
-
-  function isRequireApproval(error: unknown): boolean {
-    if (!(error instanceof Error) || error.name !== GUEST_ERROR_NAMES.policyDenied) {
-      return false;
-    }
-    lastApprovalReason = error.message;
-    return true;
-  }
-
   /**
    * Guard a POST-SANDBOX persistence write (the paused/finish/expiry `put`s).
    * By the time these run the row is already `running` (`start` put it, or
@@ -350,7 +420,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     secret: string | undefined,
     limits: Partial<SandboxLimits> | undefined,
   ): Promise<ExecutionOutcome> {
-    const captured: { pending?: PendingApproval; ambiguous?: SandboxError } = {};
+    const captured: CapturedDriveState = {};
     const host = makeJournalingHost(
       deps.makeToolHost(invoke),
       { executionId: execution.id, secret },
@@ -392,11 +462,16 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       throw cause;
     }
 
-    // Outcome-ambiguous barrier failure (design D8/F5): the wrapper threw a
-    // `ConduitApprovalPause(true)` after a side effect completed but its
-    // result could not be journaled. The sandbox treats that as a pause
-    // (name-match) and returns `status:"paused"`, but this is a terminal,
-    // NON-resumable failure — never a real approval pause. Check it first.
+    // Terminal barrier signals (design D6/F2 and D8/F5): the wrapper threw a
+    // `ConduitApprovalPause(true)` — a suspend the sandbox surfaces as
+    // `status:"paused"`, but which is actually a terminal, NON-resumable
+    // failure, never a real approval pause. Check these BEFORE the switch.
+    //
+    // divergence — the first live call on resume was not the approved call.
+    if (captured.divergence !== undefined) {
+      return finish(execution, { status: "failed", error: captured.divergence });
+    }
+    // ambiguous — a side effect completed but its result could not be journaled.
     if (captured.ambiguous !== undefined) {
       return finish(execution, { status: "failed", error: captured.ambiguous });
     }
@@ -479,56 +554,115 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         return { status: "conflict", executionId };
       }
 
-      const execution = await deps.store.executions.get(executionId);
-      if (execution === undefined || execution.pausedOn === undefined) {
-        // The claim flipped status to running but there is no pending call to
-        // resume against — a corrupt state; fail closed.
-        return {
-          status: "failed",
+      // The claim just flipped the row to `running`. EVERYTHING from here until
+      // `drive` takes over is a fragile preparation window (design §8/F5): a
+      // throw in `get` (which can surface CORRUPT stored JSON — bad seeds or
+      // pausedOn — as a parse error), the contiguity check in `toSandboxJournal`
+      // (design D5), `listByExecution`, `stage`, or `makeInvoker` would strand
+      // the row `running` — a later resume's `claimForResume WHERE
+      // status='paused'` then finds 0 rows → permanently un-resumable. Guard the
+      // WHOLE window: any throw terminalizes the row `failed` via
+      // `failClaimedResume` (which needs NO parsed Execution — the fault may be
+      // that there is no parseable Execution to spread) BEFORE re-throwing. Once
+      // control reaches `drive`, drive's own catch owns terminalization.
+      let execution: Execution | undefined;
+      try {
+        execution = await deps.store.executions.get(executionId);
+        if (execution === undefined || execution.pausedOn === undefined) {
+          // The claim flipped status to running but there is no pending call to
+          // resume against — a corrupt state. Persist the terminal `failed`
+          // (via the raw terminalizer, since there may be no valid Execution)
+          // BEFORE returning, so the row is never a stranded `running`.
+          await deps.store.executions.failClaimedResume(
+            executionId,
+            "resumed execution has no pending approval (corrupt state)",
+          );
+          return {
+            status: "failed",
+            executionId,
+            error: {
+              name: "ConduitInternalError",
+              message: `[ExecutionManager] Resumed execution has no pending approval. Context: { executionId: ${executionId} }`,
+            },
+          };
+        }
+        const pausedOn = execution.pausedOn;
+
+        // TTL (design D8): lazily expire on resume. `claimForResume` already
+        // flipped status to running, so persist the terminal `expired` state.
+        if (now() > pausedOn.expiresAt) {
+          const expired: Execution = { ...execution, status: "expired", endedAt: now() };
+          // A settled execution carries no pending approval — clear pausedOn so
+          // the terminal row is not left with a stale pending call (same
+          // discipline as finish()).
+          delete expired.pausedOn;
+          await persistOrFinalizeFailed(execution, () => deps.store.executions.put(expired));
+          return { status: "expired", executionId, pending: pausedOn };
+        }
+
+        // Load the durable prefix and stage the decision bound to the pending
+        // call's identity (design D6). Serialization MUST match the invoker's:
+        // request = JSON.stringify(pausedOn.input) via the shared identity from
+        // journal.ts — so it cannot drift and fail every approved resume closed.
+        const prefixRows = await deps.store.replayJournal.listByExecution(executionId);
+        const prefix = toSandboxJournal(prefixRows);
+
+        // Outcome-ambiguity on recovery (design D8/F5): an un-cleared attempt
+        // marker means a PRIOR drive crashed between an upstream side effect
+        // and its journal append — the side effect MAY have fired but was never
+        // recorded. With no idempotency key (v1 has none), re-running would risk
+        // a double side effect, so fail CLOSED: terminalize `failed`
+        // (outcome-ambiguous), never re-run. The terminal state records the
+        // pending call so a human can re-issue deliberately.
+        const strandedAttempts = await deps.store.replayJournal.listAttempts(executionId);
+        if (strandedAttempts.length > 0) {
+          const failed: Execution = { ...execution, status: "failed", endedAt: now() };
+          delete failed.pausedOn;
+          await persistOrFinalizeFailed(execution, () => deps.store.executions.put(failed));
+          return {
+            status: "failed",
+            executionId,
+            error: {
+              name: "ConduitOutcomeAmbiguous",
+              message:
+                `[ExecutionManager] A prior upstream call was attempted but its result was never ` +
+                `journaled (crash between side effect and append); the execution is outcome-ambiguous ` +
+                `and not resumable. Context: { executionId: ${executionId}, attemptOrdinals: [${strandedAttempts.join(", ")}] }`,
+            },
+          };
+        }
+
+        const decisions = makeDecisions();
+        decisions.stage(
           executionId,
-          error: {
-            name: "ConduitInternalError",
-            message: `[ExecutionManager] Resumed execution has no pending approval. Context: { executionId: ${executionId} }`,
-          },
-        };
-      }
-      const pausedOn = execution.pausedOn;
-
-      // TTL (design D8): lazily expire on resume. `claimForResume` already
-      // flipped status to running, so persist the terminal `expired` state.
-      if (now() > pausedOn.expiresAt) {
-        await persistOrFinalizeFailed(execution, () =>
-          deps.store.executions.put({
-            ...execution,
-            status: "expired",
-            endedAt: now(),
-          }),
+          { op: "call", toolName: pausedOn.toolName, request: JSON.stringify(pausedOn.input) },
+          decision,
         );
-        return { status: "expired", executionId, pending: pausedOn };
+
+        // The execution is `running` again (the claim did that); re-drive with
+        // the decisions-wired invoker. The approved call is the FIRST
+        // un-journaled call → runs live via the decision seam (allow), or
+        // resolves ConduitPolicyBlocked (deny). Continue to completed / failed /
+        // next pause. drive() owns terminalization from here on.
+        const running: Execution = { ...execution, status: "running" };
+        delete running.pausedOn;
+        const invoke = deps.makeInvoker({ executionId, decisions });
+        return await drive(running, invoke, prefix, undefined, undefined);
+      } catch (cause) {
+        // A throw in the preparation window (NOT from inside drive — drive
+        // finalizes its own faults and re-throws already-terminalized). Best
+        // effort: terminalize the claimed row `failed` so it is never stranded
+        // `running`, then re-throw the original fault. `failClaimedResume` only
+        // fires on a still-`running` row, so if drive already finalized it to a
+        // terminal state this is a harmless no-op.
+        await deps.store.executions
+          .failClaimedResume(executionId, `resume preparation failed: ${String(cause)}`)
+          .catch(() => {
+            // The store is genuinely faulting; nothing more can persist. Surface
+            // the original fault regardless.
+          });
+        throw cause;
       }
-
-      // Load the durable prefix and stage the decision bound to the pending
-      // call's identity (design D6). Serialization MUST match the invoker's:
-      // request = JSON.stringify(pausedOn.input) via the shared identity from
-      // journal.ts — so it cannot drift and fail every approved resume closed.
-      const prefixRows = await deps.store.replayJournal.listByExecution(executionId);
-      const prefix = toSandboxJournal(prefixRows);
-      const decisions = makeDecisions();
-      decisions.stage(
-        executionId,
-        { op: "call", toolName: pausedOn.toolName, request: JSON.stringify(pausedOn.input) },
-        decision,
-      );
-
-      // The execution is `running` again (the claim did that); re-drive with
-      // the decisions-wired invoker. The approved call is the FIRST
-      // un-journaled call → runs live via the decision seam (allow), or
-      // resolves ConduitPolicyBlocked (deny). Continue to completed / failed /
-      // next pause.
-      const running: Execution = { ...execution, status: "running" };
-      delete running.pausedOn;
-      const invoke = deps.makeInvoker({ executionId, decisions });
-      return drive(running, invoke, prefix, undefined, undefined);
     },
 
     get(executionId) {

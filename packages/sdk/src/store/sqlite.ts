@@ -102,6 +102,17 @@ const SCHEMA = [
     outcome TEXT NOT NULL,
     PRIMARY KEY (execution_id, ordinal)
   )`,
+  // (design D8/F5) An in-flight upstream `call` marker: written before the
+  // side effect reaches upstream, deleted once its outcome is durably in
+  // replay_journal. A marker that outlives a drive (a crash in that window)
+  // proves the side effect MAY have fired without its result being recorded →
+  // the execution is outcome-ambiguous on resume. Kept in its OWN table so it
+  // never pollutes the replay prefix (replay_journal rows are the prefix).
+  `CREATE TABLE IF NOT EXISTS call_attempts (
+    execution_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    PRIMARY KEY (execution_id, ordinal)
+  )`,
   `CREATE TABLE IF NOT EXISTS secrets (
     ref TEXT PRIMARY KEY,
     sealed TEXT NOT NULL,
@@ -365,6 +376,21 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         });
         return rs.rowsAffected === 1;
       },
+      async failClaimedResume(id: string, _reason: string): Promise<void> {
+        // Guarded terminalizer for a row THIS resume claimed (design §8/F5).
+        // The `WHERE status='running'` clause means it ONLY finalizes a row a
+        // successful `claimForResume` left `running` — never a row another
+        // actor already moved to a terminal or re-`paused` state. No parsed
+        // Execution is needed (the fault may be corrupt stored JSON), so this
+        // writes columns directly. `_reason` is the caller-facing failure
+        // detail (surfaced in the thrown/returned error); the executions table
+        // has no reason column in v1, so it is not persisted here.
+        await client.execute({
+          sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL
+                WHERE id = ? AND status = 'running'`,
+          args: [Date.now(), id],
+        });
+      },
     },
 
     trace: {
@@ -400,17 +426,39 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
 
     replayJournal: {
       async append(executionId: string, entry: ReplayJournalRow): Promise<void> {
+        // Append is idempotent on (execution_id, ordinal): a legitimate
+        // re-`perform` of the same segment re-appends byte-identical content,
+        // which must stay a no-op (design D8). But a conflict whose STORED row
+        // DIFFERS from the incoming one is corruption — a duplicate ordinal
+        // carrying a different request/outcome would silently keep the stale
+        // row and diverge replay. A bare `ON CONFLICT DO NOTHING` cannot tell
+        // the two apart, so read the existing row first and reject a genuine
+        // mismatch. Safe as a read-then-write because the manager is the sole
+        // writer per execution (single-process MVP, one drive at a time).
+        const outcomeJson = JSON.stringify(entry.outcome);
+        const existing = await client.execute({
+          sql: "SELECT op, request, outcome FROM replay_journal WHERE execution_id = ? AND ordinal = ?",
+          args: [executionId, entry.ordinal],
+        });
+        const prior = existing.rows[0];
+        if (prior !== undefined) {
+          if (
+            text(prior, "op") !== entry.op ||
+            text(prior, "request") !== entry.request ||
+            text(prior, "outcome") !== outcomeJson
+          ) {
+            throw new Error(
+              `[SqliteStore] Replay-journal append conflict: ordinal ${entry.ordinal} already holds a DIFFERENT ` +
+                `entry (corruption; not an idempotent retry). Context: { executionId: ${JSON.stringify(executionId)} }`,
+            );
+          }
+          return; // identical content — idempotent no-op
+        }
         await client.execute({
           sql: `INSERT INTO replay_journal (execution_id, ordinal, op, request, outcome)
                 VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(execution_id, ordinal) DO NOTHING`,
-          args: [
-            executionId,
-            entry.ordinal,
-            entry.op,
-            entry.request,
-            JSON.stringify(entry.outcome),
-          ],
+          args: [executionId, entry.ordinal, entry.op, entry.request, outcomeJson],
         });
       },
       async listByExecution(executionId: string): Promise<ReplayJournalRow[]> {
@@ -439,6 +487,26 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             ) as ReplayJournalRow["outcome"],
           };
         });
+      },
+      async markAttempt(executionId: string, ordinal: number): Promise<void> {
+        await client.execute({
+          sql: `INSERT INTO call_attempts (execution_id, ordinal) VALUES (?, ?)
+                ON CONFLICT(execution_id, ordinal) DO NOTHING`,
+          args: [executionId, ordinal],
+        });
+      },
+      async clearAttempt(executionId: string, ordinal: number): Promise<void> {
+        await client.execute({
+          sql: "DELETE FROM call_attempts WHERE execution_id = ? AND ordinal = ?",
+          args: [executionId, ordinal],
+        });
+      },
+      async listAttempts(executionId: string): Promise<number[]> {
+        const rs = await client.execute({
+          sql: "SELECT ordinal FROM call_attempts WHERE execution_id = ? ORDER BY ordinal",
+          args: [executionId],
+        });
+        return rs.rows.map((row) => integer(row, "ordinal"));
       },
     },
 

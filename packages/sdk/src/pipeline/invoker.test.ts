@@ -450,10 +450,13 @@ describe("createToolInvoker (spec §5.3)", () => {
       expect(requests).toHaveLength(1); // still 1: the replayed call did not reach upstream
     });
 
-    it("FAILS CLOSED when a decision is staged but its identity does NOT match the current call — an approval for tool A never authorizes tool B, and upstream is NEVER reached", async () => {
-      // The confused-deputy defense. Operator approved delete_repo; the resumed
-      // run instead invokes list_issues. It MUST be blocked, MUST NOT fall
-      // through to policy's allow, MUST NOT reach the upstream.
+    it("FAILS CLOSED as a TERMINAL replay-divergence when a decision is staged but its identity does NOT match — an approval for tool A never authorizes tool B, and upstream is NEVER reached (F2)", async () => {
+      // The confused-deputy defense, now TERMINAL (design F2). Operator approved
+      // delete_repo; the resumed run instead invokes list_issues. It MUST NOT
+      // fall through to policy's allow, MUST NOT reach the upstream, and MUST
+      // throw the uncatchable ConduitReplayDivergence (not a guest-catchable
+      // ConduitPolicyBlocked) so the guest cannot catch-and-continue. The staged
+      // decision is DISCARDED so it can never authorize a later call.
       const { caller, requests } = recordingUpstream();
       const decisions = createInMemoryApprovalDecisions();
       decisions.stage(
@@ -467,12 +470,17 @@ describe("createToolInvoker (spec §5.3)", () => {
       });
 
       const attempt = invoke("github.list_issues", { owner: "acme" });
-      await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyBlocked });
+      await expect(attempt).rejects.toMatchObject({ name: "ConduitReplayDivergence" });
       await expect(attempt).rejects.toThrow(/resume divergence/i);
+      // It is NOT a guest-safe ConduitCallError name (uncatchable-by-design).
+      await expect(attempt).rejects.not.toMatchObject({ name: GUEST_ERROR_NAMES.policyBlocked });
       expect(requests).toHaveLength(0); // credentialed bytes NEVER left the host
+      // The mismatched decision was discarded — a later matching call cannot
+      // reuse it (it was never the guest's to consume).
+      expect(decisions.peek("exec_divergence")).toBe(false);
     });
 
-    it("also fails closed when the tool matches but the request (input) diverges — approval is bound to the exact payload", async () => {
+    it("also terminates as replay-divergence when the tool matches but the request (input) diverges — approval is bound to the exact payload (F2)", async () => {
       const { caller, requests } = recordingUpstream();
       const decisions = createInMemoryApprovalDecisions();
       decisions.stage(
@@ -485,11 +493,12 @@ describe("createToolInvoker (spec §5.3)", () => {
         log: vi.fn(),
       });
 
-      // same tool, different input → identity mismatch → fail closed
+      // same tool, different input → identity mismatch → terminal divergence
       const attempt = invoke("github.delete_repo", { repo: "OTHER" });
-      await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyBlocked });
+      await expect(attempt).rejects.toMatchObject({ name: "ConduitReplayDivergence" });
       await expect(attempt).rejects.toThrow(/resume divergence/i);
       expect(requests).toHaveLength(0);
+      expect(decisions.peek("exec_input_div")).toBe(false);
     });
 
     it("a staged deny forces ConduitPolicyBlocked for exactly this call and never reaches upstream", async () => {
