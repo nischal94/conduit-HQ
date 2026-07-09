@@ -178,9 +178,29 @@ verdict is data; suspending the Execution it belongs to is the §5.5 execution m
 job."* Policy stays entirely in the invoker; see D2 for how the suspension is wired
 without teaching the sandbox about policy.
 
-> **Load-bearing naming, do not "fix":** `ConduitPolicyDenied` (from `require_approval`) =
-> *pausable*; `ConduitPolicyBlocked` (from `block`) = *terminal*. The pause/resume logic
-> depends on this distinction.
+> **What the split actually keys on (M2/M3 reconciliation).** The pause-vs-terminate
+> decision is made **host-side, on the policy verdict**, not on a guest-facing error name.
+> When policy returns `require_approval`, the invoker's `policyError("require_approval", …)`
+> throw is the **internal pause signal** that `perform` recognizes and converts to
+> suspension (D2) — it is *never delivered to the guest as an error and never journaled*, so
+> there is no "pausable guest error." When policy returns `block`, the guest **does** receive
+> `ConduitPolicyBlocked` and may catch it — terminal for that call. So the guest-facing
+> distinction is really: `block` → catchable `ConduitPolicyBlocked`; `require_approval` →
+> (no guest error) suspension.
+> - **`NON_MEMOIZABLE_ERROR_NAMES` (errors.ts) still lists `policyDenied`**, but under the
+>   corrected model a `require_approval` can never be journaled at all (it suspends first), so
+>   that entry is now **defensive/dead for the pause path** — kept as belt-and-suspenders, not
+>   relied upon. One sentence in the impl should note this so a reader doesn't infer the old
+>   "journal the denial, strip on resume" flow from its presence.
+> - **Deny reuses `ConduitPolicyBlocked` deliberately (M3).** A human "no" on a pending
+>   approval resolves the call as `ConduitPolicyBlocked` on the resume re-run — the same name
+>   `block` uses. This is intentional, not the name-collapse the pre-correction draft warned
+>   against: from the guest's and audit's perspective a denied-by-human call and an
+>   operator-`block`ed call are the *same terminal outcome* (this call will not proceed);
+>   collapsing them is correct. What must stay distinct is the **verdict/source** in the audit
+>   Trace (a human deny vs. an operator block are different *reasons*), not the guest error
+>   name. If the audit needs to tell them apart, carry it in the trace reason/source, not the
+>   error name.
 
 ### D2 — How the suspension is wired (the one honest sandbox change)
 
@@ -204,20 +224,45 @@ credentials, or connections. Policy lives in the invoker; the invoker's existing
 `policyError("require_approval", …)` throw is what `perform` recognizes as the pause
 signal (the branch already exists at `invoker.ts:117`).
 
-`SandboxResult` gains a `paused` arm:
-`{ status: "paused"; pending: { toolName; input; reason; callId }; seeds; journal }`.
+`SandboxResult` gains a `paused` arm. But the sandbox's own `PendingToolCall` carries only
+`{ op, request }` (`quickjs.ts:81-84`) — it has **no** `toolName`/`input`/`reason`/`callId`,
+and it must not, because the sandbox knows nothing of policies. So the paused arm the
+**sandbox core** returns is minimal:
+`{ status: "paused"; pending: { op: "call"; request: string }; seeds; journal }`.
+
+**Where `reason`/`callId`/`toolName`/`input` come from (C3 — the plumbing).** These are
+invoker/host concepts, not sandbox concepts. The pause is *detected* in the journaling
+ToolHost wrapper (D8): that wrapper calls the invoker, sees the `require_approval` verdict
+(the `policyError` throw), and it is the wrapper — host-side, outside the sandbox — that
+**assembles the full `PendingApproval`** `{ callId, toolName, input, reason, expiresAt }`
+from the invoker's verdict (reason), the pending call (toolName/input), and the derived
+callId. The sandbox core only signals "this call paused"; the manager pairs the sandbox's
+minimal `pending` with the wrapper-captured `PendingApproval` to build the
+`ExecutionOutcome`. This keeps the sandbox policy-oblivious while the human-facing pause
+payload is fully populated. **Degree of freedom for the implementer:** the exact carrier
+(a side-channel from the wrapper vs. threading through the sandbox result) is an
+implementation choice, but the constraint is hard — `reason`/`callId` MUST originate
+host-side, never in the sandbox.
+
 The `block` path is unchanged: it throws `ConduitPolicyBlocked`, `perform` journals it as a
 failed outcome, and the guest sees it — exactly today's behavior.
 
 **Behavior change this forces (intended — a latent-bug fix).** `e2e.smoke.test.ts`
-Phase 6 currently asserts that a `require_approval` call (`delete_repo`) is caught by the
-guest and the guest keeps running. Under the correct §5.5 model that call **pauses the
-execution**. Phase 6 is updated to assert the pause. Rationale: the old behavior made
-`require_approval` indistinguishable from a hard denial and put the agent in charge of the
-approval flow — contradicting §5.5/§10.2. Caught now, before the CLI/MCP server build on
-it, it costs one test rewrite; caught later it is a behavior migration. Documented in the
-PR and LEARNINGS as an intended fix, and the new INVARIANT §5.5 test pins the correct
-behavior. (Decision made 2026-07-09 at the user's delegation; recorded in spec §18.)
+Phase 6 (lines 262–292, verified) currently asserts that a `require_approval` call
+(`delete_repo`) is **caught by the guest, which returns the error** (`return { name,
+message }`) — so the execution *completes* (with the denial as its value) rather than
+pausing, and a single journal entry records the denial under its non-memoizable name. Under
+the correct §5.5 model that call **pauses the execution** instead. Phase 6 is updated to
+assert the pause, and the denial no longer lands in the replay projection (D4). Rationale:
+the old behavior made `require_approval` indistinguishable from a hard denial and put the
+agent in charge of the approval flow — the agent's `catch` decides what happens, when
+§5.5/§10.2 intend a *human* to. (The current test does not itself show the guest making
+further side-effecting calls after the denial; the defect is that the approval is delivered
+to the agent as a catchable error at all, not that the smoke-test guest exploits it.) Caught
+now, before the CLI/MCP server build on it, it costs one test rewrite; caught later it is a
+behavior migration. Documented in the PR and LEARNINGS as an intended fix, and the new
+INVARIANT §5.5 test pins the correct behavior. (Decision made 2026-07-09 at the user's
+delegation; recorded in spec §18.)
 
 ### D3 — One approval at a time (forced by replay determinism)
 
@@ -284,7 +329,10 @@ past — those are audit-Trace rows, never replay-journal entries.
 >   claimForResume(id: string, resumeAttemptId: string): Promise<boolean>;
 > }
 > ```
-> On SQLite/libSQL this is a single guarded update —
+> The `resumeAttemptId` is **generated by the manager per `resume` call** (`crypto.randomUUID()`)
+> — `ExecutionManager.resume(executionId, decision)` takes no attempt id from its caller; it
+> mints one internally, so each `resume` invocation races with a distinct token and the
+> winner is unambiguous. On SQLite/libSQL this is a single guarded update —
 > `UPDATE executions SET status='running', resume_attempt=? WHERE id=? AND status='paused'` —
 > using the affected-row count to decide the winner. The loser gets `false` → `resume`
 > returns `{ status: "conflict" }` (§4) and does nothing. This is the exactly-one-resume
@@ -367,12 +415,16 @@ never authorize `delete_repo`.
 
 > **Determinism-hole prerequisite (F2, existing bug).** The sandbox pins `Date.now` and
 > `Math.random` but **not `new Date()`** (`quickjs.ts:346`, and its own comment admits it).
-> A guest using `new Date()`/`performance.now()` is non-deterministic and *can* reach a
-> different first-un-journaled call on resume. The fail-closed identity check above contains
-> the security impact regardless. Separately, this work SHOULD pin the remaining clock
-> surfaces (`new Date()` → seeded epoch; block/seed `performance.now`) so honest guests
-> don't spuriously fail resume. Pinning breadth is a plan-time decision; the identity check
-> is non-negotiable.
+> A guest using `new Date()` (e.g. `new Date().getSeconds()`) reads real wall-clock time and
+> is non-deterministic — it *can* reach a different first-un-journaled call on resume. The
+> fail-closed identity check above contains the security impact regardless. Separately, this
+> work SHOULD pin `new Date()` (route the `Date` constructor's no-arg/now path through the
+> same seeded epoch + tick as `Date.now`) so honest guests don't spuriously fail resume.
+> **`performance.now` is NOT a concern (C4, verified):** the QuickJS bootstrap
+> (`quickjs.ts:338-401`) never defines `performance`, and the bare engine provides no host
+> `performance` global, so it does not exist in the guest — there is nothing to pin. Pinning
+> breadth (which clock surfaces beyond `new Date()`) is a plan-time decision; the identity
+> check is non-negotiable.
 
 ### D7 — Credential scrubbing (best-effort) vs. semantic redaction, and the real structural guarantee (F6 + New-2)
 
@@ -595,6 +647,12 @@ spec, or a future implementer will follow the stale invariant. The protocol (CLA
   pollute the replay prefix and (F7) that `TraceEvent` cannot represent read-ops.
 - **The `search`/`describe` deferral named in §18 is discharged here** (D5): they are
   journaled, in the new replay-journal table.
+- **BOTH spec locations must change (C5).** The "doubles as" claim appears TWICE in the
+  spec: the §18 locked-decision line *and* §5.5's prose (`conduitspec.md:180`: "the Trace
+  store (§11) doubles as the replay log"). The implementation PR's spec edit must update
+  **both** — editing only §18 would leave §5.5 asserting the stale model. Edit the HTML
+  source, regenerate `conduitspec.md` via `html2md.py`, and grep the regenerated file for
+  "doubles as" to confirm neither location survives.
 
 **When:** the §18 edit lands **in the implementation PR** (regenerate `conduitspec.md` via
 `html2md.py` in the same commit, so the spec-drift CI check stays green and spec + code +
@@ -626,3 +684,17 @@ spec text changes atomically with the code that honors it.
 - **Convergence trajectory:** pass 1 → 7 findings (3 structural) · pass 2 → 5 (2 structural,
   3 specification) · pass 3 → 0. Monotonic decrease in count and severity, residual is a
   labeled best-effort layer — healthy convergence, not a denylist treadmill.
+
+- **Editorial/consistency review (`code-reviewer` agent, on PR #25).** Verified every
+  claim-vs-code assertion in the doc against the source (all correct). Found 3 must-fix
+  documentation-accuracy defects (none architectural), all folded in: **M1** — D2 overstated
+  the current smoke-test behavior ("guest keeps running" → actually "guest catches and
+  returns; execution completes"); **M2** — D1's "pausable guest error" framing was stale
+  (under the corrected model `require_approval` never reaches the guest); **M3** — deny
+  reusing `ConduitPolicyBlocked` needed explicit reconciliation with D1's
+  don't-collapse-names rule. Plus material consider-items folded: **C3** — the plumbing of
+  invoker-side `reason`/`callId` through the sandbox's minimal paused arm (now specified as
+  the ToolHost wrapper's job); **C1** — `resumeAttemptId` origin (manager-generated per
+  resume); **C4** — `performance.now` is not a guest global (verified, no pinning needed);
+  **C5** — the "doubles as" claim lives in BOTH §18 and §5.5, so the spec migration must fix
+  both. This review closed the doc-accuracy and implementability gaps before the plan.
