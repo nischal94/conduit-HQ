@@ -66,7 +66,14 @@ interface StagedDecision {
   decision: ApprovalDecision;
 }
 
-function identitiesMatch(a: PendingCallIdentity, b: PendingCallIdentity): boolean {
+/**
+ * Exact-match comparison for two pending-call identities: op, toolName, and
+ * the byte-exact request string must all match. Exported so journal.ts's
+ * `matchesPending` (the pausedOn-identity check on resume) reuses this exact
+ * comparison rather than re-deriving it — two definitions of "identities
+ * match" would be a latent confused-deputy bug if they ever drifted apart.
+ */
+export function identitiesMatch(a: PendingCallIdentity, b: PendingCallIdentity): boolean {
   return a.op === b.op && a.toolName === b.toolName && a.request === b.request;
 }
 
