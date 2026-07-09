@@ -23,11 +23,41 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-08 (Issue #21 MERGED; next target = the walking-skeleton MVP)
+## Current handoff — written 2026-07-09 (§5.5 execution-manager DESIGN done + PR'd; gated on human review of PR #25)
 
-### Where things stand
+### Where things stand (2026-07-09 update)
 
-- **Main is `e1a26f4`, 228/228 green, in sync with origin.** Issue #21
+- **Main is still `29021c9`, 228/228 green.** No product code changed this session.
+  The work was **design**: the §5.5 execution manager (MVP build step 1, the largest
+  unbuilt piece) was brainstormed and **adversarially reviewed to convergence**, then
+  committed as a design doc and opened as **PR #25**
+  (https://github.com/nischal94/conduit-HQ/pull/25) on branch
+  `docs/execution-manager-design` (commit `6144160`, docs-only, inert prose).
+  - Doc: `docs/superpowers/specs/2026-07-09-execution-manager-design.md`.
+  - **Review provenance:** 1 author adversarial pass (found the naive model UNSOUND —
+    positional replay cursor ⇒ journals must be prefixes) + **3 cross-model Codex passes**
+    (`codex exec`, high reasoning; quota is BACK — the user confirmed the Aug-1 block is
+    lifted) + interactive grilling. Trajectory: pass1 → 7 findings (3 structural the author
+    missed: trace-before-pause, cursor-grant confused-deputy, concurrent-resume double-exec)
+    · pass2 → 5 · **pass3 → 0 new in-scope → CONVERGED**.
+  - **Nine decisions (D1–D9) recorded** in the doc; three were user-delegated (F5
+    crash-window → fail-closed w/ visible ambiguity; storage → separate `replay_journal`
+    table not a projection; §18 edit timing → in the implementation PR).
+  - **Carries a spec-migration obligation:** the design SUPERSEDES the locked spec §18
+    decision "Trace doubles as replay journal". Doc §11 says the §18 edit + `html2md.py`
+    regen + the flipped INVARIANTS §5.5 row all land ATOMICALLY in the implementation PR.
+
+- **NEXT ACTION IS THE HUMAN'S:** review/redline PR #25
+  (https://github.com/nischal94/conduit-HQ/pull/25) — the design. Do NOT write the
+  implementation plan or any code until PR #25 is settled — the user explicitly chose
+  "wait for my PR review" before planning. After it's settled: invoke
+  `superpowers:writing-plans` against the FINAL design, then implement.
+
+### Prior state (2026-07-08 — Issue #21, still true for the codebase)
+
+- **Issue #21** (per-connect IP pinning) is DONE — PR #22 MERGED. Four PRs merged that
+  session: #22, #23, #24. Main was `e1a26f4` at that handoff; it is now `29021c9` after
+  the 2026-07-08 HANDOFF commit. Issue #21
   (per-connect IP pinning) is DONE — **PR #22 MERGED** (squash) 2026-07-08,
   human-named for merge + quiz passed; **Issue #21 CLOSED**. Four PRs
   merged this session: #22 (pinning), #23 (spec: desktop out of launch),
@@ -155,22 +185,37 @@ Build the rest of the product only AFTER both gates pass.
 
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
 > first and follow its protocol — including `gh pr list --state all
-> --limit 5`. **Issue #21 is DONE (PR #22 merged); main is `e1a26f4`,
-> 228/228 green. Do NOT redo it.** Next target: **build the
-> walking-skeleton MVP** — read spec §17 "MVP Prototype Checkpoint" for
-> the authoritative scope/done-definition, then build in order: (1) §5.5
-> execution manager, (2) §11 Trace redaction [these two finish Phase 0 and
-> flip the last ⏳ invariants], (3) `/mcp` server (stdio first), (4)
-> minimal `conduit` CLI, (5) the §4.2 before/after token demo. Do NOT
-> build the web console, FTS5, Trace viewer, or Phases 2–5 yet. The MVP is
-> done only when BOTH gates pass: built (a real MCP agent drives a real
-> tool call through the boundary) AND verified (a deliberate edge-case pass
-> on the running skeleton has converged). Each step: branch from
-> origin/main; PR per commit routing; Tier 2 + /security-review on the
-> security surface; ONE adversarial pass as the convergence gate (real
-> `codex exec` if quota is back post-Aug-1, else the sub-agent stand-in);
-> /explain-diff + full-pass quiz before merge; merge only when the human
-> names it. Before starting, consider `superpowers:brainstorming` /
-> `writing-plans` for the MVP build sequence — it's a multi-step feature,
-> not a one-shot. At session end, rewrite HANDOFF, append LEARNINGS,
-> publish the debrief artifact.
+> --limit 5`. **State: the §5.5 execution-manager DESIGN is done and
+> opened as PR #25 (https://github.com/nischal94/conduit-HQ/pull/25),
+> adversarially reviewed to convergence. Main is `29021c9`, 228/228 green,
+> no product code changed yet.**
+>
+> **FIRST: check whether the human has reviewed PR #25.** The user chose
+> "wait for my PR review" before any implementation planning.
+> - If PR #25 is still open / has redlines → address the human's + any
+>   CodeRabbit feedback on the design doc, re-run a consistency + (if a
+>   decision changed) a `codex exec` convergence pass, and wait again. Do
+>   NOT start the plan or code until the design is settled.
+> - Once PR #25 is settled (merged or the design is agreed) → invoke
+>   `superpowers:writing-plans` against the FINAL design
+>   (`docs/superpowers/specs/2026-07-09-execution-manager-design.md`) to
+>   produce the tweakable implementation plan, then implement.
+>
+> **Implementation must-dos (from the design doc):** it touches the
+> credential/policy boundary, so it is fully load-bearing — Tier 2 +
+> `/security-review` + a `codex exec` convergence pass on the security
+> surface, `/explain-diff` + full-pass quiz before merge, human-named
+> merge. **The implementation PR must ALSO edit spec §18** (supersede
+> "Trace doubles as replay journal"), regenerate `conduitspec.md` via
+> `python3 html2md.py`, and flip the INVARIANTS §5.5 row — all atomically
+> in that PR. Codex quota is BACK (user confirmed the Aug-1 block lifted),
+> so the real `codex exec` path is the adversarial gate.
+>
+> **After the execution manager (the rest of MVP build order, spec §17):**
+> (2) §11 Trace redaction [display-only; must NOT touch the replay payload —
+> design D7], (3) `/mcp` server (stdio first), (4) minimal `conduit` CLI
+> (`serve`, `add-mcp`, `approvals list|approve|deny`), (5) the §4.2
+> before/after token demo. Do NOT build the web console, FTS5, Trace
+> viewer, or Phases 2–5 yet. MVP done only when BOTH §17 gates pass. At
+> session end, rewrite HANDOFF, append LEARNINGS, publish the debrief
+> artifact.
