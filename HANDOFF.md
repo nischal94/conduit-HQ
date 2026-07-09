@@ -23,14 +23,28 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-09 (§5.5 execution-manager BUILT + reviewed + PR'd; gated on human quiz + merge of PR #26)
+## Current handoff — written 2026-07-09 (§5.5 execution manager MERGED to main; next MVP step = §11 Trace redaction)
 
-### Where things stand (2026-07-09 — end of build session)
+### Where things stand
 
-- **Main is still `adb03ea`, 228/228 green — no product code on main yet.** The §5.5
-  execution manager is **fully implemented + bot/cross-model-reviewed on branch
-  `feat/execution-manager`**, PR **#26** (https://github.com/nischal94/conduit-HQ/pull/26).
-  **~17 commits, 284/284 tests green, INVARIANT §5.5 flipped → ✅.** Not merged (human's call).
+- **PR #26 MERGED (squash) → main is `2694791`, 284/284 green, tsc clean.** The §5.5
+  execution manager (pause/resume via deterministic replay) is **landed on main**;
+  **INVARIANT §5.5 → ✅ pinned** (`packages/sdk/src/execution/manager.test.ts`). Branch
+  `feat/execution-manager` deleted. This was MVP build step 1 (spec §17) — Phase 0 is
+  now complete EXCEPT §11 Trace redaction (still ⏳, the last unpinned invariant).
+  - **The whole review saga (design → build → bot/cross-model) is history now** — the
+    detail is in git, the PR #26 comments, LEARNINGS (2026-07-09 + 2026-07-10 sections),
+    and `.superpowers/sdd/progress.md`. Key durable facts carried forward: (a) the
+    `call_attempts` marker was REMOVED as an over-claim — **process-crash recovery of
+    `running` executions is DEFERRED out of MVP scope** (needs a multi-worker
+    lease/heartbeat to distinguish crashed-vs-live; MVP guarantees no double-execution,
+    NOT recovery — see design doc D8/§7 + manager.ts drive() note). (b) §18 + §5.5 spec
+    migration is DONE (replay journal is a separate `replay_journal` table, not the Trace
+    store). (c) Cross-model gate was exercised for real (codex 0.144.0) — no retroactive
+    pass owed.
+  - **PR #25** (design doc, branch `docs/execution-manager-design`) is still OPEN — its
+    content also rode into #26. **Consider closing it** (or keep as the design record). Not
+    blocking.
   - **BOT + CROSS-MODEL REVIEW ROUND DONE + CONVERGED (2026-07-10).** CodeRabbit (walkthrough
     only) + Greptile (3, 1 P1) + **real `codex exec` cross-model passes** found issues the
     self-review pipeline MISSED, fixed across 5 commits (36974b6, 9083f1d, 23b03c9, 02988e4,
@@ -95,19 +109,31 @@ at session start.
   (no emitter in the SDK; the agent prompt only documents `true`; semantically = omitting).
   Documented in-code (`manager.ts:259`).
 
-- **NEXT ACTION IS THE HUMAN'S — quiz + merge PR #26.** (1) Pass the `/explain-diff` quiz
-  (link above) FULLY — a missed question means reread + retake. (2) Read the CodeRabbit
-  review when it posts. (3) Name PR #26 for merge. **The agent does NOT merge** — merge
-  authority is the human's. Optionally: run the real `codex exec` convergence pass after
-  Aug 8; decide whether to close PR #25.
+### NEXT TASK — §11 Trace redaction (finishes Phase 0; flips the last ⏳ invariant)
 
-### After PR #26 merges — the rest of the MVP (spec §17 build order)
+The rest of the walking-skeleton MVP (spec §17 build order), starting with §11:
 
-Phase 0 is COMPLETE once #26 lands (both §5.5 + §11… wait: §11 Trace redaction is still ⏳).
-Next: (2) §11 Trace redaction [display-only; MUST NOT touch the replay `output` payload —
-design D7], (3) `/mcp` server (stdio first), (4) minimal `conduit` CLI (`serve`, `add-mcp`,
-`approvals list|approve|deny`), (5) the §4.2 before/after token demo. Do NOT build the web
-console, FTS5, Trace viewer, or Phases 2–5 yet. MVP done only when BOTH §17 gates pass.
+1. **§11 Trace redaction** — the next piece. Redact policy-configured sensitive fields in
+   the Trace **display** projection (`outputSummary` / audit views). **HARD CONSTRAINT
+   from the just-merged design (D7): redaction MUST NOT touch the replay `output` payload**
+   — the replay journal needs the unredacted result, and the credential boundary is
+   structural (request-scoped, never-persisted), NOT the redaction. Flips the §11
+   INVARIANTS row (currently ⏳). After this, Phase 0 is fully ✅.
+2. `/mcp` server — **stdio transport first** (the form Claude Desktop / Cursor use). The
+   front door. (§5.5-scale piece — consider brainstorming/writing-plans.)
+3. Minimal `conduit` CLI — `serve`, `add-mcp`, `approvals list|approve|deny` (the spec-pinned
+   verbs; the manager's `resume(execId, {approve|deny})` is the engine behind them).
+4. The §4.2 before/after token demo (~1,600 tools → 1 tool / ~1,044 tokens).
+
+Do NOT build the web console, FTS5, Trace viewer, or Phases 2–5 yet. MVP done only when
+BOTH §17 gates pass (built end-to-end through the front door + a converged edge-case pass on
+the running skeleton). Each piece is load-bearing on the security surface: branch from
+origin/main, PR per commit routing, Tier 2 + `/security-review` + a real `codex exec`
+cross-model pass (0.144.0 works now — probe live per LEARNINGS 2026-07-10 #4), `/explain-diff`
++ full-pass quiz before merge, human-named merge.
+
+**Housekeeping carry-over:** consider closing PR #25 (design doc — content rode into the
+merged #26).
 
 ### Prior state (2026-07-08 — Issue #21, still true for the codebase)
 
@@ -241,36 +267,33 @@ Build the rest of the product only AFTER both gates pass.
 
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
 > first and follow its protocol — including `gh pr list --state all
-> --limit 5`. **State: the §5.5 execution manager is BUILT + reviewed and
-> opened as PR #26 (https://github.com/nischal94/conduit-HQ/pull/26) —
-> branch `feat/execution-manager`, 12 commits, 272/272 green, INVARIANT
-> §5.5 ✅. Main is `adb03ea`, 228/228 (no product code on main yet). NOT
-> merged — merge is the human's call. Do NOT re-implement it.**
+> --limit 5`. **State: the §5.5 execution manager is MERGED (PR #26,
+> squash) → main is `2694791`, 284/284 green, INVARIANT §5.5 ✅. Phase 0 is
+> complete EXCEPT §11 Trace redaction (the last ⏳). Do NOT re-implement
+> §5.5.** Note: process-crash recovery of `running` executions was
+> deliberately DEFERRED out of MVP scope (design D8/§7) — don't "fix" it.
 >
-> **FIRST: check PR #26's state.** `gh pr view 26` + `gh pr checks 26`.
-> - If the human has NOT yet merged → they still owe the quiz
->   (https://claude.ai/code/artifact/5281e33b-4fcb-42f6-942e-5002ee34899b)
->   + reading CodeRabbit. If CodeRabbit/CI posted findings, ADDRESS them on
->   the branch (fix → re-review → push), then wait for the human to merge.
->   **The agent does NOT merge.** Optionally run the real `codex exec`
->   convergence pass on the PR diff **after ~Aug 8** (Codex account was
->   usage-limited this session — the earlier "quota is back" was wrong; it
->   re-triggered). Consider closing PR #25 (design doc; its content also
->   rode into #26).
-> - If PR #26 is already MERGED → proceed to the rest of the MVP below.
+> **NEXT TASK: §11 Trace redaction.** Redact policy-configured sensitive
+> fields in the Trace DISPLAY projection (`outputSummary`/audit views) only.
+> **HARD CONSTRAINT (design D7): redaction MUST NOT touch the replay
+> `output` payload** — replay needs the unredacted result; the credential
+> boundary is structural (request-scoped, never-persisted), NOT redaction.
+> Flips the §11 INVARIANTS row (currently ⏳) → Phase 0 fully done. It's a
+> §5.5-scale-or-smaller piece; consider brainstorming/writing-plans if the
+> policy-rule surface is nontrivial.
 >
-> **After PR #26 merges — the rest of the MVP (spec §17 build order):**
-> (2) **§11 Trace redaction** — display-only; MUST NOT touch the replay
-> `output` payload (design D7); flips the last ⏳ invariant (§11). (3)
-> `/mcp` server (stdio first) — the front door. (4) minimal `conduit` CLI
-> (`serve`, `add-mcp`, `approvals list|approve|deny`). (5) the §4.2
-> before/after token demo. Do NOT build the web console, FTS5, Trace
-> viewer, or Phases 2–5 yet. Each is load-bearing on the security surface:
-> branch from origin/main, PR per commit routing, Tier 2 + `/security-review`
-> + (post-Aug-8) a real `codex exec` convergence pass, `/explain-diff` +
-> full-pass quiz before merge, human-named merge. Consider
-> `superpowers:brainstorming`/`writing-plans` for §5.5-scale pieces (the
-> `/mcp` server). MVP done only when BOTH §17 gates pass (built end-to-end
-> through the front door + a converged edge-case pass on the running
-> skeleton). At session end, rewrite HANDOFF, append LEARNINGS, publish the
-> debrief artifact.
+> **Then (spec §17 build order):** (2) `/mcp` server — stdio first (the
+> front door; Claude Desktop/Cursor form). (3) minimal `conduit` CLI
+> (`serve`, `add-mcp`, `approvals list|approve|deny` — the spec-pinned
+> verbs; the merged manager's `resume(execId,{approve|deny})` is the
+> engine). (4) the §4.2 before/after token demo. Do NOT build the web
+> console, FTS5, Trace viewer, or Phases 2–5 yet.
+>
+> Each piece is load-bearing on the security surface: branch from
+> origin/main, PR per commit routing, Tier 2 + `/security-review` + a real
+> `codex exec` cross-model pass (0.144.0 works now — but probe LIVE, the
+> availability is a moving target: quota / CLI-version / supply-chain
+> age-gate each fail differently in stderr — LEARNINGS 2026-07-10 #4),
+> `/explain-diff` + full-pass quiz before merge, human-named merge. MVP done
+> only when BOTH §17 gates pass. Housekeeping: consider closing PR #25.
+> At session end, rewrite HANDOFF, append LEARNINGS, publish the debrief.
