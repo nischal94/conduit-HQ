@@ -44,6 +44,45 @@ describe("toSandboxJournal (§5.5 design D4)", () => {
     expect(toSandboxJournal([])).toEqual([]);
   });
 
+  it("REJECTS a journal with a gap in the ordinals (0,2 → not contiguous)", () => {
+    // (F5) The sandbox replays by array POSITION; a gap compacts the surviving
+    // rows into different slots than the guest re-emits → a silent WRONG prefix.
+    // Fail loudly instead of replaying a corrupt journal as a valid short one.
+    const rows: ReplayJournalRow[] = [
+      { ordinal: 0, op: "call", request: "{}", outcome: { ok: true, value: 1 } },
+      { ordinal: 2, op: "call", request: "{}", outcome: { ok: true, value: 2 } },
+    ];
+    expect(() => toSandboxJournal(rows)).toThrow(/contiguous/i);
+  });
+
+  it("REJECTS a journal that does not start at ordinal 0", () => {
+    const rows: ReplayJournalRow[] = [
+      { ordinal: 1, op: "call", request: "{}", outcome: { ok: true, value: 1 } },
+    ];
+    expect(() => toSandboxJournal(rows)).toThrow(/contiguous/i);
+  });
+
+  it("REJECTS a journal with a duplicate ordinal", () => {
+    const rows: ReplayJournalRow[] = [
+      { ordinal: 0, op: "call", request: "{}", outcome: { ok: true, value: 1 } },
+      { ordinal: 0, op: "call", request: "{}", outcome: { ok: true, value: 2 } },
+    ];
+    expect(() => toSandboxJournal(rows)).toThrow(/contiguous/i);
+  });
+
+  it("accepts a contiguous 0..n-1 journal", () => {
+    const rows: ReplayJournalRow[] = [
+      { ordinal: 0, op: "search", request: "{}", outcome: { ok: true, value: 1 } },
+      { ordinal: 1, op: "call", request: "{}", outcome: { ok: true, value: 2 } },
+      { ordinal: 2, op: "call", request: "{}", outcome: { ok: true, value: 3 } },
+    ];
+    expect(toSandboxJournal(rows).map((e) => e.outcome)).toEqual([
+      { ok: true, value: 1 },
+      { ok: true, value: 2 },
+      { ok: true, value: 3 },
+    ]);
+  });
+
   it("does not mutate the input rows array (pure function)", () => {
     const rows: ReplayJournalRow[] = [
       { ordinal: 1, op: "call", request: "{}", outcome: { ok: true, value: null } },

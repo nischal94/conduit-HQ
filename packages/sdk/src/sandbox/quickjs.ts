@@ -350,9 +350,10 @@ function toSandboxError(detail: unknown): SandboxError {
  *
  * - `Math.random()` — mulberry32 over `seeds.random`: the recorded seed
  *   replays the exact sequence (spec §5.5).
- * - `Date.now()` and no-arg `new Date()` — `seeds.now` plus a 1ms-per-call
- *   tick: deterministic, monotonic, replayable. Both wall-clock reads route
- *   through the one seeded clock; parameterized `new Date(...)` is untouched.
+ * - `Date.now()`, no-arg `new Date()`, and the non-constructor `Date()` (which
+ *   returns a time STRING) — `seeds.now` plus a 1ms-per-call tick:
+ *   deterministic, monotonic, replayable. Every wall-clock read routes through
+ *   the one seeded clock; parameterized `new Date(...)` is untouched.
  * - `tools` — search/describe verbs plus a path proxy, so both
  *   `tools["github.issues.list"](input)` and typed-style
  *   `tools.github.issues.list(input)` resolve to the same bridge call.
@@ -376,7 +377,12 @@ function bootstrapSource(seeds: ExecutionSeeds): string {
   // behavior; only the zero-arg "read the wall clock" path is seeded.
   var RealDate = Date;
   function PinnedDate(y, mo, d, h, mi, s, ms) {
-    if (!(this instanceof PinnedDate)) return RealDate();
+    // \`Date()\` called WITHOUT \`new\` returns a STRING of the current time.
+    // The real \`Date()\` reads the wall clock — non-deterministic across a
+    // pause/resume, so a guest branching on \`Date()\` could reach a different
+    // first-live call on resume (spec §5.5). Route it through the same seeded,
+    // ticking clock as \`Date.now\`/\`new Date()\` so it replays identically.
+    if (!(this instanceof PinnedDate)) return new RealDate(Date.now()).toString();
     switch (arguments.length) {
       case 0: return new RealDate(Date.now());
       case 1: return new RealDate(y);

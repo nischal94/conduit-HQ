@@ -353,6 +353,29 @@ describe("QuickJSSandbox", () => {
       }
     });
 
+    it("§5.5: Date() called as a function (no `new`) is pinned to the seeded clock across replays", async () => {
+      // `Date()` without `new` returns a STRING of the current time. The real
+      // one reads the wall clock — a guest branching on it could reach a
+      // different first-live call on resume. It must route through the same
+      // seeded clock so two runs with identical seeds behave identically.
+      const code = "return typeof Date() === 'string' ? Date() : 'not-a-string';";
+      const seeds = { now: 1000, random: 5 };
+      const r1 = await sandbox.execute({ code, tools: THROWING_HOST, seeds });
+      const r2 = await sandbox.execute({ code, tools: THROWING_HOST, seeds });
+      expect(r1.status).toBe("completed");
+      expect(r2.status).toBe("completed");
+      if (r1.status === "completed" && r2.status === "completed") {
+        // Identical across replays (the divergence this closes) AND derived
+        // from the seeded clock, not the real wall clock. The exact toString
+        // format is the engine's; what matters is that it renders the 1970
+        // seed epoch, never "now". (QuickJS omits Node's timezone-name suffix,
+        // so compare on the seeded year rather than byte-for-byte.)
+        expect(r1.value).toEqual(r2.value);
+        expect(r1.value).toContain("1970");
+        expect(r1.value).not.toContain(`${new Date().getFullYear()}`);
+      }
+    });
+
     it("§5.5: parameterized new Date(y, m, d, ...) is unaffected by the pin", async () => {
       const result = await sandbox.execute({
         code: "return new Date(2020, 0, 15).getFullYear();",

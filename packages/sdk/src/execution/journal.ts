@@ -25,11 +25,27 @@ import { identitiesMatch, type PendingCallIdentity } from "./decisions.js";
  * `ordinal` is the actual correctness-bearing field. `ordinal` itself is
  * dropped: the sandbox's `JournalEntry` has no ordinal field, only array
  * position, which the sort now encodes.
+ *
+ * The ordinals MUST be exactly the contiguous sequence 0..n-1 (design D5/F5).
+ * The sandbox replays by array POSITION: a gap (missing ordinal), a duplicate,
+ * or a non-zero start would compact the surviving rows into different array
+ * slots than the ones the guest re-emits on replay, silently producing a
+ * DIFFERENT prefix — the exact "wrong-prefix replay" the split-journal model
+ * exists to avoid. Rather than replay a corrupt journal as if it were a valid
+ * shorter prefix, fail loudly; the manager treats this as a terminal failure,
+ * never a silent divergence.
  */
 export function toSandboxJournal(rows: ReplayJournalRow[]): JournalEntry[] {
-  return [...rows]
-    .sort((a, b) => a.ordinal - b.ordinal)
-    .map(({ op, request, outcome }) => ({ op, request, outcome }));
+  const sorted = [...rows].sort((a, b) => a.ordinal - b.ordinal);
+  sorted.forEach((row, index) => {
+    if (row.ordinal !== index) {
+      throw new Error(
+        `[toSandboxJournal] Corrupt replay journal: ordinals must be contiguous 0..n-1, ` +
+          `but position ${index} has ordinal ${row.ordinal}. Context: { count: ${sorted.length} }`,
+      );
+    }
+  });
+  return sorted.map(({ op, request, outcome }) => ({ op, request, outcome }));
 }
 
 /**
