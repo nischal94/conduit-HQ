@@ -16,7 +16,7 @@ import type {
   Tool,
   TraceEvent,
 } from "../types.js";
-import type { ConduitStore } from "./store.js";
+import type { ConduitStore, ReplayJournalRow } from "./store.js";
 
 /**
  * libSQL/SQLite implementation of the ConduitStore seam. Single file
@@ -93,6 +93,14 @@ const SCHEMA = [
     at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS trace_execution ON trace_events (execution_id, seq)`,
+  `CREATE TABLE IF NOT EXISTS replay_journal (
+    execution_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    op TEXT NOT NULL CHECK (op IN ('search', 'describe', 'call')),
+    request TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    PRIMARY KEY (execution_id, ordinal)
+  )`,
   `CREATE TABLE IF NOT EXISTS secrets (
     ref TEXT PRIMARY KEY,
     sealed TEXT NOT NULL,
@@ -370,6 +378,50 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       },
     },
 
+    replayJournal: {
+      async append(executionId: string, entry: ReplayJournalRow): Promise<void> {
+        await client.execute({
+          sql: `INSERT INTO replay_journal (execution_id, ordinal, op, request, outcome)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(execution_id, ordinal) DO NOTHING`,
+          args: [
+            executionId,
+            entry.ordinal,
+            entry.op,
+            entry.request,
+            JSON.stringify(entry.outcome),
+          ],
+        });
+      },
+      async listByExecution(executionId: string): Promise<ReplayJournalRow[]> {
+        const rs = await client.execute({
+          sql: "SELECT ordinal, op, request, outcome FROM replay_journal WHERE execution_id = ? ORDER BY ordinal",
+          args: [executionId],
+        });
+        return rs.rows.map((row) => {
+          const op = text(row, "op");
+          if (!isOneOf(op, REPLAY_OPS)) {
+            throw new Error(
+              `[SqliteStore] Failed to read replay_journal: unrecognized op ${JSON.stringify(op)}. Context: { executionId: ${JSON.stringify(executionId)} }`,
+            );
+          }
+          return {
+            ordinal: integer(row, "ordinal"),
+            op,
+            request: text(row, "request"),
+            outcome: parseJson(
+              text(row, "outcome"),
+              (cause) =>
+                new Error(
+                  `[SqliteStore] Failed to read replay_journal outcome: not valid JSON. Context: { executionId: ${JSON.stringify(executionId)} }`,
+                  { cause },
+                ),
+            ) as ReplayJournalRow["outcome"],
+          };
+        });
+      },
+    },
+
     secrets: {
       async put(ref: string, secret: string): Promise<void> {
         const sealed = await secretBox.seal(secret);
@@ -444,6 +496,7 @@ const EXECUTION_STATUSES: readonly ExecutionStatus[] = [
   "expired",
 ];
 
+const REPLAY_OPS: readonly ReplayJournalRow["op"][] = ["search", "describe", "call"];
 const GRAPHQL_OPERATIONS: readonly ("query" | "mutation")[] = ["query", "mutation"];
 const SEMANTICS_KINDS: readonly SourceSemantics["kind"][] = [
   "openapi",

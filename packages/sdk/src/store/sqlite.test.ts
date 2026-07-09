@@ -231,6 +231,41 @@ describe("SqliteStore", () => {
     });
   });
 
+  describe("replayJournal", () => {
+    it("append + listByExecution returns rows in ordinal order", async () => {
+      await store.replayJournal.append("exec_1", {
+        ordinal: 0,
+        op: "search",
+        request: '{"query":"x"}',
+        outcome: { ok: true, value: [{ path: "a" }] },
+      });
+      await store.replayJournal.append("exec_1", {
+        ordinal: 1,
+        op: "call",
+        request: '{"path":"a","input":null}',
+        outcome: { ok: true, value: { done: true } },
+      });
+      const rows = await store.replayJournal.listByExecution("exec_1");
+      expect(rows.map((r) => [r.ordinal, r.op])).toEqual([
+        [0, "search"],
+        [1, "call"],
+      ]);
+      expect(rows[1]?.outcome).toEqual({ ok: true, value: { done: true } });
+    });
+
+    it("append is idempotent on (executionId, ordinal)", async () => {
+      const row = {
+        ordinal: 0,
+        op: "call" as const,
+        request: "{}",
+        outcome: { ok: true as const, value: 1 },
+      };
+      await store.replayJournal.append("exec_2", row);
+      await store.replayJournal.append("exec_2", row); // second write must not duplicate or throw
+      expect(await store.replayJournal.listByExecution("exec_2")).toHaveLength(1);
+    });
+  });
+
   describe("secrets", () => {
     it("INVARIANT §9.2: secrets are encrypted at rest — plaintext never touches the database", async () => {
       await store.secrets.put("cred_github_main", "ghp_SuperSecretToken123");

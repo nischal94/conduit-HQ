@@ -25,6 +25,7 @@ export interface ConduitStore {
   readonly policies: PolicyRepository;
   readonly executions: ExecutionRepository;
   readonly trace: TraceRepository;
+  readonly replayJournal: ReplayJournalRepository;
   readonly secrets: SecretRepository;
 }
 
@@ -79,6 +80,18 @@ export interface TraceRepository {
    * (spec §5.5), so ordering is a correctness requirement, not cosmetics.
    */
   listByExecution(executionId: string): Promise<TraceEvent[]>;
+}
+
+export interface ReplayJournalRow {
+  ordinal: number;
+  op: "search" | "describe" | "call";
+  request: string;
+  outcome: { ok: true; value: unknown } | { ok: false; error: { name: string; message: string } };
+}
+
+export interface ReplayJournalRepository {
+  append(executionId: string, entry: ReplayJournalRow): Promise<void>;
+  listByExecution(executionId: string): Promise<ReplayJournalRow[]>;
 }
 
 export interface SecretRepository {
