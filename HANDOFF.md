@@ -30,20 +30,29 @@ at session start.
 - **Main is still `adb03ea`, 228/228 green — no product code on main yet.** The §5.5
   execution manager is **fully implemented + bot/cross-model-reviewed on branch
   `feat/execution-manager`**, PR **#26** (https://github.com/nischal94/conduit-HQ/pull/26).
-  **~16 commits, 292/292 tests green, INVARIANT §5.5 flipped → ✅.** Not merged (human's call).
-  - **BOT + CODEX REVIEW ROUND DONE (2026-07-10).** CodeRabbit (walkthrough only) + Greptile
-    (3 findings, 1 confirmed P1) + a real `codex exec` cross-model pass (agreed + **6 more, 3
-    High**) found real issues the self-review pipeline MISSED: stranded-`running` on a
-    corrupt-state resume branch; guest-catchable resume-divergence; a pre-append crash window.
-    ALL fixed across 5 commits (36974b6, 9083f1d, 23b03c9, 02988e4) and re-reviewed to
-    convergence (Codex passes 1→2→3 narrowed 9→3→1; the final M1 fix confirmed by an
-    independent stand-in FROM SOURCE — no double-exec window; the two modified F5 tests
-    PRESERVE-INTENT). Full trail is a PR #26 comment; details in `.superpowers/sdd/progress.md`.
-  - **⚠️ MERGE CAVEAT:** the FINAL fix (M1) has SAME-MODEL confirmation only — Codex hit its
-    usage limit mid-pass (resets **Aug 8**). Passes 1–3 (which found the substantive bugs)
-    were genuine cross-model. **Recommend a retroactive `codex exec` pass on the PR #26 diff
-    after Aug 8** for cross-model closure. (Codex quota is stateful and re-triggers — LEARNINGS
-    2026-07-09 #5; verify live, don't trust a prior "it's back".)
+  **~17 commits, 284/284 tests green, INVARIANT §5.5 flipped → ✅.** Not merged (human's call).
+  - **BOT + CROSS-MODEL REVIEW ROUND DONE + CONVERGED (2026-07-10).** CodeRabbit (walkthrough
+    only) + Greptile (3, 1 P1) + **real `codex exec` cross-model passes** found issues the
+    self-review pipeline MISSED, fixed across 5 commits (36974b6, 9083f1d, 23b03c9, 02988e4,
+    c71c859), narrowing **9 → 3 → 1 → 1(P1) → 0**. The substantive bugs: stranded-`running`
+    on multiple paths; guest-catchable resume-divergence; and — the P1 the same-model stand-in
+    MISSED but real cross-model caught — the `call_attempts` marker OVER-CLAIMED process-crash
+    recovery it never delivered (marker only read on `paused` recovery; a real crash leaves
+    `running`, which nothing recovers). **Fix: removed the marker over-claim** (kept the
+    append-throw guarantee via `drive()`'s catch) and **explicitly DEFERRED process-crash
+    recovery of `running` rows out of MVP scope** (needs multi-worker lease). MVP guarantee =
+    no double-execution, NOT recovery. **CONVERGED:** the final Codex pass (0.144.0) + an
+    independent reviewer BOTH returned zero in-scope findings — agreeing on the axis they
+    previously split on. Full trail is a PR #26 comment; details in `.superpowers/sdd/progress.md`.
+  - **✅ CROSS-MODEL GATE CLOSED (Aug-8 caveat DISCHARGED).** The real `codex exec` pass DID
+    run on the final fixes — the earlier "Codex limited until Aug 8" blocker was resolved: quota
+    came back, then the CLI needed upgrading (npm's `@openai/codex` lagged the server model
+    rollout — 0.142.5 too old for `gpt-5.6-*`), and 0.144.0 was blocked by the user's Socket
+    Firewall `minimumReleaseAge` gate until the user deliberately bypassed sfw for that one
+    install. LEARNING: Codex CLI/model availability is a moving target — probe live
+    (`codex exec` fails closed with the reason in stderr: quota vs. "requires newer version"
+    vs. supply-chain age-gate); don't assume. No retroactive pass needed — cross-model closure
+    is done.
   - **PR #25** (the design doc, branch `docs/execution-manager-design`) is still OPEN and
     superseded-in-practice: the design + plan it carries were ALSO copied onto the
     `feat/execution-manager` branch (commit `d899dfd`) and are in PR #26. **Decide whether
