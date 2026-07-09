@@ -1,0 +1,54 @@
+import { describe, expect, it } from "vitest";
+import { createInMemoryApprovalDecisions, type PendingCallIdentity } from "./decisions.js";
+
+const deleteRepo: PendingCallIdentity = {
+  op: "call",
+  toolName: "github.delete_repo",
+  request: '{"repo":"x"}',
+};
+const createIssue: PendingCallIdentity = {
+  op: "call",
+  toolName: "github.create_issue",
+  request: '{"repo":"x"}',
+};
+
+describe("createInMemoryApprovalDecisions (§5.5 design D6)", () => {
+  it("take: returns the staged decision once, only for the matching identity", () => {
+    const d = createInMemoryApprovalDecisions();
+    d.stage("exec_1", deleteRepo, { kind: "approve" });
+    // wrong identity → undefined (the decision stays staged; it is NOT consumed)
+    expect(d.take("exec_1", createIssue)).toBeUndefined();
+    // right identity → approve, once
+    expect(d.take("exec_1", deleteRepo)).toEqual({ kind: "approve" });
+    // consumed one-shot: a second take of the same identity returns undefined
+    expect(d.take("exec_1", deleteRepo)).toBeUndefined();
+  });
+
+  it("peek: reports a decision is staged without consuming it", () => {
+    const d = createInMemoryApprovalDecisions();
+    expect(d.peek("exec_1")).toBe(false);
+    d.stage("exec_1", deleteRepo, { kind: "deny" });
+    expect(d.peek("exec_1")).toBe(true);
+    // peek does not consume — the matching take still succeeds
+    expect(d.take("exec_1", deleteRepo)).toEqual({ kind: "deny" });
+    expect(d.peek("exec_1")).toBe(false);
+  });
+
+  it("isolates decisions by executionId — a decision for one execution never leaks to another", () => {
+    const d = createInMemoryApprovalDecisions();
+    d.stage("exec_1", deleteRepo, { kind: "approve" });
+    expect(d.take("exec_2", deleteRepo)).toBeUndefined();
+    expect(d.peek("exec_2")).toBe(false);
+    // exec_1's decision is untouched by the exec_2 probe
+    expect(d.take("exec_1", deleteRepo)).toEqual({ kind: "approve" });
+  });
+
+  it("request equality is byte-exact: a differing input serialization does not match", () => {
+    const d = createInMemoryApprovalDecisions();
+    d.stage("exec_1", deleteRepo, { kind: "approve" });
+    expect(
+      d.take("exec_1", { op: "call", toolName: "github.delete_repo", request: '{"repo":"y"}' }),
+    ).toBeUndefined();
+    expect(d.take("exec_1", deleteRepo)).toEqual({ kind: "approve" });
+  });
+});

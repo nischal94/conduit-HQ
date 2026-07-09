@@ -1,5 +1,6 @@
 import type { CredentialResolver } from "../credentials.js";
 import type { ToolInvoker } from "../execute.js";
+import type { ApprovalDecisions } from "../execution/decisions.js";
 import type { PolicyEngine, PolicyVerdict } from "../policy.js";
 import type { ConduitStore } from "../store/store.js";
 import type { Connection, TraceEvent } from "../types.js";
@@ -34,6 +35,16 @@ export interface ToolInvokerDeps {
   policy: PolicyEngine;
   credentials: CredentialResolver;
   upstream: UpstreamCaller;
+  /**
+   * §5.5 design D6: request-bound operator decisions staged for a resume.
+   * OPTIONAL — when absent (the common case) runCall behaves exactly as it
+   * does with no decision. When present, a decision staged for THIS call's
+   * exact identity forces allow (approve) or block (deny), checked BEFORE
+   * policy; a decision staged for a DIFFERENT identity fails the call closed
+   * (confused-deputy defense: an approval for one call never authorizes
+   * another). See execution/decisions.ts.
+   */
+  decisions?: ApprovalDecisions;
 }
 
 export interface CreateToolInvokerOptions {
@@ -81,16 +92,28 @@ async function runCall(
     throw infraError(cause, log);
   });
 
+  // 1b. §5.5 design D6 — request-bound operator decision, checked BEFORE
+  //     policy (a human approval/denial on the paused call overrides the
+  //     policy verdict for exactly this call). This is the confused-deputy
+  //     defense at the resume boundary: the staged decision is bound to the
+  //     pending call's identity, and only the identical call may consume it.
+  //     Absent the decisions dep (the common case) this is a no-op and the
+  //     policy path below is byte-for-byte unchanged.
+  const decisionVerdict = resolveDecisionVerdict(deps, options.executionId, path, input);
+
   // 2. Policy. Allow-list discipline (policy.ts contract): proceed ONLY on
-  //    "allow"; a store rejection is a failed call, never a verdict.
-  const verdict = await deps.policy
-    .evaluate({
-      target: tool !== undefined ? { kind: "known", tool } : { kind: "unknown", toolName: path },
-      input,
-    })
-    .catch((cause) => {
-      throw infraError(cause, log);
-    });
+  //    "allow"; a store rejection is a failed call, never a verdict. Skipped
+  //    entirely when an operator decision already resolved this call.
+  const verdict =
+    decisionVerdict ??
+    (await deps.policy
+      .evaluate({
+        target: tool !== undefined ? { kind: "known", tool } : { kind: "unknown", toolName: path },
+        input,
+      })
+      .catch((cause) => {
+        throw infraError(cause, log);
+      }));
   // Unknown tool: fail closed as blocked regardless of the verdict. The
   // built-in engine returns block/unknown_tool here; a custom engine that
   // returns "allow" for a tool absent from the catalog still cannot proceed
@@ -178,6 +201,57 @@ async function runCall(
   //    (decision A3): an unauditable call must not silently succeed.
   await appendTrace(deps, options, log, { path, input, verdict, connection, outcome });
   return outcome.result;
+}
+
+/**
+ * §5.5 design D6 — resolve the operator decision for this call into a
+ * synthetic PolicyVerdict, or `undefined` to fall through to policy.
+ *
+ * The identity is `{ op: "call", toolName: path, request }`, where `request`
+ * is `JSON.stringify(input)` — the canonical serialization of the call's
+ * INPUT. The path is carried separately as `toolName`, so it is NOT folded
+ * into `request` (that would double-encode it and desync from how a decision
+ * is staged). Whoever stages a decision MUST use the identical serialization.
+ *
+ * Three outcomes, all fail-closed by construction:
+ *  - no decisions dep, or nothing staged for this execution → undefined
+ *    (the policy path runs unchanged — the common resume case).
+ *  - a decision staged for THIS exact identity → consume it (one-shot):
+ *    approve → synthetic allow (skips policy); deny → synthetic block.
+ *  - a decision staged but its identity DIVERGES from this call → block.
+ *    `take` returned undefined (no match) yet `peek` shows one is staged:
+ *    an approval for one call must never authorize another, so we refuse
+ *    rather than fall through to policy (which might allow). This is the
+ *    confused-deputy defense.
+ */
+function resolveDecisionVerdict(
+  deps: ToolInvokerDeps,
+  executionId: string,
+  path: string,
+  input: unknown,
+): PolicyVerdict | undefined {
+  const decisions = deps.decisions;
+  if (decisions === undefined) {
+    return undefined;
+  }
+  const identity = { op: "call", toolName: path, request: JSON.stringify(input) } as const;
+  const decision = decisions.take(executionId, identity);
+  if (decision === undefined) {
+    // Nothing staged → normal policy path. Something staged but non-matching
+    // → resume divergence, fail closed (block-class, never allow).
+    if (decisions.peek(executionId)) {
+      return {
+        action: "block",
+        reason: "resume divergence: approved call does not match the approved pending call",
+        source: "default",
+      };
+    }
+    return undefined;
+  }
+  if (decision.kind === "approve") {
+    return { action: "allow", reason: "operator approved this call on resume", source: "override" };
+  }
+  return { action: "block", reason: "operator denied this call on resume", source: "override" };
 }
 
 /**
