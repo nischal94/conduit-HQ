@@ -147,6 +147,33 @@ describe("SqliteStore", () => {
   });
 
   describe("executions", () => {
+    it("claimForResume: exactly one caller wins the paused→running transition", async () => {
+      await store.executions.put({
+        id: "e",
+        code: "",
+        status: "paused",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+      });
+      const [a, b] = await Promise.all([
+        store.executions.claimForResume("e", "attempt-A"),
+        store.executions.claimForResume("e", "attempt-B"),
+      ]);
+      expect([a, b].filter(Boolean)).toHaveLength(1); // exactly one won
+      expect((await store.executions.get("e"))?.status).toBe("running");
+    });
+
+    it("claimForResume: returns false when not paused", async () => {
+      await store.executions.put({
+        id: "e2",
+        code: "",
+        status: "running",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+      });
+      expect(await store.executions.claimForResume("e2", "x")).toBe(false);
+    });
+
     it("round-trips executions including pause state and seeds", async () => {
       await store.executions.put({
         id: "exec_1",
@@ -171,7 +198,7 @@ describe("SqliteStore", () => {
   });
 
   describe("trace", () => {
-    it("preserves append order per execution (the replay journal contract, §5.5)", async () => {
+    it("preserves append order per execution (the audit Trace ordering contract, §11)", async () => {
       for (const [i, toolName] of ["a.first", "a.second", "a.third"].entries()) {
         await store.trace.append({
           callId: `call_${i}`,
@@ -228,6 +255,66 @@ describe("SqliteStore", () => {
       });
       const [event] = await store.trace.listByExecution("exec_denied");
       expect(event && "output" in event).toBe(false);
+    });
+  });
+
+  describe("replayJournal", () => {
+    it("append + listByExecution returns rows in ordinal order", async () => {
+      await store.replayJournal.append("exec_1", {
+        ordinal: 0,
+        op: "search",
+        request: '{"query":"x"}',
+        outcome: { ok: true, value: [{ path: "a" }] },
+      });
+      await store.replayJournal.append("exec_1", {
+        ordinal: 1,
+        op: "call",
+        request: '{"path":"a","input":null}',
+        outcome: { ok: true, value: { done: true } },
+      });
+      const rows = await store.replayJournal.listByExecution("exec_1");
+      expect(rows.map((r) => [r.ordinal, r.op])).toEqual([
+        [0, "search"],
+        [1, "call"],
+      ]);
+      expect(rows[1]?.outcome).toEqual({ ok: true, value: { done: true } });
+    });
+
+    it("append is idempotent on (executionId, ordinal)", async () => {
+      const row = {
+        ordinal: 0,
+        op: "call" as const,
+        request: "{}",
+        outcome: { ok: true as const, value: 1 },
+      };
+      await store.replayJournal.append("exec_2", row);
+      await store.replayJournal.append("exec_2", row); // second write must not duplicate or throw
+      expect(await store.replayJournal.listByExecution("exec_2")).toHaveLength(1);
+    });
+
+    it("append REJECTS a conflicting ordinal that carries DIFFERENT content (corruption, not idempotent retry)", async () => {
+      // (F5) `ON CONFLICT DO NOTHING` silently kept the stale row even when the
+      // incoming row differed — diverging replay. A duplicate ordinal whose
+      // request/outcome differs is corruption and must fail loudly; the
+      // identical-content retry above must stay a no-op.
+      await store.replayJournal.append("exec_conflict", {
+        ordinal: 0,
+        op: "call",
+        request: '{"path":"a","input":null}',
+        outcome: { ok: true, value: { done: true } },
+      });
+      await expect(
+        store.replayJournal.append("exec_conflict", {
+          ordinal: 0,
+          op: "call",
+          request: '{"path":"b","input":null}', // different request at the same ordinal
+          outcome: { ok: true, value: { done: true } },
+        }),
+      ).rejects.toThrow(/append conflict/i);
+      // The original row is untouched — the mismatch did not overwrite it.
+      const rows = await store.replayJournal.listByExecution("exec_conflict");
+      expect(rows).toHaveLength(1);
+      expect(rows[0]?.request).toBe('{"path":"a","input":null}');
     });
   });
 

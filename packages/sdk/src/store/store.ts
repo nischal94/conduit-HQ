@@ -25,6 +25,7 @@ export interface ConduitStore {
   readonly policies: PolicyRepository;
   readonly executions: ExecutionRepository;
   readonly trace: TraceRepository;
+  readonly replayJournal: ReplayJournalRepository;
   readonly secrets: SecretRepository;
 }
 
@@ -70,15 +71,45 @@ export interface PolicyRepository {
 export interface ExecutionRepository {
   put(execution: Execution): Promise<void>;
   get(id: string): Promise<Execution | undefined>;
+  /** Atomic paused→running for a single resume. Returns true iff THIS caller won (design F4). */
+  claimForResume(id: string, resumeAttemptId: string): Promise<boolean>;
+  /**
+   * Terminalize a row THIS resume claimed but could not finish preparing
+   * (design §8/F5, the stranded-running guard). A guarded
+   * `UPDATE ... status='failed', ended_at, paused_on=NULL WHERE id=? AND
+   * status='running'` — it only fires on a row currently `running`, so it can
+   * never stomp a row another actor already moved on. Unlike `put`, it needs
+   * NO parsed `Execution`: the very failure it recovers from can be that
+   * `get` returned corrupt/unparseable JSON, so there may be no Execution to
+   * spread. Returns nothing; a no-op (0 rows) means the row was already
+   * terminal or re-claimed, which is fine.
+   */
+  failClaimedResume(id: string, reason: string): Promise<void>;
 }
 
 export interface TraceRepository {
   append(event: TraceEvent): Promise<void>;
   /**
-   * In insertion order — this listing IS the deterministic-replay journal
-   * (spec §5.5), so ordering is a correctness requirement, not cosmetics.
+   * In insertion order — the §11 AUDIT trail for an execution. After the D4
+   * split this is NOT the deterministic-replay journal (that is
+   * `ReplayJournalRepository`, below): the audit Trace records refusals and
+   * allowed calls alike, whereas replay reads the clean prefix. Ordering is
+   * still a correctness requirement — the audit trail must read chronologically
+   * — but it is an audit projection, not a replay source.
    */
   listByExecution(executionId: string): Promise<TraceEvent[]>;
+}
+
+export interface ReplayJournalRow {
+  ordinal: number;
+  op: "search" | "describe" | "call";
+  request: string;
+  outcome: { ok: true; value: unknown } | { ok: false; error: { name: string; message: string } };
+}
+
+export interface ReplayJournalRepository {
+  append(executionId: string, entry: ReplayJournalRow): Promise<void>;
+  listByExecution(executionId: string): Promise<ReplayJournalRow[]>;
 }
 
 export interface SecretRepository {

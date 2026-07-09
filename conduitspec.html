@@ -343,11 +343,15 @@ the §5.3 pipeline. &quot;Code-mode MCP&quot; = (one MCP tool) + (a sandbox that
 the catalog). Spec consumers should hold both views at once.</p>
 <h3 id="5-5-pause-resume-deterministic-replay">5.5 Pause/resume — deterministic replay (decided)</h3>
 <p>Executions pause only at <strong>tool-call boundaries</strong> (a policy approval or an auth prompt).
-The mechanism is <strong>deterministic replay</strong>, not VM snapshotting: every tool call&#39;s result is
-<strong>journaled</strong> — the Trace store (§11) doubles as the replay log. On resume, the execution&#39;s
+The mechanism is <strong>deterministic replay</strong>, not VM snapshotting: every finalized tool call&#39;s
+result is <strong>journaled</strong> — into a dedicated <strong>replay-journal projection</strong>, distinct from
+the audit Trace (§11). On resume, the execution&#39;s
 code re-runs from the top; journaled calls return their <strong>memoized results</strong> without
-re-hitting upstream; the execution proceeds live from the first un-journaled call. <strong>One
-mechanism powers both the audit differentiator and pause/resume correctness.</strong></p>
+re-hitting upstream; the execution proceeds live from the first un-journaled call. A
+<code>require_approval</code> pause writes nothing to the replay journal (it is recorded on the
+Execution&#39;s pending approval), so the journal is a clean prefix by construction; the audit Trace still
+records the refusal. <strong>The same durable-data model powers both the audit differentiator and
+pause/resume correctness.</strong></p>
 <ul>
 <li><strong>Survives restarts:</strong> a paused Execution is pure data (code + journal); the daemon can
 restart — or a different worker can pick it up — and resume it.</li>
@@ -839,10 +843,17 @@ quickjs-emscripten, Ajv + Zod, Vitest, libSQL.</li>
 namespace resolves to its one configured connection; multiple connections for an integration fail
 closed until per-call addressing ships. The pipeline's resolver seam accepts a <code>prefix</code>
 parameter from day one (unused in v1) so real addressing arrives without an interface change.</li>
-<li><strong>Trace as replay log:</strong> ✅ <strong><code>TraceEvent.output</code> carries the full
-(response-capped) call result</strong> (§5.5, §11) — the Trace store doubles as the durable replay
-journal for <code>call</code> ops; <code>outputSummary</code> is a display projection. Persisting
-<code>search</code>/<code>describe</code> journal entries is deferred to the §5.5 execution-manager work.
+<li><strong>Replay journal as a dedicated projection (revised 2026-07-09, §5.5 execution-manager work):</strong>
+✅ the durable replay journal is a <strong>separate <code>replay_journal</code> table</strong>, distinct from the
+audit Trace, holding <code>{ execution_id, ordinal, op, request, outcome }</code> for finalized
+<code>search</code>/<code>describe</code>/<code>call</code> ops. This supersedes the earlier "the Trace store
+doubles as the replay journal" decision: a cross-model review proved the audit Trace records the
+<code>require_approval</code> refusal row (polluting the replay prefix) and that <code>TraceEvent</code>
+cannot represent read-ops — so the two projections are split. The §18 rationale is preserved (durable-data
+replay over the SQLite store, no VM snapshots); only the "same table" detail changes. <code>TraceEvent.output</code>
+still carries the full (response-capped) call result for the §11 audit trail, with <code>outputSummary</code>
+as its display projection. Persisting <code>search</code>/<code>describe</code> journal entries — deferred here
+in the original decision — is discharged: they live in the new replay-journal table.
 <strong>Audit semantics:</strong> refusals (policy-denied, blocked) and allowed calls that reached the
 upstream caller and failed are traced (the latter with the allow verdict and no output); pre-flight
 refusals (no connection, unsupported source type, exhausted budget) and infra faults are not traced —

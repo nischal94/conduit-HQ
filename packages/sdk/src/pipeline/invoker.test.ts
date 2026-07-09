@@ -1,6 +1,7 @@
 import { createClient } from "@libsql/client";
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { createStoreCredentialResolver } from "../credentials.js";
+import { createInMemoryApprovalDecisions } from "../execution/decisions.js";
 import { createStorePolicyEngine } from "../policy.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
@@ -413,5 +414,135 @@ describe("createToolInvoker (spec §5.3)", () => {
     const trace = await store.trace.listByExecution("exec_t");
     expect(JSON.stringify(trace)).not.toContain(SECRET);
     expect(JSON.stringify(trace)).not.toContain("cred_gh");
+  });
+
+  describe("ApprovalDecisions wiring (§5.5 design D6, confused-deputy defense)", () => {
+    it("a staged approve for the EXACT call forces allow, skipping policy — upstream is reached and the row is traced as allow", async () => {
+      // github.delete_repo is destructive → policy would return require_approval.
+      // A request-bound operator approval for this exact call overrides that.
+      const upstreamResult = { content: [{ type: "text", text: "deleted" }] };
+      const { caller, requests } = recordingUpstream(upstreamResult);
+      const decisions = createInMemoryApprovalDecisions();
+      const input = { repo: "site" };
+      decisions.stage(
+        "exec_approve",
+        { op: "call", toolName: "github.delete_repo", request: JSON.stringify(input) },
+        { kind: "approve" },
+      );
+      const invoke = createToolInvoker(deps(caller, { decisions }), {
+        executionId: "exec_approve",
+        log: vi.fn(),
+      });
+
+      const result = await invoke("github.delete_repo", input);
+      expect(result).toEqual(upstreamResult);
+      expect(requests).toHaveLength(1); // policy was skipped; upstream WAS reached
+
+      const trace = await store.trace.listByExecution("exec_approve");
+      expect(trace).toHaveLength(1);
+      expect(trace[0]?.policyVerdict).toBe("allow");
+      expect(trace[0]?.toolName).toBe("github.delete_repo");
+
+      // one-shot: the decision is consumed — a second identical call falls back
+      // to policy (require_approval), never reusing the approval.
+      const second = invoke("github.delete_repo", input);
+      await expect(second).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyDenied });
+      expect(requests).toHaveLength(1); // still 1: the replayed call did not reach upstream
+    });
+
+    it("FAILS CLOSED as a TERMINAL replay-divergence when a decision is staged but its identity does NOT match — an approval for tool A never authorizes tool B, and upstream is NEVER reached (F2)", async () => {
+      // The confused-deputy defense, now TERMINAL (design F2). Operator approved
+      // delete_repo; the resumed run instead invokes list_issues. It MUST NOT
+      // fall through to policy's allow, MUST NOT reach the upstream, and MUST
+      // throw the uncatchable ConduitReplayDivergence (not a guest-catchable
+      // ConduitPolicyBlocked) so the guest cannot catch-and-continue. The staged
+      // decision is DISCARDED so it can never authorize a later call.
+      const { caller, requests } = recordingUpstream();
+      const decisions = createInMemoryApprovalDecisions();
+      decisions.stage(
+        "exec_divergence",
+        { op: "call", toolName: "github.delete_repo", request: JSON.stringify({ repo: "site" }) },
+        { kind: "approve" },
+      );
+      const invoke = createToolInvoker(deps(caller, { decisions }), {
+        executionId: "exec_divergence",
+        log: vi.fn(),
+      });
+
+      const attempt = invoke("github.list_issues", { owner: "acme" });
+      await expect(attempt).rejects.toMatchObject({ name: "ConduitReplayDivergence" });
+      await expect(attempt).rejects.toThrow(/resume divergence/i);
+      // It is NOT a guest-safe ConduitCallError name (uncatchable-by-design).
+      await expect(attempt).rejects.not.toMatchObject({ name: GUEST_ERROR_NAMES.policyBlocked });
+      expect(requests).toHaveLength(0); // credentialed bytes NEVER left the host
+      // The mismatched decision was discarded — a later matching call cannot
+      // reuse it (it was never the guest's to consume).
+      expect(decisions.peek("exec_divergence")).toBe(false);
+    });
+
+    it("also terminates as replay-divergence when the tool matches but the request (input) diverges — approval is bound to the exact payload (F2)", async () => {
+      const { caller, requests } = recordingUpstream();
+      const decisions = createInMemoryApprovalDecisions();
+      decisions.stage(
+        "exec_input_div",
+        { op: "call", toolName: "github.delete_repo", request: JSON.stringify({ repo: "site" }) },
+        { kind: "approve" },
+      );
+      const invoke = createToolInvoker(deps(caller, { decisions }), {
+        executionId: "exec_input_div",
+        log: vi.fn(),
+      });
+
+      // same tool, different input → identity mismatch → terminal divergence
+      const attempt = invoke("github.delete_repo", { repo: "OTHER" });
+      await expect(attempt).rejects.toMatchObject({ name: "ConduitReplayDivergence" });
+      await expect(attempt).rejects.toThrow(/resume divergence/i);
+      expect(requests).toHaveLength(0);
+      expect(decisions.peek("exec_input_div")).toBe(false);
+    });
+
+    it("a staged deny forces ConduitPolicyBlocked for exactly this call and never reaches upstream", async () => {
+      const { caller, requests } = recordingUpstream();
+      const decisions = createInMemoryApprovalDecisions();
+      const input = { owner: "acme" };
+      decisions.stage(
+        "exec_deny",
+        { op: "call", toolName: "github.list_issues", request: JSON.stringify(input) },
+        { kind: "deny" },
+      );
+      const invoke = createToolInvoker(deps(caller, { decisions }), {
+        executionId: "exec_deny",
+        log: vi.fn(),
+      });
+
+      // github.list_issues is safe → policy would ALLOW it; the operator deny wins.
+      const attempt = invoke("github.list_issues", input);
+      await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyBlocked });
+      expect(requests).toHaveLength(0);
+
+      const trace = await store.trace.listByExecution("exec_deny");
+      expect(trace).toHaveLength(1);
+      expect(trace[0]?.policyVerdict).toBe("block");
+    });
+
+    it("no decision staged for this execution → today's policy path is byte-for-byte unchanged", async () => {
+      // A decisions dep is present but empty: the common resume case where THIS
+      // call has no staged decision must behave exactly as the no-dep path.
+      const { caller, requests } = recordingUpstream();
+      const decisions = createInMemoryApprovalDecisions();
+      const invoke = createToolInvoker(deps(caller, { decisions }), {
+        executionId: "exec_empty",
+        log: vi.fn(),
+      });
+
+      // safe tool → allowed as usual
+      await invoke("github.list_issues", { owner: "acme" });
+      expect(requests).toHaveLength(1);
+
+      // destructive tool → policy require_approval as usual (no decision to override)
+      const denied = invoke("github.delete_repo", { repo: "x" });
+      await expect(denied).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyDenied });
+      expect(requests).toHaveLength(1);
+    });
   });
 });

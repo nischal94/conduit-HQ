@@ -25,7 +25,7 @@ promise the product makes but does not yet enforce.
 | §9.3 — loopback/private egress off by default (authoritative check: per-connect IP pinning, `createPinnedLookup` — canonicalize-then-check, closes DNS-rebinding TOCTOU per spec §18) | `packages/sdk/src/pipeline/egress.test.ts` (redirect refusal covered in `pipeline/upstream.test.ts`) | ✅ pinned |
 | §11 — Trace stores no raw credentials; inputs redacted per policy | — | ⏳ awaits Trace redaction (scope includes `TraceEvent.output`, which persists full upstream results unredacted for §5.5 replay) |
 | §16 — runaway executions interrupted (time / memory / output caps) | `packages/sdk/src/sandbox/quickjs.test.ts` | ✅ pinned |
-| §5.5 — pause/resume via deterministic replay (journaled results, seeded non-determinism) | — | ⏳ awaits execution manager (replay mechanism + seeds landed in sandbox, tested un-prefixed in `quickjs.test.ts`) |
+| §5.5 — pause/resume via deterministic replay (journaled results, seeded non-determinism) | `packages/sdk/src/execution/manager.test.ts` | ✅ pinned |
 | §10.2 — policy defaults: safe→Allow, review/destructive→Require approval; block never seeded | `packages/sdk/src/policy.test.ts` | ✅ pinned |
 
 ---

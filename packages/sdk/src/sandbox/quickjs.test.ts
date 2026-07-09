@@ -9,6 +9,20 @@ const NOOP_HOST: ToolHost = {
   call: async () => null,
 };
 
+// A host whose every verb throws if reached — for tests that must make
+// no tool calls, so a stray call fails loudly instead of silently.
+const THROWING_HOST: ToolHost = {
+  search: async () => {
+    throw new Error("THROWING_HOST.search must not be called");
+  },
+  describe: async () => {
+    throw new Error("THROWING_HOST.describe must not be called");
+  },
+  call: async () => {
+    throw new Error("THROWING_HOST.call must not be called");
+  },
+};
+
 function recordingHost(overrides: Partial<ToolHost> = {}) {
   const calls: Array<{ op: string; args: unknown[] }> = [];
   const host: ToolHost = {
@@ -292,6 +306,83 @@ describe("QuickJSSandbox", () => {
         status: "failed",
         error: { name: "NondeterministicExecutionError" },
       });
+    });
+  });
+
+  describe("approval-pause suspension (spec §5.5)", () => {
+    it("INVARIANT §5.5: a tool call that signals approval-pause suspends without journaling it", async () => {
+      const tools: ToolHost = {
+        search: async () => [{ path: "github.delete_repo", riskClass: "destructive", score: 1 }],
+        describe: async () => ({
+          path: "github.delete_repo",
+          namespace: "github",
+          riskClass: "destructive",
+        }),
+        call: async () => {
+          const error = new Error("approval required");
+          error.name = "ConduitApprovalPause";
+          throw error;
+        },
+      };
+      const result = await sandbox.execute({
+        code: `const { items } = await tools.search({ query: "delete" }); return await tools[items[0].path]({ repo: "x" });`,
+        tools,
+      });
+      expect(result.status).toBe("paused");
+      if (result.status === "paused") {
+        expect(result.pending.op).toBe("call");
+        // the search IS journaled (prefix), the paused call is NOT
+        expect(result.journal.map((entry) => entry.op)).toEqual(["search"]);
+      }
+    });
+  });
+
+  describe("new Date() determinism (spec §5.5)", () => {
+    it("§5.5: new Date() is deterministic across replays (pinned like Date.now)", async () => {
+      const code = "return new Date().getTime();";
+      const seeds = { now: 1000, random: 5 };
+      const r1 = await sandbox.execute({ code, tools: THROWING_HOST, seeds });
+      const r2 = await sandbox.execute({ code, tools: THROWING_HOST, seeds });
+      expect(r1.status).toBe("completed");
+      expect(r2.status).toBe("completed");
+      if (r1.status === "completed" && r2.status === "completed") {
+        expect(r1.value).toEqual(r2.value);
+        // Pinned to the seeded clock, not real wall-clock: the sole
+        // `new Date()` call reads the seed's first tick.
+        expect(r1.value).toBe(seeds.now);
+      }
+    });
+
+    it("§5.5: Date() called as a function (no `new`) is pinned to the seeded clock across replays", async () => {
+      // `Date()` without `new` returns a STRING of the current time. The real
+      // one reads the wall clock — a guest branching on it could reach a
+      // different first-live call on resume. It must route through the same
+      // seeded clock so two runs with identical seeds behave identically.
+      const code = "return typeof Date() === 'string' ? Date() : 'not-a-string';";
+      const seeds = { now: 1000, random: 5 };
+      const r1 = await sandbox.execute({ code, tools: THROWING_HOST, seeds });
+      const r2 = await sandbox.execute({ code, tools: THROWING_HOST, seeds });
+      expect(r1.status).toBe("completed");
+      expect(r2.status).toBe("completed");
+      if (r1.status === "completed" && r2.status === "completed") {
+        // Identical across replays (the divergence this closes) AND derived
+        // from the seeded clock, not the real wall clock. The exact toString
+        // format is the engine's; what matters is that it renders the 1970
+        // seed epoch, never "now". (QuickJS omits Node's timezone-name suffix,
+        // so compare on the seeded year rather than byte-for-byte.)
+        expect(r1.value).toEqual(r2.value);
+        expect(r1.value).toContain("1970");
+        expect(r1.value).not.toContain(`${new Date().getFullYear()}`);
+      }
+    });
+
+    it("§5.5: parameterized new Date(y, m, d, ...) is unaffected by the pin", async () => {
+      const result = await sandbox.execute({
+        code: "return new Date(2020, 0, 15).getFullYear();",
+        tools: THROWING_HOST,
+        seeds: { now: 1000, random: 5 },
+      });
+      expect(result).toMatchObject({ status: "completed", value: 2020 });
     });
   });
 });

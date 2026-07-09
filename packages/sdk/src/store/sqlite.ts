@@ -16,7 +16,7 @@ import type {
   Tool,
   TraceEvent,
 } from "../types.js";
-import type { ConduitStore } from "./store.js";
+import type { ConduitStore, ReplayJournalRow } from "./store.js";
 
 /**
  * libSQL/SQLite implementation of the ConduitStore seam. Single file
@@ -76,7 +76,8 @@ const SCHEMA = [
     seeds TEXT NOT NULL,
     paused_on TEXT,
     started_at INTEGER NOT NULL,
-    ended_at INTEGER
+    ended_at INTEGER,
+    resume_attempt TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS trace_events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +94,14 @@ const SCHEMA = [
     at INTEGER NOT NULL
   )`,
   `CREATE INDEX IF NOT EXISTS trace_execution ON trace_events (execution_id, seq)`,
+  `CREATE TABLE IF NOT EXISTS replay_journal (
+    execution_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    op TEXT NOT NULL CHECK (op IN ('search', 'describe', 'call')),
+    request TEXT NOT NULL,
+    outcome TEXT NOT NULL,
+    PRIMARY KEY (execution_id, ordinal)
+  )`,
   `CREATE TABLE IF NOT EXISTS secrets (
     ref TEXT PRIMARY KEY,
     sealed TEXT NOT NULL,
@@ -109,6 +118,13 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   const traceColumns = await client.execute("PRAGMA table_info(trace_events)");
   if (!traceColumns.rows.some((row) => row.name === "output")) {
     await client.execute("ALTER TABLE trace_events ADD COLUMN output TEXT");
+  }
+
+  // executions.resume_attempt arrived after the first shipped schema; same
+  // retrofit as trace_events.output above.
+  const executionColumns = await client.execute("PRAGMA table_info(executions)");
+  if (!executionColumns.rows.some((row) => row.name === "resume_attempt")) {
+    await client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT");
   }
 
   return {
@@ -337,6 +353,33 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         }
         return execution;
       },
+      async claimForResume(id: string, resumeAttemptId: string): Promise<boolean> {
+        // Single guarded UPDATE: the WHERE status = 'paused' clause makes
+        // this a compare-and-swap — SQLite serializes writes, so exactly
+        // one concurrent caller's UPDATE matches the row and affects it.
+        // A read-then-write would race here; this must stay one statement.
+        const rs = await client.execute({
+          sql: `UPDATE executions SET status = 'running', resume_attempt = ?
+                WHERE id = ? AND status = 'paused'`,
+          args: [resumeAttemptId, id],
+        });
+        return rs.rowsAffected === 1;
+      },
+      async failClaimedResume(id: string, _reason: string): Promise<void> {
+        // Guarded terminalizer for a row THIS resume claimed (design §8/F5).
+        // The `WHERE status='running'` clause means it ONLY finalizes a row a
+        // successful `claimForResume` left `running` — never a row another
+        // actor already moved to a terminal or re-`paused` state. No parsed
+        // Execution is needed (the fault may be corrupt stored JSON), so this
+        // writes columns directly. `_reason` is the caller-facing failure
+        // detail (surfaced in the thrown/returned error); the executions table
+        // has no reason column in v1, so it is not persisted here.
+        await client.execute({
+          sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL
+                WHERE id = ? AND status = 'running'`,
+          args: [Date.now(), id],
+        });
+      },
     },
 
     trace: {
@@ -367,6 +410,72 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           args: [executionId],
         });
         return rs.rows.map(rowToTraceEvent);
+      },
+    },
+
+    replayJournal: {
+      async append(executionId: string, entry: ReplayJournalRow): Promise<void> {
+        // Append is idempotent on (execution_id, ordinal): a legitimate
+        // re-`perform` of the same segment re-appends byte-identical content,
+        // which must stay a no-op (design D8). But a conflict whose STORED row
+        // DIFFERS from the incoming one is corruption — a duplicate ordinal
+        // carrying a different request/outcome would silently keep the stale
+        // row and diverge replay. A bare `ON CONFLICT DO NOTHING` cannot tell
+        // the two apart, so read the existing row first and reject a genuine
+        // mismatch. Safe as a read-then-write because the manager is the sole
+        // writer per execution (single-process MVP, one drive at a time).
+        const outcomeJson = JSON.stringify(entry.outcome);
+        const existing = await client.execute({
+          sql: "SELECT op, request, outcome FROM replay_journal WHERE execution_id = ? AND ordinal = ?",
+          args: [executionId, entry.ordinal],
+        });
+        const prior = existing.rows[0];
+        if (prior !== undefined) {
+          if (
+            text(prior, "op") !== entry.op ||
+            text(prior, "request") !== entry.request ||
+            text(prior, "outcome") !== outcomeJson
+          ) {
+            throw new Error(
+              `[SqliteStore] Replay-journal append conflict: ordinal ${entry.ordinal} already holds a DIFFERENT ` +
+                `entry (corruption; not an idempotent retry). Context: { executionId: ${JSON.stringify(executionId)} }`,
+            );
+          }
+          return; // identical content — idempotent no-op
+        }
+        await client.execute({
+          sql: `INSERT INTO replay_journal (execution_id, ordinal, op, request, outcome)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(execution_id, ordinal) DO NOTHING`,
+          args: [executionId, entry.ordinal, entry.op, entry.request, outcomeJson],
+        });
+      },
+      async listByExecution(executionId: string): Promise<ReplayJournalRow[]> {
+        const rs = await client.execute({
+          sql: "SELECT ordinal, op, request, outcome FROM replay_journal WHERE execution_id = ? ORDER BY ordinal",
+          args: [executionId],
+        });
+        return rs.rows.map((row) => {
+          const op = text(row, "op");
+          if (!isOneOf(op, REPLAY_OPS)) {
+            throw new Error(
+              `[SqliteStore] Failed to read replay_journal: unrecognized op ${JSON.stringify(op)}. Context: { executionId: ${JSON.stringify(executionId)} }`,
+            );
+          }
+          return {
+            ordinal: integer(row, "ordinal"),
+            op,
+            request: text(row, "request"),
+            outcome: parseJson(
+              text(row, "outcome"),
+              (cause) =>
+                new Error(
+                  `[SqliteStore] Failed to read replay_journal outcome: not valid JSON. Context: { executionId: ${JSON.stringify(executionId)} }`,
+                  { cause },
+                ),
+            ) as ReplayJournalRow["outcome"],
+          };
+        });
       },
     },
 
@@ -444,6 +553,7 @@ const EXECUTION_STATUSES: readonly ExecutionStatus[] = [
   "expired",
 ];
 
+const REPLAY_OPS: readonly ReplayJournalRow["op"][] = ["search", "describe", "call"];
 const GRAPHQL_OPERATIONS: readonly ("query" | "mutation")[] = ["query", "mutation"];
 const SEMANTICS_KINDS: readonly SourceSemantics["kind"][] = [
   "openapi",
