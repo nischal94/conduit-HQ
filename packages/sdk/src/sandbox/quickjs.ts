@@ -69,7 +69,20 @@ export class QuickJSSandbox implements Sandbox {
       }
       // Tool-call boundary (spec §5.3 / §5.5): the VM is gone; the host
       // performs the call and the journal memoizes it for the replay.
-      journal.push(await perform(request.tools, run.pending));
+      const performed = await perform(request.tools, run.pending);
+      if ("pause" in performed) {
+        // The ToolHost signalled an approval gate (§5.5): suspend WITHOUT
+        // journaling this call, so the journal stays a clean prefix that
+        // resumes live from here once approved. Only a `call` op can pause
+        // (search/describe never gate); narrow the pending op accordingly.
+        return {
+          status: "paused",
+          pending: { op: "call", request: run.pending.request },
+          seeds,
+          journal,
+        };
+      }
+      journal.push(performed);
       if (Date.now() >= deadline) {
         return { status: "interrupted", reason: "wall_clock", seeds, journal };
       }
@@ -241,17 +254,29 @@ function drive(context: QuickJSContext, runtime: QuickJSRuntime, code: string): 
   }
 }
 
-/** Perform one tool call host-side and reduce it to a journal entry. */
+/**
+ * Perform one tool call host-side. Reduces to a journal entry, or — when
+ * the ToolHost throws the recognized approval-pause sentinel (spec §5.5) —
+ * to `{ pause: true }`, which suspends the run without journaling.
+ *
+ * The sentinel is matched structurally by `name === "ConduitApprovalPause"`
+ * alone; the sandbox never sees the policy that produced it (a later
+ * host-side wrapper throws it). Everything else is a normal outcome —
+ * including genuine tool failures, which stay catchable in guest code.
+ */
 async function perform(
   tools: ExecutionRequest["tools"],
   pending: PendingToolCall,
-): Promise<JournalEntry> {
+): Promise<JournalEntry | { pause: true }> {
   const base = { op: pending.op, request: pending.request };
   try {
     const payload: unknown = JSON.parse(pending.request);
     const value = await dispatchOp(tools, pending.op, payload);
     return { ...base, outcome: { ok: true, value: value === undefined ? null : value } };
   } catch (error) {
+    if (error instanceof Error && error.name === "ConduitApprovalPause") {
+      return { pause: true };
+    }
     return { ...base, outcome: { ok: false, error: toSandboxError(error) } };
   }
 }
@@ -325,9 +350,9 @@ function toSandboxError(detail: unknown): SandboxError {
  *
  * - `Math.random()` — mulberry32 over `seeds.random`: the recorded seed
  *   replays the exact sequence (spec §5.5).
- * - `Date.now()` — `seeds.now` plus a 1ms-per-call tick: deterministic,
- *   monotonic, replayable. Only `Date.now` is pinned; the spec names
- *   exactly `Date.now()` and `Math.random()` as the enforced boundary.
+ * - `Date.now()` and no-arg `new Date()` — `seeds.now` plus a 1ms-per-call
+ *   tick: deterministic, monotonic, replayable. Both wall-clock reads route
+ *   through the one seeded clock; parameterized `new Date(...)` is untouched.
  * - `tools` — search/describe verbs plus a path proxy, so both
  *   `tools["github.issues.list"](input)` and typed-style
  *   `tools.github.issues.list(input)` resolve to the same bridge call.
@@ -344,6 +369,30 @@ function bootstrapSource(seeds: ExecutionSeeds): string {
 
   var tick = 0;
   Date.now = function () { return ${seeds.now} + tick++; };
+
+  // Pin the no-arg Date constructor to the same seeded, ticking clock so
+  // \`new Date()\` replays deterministically (spec §5.5). Parameterized
+  // \`new Date(y, mo, d, ...)\` and \`new Date(ms)\` keep their real
+  // behavior; only the zero-arg "read the wall clock" path is seeded.
+  var RealDate = Date;
+  function PinnedDate(y, mo, d, h, mi, s, ms) {
+    if (!(this instanceof PinnedDate)) return RealDate();
+    switch (arguments.length) {
+      case 0: return new RealDate(Date.now());
+      case 1: return new RealDate(y);
+      case 2: return new RealDate(y, mo);
+      case 3: return new RealDate(y, mo, d);
+      case 4: return new RealDate(y, mo, d, h);
+      case 5: return new RealDate(y, mo, d, h, mi);
+      case 6: return new RealDate(y, mo, d, h, mi, s);
+      default: return new RealDate(y, mo, d, h, mi, s, ms);
+    }
+  }
+  PinnedDate.now = Date.now;
+  PinnedDate.parse = RealDate.parse;
+  PinnedDate.UTC = RealDate.UTC;
+  PinnedDate.prototype = RealDate.prototype;
+  Date = PinnedDate;
 
   var state = ${seeds.random} >>> 0;
   Math.random = function () {

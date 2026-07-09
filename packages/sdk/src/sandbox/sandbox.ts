@@ -101,6 +101,22 @@ export type SandboxResult =
       reason: InterruptReason;
       seeds: ExecutionSeeds;
       journal: JournalEntry[];
+    }
+  /**
+   * A tool call reached an approval gate (spec §5.5): the ToolHost threw
+   * the recognized pause sentinel, so the run suspends instead of
+   * journaling the call. `pending` is the un-journaled bridge op the
+   * guest is waiting on; `journal` stays a clean prefix (the paused call
+   * is NOT appended). The sandbox stays policy-oblivious — it carries
+   * only the structural `{ op, request }`, never why approval was
+   * required. The invoker-side fields (reason, callId) are added by the
+   * host-side wrapper, outside the sandbox.
+   */
+  | {
+      status: "paused";
+      pending: { op: "call"; request: string };
+      seeds: ExecutionSeeds;
+      journal: JournalEntry[];
     };
 
 /** Which §16 cap fired. */
