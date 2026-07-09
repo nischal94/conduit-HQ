@@ -223,6 +223,39 @@ function makeStubDeps(
   };
 }
 
+/**
+ * Wrap a harness's manager deps so the manager's OWN store view has its
+ * `replayJournal` marker maintenance (markAttempt / clearAttempt) fault-
+ * injectable. Only the manager's `deps.store` is replaced — the invoker and
+ * host still close over the real harness store — so this exercises exactly the
+ * marker WRITE/CLEAR operations the journaling wrapper performs, without
+ * disturbing upstream/loopback wiring (design D8/F5 marker maintenance).
+ */
+function withMarkerFaults(
+  deps: ExecutionManagerDeps,
+  faults: {
+    markAttempt?: (executionId: string, ordinal: number) => void;
+    clearAttempt?: (executionId: string, ordinal: number) => void;
+  },
+): ExecutionManagerDeps {
+  const rj = deps.store.replayJournal;
+  const wrappedStore: ConduitStore = {
+    ...deps.store,
+    replayJournal: {
+      ...rj,
+      markAttempt: async (executionId, ordinal) => {
+        faults.markAttempt?.(executionId, ordinal);
+        return rj.markAttempt(executionId, ordinal);
+      },
+      clearAttempt: async (executionId, ordinal) => {
+        faults.clearAttempt?.(executionId, ordinal);
+        return rj.clearAttempt(executionId, ordinal);
+      },
+    },
+  };
+  return { ...deps, store: wrappedStore };
+}
+
 describe("§5.5 execution manager — pause/resume via deterministic replay", () => {
   let active: Harness | undefined;
   afterEach(async () => {
@@ -1074,5 +1107,237 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(after?.pausedOn).toBeUndefined();
     const retry = await manager.resume(id, { kind: "approve" });
     expect(retry.status).toBe("conflict");
+  });
+
+  it("§5.5 (H1): a markAttempt WRITE fault on the approved call terminalizes `failed` (NOT a catchable guest error), side effect never fires", async () => {
+    // (Fix Pass 2 / H1) The attempt-marker WRITE is host-side infrastructure.
+    // If it throws BEFORE the side effect reaches upstream, it must NOT escape
+    // into the sandbox as a normal (catchable) tool outcome — no journal row
+    // was appended, so the guest would continue on a phantom failure. It must
+    // terminalize the drive `failed` uncatchably instead.
+    const h = await makeHarness();
+    active = h;
+
+    // The guest CATCHES any tool error and returns a sentinel. If the marker
+    // fault leaked as a catchable error, the execution would COMPLETE with this
+    // sentinel — the bug. Correct behavior: the guest can never catch it; the
+    // execution is terminal `failed`.
+    const code = `
+      try {
+        const created = await tools.github.create_issue({ title: "from agent" });
+        return { caught: false, created };
+      } catch (error) {
+        return { caught: true, name: error.name };
+      }
+    `;
+    // Pause on the require_approval call using the plain harness manager.
+    const first = await createExecutionManager(h.deps).start(code);
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      return;
+    }
+    const id = first.executionId;
+    // Resume with a deps view whose markAttempt WRITE faults — for the approved
+    // (create_issue) call this fires BEFORE the side effect reaches upstream.
+    const faultingDeps = withMarkerFaults(h.deps, {
+      markAttempt: () => {
+        throw new Error("[test] simulated markAttempt store fault");
+      },
+    });
+    const outcome = await createExecutionManager(faultingDeps).resume(id, { kind: "approve" });
+
+    // Terminal `failed` — NOT completed-with-sentinel (which would prove the
+    // guest caught it).
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitOutcomeAmbiguous");
+    }
+    // The side effect NEVER fired (the write faulted before reaching upstream).
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(0);
+    // No journal row was appended for the faulted attempt.
+    const rows = await h.store.replayJournal.listByExecution(id);
+    expect(rows.some((r) => JSON.parse(r.request).path === "github.create_issue")).toBe(false);
+    // Persisted terminal + non-resumable.
+    const settled = await h.store.executions.get(id);
+    expect(settled?.status).toBe("failed");
+    expect(settled?.pausedOn).toBeUndefined();
+    const retry = await createExecutionManager(h.deps).resume(id, { kind: "approve" });
+    expect(retry.status).toBe("conflict");
+  });
+
+  it("§5.5 (H2/pause): a clearAttempt fault on the require_approval branch still PAUSES uncatchably (guest cannot catch-and-continue)", async () => {
+    // (Fix Pass 2 / H2) On the pause branch the captured signal is set BEFORE
+    // clearAttempt, so a clearAttempt fault can never downgrade the pause into
+    // a catchable guest error. The guest wraps the paused call in try/catch: if
+    // the fault leaked, the guest would catch it and COMPLETE. Correct: the run
+    // suspends and the manager returns `paused`.
+    const h = await makeHarness();
+    active = h;
+    const faultingDeps = withMarkerFaults(h.deps, {
+      clearAttempt: () => {
+        throw new Error("[test] simulated clearAttempt store fault on pause branch");
+      },
+    });
+    const code = `
+      try {
+        const created = await tools.github.create_issue({ title: "pause please" });
+        return { paused: false, created };
+      } catch (error) {
+        return { paused: false, caught: error.name };
+      }
+    `;
+    // start() drives to the require_approval pause; the clearAttempt on that
+    // branch faults but must NOT surface as a catchable guest error.
+    const outcome = await createExecutionManager(faultingDeps).start(code);
+    expect(outcome.status).toBe("paused");
+    if (outcome.status === "paused") {
+      expect(outcome.pending.toolName).toBe("github.create_issue");
+    }
+    // The paused call never reached upstream.
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(0);
+  });
+
+  it("§5.5 (H2/divergence): a clearAttempt fault on the replay-divergence branch still terminalizes `failed` uncatchably", async () => {
+    // (Fix Pass 2 / H2) On resume, if the first live call is NOT the approved
+    // call, the wrapper captures divergence and terminalizes. The captured
+    // signal is set BEFORE clearAttempt, so a clearAttempt fault cannot bypass
+    // the terminal path and leak as a catchable guest error.
+    const h = await makeHarness();
+    active = h;
+    const plain = createExecutionManager(h.deps);
+
+    // The guest pauses on delete_repo (tool B) then wraps it in try/catch. On
+    // resume we corrupt the persisted `pausedOn` to a DIFFERENT identity
+    // (create_issue, tool A) — the confused-deputy setup — so the staged
+    // decision does not match the first live call, forcing divergence.
+    const code = `
+      try {
+        const r = await tools.github.delete_repo({ repo: "prod" });
+        return { diverged: false, r };
+      } catch (error) {
+        return { diverged: false, caught: error.name };
+      }
+    `;
+    const first = await plain.start(code);
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      return;
+    }
+    const id = first.executionId;
+    const persisted = await h.store.executions.get(id);
+    if (persisted?.pausedOn === undefined) {
+      throw new Error("expected a persisted pausedOn to corrupt");
+    }
+    await h.store.executions.put({
+      ...persisted,
+      pausedOn: {
+        ...persisted.pausedOn,
+        toolName: "github.create_issue",
+        input: { title: "harmless" },
+      },
+    });
+    const faultingDeps = withMarkerFaults(h.deps, {
+      clearAttempt: () => {
+        throw new Error("[test] simulated clearAttempt store fault on divergence branch");
+      },
+    });
+    const outcome = await createExecutionManager(faultingDeps).resume(id, { kind: "approve" });
+    // Terminal `failed` (divergence) — NOT completed-with-catch.
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitReplayDivergence");
+    }
+    const settled = await h.store.executions.get(id);
+    expect(settled?.status).toBe("failed");
+    expect(settled?.pausedOn).toBeUndefined();
+  });
+
+  it("§5.5 (M): a stale marker at an ordinal ALREADY in the journal is RESOLVED — resume proceeds; a marker at an UNRECORDED ordinal terminalizes", async () => {
+    // (Fix Pass 2 / M) A crash BETWEEN appendBarrier and clearAttempt leaves a
+    // stale marker AND a valid journal row at the same ordinal. That ordinal is
+    // RESOLVED (outcome durable) — resume must NOT terminalize on it. Only a
+    // marker whose ordinal is ABSENT from the journal is the true ambiguous
+    // (attempted-but-unrecorded) case.
+    const store = await makeBareStore();
+
+    // --- Case A: stale marker at a JOURNALED ordinal → resume proceeds. ---
+    const idResolved = "exec_m_resolved";
+    await store.executions.put({
+      id: idResolved,
+      code: "return 1;",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.create_issue",
+        input: { title: "x" },
+        reason: "requires approval",
+        expiresAt: Date.now() + 3_600_000,
+      },
+      startedAt: Date.now(),
+    });
+    // A durable journal row exists at ordinal 0 (the append succeeded)…
+    await store.replayJournal.append(idResolved, {
+      ordinal: 0,
+      op: "call",
+      request: JSON.stringify({ path: "github.create_issue", input: { title: "x" } }),
+      outcome: { ok: true, value: { ok: true } },
+    });
+    // …but a crash left the marker at ordinal 0 uncleared.
+    await store.replayJournal.markAttempt(idResolved, 0);
+
+    // A sandbox that COMPLETES without performing any tool call — proving the
+    // recovery check did NOT terminalize (it drove into the sandbox).
+    const completingSandbox: Sandbox = {
+      execute: (request) =>
+        Promise.resolve({
+          status: "completed",
+          value: { resumed: true },
+          seeds: request.seeds ?? { now: 1, random: 2 },
+          journal: [...(request.journal ?? [])],
+        }),
+    };
+    const resolvedOutcome = await createExecutionManager(
+      makeStubDeps(store, completingSandbox),
+    ).resume(idResolved, { kind: "approve" });
+    // Resume PROCEEDED (drove the sandbox to completion), NOT terminalized.
+    expect(resolvedOutcome.status).toBe("completed");
+    // The resolved marker was tidied.
+    expect(await store.replayJournal.listAttempts(idResolved)).toEqual([]);
+
+    // --- Case B: stale marker at an UNRECORDED ordinal → terminal ambiguous. ---
+    const idUnrecorded = "exec_m_unrecorded";
+    await store.executions.put({
+      id: idUnrecorded,
+      code: "return 1;",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.create_issue",
+        input: { title: "y" },
+        reason: "requires approval",
+        expiresAt: Date.now() + 3_600_000,
+      },
+      startedAt: Date.now(),
+    });
+    // Marker at ordinal 0 with NO journal row → genuinely attempted-but-unrecorded.
+    await store.replayJournal.markAttempt(idUnrecorded, 0);
+
+    let sandboxRuns = 0;
+    const neverSandbox: Sandbox = {
+      execute: () => {
+        sandboxRuns += 1;
+        return Promise.reject(new Error("sandbox must not run on an outcome-ambiguous recovery"));
+      },
+    };
+    const unrecordedOutcome = await createExecutionManager(
+      makeStubDeps(store, neverSandbox),
+    ).resume(idUnrecorded, { kind: "approve" });
+    expect(unrecordedOutcome.status).toBe("failed");
+    if (unrecordedOutcome.status === "failed") {
+      expect(unrecordedOutcome.error.name).toBe("ConduitOutcomeAmbiguous");
+    }
+    expect(sandboxRuns).toBe(0);
   });
 });

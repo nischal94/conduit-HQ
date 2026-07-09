@@ -166,6 +166,15 @@ interface CapturedDriveState {
   ambiguous?: SandboxError;
   /** design D6/F2: the first live call on resume ≠ the approved call. */
   divergence?: SandboxError;
+  /**
+   * design D8/F5: writing the attempt marker itself faulted (a store blip),
+   * BEFORE the side effect could reach upstream. The write is host-side
+   * infrastructure — its failure must terminalize the drive `failed`, never
+   * surface to the guest as a catchable tool error (which the guest could
+   * treat as a phantom failure and continue past, since NO journal row was
+   * appended). Fails closed: side effect never fired, execution non-resumable.
+   */
+  markerFault?: SandboxError;
 }
 
 export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionManager {
@@ -246,7 +255,25 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // nothing runs between here and the append to shift it.
       const attemptOrdinal = ordinal;
       if (op === "call") {
-        await deps.store.replayJournal.markAttempt(ctx.executionId, attemptOrdinal);
+        // The marker WRITE is host-side infrastructure (design D8/F5). If it
+        // faults it must NOT propagate into `perform` as a normal (catchable)
+        // tool error — no journal row was appended, so the guest would continue
+        // on a phantom failure. Terminalize `failed` UNCATCHABLY instead: set
+        // the host-side signal, then suspend via ConduitApprovalPause(true)
+        // (the divergence/ambiguous path). Fails closed: side effect never
+        // reached upstream, execution is non-resumable.
+        try {
+          await deps.store.replayJournal.markAttempt(ctx.executionId, attemptOrdinal);
+        } catch (cause) {
+          captured.markerFault = {
+            name: "ConduitOutcomeAmbiguous",
+            message:
+              `[ExecutionManager] Failed to write the attempt marker before an upstream call; ` +
+              `execution terminated (non-resumable) so the side effect is never issued unrecorded. ` +
+              `Context: { executionId: ${ctx.executionId}, ordinal: ${attemptOrdinal}, cause: ${String(cause)} }`,
+          };
+          throw new ConduitApprovalPause(true);
+        }
       }
 
       let value: unknown;
@@ -255,22 +282,30 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       } catch (error) {
         if (isRequireApproval(error)) {
           // Pause: no upstream side effect happened (policy refuses BEFORE
-          // upstream). Clear the attempt marker — nothing to be ambiguous
-          // about — then suspend WITHOUT journaling (design D2/D4).
-          await clearAttempt(op, attemptOrdinal);
+          // upstream). Commit to the uncatchable suspend path FIRST (set the
+          // captured signal + decide to throw ConduitApprovalPause) so a
+          // clearAttempt fault can NEVER downgrade this pause into a catchable
+          // guest error (H2). The marker clear is best-effort: on this
+          // no-side-effect branch a stale marker is safe — its ordinal is
+          // absent from the journal, so resume treats it per the recovery
+          // check; but M-fix means a stale marker whose ordinal never lands a
+          // row IS the true ambiguous case, so we still clear when we can.
           captured.pending = onApprovalPause();
+          await clearAttemptBestEffort(op, attemptOrdinal);
           throw new ConduitApprovalPause();
         }
         if (isReplayDivergence(error)) {
           // Resume replay-divergence (design D6/F2): refused BEFORE upstream,
-          // like require_approval — no side effect. Clear the marker, then
-          // terminate the execution (uncatchable by the guest). The manager
-          // finalizes `failed`; do NOT journal it (not real guest control flow).
-          await clearAttempt(op, attemptOrdinal);
+          // like require_approval — no side effect. Commit to the uncatchable
+          // terminal path FIRST (H2), THEN best-effort clear the marker — a
+          // clearAttempt fault must not bypass the divergence terminalization.
+          // The manager finalizes `failed`; do NOT journal it (not real guest
+          // control flow).
           captured.divergence = {
             name: REPLAY_DIVERGENCE_ERROR_NAME,
             message: `[ExecutionManager] Resume replay-divergence; execution terminated (non-resumable). Context: { executionId: ${ctx.executionId} }`,
           };
+          await clearAttemptBestEffort(op, attemptOrdinal);
           throw new ConduitApprovalPause(true);
         }
         // Any other error (a `block`, a real upstream failure, a denied
@@ -280,7 +315,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // longer ambiguous — clear the marker after the append.
         const outcome = { ok: false as const, error: toSandboxError(error) };
         await appendBarrier(op, request, outcome);
-        await clearAttempt(op, attemptOrdinal);
+        // The failed outcome is durably journaled at this ordinal, so a stale
+        // marker is RESOLVED on resume (M-fix: ordinal present in the journal).
+        // Clearing is best-effort — a clear fault must not replace the guest's
+        // real (guest-safe) error with a store fault.
+        await clearAttemptBestEffort(op, attemptOrdinal);
         // Re-throw so the guest sees the (guest-safe) error.
         throw error;
       }
@@ -291,7 +330,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // could not be journaled), it terminalizes outcome-ambiguous and the
       // marker is deliberately LEFT in place — the drive is terminal anyway.
       await appendBarrier(op, request, { ok: true as const, value: normalized });
-      await clearAttempt(op, attemptOrdinal);
+      // The success outcome is durably journaled at this ordinal, so a stale
+      // marker is RESOLVED on resume (M-fix: ordinal present in the journal).
+      // Clearing is best-effort — a clear fault must not turn a durably
+      // recorded success into a guest-visible store error.
+      await clearAttemptBestEffort(op, attemptOrdinal);
       return normalized;
     }
 
@@ -301,6 +344,30 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     ): Promise<void> {
       if (op === "call") {
         await deps.store.replayJournal.clearAttempt(ctx.executionId, attemptOrdinal);
+      }
+    }
+
+    /**
+     * Clear the attempt marker on a branch that has ALREADY committed to a
+     * terminal/pause outcome (require_approval, replay-divergence). A clear
+     * failure here is harmless to replay — no journal row was appended, so the
+     * stale marker's ordinal is absent from the journal; on resume the M-fix
+     * treats an ordinal absent from the journal as the true outcome-ambiguous
+     * case only if a side effect could have fired, and NEITHER of these
+     * branches reaches upstream. Swallowing the clear fault is therefore safe
+     * and is REQUIRED: it must never be able to bypass the captured terminal
+     * signal and downgrade the outcome into a catchable guest error (H2).
+     */
+    async function clearAttemptBestEffort(
+      op: "search" | "describe" | "call",
+      attemptOrdinal: number,
+    ): Promise<void> {
+      try {
+        await clearAttempt(op, attemptOrdinal);
+      } catch {
+        // Deliberately swallowed — see the doc comment. The terminal/pause
+        // signal was already captured; a stale marker on a no-side-effect
+        // branch cannot cause a double side effect.
       }
     }
 
@@ -475,6 +542,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     if (captured.ambiguous !== undefined) {
       return finish(execution, { status: "failed", error: captured.ambiguous });
     }
+    // markerFault — the attempt marker WRITE faulted before the side effect
+    // reached upstream. Host-side infra failure: terminalize `failed`, never
+    // surface to the guest as a catchable tool error.
+    if (captured.markerFault !== undefined) {
+      return finish(execution, { status: "failed", error: captured.markerFault });
+    }
 
     switch (result.status) {
       case "completed":
@@ -608,14 +681,23 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         const prefix = toSandboxJournal(prefixRows);
 
         // Outcome-ambiguity on recovery (design D8/F5): an un-cleared attempt
-        // marker means a PRIOR drive crashed between an upstream side effect
-        // and its journal append — the side effect MAY have fired but was never
-        // recorded. With no idempotency key (v1 has none), re-running would risk
-        // a double side effect, so fail CLOSED: terminalize `failed`
-        // (outcome-ambiguous), never re-run. The terminal state records the
-        // pending call so a human can re-issue deliberately.
+        // marker means a PRIOR drive MAY have crashed between an upstream side
+        // effect and its journal append. But a marker is outcome-ambiguous ONLY
+        // IF its ordinal is ABSENT from the durable journal prefix (H/M-fix): a
+        // marker whose ordinal ALREADY has a journal row is RESOLVED — the
+        // append succeeded and only the clear didn't (a crash BETWEEN
+        // appendBarrier and clearAttempt). Re-running is not at stake there;
+        // the outcome is durably recorded. So compare the attempt ordinals
+        // against the journal ordinals and terminalize only on the genuinely
+        // unrecorded ones. With no idempotency key (v1 has none), those fail
+        // CLOSED: terminal `failed` (outcome-ambiguous), never re-run. The
+        // terminal state records the pending call so a human can re-issue.
         const strandedAttempts = await deps.store.replayJournal.listAttempts(executionId);
-        if (strandedAttempts.length > 0) {
+        const journaledOrdinals = new Set(prefixRows.map((row) => row.ordinal));
+        const unrecordedAttempts = strandedAttempts.filter(
+          (ordinal) => !journaledOrdinals.has(ordinal),
+        );
+        if (unrecordedAttempts.length > 0) {
           const failed: Execution = { ...execution, status: "failed", endedAt: now() };
           delete failed.pausedOn;
           await persistOrFinalizeFailed(execution, () => deps.store.executions.put(failed));
@@ -627,9 +709,20 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               message:
                 `[ExecutionManager] A prior upstream call was attempted but its result was never ` +
                 `journaled (crash between side effect and append); the execution is outcome-ambiguous ` +
-                `and not resumable. Context: { executionId: ${executionId}, attemptOrdinals: [${strandedAttempts.join(", ")}] }`,
+                `and not resumable. Context: { executionId: ${executionId}, attemptOrdinals: [${unrecordedAttempts.join(", ")}] }`,
             },
           };
+        }
+        // Any RESOLVED markers (ordinal already journaled — only the clear was
+        // lost to a crash) are stale but harmless. Best-effort clear them so the
+        // journal is tidy; a clear fault here does not block resume, because the
+        // outcome is durably recorded and re-running is not at stake.
+        for (const ordinal of strandedAttempts) {
+          if (journaledOrdinals.has(ordinal)) {
+            await deps.store.replayJournal.clearAttempt(executionId, ordinal).catch(() => {
+              // Stale marker at a journaled ordinal — resume proceeds regardless.
+            });
+          }
         }
 
         const decisions = makeDecisions();
