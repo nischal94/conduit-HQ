@@ -999,11 +999,19 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
   it("§5.5 (F5/I-5): a crash mid-call (attempt marker persisted, no outcome) → resume is terminal outcome-ambiguous, side effect NOT re-run", async () => {
     // (Fix 3) The crash window between an upstream side effect and its journal
     // append. Simulate the crash by seeding a paused row PLUS a lingering
-    // attempt marker at an ordinal with NO finalized replay_journal row. On
-    // resume, the recovery check sees the stranded marker and fails CLOSED —
-    // terminal `failed` (outcome-ambiguous), never re-running the side effect
-    // (the sandbox is never even driven). v1 has no idempotency key, so
+    // attempt marker at an un-journaled ordinal that is NOT the pending call's
+    // ordinal. On resume, the recovery check sees the stranded marker and fails
+    // CLOSED — terminal `failed` (outcome-ambiguous), never re-running the side
+    // effect (the sandbox is never even driven). v1 has no idempotency key, so
     // fail-closed is the correct default (design D8).
+    //
+    // NOTE (Fix Pass 3 / M1): the marker must NOT sit at the pending-call ordinal.
+    // On a genuinely `paused` row the pending call's marker is the require_approval
+    // PAUSE artifact (written before upstream, no side effect) and is now
+    // deliberately excluded from the ambiguity check — resuming on it is correct.
+    // The reachable true-crash this test pins is a marker at a DIFFERENT ordinal:
+    // seed a durable prefix row at ordinal 0 (pending ordinal → 1) and strand the
+    // crash marker at ordinal 2, above the pending call and absent from the journal.
     const store = await makeBareStore();
     const id = "exec_f5_crash";
     await store.executions.put({
@@ -1020,8 +1028,16 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       },
       startedAt: Date.now(),
     });
-    // A crash left an attempt marker at ordinal 0 with no finalized outcome.
-    await store.replayJournal.markAttempt(id, 0);
+    // A durable prefix row at ordinal 0 → the pending call is ordinal 1.
+    await store.replayJournal.append(id, {
+      ordinal: 0,
+      op: "call",
+      request: JSON.stringify({ path: "github.list_issues", input: {} }),
+      outcome: { ok: true, value: { ok: true } },
+    });
+    // A crash left an attempt marker at ordinal 2 (NOT the pending ordinal 1) with
+    // no finalized outcome — a genuine unrecorded side effect that must fail closed.
+    await store.replayJournal.markAttempt(id, 2);
 
     // A sandbox that must NEVER run — the recovery check fails closed before any
     // drive, so the side effect is never re-issued.
@@ -1305,7 +1321,12 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // The resolved marker was tidied.
     expect(await store.replayJournal.listAttempts(idResolved)).toEqual([]);
 
-    // --- Case B: stale marker at an UNRECORDED ordinal → terminal ambiguous. ---
+    // --- Case B: stale marker at an UNRECORDED ordinal that is NOT the pending
+    //     call's ordinal → terminal ambiguous. (Fix Pass 3 / M1: the pending
+    //     call's own ordinal is the pause artifact and now resumes; a marker at
+    //     any OTHER un-journaled ordinal is the reachable true-crash and still
+    //     fails closed.) Seed a durable prefix row at ordinal 0 (pending ordinal
+    //     → 1) and strand the crash marker at ordinal 2. ---
     const idUnrecorded = "exec_m_unrecorded";
     await store.executions.put({
       id: idUnrecorded,
@@ -1321,8 +1342,16 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       },
       startedAt: Date.now(),
     });
-    // Marker at ordinal 0 with NO journal row → genuinely attempted-but-unrecorded.
-    await store.replayJournal.markAttempt(idUnrecorded, 0);
+    // A durable prefix row at ordinal 0 → the pending call is ordinal 1.
+    await store.replayJournal.append(idUnrecorded, {
+      ordinal: 0,
+      op: "call",
+      request: JSON.stringify({ path: "github.list_issues", input: {} }),
+      outcome: { ok: true, value: { ok: true } },
+    });
+    // Marker at ordinal 2 (NOT the pending ordinal 1) with NO journal row →
+    // genuinely attempted-but-unrecorded, must fail closed.
+    await store.replayJournal.markAttempt(idUnrecorded, 2);
 
     let sandboxRuns = 0;
     const neverSandbox: Sandbox = {
@@ -1339,5 +1368,133 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       expect(unrecordedOutcome.error.name).toBe("ConduitOutcomeAmbiguous");
     }
     expect(sandboxRuns).toBe(0);
+  });
+
+  it("§5.5 (M1): a stranded marker AT THE PENDING-CALL ordinal is the pause artifact — resume(approve) COMPLETES, not false outcome-ambiguous", async () => {
+    // (Fix Pass 3 / M1) On a require_approval PAUSE the wrapper writes an attempt
+    // marker at the pending call's ordinal BEFORE run(), then best-effort clears
+    // it. If that clear FAULTS, a stale marker survives at the pending call's own
+    // ordinal — which is (correctly) ABSENT from the journal, because the pause
+    // happened BEFORE upstream, so NO side effect fired and nothing was journaled.
+    // The prior recovery check treated any un-journaled marker as ambiguous and
+    // terminalized the execution — a FALSE ambiguity: a policy pause before
+    // upstream has no side effect to protect. The pending-call ordinal
+    // (== prefix.length, the first un-journaled call) must be EXCLUDED from the
+    // ambiguity check so the approval resumes normally.
+    const h = await makeHarness();
+    active = h;
+
+    // A safe read (auto-allowed, journaled at ordinal 0) then a review-class
+    // write (require_approval → pauses; its marker is written at ordinal 1).
+    const code = `
+      const before = await tools.github.list_issues({ owner: "acme", repo: "site" });
+      const created = await tools.github.create_issue({ title: "from agent" });
+      return { before, created };
+    `;
+
+    // START with a deps view whose clearAttempt WRITE faults. On the pause branch
+    // the marker at the pending ordinal (1) is best-effort cleared — the fault is
+    // swallowed, so the marker survives. The execution still PAUSES uncatchably.
+    const faultingStart = withMarkerFaults(h.deps, {
+      clearAttempt: () => {
+        throw new Error("[test] simulated clearAttempt store fault on the pause branch");
+      },
+    });
+    const first = await createExecutionManager(faultingStart).start(code);
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      return;
+    }
+    const id = first.executionId;
+    expect(first.pending.toolName).toBe("github.create_issue");
+
+    // The safe read is journaled at ordinal 0; the pending call did NOT reach
+    // upstream, so it has NO journal row — its ordinal (1) is the pending ordinal.
+    const rows = await h.store.replayJournal.listByExecution(id);
+    expect(rows.map((r) => r.ordinal)).toEqual([0]);
+    // The clearAttempt fault leaves BOTH markers stale: ordinal 0 (the safe read,
+    // whose clear after append faulted — but it IS journaled, so RESOLVED) and
+    // ordinal 1 (the pending call's own ordinal, absent from the journal — the
+    // pause artifact M1 must not terminalize).
+    expect(await h.store.replayJournal.listAttempts(id)).toEqual([0, 1]);
+    expect(h.calls.map((c) => c.name)).toEqual(["list_issues"]);
+
+    // RESUME(approve) with the PLAIN (non-faulting) manager. The pending-call
+    // ordinal must be excluded from the ambiguity check, so the approved call
+    // runs live exactly once and the execution COMPLETES — NOT terminalized
+    // outcome-ambiguous. (Before the fix this returned failed/ConduitOutcomeAmbiguous.)
+    const outcome = await createExecutionManager(h.deps).resume(id, { kind: "approve" });
+    expect(outcome.status).toBe("completed");
+    if (outcome.status === "completed") {
+      expect(outcome.value).toEqual({
+        before: { ok: true, tool: "list_issues" },
+        created: { ok: true, tool: "create_issue" },
+      });
+    }
+    // EXACTLY ONCE: the approved create_issue reached upstream a single time.
+    expect(h.calls.map((c) => c.name)).toEqual(["list_issues", "create_issue"]);
+    const done = await h.store.executions.get(id);
+    expect(done?.status).toBe("completed");
+  });
+
+  it("§5.5 (M1): a stranded marker at an ordinal that is NOT the pending call, absent from the journal, is STILL terminal outcome-ambiguous (F5 preserved)", async () => {
+    // (Fix Pass 3 / M1) Only the pending call's OWN ordinal is newly excluded.
+    // The pending call is the first un-journaled call, so its ordinal ==
+    // prefix.length (the durable journal is the contiguous prefix 0..prefix.length-1,
+    // enforced by toSandboxJournal). A marker at the pending ordinal is the pause
+    // artifact (refused before upstream, no side effect) → safe to resume. A
+    // marker at any OTHER un-journaled ordinal is a genuinely prior/other call
+    // that crashed after its side effect but before its append — TRUE ambiguity
+    // that must still fail closed. This pins the load-bearing F5/D8 guarantee and
+    // proves the M1 exclusion is exactly one ordinal wide.
+    const store = await makeBareStore();
+    const id = "exec_m1_priorcrash";
+    await store.executions.put({
+      id,
+      code: "return 1;",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.create_issue",
+        input: { title: "y" },
+        reason: "requires approval",
+        expiresAt: Date.now() + 3_600_000,
+      },
+      startedAt: Date.now(),
+    });
+    // One durable prefix row → pending-call ordinal is 1 (the first un-journaled).
+    await store.replayJournal.append(id, {
+      ordinal: 0,
+      op: "call",
+      request: JSON.stringify({ path: "github.list_issues", input: {} }),
+      outcome: { ok: true, value: { ok: true } },
+    });
+    // A stranded marker at ordinal 2 — NOT the pending-call ordinal (1), and
+    // absent from the journal: a genuinely other call that crashed after its side
+    // effect, NOT the pause artifact. Must still fail closed. (A marker at the
+    // pending ordinal 1 would be the pause artifact — excluded; this ordinal 2 is
+    // not, so the F5/D8 guarantee holds.)
+    await store.replayJournal.markAttempt(id, 2);
+
+    let sandboxRuns = 0;
+    const neverSandbox: Sandbox = {
+      execute: () => {
+        sandboxRuns += 1;
+        return Promise.reject(new Error("sandbox must not run on an outcome-ambiguous recovery"));
+      },
+    };
+    const outcome = await createExecutionManager(makeStubDeps(store, neverSandbox)).resume(id, {
+      kind: "approve",
+    });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitOutcomeAmbiguous");
+    }
+    // The side effect was NOT re-run: the sandbox was never driven.
+    expect(sandboxRuns).toBe(0);
+    const after = await store.executions.get(id);
+    expect(after?.status).toBe("failed");
+    expect(after?.pausedOn).toBeUndefined();
   });
 });

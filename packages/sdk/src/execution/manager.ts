@@ -692,10 +692,28 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // unrecorded ones. With no idempotency key (v1 has none), those fail
         // CLOSED: terminal `failed` (outcome-ambiguous), never re-run. The
         // terminal state records the pending call so a human can re-issue.
+        //
+        // M1-fix (Codex pass-3): the ONE un-journaled ordinal that is NOT a
+        // crash artifact is the PENDING CALL'S OWN ordinal. On a require_approval
+        // pause the wrapper writes the marker at the pending call's ordinal
+        // BEFORE reaching upstream, then best-effort clears it; if that clear
+        // FAULTS, a stale marker survives at that ordinal. It is (correctly)
+        // absent from the journal — the pause happened BEFORE upstream, so NO
+        // side effect fired and nothing was journaled. Terminalizing on it is a
+        // FALSE ambiguity: a policy pause before upstream has no side effect to
+        // protect, and the call is about to run live under the approval. The
+        // pending call is the FIRST un-journaled call, so its ordinal is exactly
+        // the durable prefix length (the sandbox replays the contiguous prefix
+        // 0..prefix.length-1, enforced by toSandboxJournal, then suspends on the
+        // next call at cursor == prefix.length). Exclude that single ordinal;
+        // best-effort clear it below. Markers at ordinals OTHER than the pending
+        // call, absent from the journal, remain TRUE prior-crash ambiguity and
+        // still fail closed (the load-bearing F5/D8 guarantee).
+        const pendingCallOrdinal = prefix.length;
         const strandedAttempts = await deps.store.replayJournal.listAttempts(executionId);
         const journaledOrdinals = new Set(prefixRows.map((row) => row.ordinal));
         const unrecordedAttempts = strandedAttempts.filter(
-          (ordinal) => !journaledOrdinals.has(ordinal),
+          (ordinal) => !journaledOrdinals.has(ordinal) && ordinal !== pendingCallOrdinal,
         );
         if (unrecordedAttempts.length > 0) {
           const failed: Execution = { ...execution, status: "failed", endedAt: now() };
@@ -713,14 +731,20 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             },
           };
         }
-        // Any RESOLVED markers (ordinal already journaled — only the clear was
-        // lost to a crash) are stale but harmless. Best-effort clear them so the
-        // journal is tidy; a clear fault here does not block resume, because the
-        // outcome is durably recorded and re-running is not at stake.
+        // Any RESOLVED or pause-artifact markers are stale but harmless. Clear
+        // them best-effort so the journal is tidy and a future resume does not
+        // re-encounter them:
+        //  - a marker at a JOURNALED ordinal is RESOLVED (append succeeded, only
+        //    the clear was lost to a crash); the outcome is durably recorded.
+        //  - the marker at the PENDING-CALL ordinal (M1-fix) is the pause
+        //    artifact (refused before upstream, no side effect); it is about to
+        //    be superseded when the approved call runs live below.
+        // A clear fault here does not block resume in either case — re-running is
+        // not at stake (nothing durable to protect / the call runs fresh anyway).
         for (const ordinal of strandedAttempts) {
-          if (journaledOrdinals.has(ordinal)) {
+          if (journaledOrdinals.has(ordinal) || ordinal === pendingCallOrdinal) {
             await deps.store.replayJournal.clearAttempt(executionId, ordinal).catch(() => {
-              // Stale marker at a journaled ordinal — resume proceeds regardless.
+              // Stale/pause-artifact marker — resume proceeds regardless.
             });
           }
         }
