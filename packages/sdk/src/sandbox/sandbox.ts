@@ -43,10 +43,14 @@ export interface ExecutionRequest {
  * VM snapshot. Entries are consumed in call order; deterministic code
  * (enforced by the seeds) makes that order stable across replays.
  *
- * Entries whose error name is in NON_MEMOIZABLE_ERROR_NAMES
- * (pipeline/errors.ts) record a policy refusal, not a result; the §5.5
- * execution manager (pending — INVARIANTS.md) MUST strip them before replay
- * so an approved call re-executes live instead of replaying its own denial.
+ * A `require_approval` is NEVER journaled: the shipped §5.5 execution manager
+ * SUSPENDS the execution at that call (the ToolHost wrapper throws the pause
+ * sentinel; nothing is appended), so the journal is a clean PREFIX by
+ * construction and resume proceeds live from that first un-journaled call —
+ * there is no strip step and no strip code. NON_MEMOIZABLE_ERROR_NAMES
+ * (pipeline/errors.ts) is now defensive/dead for the pause path; the only
+ * refusals that reach the journal are `block` denials the guest caught and
+ * continued past — a journaled failed outcome, not a pause.
  */
 export interface JournalEntry {
   op: "search" | "describe" | "call";

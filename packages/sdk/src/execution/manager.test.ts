@@ -396,6 +396,84 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     }
   });
 
+  it("§5.5: describe WITHOUT includeSchemas journals the guest's bytes → resume completes (no spurious divergence)", async () => {
+    // Regression: the journaling wrapper used to RECONSTRUCT the describe
+    // request as JSON.stringify({ path, includeSchemas: options?.includeSchemas
+    // === true }). The guest bridge emits JSON.stringify(options) verbatim, so
+    // `tools.describe.tool({ path })` (the natural lazy-describe, spec §6) emits
+    // {"path":"x"} while the wrapper stored {"path":"x","includeSchemas":false}.
+    // On resume the divergence guard compared the stored request byte-for-byte
+    // against the guest's re-emit → mismatch → NondeterministicExecutionError,
+    // killing a perfectly deterministic approved execution. Journaling the
+    // guest's original bytes closes it.
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+
+    // describe WITHOUT includeSchemas, then a review-class write (the gate).
+    const code = `
+      const details = await tools.describe.tool({ path: "github.create_issue" });
+      const created = await tools.github.create_issue({ title: "lazy describe" });
+      return { described: details?.path ?? "none", created };
+    `;
+    const started = await manager.start(code);
+    expect(started.status).toBe("paused");
+    if (started.status !== "paused") {
+      return;
+    }
+    const id = started.executionId;
+
+    // The pre-gate describe is journaled with the GUEST'S bytes — no injected
+    // includeSchemas:false. This is the exact string the guest re-emits on
+    // replay, so the divergence guard sees a match.
+    const rows = await h.store.replayJournal.listByExecution(id);
+    expect(rows.map((r) => r.op)).toEqual(["describe"]);
+    expect(rows[0]?.request).toBe(JSON.stringify({ path: "github.create_issue" }));
+
+    // Resume(approve) must COMPLETE — not die with NondeterministicExecutionError.
+    const outcome = await manager.resume(id, { kind: "approve" });
+    expect(outcome.status).toBe("completed");
+    if (outcome.status === "completed") {
+      expect(outcome.value).toEqual({
+        described: "github.create_issue",
+        created: { ok: true, tool: "create_issue" },
+      });
+    }
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(1);
+  });
+
+  it("§5.5: describe WITH includeSchemas:true still journals and resumes cleanly", async () => {
+    // The other arm of the same fix: an explicit includeSchemas:true is part of
+    // the guest's options object, so the guest emits it verbatim and the
+    // wrapper journals the same bytes — replay stays deterministic.
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+
+    const code = `
+      const details = await tools.describe.tool({ path: "github.create_issue", includeSchemas: true });
+      const created = await tools.github.create_issue({ title: "with schema" });
+      return { hasSchema: details?.inputSchema !== undefined, created };
+    `;
+    const started = await manager.start(code);
+    expect(started.status).toBe("paused");
+    if (started.status !== "paused") {
+      return;
+    }
+    const id = started.executionId;
+    const rows = await h.store.replayJournal.listByExecution(id);
+    expect(rows[0]?.request).toBe(
+      JSON.stringify({ path: "github.create_issue", includeSchemas: true }),
+    );
+
+    const outcome = await manager.resume(id, { kind: "approve" });
+    expect(outcome.status).toBe("completed");
+    if (outcome.status === "completed") {
+      const value = outcome.value as { hasSchema: boolean };
+      expect(value.hasSchema).toBe(true);
+    }
+  });
+
   it("§5.5: resume-path re-pause — two sequential approvals (design D3)", async () => {
     const h = await makeHarness();
     active = h;
@@ -693,6 +771,97 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // half-transitioned.
     const second = await manager.resume(id, { kind: "approve" });
     expect(second.status).toBe("conflict");
+  });
+
+  it("§5.5 (I-2): a post-sandbox persistence throw on resume does not strand the execution in `running`", async () => {
+    // Sibling of the drive()-catch fix (commit 0991204): that fix covered a
+    // throw OUT of sandbox.execute. This covers the SIBLING store-write path —
+    // the post-sandbox `finish`/paused/expiry `put()` that runs after
+    // claimForResume has already flipped the row to `running`. If that write
+    // throws (a transient store/disk fault) and is left uncaught, the row is
+    // stranded `running` with a stale pausedOn → a later resume's
+    // claimForResume WHERE status='paused' finds 0 rows → permanently
+    // un-resumable (design §8/§6: running must reach a terminal, never a silent
+    // half-transition).
+    const store = await makeBareStore();
+
+    // A stub sandbox that returns `completed` WITHOUT performing any tool call,
+    // so the (rejecting) host/invoker are never touched and no upstream/loopback
+    // is needed — this runs under the Bash-tool sandbox.
+    const completingSandbox: Sandbox = {
+      execute(request) {
+        return Promise.resolve({
+          status: "completed",
+          value: { done: true },
+          seeds: request.seeds ?? { now: 1, random: 2 },
+          journal: [...(request.journal ?? [])],
+        });
+      },
+    };
+
+    // Wrap the store so `executions.put` throws ONCE — a transient fault on the
+    // post-sandbox terminal write (a disk/store blip that clears). The fix's
+    // fallback finalize-failed write then succeeds, so the row lands terminal.
+    // `claimForResume` is a separate UPDATE, left intact so the paused→running
+    // claim still succeeds.
+    const realPut = store.executions.put.bind(store.executions);
+    let armed = false;
+    let faults = 0;
+    const wrappedStore: ConduitStore = {
+      ...store,
+      executions: {
+        ...store.executions,
+        put: async (execution) => {
+          if (armed && faults === 0) {
+            faults += 1;
+            throw new Error("[test] simulated executions.put fault after sandbox settled");
+          }
+          return realPut(execution);
+        },
+      },
+    };
+
+    const deps = makeStubDeps(wrappedStore, completingSandbox);
+    const manager = createExecutionManager(deps);
+
+    const id = "exec_i2_resume";
+    const pausedOn = {
+      callId: "call_1",
+      toolName: "github.create_issue",
+      input: { title: "from agent" },
+      reason: "github.create_issue requires approval before it can run.",
+      expiresAt: Date.now() + 3_600_000,
+    };
+    await store.executions.put({
+      id,
+      code: "return await tools.github.create_issue({ title: 'from agent' });",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn,
+      startedAt: Date.now(),
+    });
+
+    // Arm the fault: the NEXT put() (the terminal finish write) throws once.
+    armed = true;
+
+    // Resume: claimForResume flips paused→running, the sandbox settles
+    // `completed`, then finish's put() throws. The error may surface (throw is
+    // acceptable) — what is NOT acceptable is a silently-stranded `running`.
+    await expect(manager.resume(id, { kind: "approve" })).rejects.toThrow();
+    expect(faults).toBe(1);
+
+    // The invariant: the row is NOT a stranded `running` that looks
+    // resumable-but-isn't. The fallback finalize-failed write landed it terminal.
+    const after = await manager.get(id);
+    expect(after?.status).not.toBe("running");
+    expect(after?.status).toBe("failed");
+    expect(after?.pausedOn).toBeUndefined();
+
+    // Consequence proof: a later resume is a no-op conflict (no `paused` row to
+    // claim) — the execution is settled, not half-transitioned into a
+    // permanently un-resumable `running`.
+    const retry = await manager.resume(id, { kind: "approve" });
+    expect(retry.status).toBe("conflict");
   });
 
   it("§5.5 (I-1): a start-time sandbox throw finalizes terminal `failed`, never a stranded `running`", async () => {

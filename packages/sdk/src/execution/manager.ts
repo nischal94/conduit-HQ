@@ -247,7 +247,20 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       describe: (path, options) =>
         journal(
           "describe",
-          JSON.stringify({ path, includeSchemas: options?.includeSchemas === true }),
+          // MUST match the guest bridge's own serialization of the describe
+          // payload. The guest emits `JSON.stringify(options)` verbatim
+          // (bootstrapSource: `bridge("describe", options)`), and the sandbox's
+          // divergence guard compares the stored `request` byte-for-byte against
+          // that on replay. The bridge's payload is dispatched as
+          // `describe(path, includeSchemas === true ? { includeSchemas: true } :
+          // {})` (quickjs.ts dispatchOp), so the guest's two canonical option
+          // shapes are `{ path }` (the §6 lazy-describe pattern) and
+          // `{ path, includeSchemas: true }`. Reconstruct THOSE exact bytes —
+          // never inject `includeSchemas: false`, which the guest never emits
+          // and which would diverge every lazy-describe resume.
+          options?.includeSchemas === true
+            ? JSON.stringify({ path, includeSchemas: true })
+            : JSON.stringify({ path }),
           () => inner.describe(path, options),
           neverPauses("describe"),
         ) as Promise<Awaited<ReturnType<ToolHost["describe"]>>>,
@@ -289,6 +302,45 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     }
     lastApprovalReason = error.message;
     return true;
+  }
+
+  /**
+   * Guard a POST-SANDBOX persistence write (the paused/finish/expiry `put`s).
+   * By the time these run the row is already `running` (`start` put it, or
+   * `claimForResume` flipped it), so if the write throws — a transient
+   * store/disk fault — and we let it propagate uncaught, the row is stranded
+   * `running` with a stale `pausedOn`: a later resume's `claimForResume WHERE
+   * status='paused'` finds 0 rows → permanently un-resumable (design §8/§6:
+   * running must reach a terminal, never a silent half-transition). This is the
+   * SIBLING of the drive()-catch (commit 0991204) that already covers a throw
+   * OUT of `sandbox.execute`.
+   *
+   * On a write failure, best-effort finalize the row `failed` (endedAt set,
+   * pausedOn cleared) so it is observably terminal and never a
+   * resumable-but-isn't `running`, then re-throw the original fault (not
+   * swallowed — the error still surfaces to the caller). If the fallback write
+   * ALSO throws (the store is genuinely down, not transient), we cannot persist
+   * anything; re-throw the original — there is no better recovery than
+   * surfacing the fault.
+   */
+  async function persistOrFinalizeFailed(
+    execution: Execution,
+    write: () => Promise<void>,
+  ): Promise<void> {
+    try {
+      await write();
+    } catch (cause) {
+      const failed: Execution = { ...execution, status: "failed", endedAt: now() };
+      delete failed.pausedOn;
+      try {
+        await deps.store.executions.put(failed);
+      } catch {
+        // The store is genuinely faulting (not a transient blip): even the
+        // finalize write failed. Nothing more can persist; surface the
+        // original fault so the caller sees a failure, not a silent success.
+      }
+      throw cause;
+    }
   }
 
   async function drive(
@@ -376,11 +428,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             },
           });
         }
-        await deps.store.executions.put({
-          ...execution,
-          status: "paused",
-          pausedOn: pending,
-        });
+        await persistOrFinalizeFailed(execution, () =>
+          deps.store.executions.put({
+            ...execution,
+            status: "paused",
+            pausedOn: pending,
+          }),
+        );
         return { status: "paused", executionId: execution.id, pending };
       }
     }
@@ -397,7 +451,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     };
     // A settled execution carries no pending approval.
     delete persisted.pausedOn;
-    await deps.store.executions.put(persisted);
+    await persistOrFinalizeFailed(execution, () => deps.store.executions.put(persisted));
     return outcome.status === "completed"
       ? { status: "completed", executionId: execution.id, value: outcome.value }
       : { status: "failed", executionId: execution.id, error: outcome.error };
@@ -443,11 +497,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // TTL (design D8): lazily expire on resume. `claimForResume` already
       // flipped status to running, so persist the terminal `expired` state.
       if (now() > pausedOn.expiresAt) {
-        await deps.store.executions.put({
-          ...execution,
-          status: "expired",
-          endedAt: now(),
-        });
+        await persistOrFinalizeFailed(execution, () =>
+          deps.store.executions.put({
+            ...execution,
+            status: "expired",
+            endedAt: now(),
+          }),
+        );
         return { status: "expired", executionId, pending: pausedOn };
       }
 

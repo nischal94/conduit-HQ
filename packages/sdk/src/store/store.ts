@@ -78,8 +78,12 @@ export interface ExecutionRepository {
 export interface TraceRepository {
   append(event: TraceEvent): Promise<void>;
   /**
-   * In insertion order — this listing IS the deterministic-replay journal
-   * (spec §5.5), so ordering is a correctness requirement, not cosmetics.
+   * In insertion order — the §11 AUDIT trail for an execution. After the D4
+   * split this is NOT the deterministic-replay journal (that is
+   * `ReplayJournalRepository`, below): the audit Trace records refusals and
+   * allowed calls alike, whereas replay reads the clean prefix. Ordering is
+   * still a correctness requirement — the audit trail must read chronologically
+   * — but it is an audit projection, not a replay source.
    */
   listByExecution(executionId: string): Promise<TraceEvent[]>;
 }

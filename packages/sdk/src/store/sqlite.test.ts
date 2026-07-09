@@ -198,7 +198,7 @@ describe("SqliteStore", () => {
   });
 
   describe("trace", () => {
-    it("preserves append order per execution (the replay journal contract, §5.5)", async () => {
+    it("preserves append order per execution (the audit Trace ordering contract, §11)", async () => {
       for (const [i, toolName] of ["a.first", "a.second", "a.third"].entries()) {
         await store.trace.append({
           callId: `call_${i}`,
