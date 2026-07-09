@@ -8,8 +8,10 @@ import { afterAll, describe, expect, it } from "vitest";
 import { InMemoryCatalog } from "./catalog.js";
 import { createStoreCredentialResolver } from "./credentials.js";
 import { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execute.js";
+import { createInMemoryApprovalDecisions } from "./execution/decisions.js";
+import { createExecutionManager, type ExecutionManagerDeps } from "./execution/manager.js";
 import { normalizeMcp } from "./normalize/mcp.js";
-import { GUEST_ERROR_NAMES, NON_MEMOIZABLE_ERROR_NAMES } from "./pipeline/errors.js";
+import { GUEST_ERROR_NAMES } from "./pipeline/errors.js";
 import { createToolInvoker } from "./pipeline/invoker.js";
 import { createMcpUpstreamCaller } from "./pipeline/upstream.js";
 import { createStorePolicyEngine } from "./policy.js";
@@ -259,37 +261,107 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       { name: "list_issues", arguments: { owner: "acme", repo: "site" }, sawAuthHeader: true },
     ]);
 
-    // ── Phase 6: policy stops a destructive call inside the sandbox ─────
-    const blocked = await sandbox.execute({
-      code: `
-        try {
-          await tools.github.delete_repo({ repo: "site" });
-          return "UNREACHABLE";
-        } catch (error) {
-          return { name: error.name, message: String(error.message ?? error) };
-        }
-      `,
-      tools: host,
-    });
-    expect(blocked.status).toBe("completed");
-    if (blocked.status === "completed") {
-      const value = blocked.value as { name: string; message: string };
-      expect(value.name).toBe(GUEST_ERROR_NAMES.policyDenied);
-      expect(value.message).toContain("requires approval");
-    }
-    expect(upstreamCalls).toHaveLength(1); // upstream never touched
+    // ── Phase 6: a require_approval call PAUSES the execution (design D2) ─
+    //
+    // BEHAVIOR CHANGE (§5.5 design D2 — the Phase-6 latent-bug fix, intended).
+    // The pre-§5.5 smoke test drove the RAW sandbox here and asserted that a
+    // require_approval call (delete_repo) was *caught by the guest, which
+    // returned the error* — so the execution COMPLETED with the denial as its
+    // value and the agent's `catch` decided what happened next. That put the
+    // untrusted agent in charge of the approval flow (a design inversion for a
+    // security product) and made require_approval indistinguishable from a hard
+    // denial. Under the correct §5.5 model, when the SAME call is driven THROUGH
+    // THE EXECUTION MANAGER (whose journaling ToolHost wrapper suspends on the
+    // invoker's require_approval verdict), it PAUSES instead — a human, not the
+    // agent, decides. This phase asserts the pause, then the full
+    // pause → approve → resume: the approved call runs live EXACTLY once and the
+    // execution completes.
+    //
+    // (The low-level catchable behavior still legitimately exists on the RAW
+    // sandbox with a bare ToolHost — no pause wrapper, no ApprovalDecisions — as
+    // Phase 9/10 exercise for `block`/upstream errors; that low-level path is not
+    // the bug. The bug was surfacing an APPROVAL to the agent as a catchable
+    // error at all. The manager is the only correct driver for require_approval.)
+    const managerDeps: ExecutionManagerDeps = {
+      store,
+      sandbox,
+      // Each invoker binds its own executionId (the manager mints one per
+      // `start`), so Phase-6 Trace rows land under the manager's execution, NOT
+      // `exec_smoke` — Phase 8 asserts both projections separately. On resume
+      // the manager passes the staged `decisions` seam so the approved call
+      // resolves live (design D6); absent it, the invoker behaves as today.
+      makeInvoker: ({ executionId, decisions }) =>
+        createToolInvoker(
+          {
+            store,
+            policy: policyEngine,
+            credentials: resolver,
+            upstream: createMcpUpstreamCaller({ egress: { allowPrivate: true } }),
+            ...(decisions !== undefined ? { decisions } : {}),
+          },
+          { executionId, log: (message) => hostLog.push(message) },
+        ),
+      makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
+      makeDecisions: () => createInMemoryApprovalDecisions(),
+    };
+    const manager = createExecutionManager(managerDeps);
 
-    // The journal entry pins the §5.5 contract end-to-end: the denial is
-    // recorded under its non-memoizable name, so the execution manager can
-    // strip it before replay (an approved call must re-execute live).
-    expect(blocked.journal).toHaveLength(1);
-    const deniedEntry = blocked.journal[0];
-    expect(deniedEntry?.op).toBe("call");
-    expect(deniedEntry?.outcome.ok).toBe(false);
-    if (deniedEntry && deniedEntry.outcome.ok === false) {
-      expect(deniedEntry.outcome.error.name).toBe(GUEST_ERROR_NAMES.policyDenied);
-      expect(NON_MEMOIZABLE_ERROR_NAMES).toContain(deniedEntry.outcome.error.name);
+    const paused = await manager.start(`
+      const deleted = await tools.github.delete_repo({ repo: "site" });
+      return { deleted };
+    `);
+    // The destructive call SUSPENDS the execution — it is NOT caught by the
+    // guest, and it did NOT reach upstream.
+    expect(paused.status).toBe("paused");
+    if (paused.status !== "paused") {
+      return;
     }
+    const managerExecId = paused.executionId;
+    expect(paused.pending.toolName).toBe("github.delete_repo");
+    expect(paused.pending.input).toEqual({ repo: "site" });
+    expect(paused.pending.reason).toContain("requires approval");
+    expect(paused.pending.callId).toBeTruthy();
+    expect(upstreamCalls).toHaveLength(1); // upstream still only saw the Phase-5 call
+
+    // Persisted as paused; the replay journal holds ONLY the finalized prefix
+    // (here: empty — the approval was the first call), never the require_approval.
+    const pausedRow = await manager.get(managerExecId);
+    expect(pausedRow?.status).toBe("paused");
+    const pausedJournal = await store.replayJournal.listByExecution(managerExecId);
+    expect(pausedJournal).toHaveLength(0);
+
+    // Resume with approve → the approved call runs LIVE and completes.
+    const resumed = await manager.resume(managerExecId, { kind: "approve" });
+    expect(resumed.status).toBe("completed");
+    if (resumed.status === "completed") {
+      expect(resumed.value).toEqual({ deleted: ISSUES_RESULT });
+    }
+    // EXACTLY ONCE: the approved delete_repo reached the loopback upstream a
+    // single time on resume (the Phase-5 list_issues + this one = 2 total).
+    expect(upstreamCalls).toEqual([
+      { name: "list_issues", arguments: { owner: "acme", repo: "site" }, sawAuthHeader: true },
+      { name: "delete_repo", arguments: { repo: "site" }, sawAuthHeader: true },
+    ]);
+    const completedRow = await manager.get(managerExecId);
+    expect(completedRow?.status).toBe("completed");
+
+    // §9.2 leak sweep extended across the PAUSE and the RESUME: no secret in any
+    // guest-visible value, the persisted replay journal, or the Trace display
+    // projection of the resumed run.
+    const resumedJournal = await store.replayJournal.listByExecution(managerExecId);
+    // The approved call is now a finalized replay-journal `call` entry.
+    expect(resumedJournal.map((r) => r.op)).toEqual(["call"]);
+    const managerTrace = await store.trace.listByExecution(managerExecId);
+    const acrossResume = JSON.stringify({
+      paused,
+      resumed,
+      pendingApproval: paused.pending,
+      replayJournal: resumedJournal,
+      trace: managerTrace,
+    });
+    expect(acrossResume).not.toContain(SECRET);
+    expect(acrossResume).not.toContain("ghp_smoke");
+    expect(acrossResume).not.toContain("cred_gh");
 
     // Unknown tool fails closed with the catalog-miss vocabulary.
     const unknown = await sandbox.execute({
@@ -339,7 +411,10 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     const everythingGuestVisible = JSON.stringify({
       definition,
       happy,
-      blocked,
+      // The manager-driven pause/resume replaces the old raw-sandbox `blocked`
+      // value: both the pause payload and the resumed value are guest-visible.
+      paused,
+      resumed,
       unknown,
       overridden,
       searchHits: catalog.search({ query: "issues" }),
@@ -349,12 +424,14 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     expect(everythingGuestVisible).not.toContain("ghp_smoke");
     expect(everythingGuestVisible).not.toContain("cred_gh"); // even the ref stays host-side
 
-    // Trace persisted in call order — the §5.3 pipeline audits refusals
-    // too (decision A3), so the journal-of-record now carries them all.
+    // Trace persisted in call order — the §5.3 pipeline audits refusals too
+    // (decision A3). The delete_repo require_approval/allow rows now belong to
+    // the MANAGER's execution (Phase 6 drives it through createExecutionManager,
+    // which mints its own executionId), so `exec_smoke`'s trace no longer holds
+    // them — this is the D2 behavior change visible in the audit projection.
     const persistedTrace = await store.trace.listByExecution("exec_smoke");
     expect(persistedTrace.map((e) => [e.toolName, e.policyVerdict])).toEqual([
       ["github.list_issues", "allow"],
-      ["github.delete_repo", "require_approval"],
       ["github.no_such_tool", "block"],
       ["github.list_issues", "block"],
     ]);
@@ -362,6 +439,20 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     expect(persistedTrace[0]?.output).toEqual(ISSUES_RESULT); // §5.5 replay payload
     expect(persistedTrace[0]?.upstreamStatus).toBe(200);
     expect(JSON.stringify(persistedTrace)).not.toContain("ghp_smoke");
+
+    // The require_approval → (approved) allow pair lives under the manager's
+    // execution: the pause was audited as a refusal (F1 — the audit Trace records
+    // it even though the replay journal does NOT), and the resumed run audited the
+    // approved call as an allow that reached upstream (output present, prefix set).
+    const managerAudit = await store.trace.listByExecution(managerExecId);
+    expect(managerAudit.map((e) => [e.toolName, e.policyVerdict])).toEqual([
+      ["github.delete_repo", "require_approval"],
+      ["github.delete_repo", "allow"],
+    ]);
+    expect(managerAudit[1]?.connectionPrefix).toBe(PREFIX);
+    expect(managerAudit[1]?.output).toEqual(ISSUES_RESULT);
+    expect(managerAudit[1]?.upstreamStatus).toBe(200);
+    expect(JSON.stringify(managerAudit)).not.toContain("ghp_smoke");
 
     // ── Phase 9: §9.3 default — the same pipeline WITHOUT the opt-in flag
     // refuses the loopback upstream before a single byte leaves the host ──
@@ -398,7 +489,9 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       expect(value.name).toBe(GUEST_ERROR_NAMES.upstream);
       expect(value.message).toContain("loopback/private egress is off by default");
     }
-    expect(upstreamCalls).toHaveLength(1); // still only the Phase-5 call
+    // The egress guard refused before any byte left the host, so the count is
+    // unchanged from Phase 6: the Phase-5 list_issues + the approved delete_repo.
+    expect(upstreamCalls).toHaveLength(2);
 
     // ── Phase 10: hostile upstream echoes the secret back (card 09) —
     // the echo goes nowhere: not the error, not the journal, not Trace ──
@@ -427,8 +520,11 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     }
     expect(JSON.stringify(rejected)).not.toContain(SECRET); // result + journal
     const traceAfter401 = await store.trace.listByExecution("exec_smoke");
-    expect(traceAfter401).toHaveLength(5); // A3: allowed + upstream-failure traces
-    const failureRow = traceAfter401[4];
+    // 4 rows: P5 allow, P6b no_such_tool block, P7 block, + this upstream
+    // failure. (The delete_repo require_approval/allow pair belongs to the
+    // manager's execution now — the D2 behavior change.)
+    expect(traceAfter401).toHaveLength(4); // A3: allowed + upstream-failure traces
+    const failureRow = traceAfter401[3];
     expect(failureRow?.policyVerdict).toBe("allow");
     expect(failureRow && "output" in failureRow).toBe(false);
     expect(JSON.stringify(traceAfter401)).not.toContain(SECRET);
