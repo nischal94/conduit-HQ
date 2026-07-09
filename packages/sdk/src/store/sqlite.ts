@@ -102,17 +102,6 @@ const SCHEMA = [
     outcome TEXT NOT NULL,
     PRIMARY KEY (execution_id, ordinal)
   )`,
-  // (design D8/F5) An in-flight upstream `call` marker: written before the
-  // side effect reaches upstream, deleted once its outcome is durably in
-  // replay_journal. A marker that outlives a drive (a crash in that window)
-  // proves the side effect MAY have fired without its result being recorded →
-  // the execution is outcome-ambiguous on resume. Kept in its OWN table so it
-  // never pollutes the replay prefix (replay_journal rows are the prefix).
-  `CREATE TABLE IF NOT EXISTS call_attempts (
-    execution_id TEXT NOT NULL,
-    ordinal INTEGER NOT NULL,
-    PRIMARY KEY (execution_id, ordinal)
-  )`,
   `CREATE TABLE IF NOT EXISTS secrets (
     ref TEXT PRIMARY KEY,
     sealed TEXT NOT NULL,
@@ -487,26 +476,6 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             ) as ReplayJournalRow["outcome"],
           };
         });
-      },
-      async markAttempt(executionId: string, ordinal: number): Promise<void> {
-        await client.execute({
-          sql: `INSERT INTO call_attempts (execution_id, ordinal) VALUES (?, ?)
-                ON CONFLICT(execution_id, ordinal) DO NOTHING`,
-          args: [executionId, ordinal],
-        });
-      },
-      async clearAttempt(executionId: string, ordinal: number): Promise<void> {
-        await client.execute({
-          sql: "DELETE FROM call_attempts WHERE execution_id = ? AND ordinal = ?",
-          args: [executionId, ordinal],
-        });
-      },
-      async listAttempts(executionId: string): Promise<number[]> {
-        const rs = await client.execute({
-          sql: "SELECT ordinal FROM call_attempts WHERE execution_id = ? ORDER BY ordinal",
-          args: [executionId],
-        });
-        return rs.rows.map((row) => integer(row, "ordinal"));
       },
     },
 

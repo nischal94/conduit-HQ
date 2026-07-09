@@ -166,15 +166,6 @@ interface CapturedDriveState {
   ambiguous?: SandboxError;
   /** design D6/F2: the first live call on resume ≠ the approved call. */
   divergence?: SandboxError;
-  /**
-   * design D8/F5: writing the attempt marker itself faulted (a store blip),
-   * BEFORE the side effect could reach upstream. The write is host-side
-   * infrastructure — its failure must terminalize the drive `failed`, never
-   * surface to the guest as a catchable tool error (which the guest could
-   * treat as a phantom failure and continue past, since NO journal row was
-   * appended). Fails closed: side effect never fired, execution non-resumable.
-   */
-  markerFault?: SandboxError;
 }
 
 export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionManager {
@@ -246,129 +237,48 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       run: () => Promise<unknown>,
       onApprovalPause: () => PendingApproval,
     ): Promise<unknown> {
-      // Attempt marker (design D8/F5) — ONLY for `call` (search/describe are
-      // reads with no side effect). Written at the ordinal this call's append
-      // will consume, BEFORE the side effect reaches upstream, so a process
-      // crash between the upstream call and its journal append leaves a durable
-      // "attempted but unrecorded" marker a later resume treats as
-      // outcome-ambiguous. `ordinal` is the counter appendBarrier will read;
-      // nothing runs between here and the append to shift it.
-      const attemptOrdinal = ordinal;
-      if (op === "call") {
-        // The marker WRITE is host-side infrastructure (design D8/F5). If it
-        // faults it must NOT propagate into `perform` as a normal (catchable)
-        // tool error — no journal row was appended, so the guest would continue
-        // on a phantom failure. Terminalize `failed` UNCATCHABLY instead: set
-        // the host-side signal, then suspend via ConduitApprovalPause(true)
-        // (the divergence/ambiguous path). Fails closed: side effect never
-        // reached upstream, execution is non-resumable.
-        try {
-          await deps.store.replayJournal.markAttempt(ctx.executionId, attemptOrdinal);
-        } catch (cause) {
-          captured.markerFault = {
-            name: "ConduitOutcomeAmbiguous",
-            message:
-              `[ExecutionManager] Failed to write the attempt marker before an upstream call; ` +
-              `execution terminated (non-resumable) so the side effect is never issued unrecorded. ` +
-              `Context: { executionId: ${ctx.executionId}, ordinal: ${attemptOrdinal}, cause: ${String(cause)} }`,
-          };
-          throw new ConduitApprovalPause(true);
-        }
-      }
-
       let value: unknown;
       try {
         value = await run();
       } catch (error) {
         if (isRequireApproval(error)) {
           // Pause: no upstream side effect happened (policy refuses BEFORE
-          // upstream). Commit to the uncatchable suspend path FIRST (set the
-          // captured signal + decide to throw ConduitApprovalPause) so a
-          // clearAttempt fault can NEVER downgrade this pause into a catchable
-          // guest error (H2). The marker clear is best-effort: on this
-          // no-side-effect branch a stale marker is safe — its ordinal is
-          // absent from the journal, so resume treats it per the recovery
-          // check; but M-fix means a stale marker whose ordinal never lands a
-          // row IS the true ambiguous case, so we still clear when we can.
+          // upstream). Commit to the uncatchable suspend path — the captured
+          // signal is set and ConduitApprovalPause is thrown, which the sandbox
+          // treats as an uncatchable interrupt so the guest cannot
+          // catch-and-continue past its own approval gate.
           captured.pending = onApprovalPause();
-          await clearAttemptBestEffort(op, attemptOrdinal);
           throw new ConduitApprovalPause();
         }
         if (isReplayDivergence(error)) {
           // Resume replay-divergence (design D6/F2): refused BEFORE upstream,
-          // like require_approval — no side effect. Commit to the uncatchable
-          // terminal path FIRST (H2), THEN best-effort clear the marker — a
-          // clearAttempt fault must not bypass the divergence terminalization.
-          // The manager finalizes `failed`; do NOT journal it (not real guest
+          // like require_approval — no side effect. Terminalize uncatchably;
+          // the manager finalizes `failed`; do NOT journal it (not real guest
           // control flow).
           captured.divergence = {
             name: REPLAY_DIVERGENCE_ERROR_NAME,
             message: `[ExecutionManager] Resume replay-divergence; execution terminated (non-resumable). Context: { executionId: ${ctx.executionId} }`,
           };
-          await clearAttemptBestEffort(op, attemptOrdinal);
           throw new ConduitApprovalPause(true);
         }
         // Any other error (a `block`, a real upstream failure, a denied
         // resume resolving as ConduitPolicyBlocked) is a journaled failed
-        // outcome — catchable in the guest, exactly as today. The failed
-        // outcome IS durably recorded by appendBarrier, so the attempt is no
-        // longer ambiguous — clear the marker after the append.
+        // outcome — catchable in the guest, exactly as today.
         const outcome = { ok: false as const, error: toSandboxError(error) };
         await appendBarrier(op, request, outcome);
-        // The failed outcome is durably journaled at this ordinal, so a stale
-        // marker is RESOLVED on resume (M-fix: ordinal present in the journal).
-        // Clearing is best-effort — a clear fault must not replace the guest's
-        // real (guest-safe) error with a store fault.
-        await clearAttemptBestEffort(op, attemptOrdinal);
         // Re-throw so the guest sees the (guest-safe) error.
         throw error;
       }
       const scrubbed = scrubCredential(value, ctx.secret);
       const normalized = scrubbed === undefined ? null : scrubbed;
-      // Append the outcome FIRST (the durable barrier); only once it is durable
-      // do we clear the attempt marker. If appendBarrier throws (outcome
-      // could not be journaled), it terminalizes outcome-ambiguous and the
-      // marker is deliberately LEFT in place — the drive is terminal anyway.
+      // Append the outcome durably BEFORE handing the value back to the guest
+      // (the barrier — design D8): guest progress past a call implies that
+      // call is replay-durable. If appendBarrier throws (the completed call's
+      // outcome could not be journaled), it terminalizes outcome-ambiguous
+      // (captured.ambiguous) — the append-throw F5 guarantee (a live side
+      // effect whose result is unrecorded is never re-run in this drive).
       await appendBarrier(op, request, { ok: true as const, value: normalized });
-      // The success outcome is durably journaled at this ordinal, so a stale
-      // marker is RESOLVED on resume (M-fix: ordinal present in the journal).
-      // Clearing is best-effort — a clear fault must not turn a durably
-      // recorded success into a guest-visible store error.
-      await clearAttemptBestEffort(op, attemptOrdinal);
       return normalized;
-    }
-
-    async function clearAttempt(
-      op: "search" | "describe" | "call",
-      attemptOrdinal: number,
-    ): Promise<void> {
-      if (op === "call") {
-        await deps.store.replayJournal.clearAttempt(ctx.executionId, attemptOrdinal);
-      }
-    }
-
-    /**
-     * Clear the attempt marker on a branch that has ALREADY committed to a
-     * terminal/pause outcome (require_approval, replay-divergence). A clear
-     * failure here is harmless to replay — no journal row was appended, so the
-     * stale marker's ordinal is absent from the journal; on resume the M-fix
-     * treats an ordinal absent from the journal as the true outcome-ambiguous
-     * case only if a side effect could have fired, and NEITHER of these
-     * branches reaches upstream. Swallowing the clear fault is therefore safe
-     * and is REQUIRED: it must never be able to bypass the captured terminal
-     * signal and downgrade the outcome into a catchable guest error (H2).
-     */
-    async function clearAttemptBestEffort(
-      op: "search" | "describe" | "call",
-      attemptOrdinal: number,
-    ): Promise<void> {
-      try {
-        await clearAttempt(op, attemptOrdinal);
-      } catch {
-        // Deliberately swallowed — see the doc comment. The terminal/pause
-        // signal was already captured; a stale marker on a no-side-effect
-        // branch cannot cause a double side effect.
-      }
     }
 
     async function appendBarrier(
@@ -480,6 +390,19 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     }
   }
 
+  /**
+   * Drive one sandbox execution to a settled outcome. The MVP delivers NO
+   * DOUBLE-EXECUTION, not process-crash recovery: `resume` only claims a
+   * `paused` row, so a host crash mid-call — which leaves the row `running`,
+   * never `paused` — is never re-driven (it strands a zombie `running` row for
+   * an operator, not a silent re-run). Recovering such a row would require
+   * distinguishing "crashed" from "legitimately running", undecidable in a
+   * single-process MVP without the deferred multi-worker lease/heartbeat
+   * (design §7). The one crash-shaped guarantee the design DOES promise —
+   * an appendBarrier THROW after a live side effect → terminal
+   * `failed:outcome-ambiguous` — is delivered WITHIN this drive by
+   * `captured.ambiguous` (see appendBarrier), needing no cross-drive marker.
+   */
   async function drive(
     execution: Execution,
     invoke: ToolInvoker,
@@ -541,12 +464,6 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     // ambiguous — a side effect completed but its result could not be journaled.
     if (captured.ambiguous !== undefined) {
       return finish(execution, { status: "failed", error: captured.ambiguous });
-    }
-    // markerFault — the attempt marker WRITE faulted before the side effect
-    // reached upstream. Host-side infra failure: terminalize `failed`, never
-    // surface to the guest as a catchable tool error.
-    if (captured.markerFault !== undefined) {
-      return finish(execution, { status: "failed", error: captured.markerFault });
     }
 
     switch (result.status) {
@@ -680,74 +597,26 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         const prefixRows = await deps.store.replayJournal.listByExecution(executionId);
         const prefix = toSandboxJournal(prefixRows);
 
-        // Outcome-ambiguity on recovery (design D8/F5): an un-cleared attempt
-        // marker means a PRIOR drive MAY have crashed between an upstream side
-        // effect and its journal append. But a marker is outcome-ambiguous ONLY
-        // IF its ordinal is ABSENT from the durable journal prefix (H/M-fix): a
-        // marker whose ordinal ALREADY has a journal row is RESOLVED — the
-        // append succeeded and only the clear didn't (a crash BETWEEN
-        // appendBarrier and clearAttempt). Re-running is not at stake there;
-        // the outcome is durably recorded. So compare the attempt ordinals
-        // against the journal ordinals and terminalize only on the genuinely
-        // unrecorded ones. With no idempotency key (v1 has none), those fail
-        // CLOSED: terminal `failed` (outcome-ambiguous), never re-run. The
-        // terminal state records the pending call so a human can re-issue.
+        // DEFERRED: process-crash recovery of a `running` execution (design
+        // D8/F5). An earlier revision wrote an attempt marker before each live
+        // upstream call so a resume could detect a "fired-but-unjournaled" side
+        // effect. It was removed (Codex pass-4 P1) because it delivered no
+        // reachable in-scope guarantee: a marker is only read on this
+        // PAUSED-recovery path, but a genuine host crash mid-call leaves the row
+        // `running` (start persists running then drives; the claim above flips
+        // paused→running then drives) — never `paused` — so the marker for a real
+        // crashed side effect is never reached here. The append-throw case the
+        // design actually promises (a live appendBarrier THROW after a side
+        // effect → terminal failed:outcome-ambiguous) is handled WITHIN the drive
+        // by `captured.ambiguous`, needing no marker.
         //
-        // M1-fix (Codex pass-3): the ONE un-journaled ordinal that is NOT a
-        // crash artifact is the PENDING CALL'S OWN ordinal. On a require_approval
-        // pause the wrapper writes the marker at the pending call's ordinal
-        // BEFORE reaching upstream, then best-effort clears it; if that clear
-        // FAULTS, a stale marker survives at that ordinal. It is (correctly)
-        // absent from the journal — the pause happened BEFORE upstream, so NO
-        // side effect fired and nothing was journaled. Terminalizing on it is a
-        // FALSE ambiguity: a policy pause before upstream has no side effect to
-        // protect, and the call is about to run live under the approval. The
-        // pending call is the FIRST un-journaled call, so its ordinal is exactly
-        // the durable prefix length (the sandbox replays the contiguous prefix
-        // 0..prefix.length-1, enforced by toSandboxJournal, then suspends on the
-        // next call at cursor == prefix.length). Exclude that single ordinal;
-        // best-effort clear it below. Markers at ordinals OTHER than the pending
-        // call, absent from the journal, remain TRUE prior-crash ambiguity and
-        // still fail closed (the load-bearing F5/D8 guarantee).
-        const pendingCallOrdinal = prefix.length;
-        const strandedAttempts = await deps.store.replayJournal.listAttempts(executionId);
-        const journaledOrdinals = new Set(prefixRows.map((row) => row.ordinal));
-        const unrecordedAttempts = strandedAttempts.filter(
-          (ordinal) => !journaledOrdinals.has(ordinal) && ordinal !== pendingCallOrdinal,
-        );
-        if (unrecordedAttempts.length > 0) {
-          const failed: Execution = { ...execution, status: "failed", endedAt: now() };
-          delete failed.pausedOn;
-          await persistOrFinalizeFailed(execution, () => deps.store.executions.put(failed));
-          return {
-            status: "failed",
-            executionId,
-            error: {
-              name: "ConduitOutcomeAmbiguous",
-              message:
-                `[ExecutionManager] A prior upstream call was attempted but its result was never ` +
-                `journaled (crash between side effect and append); the execution is outcome-ambiguous ` +
-                `and not resumable. Context: { executionId: ${executionId}, attemptOrdinals: [${unrecordedAttempts.join(", ")}] }`,
-            },
-          };
-        }
-        // Any RESOLVED or pause-artifact markers are stale but harmless. Clear
-        // them best-effort so the journal is tidy and a future resume does not
-        // re-encounter them:
-        //  - a marker at a JOURNALED ordinal is RESOLVED (append succeeded, only
-        //    the clear was lost to a crash); the outcome is durably recorded.
-        //  - the marker at the PENDING-CALL ordinal (M1-fix) is the pause
-        //    artifact (refused before upstream, no side effect); it is about to
-        //    be superseded when the approved call runs live below.
-        // A clear fault here does not block resume in either case — re-running is
-        // not at stake (nothing durable to protect / the call runs fresh anyway).
-        for (const ordinal of strandedAttempts) {
-          if (journaledOrdinals.has(ordinal) || ordinal === pendingCallOrdinal) {
-            await deps.store.replayJournal.clearAttempt(executionId, ordinal).catch(() => {
-              // Stale/pause-artifact marker — resume proceeds regardless.
-            });
-          }
-        }
+        // Safely terminalizing a stranded `running` row needs to distinguish
+        // "crashed mid-call" from "legitimately running right now" — undecidable
+        // in a single-process MVP without the multi-worker lease/heartbeat the
+        // design explicitly defers (§7). So the MVP guarantee is NO
+        // DOUBLE-EXECUTION (resume only claims `paused`, so a stranded `running`
+        // row is never re-driven), NOT crash recovery (a host crash mid-call
+        // leaves a zombie `running` row until an operator intervenes).
 
         const decisions = makeDecisions();
         decisions.stage(

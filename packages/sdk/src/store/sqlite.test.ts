@@ -316,21 +316,6 @@ describe("SqliteStore", () => {
       expect(rows).toHaveLength(1);
       expect(rows[0]?.request).toBe('{"path":"a","input":null}');
     });
-
-    it("attempt markers: mark, list, and clear round-trip (F5 crash window)", async () => {
-      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([]);
-      await store.replayJournal.markAttempt("exec_att", 3);
-      await store.replayJournal.markAttempt("exec_att", 1);
-      await store.replayJournal.markAttempt("exec_att", 3); // idempotent re-mark
-      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([1, 3]);
-      // Isolated by execution.
-      expect(await store.replayJournal.listAttempts("exec_other")).toEqual([]);
-      // Clearing one leaves the other.
-      await store.replayJournal.clearAttempt("exec_att", 1);
-      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([3]);
-      await store.replayJournal.clearAttempt("exec_att", 3);
-      expect(await store.replayJournal.listAttempts("exec_att")).toEqual([]);
-    });
   });
 
   describe("secrets", () => {

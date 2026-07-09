@@ -478,21 +478,46 @@ a cross-store consistency obligation on *every* live `call`, not only approved o
 side-effecting call is traced (or reaches upstream) but its result is **not durably in the
 replay journal** before the guest proceeds, a *later* pause + resume would find that call
 un-journaled and **re-execute it**. The single-projection model didn't have this hazard;
-the split inherits it. **Resolution — one discipline for all upstream `call`s:**
+the split inherits it. **Resolution — the append barrier, for all upstream `call`s:**
 
-1. Before the call reaches upstream, write an **`attempt` marker** for `(executionId,
-   callId)` (execution enters a distinct in-flight sub-state).
-2. Perform the call. On success, the result MUST be **durably appended to the replay
+1. Perform the call. On success, the result MUST be **durably appended to the replay
    journal before the value is handed back to the guest** — the replay journal is the
    barrier; guest progress past a call implies that call is replay-durable.
-3. If the result cannot be persisted after the side effect occurred → terminal **`failed:
-   outcome-ambiguous`** (audited), **not resumable**. A call whose attempt started is never
-   re-run.
+2. If the result cannot be persisted *after the side effect occurred* (the append itself
+   throws) → terminal **`failed: outcome-ambiguous`** (audited), **not resumable**. This is
+   handled **within the live drive** by the journaling wrapper's `captured.ambiguous` signal
+   — no cross-drive bookkeeping is involved, because the throw happens in the same process
+   that fired the side effect.
 
-This covers the whole surface New-1 named — every upstream call, approval or not — and
-makes "did the side effect happen?" a recorded state, never a silent replay hazard. Where
-an upstream supports idempotency keys, the caller passes a per-`(executionId, callId)` key
-so a transport-layer retry is safe; absent that, fail-closed-terminal is the default.
+This makes "was this completed call's result recorded?" a checked state within the drive,
+never a silent replay hazard. Where an upstream supports idempotency keys, the caller passes
+a per-`(executionId, callId)` key so a transport-layer retry is safe; absent that,
+fail-closed-terminal is the default.
+
+> **Removed — the durable `call_attempts` marker (Codex pass-4 P1, 2026-07-10).** An earlier
+> revision of this design wrote a durable "attempt marker" for each live `call` BEFORE it
+> reached upstream, and had `resume` scan for un-cleared markers to detect a
+> "fired-but-unjournaled" side effect left by a **process crash** between the upstream call
+> and its append. **That machinery was removed** because it delivered no reachable in-scope
+> guarantee. A marker was only ever read on the PAUSED-recovery path of `resume`. But a
+> genuine process crash mid-call leaves the execution row `running` — `start` persists
+> `running` then drives; the resume claim flips `paused`→`running` then drives — **never
+> `paused`**. Since `resume` only ever claims a `paused` row, the marker for a real crashed
+> side effect was **never reached**. The append-throw case above (a live `appendBarrier`
+> THROW after the side effect, *within one process*) is the only F5 guarantee actually
+> promised, and `captured.ambiguous` delivers it without any marker. Keeping the marker made
+> the code *look* like it handled process-crash recovery when it structurally could not — an
+> over-claim, removed per the honesty the convergence rule requires.
+
+> **Process-crash recovery is DEFERRED (out of MVP scope).** Safely terminalizing a stranded
+> `running` row requires distinguishing "crashed mid-call" from "legitimately running right
+> now" — undecidable in a single-process MVP without a heartbeat/lease, which is exactly the
+> **multi-worker infrastructure this design defers** (§7, "Multi-worker execution pickup").
+> The MVP guarantee is therefore **NO DOUBLE-EXECUTION** (a stranded `running` row is never
+> re-run, because `resume` only claims `paused`), **NOT recovery** (a host crash mid-call
+> leaves a zombie `running` row until an operator intervenes — visible, and never silently
+> re-executed). Idempotency keys + a worker lease are the principled way to add real recovery
+> later.
 
 **Where the barrier physically lives — a journaling ToolHost wrapper, NOT the sandbox
 (Q5).** The sandbox loop (`quickjs.ts`: `perform` → `journal.push` in-memory → re-run from
@@ -509,20 +534,17 @@ ever**. The durable append is **idempotent on `(executionId, ordinal)`** (a no-o
 ordinal already exists), so even a spurious re-`perform` within a segment cannot double-write.
 The sandbox core is not modified for durability; only the new `status:"paused"` arm (D2) is.
 
-**Crash-window and the fail-closed choice (F5, decided 2026-07-09 at the user's
-delegation).** There is a window between the attempt marker and the upstream call firing
-where a crash leaves "attempt started" true but *no* side effect occurred. On resume, the
-"never re-run an attempted call" rule then fails the execution even though nothing happened
-— it **strands legitimate work**. This is accepted as the correct MVP default because the
-harms are asymmetric: a stranded execution is **visible and recoverable** (the terminal
-state records the pending call's identity so a human can re-issue the request), whereas a
-double-executed side effect (a second `delete_repo`) is **silent and irreversible**. For a
-security product the silent-irreversible failure is the one to design out. The
-risk-class-aware alternative (fail-open for safe/read calls, fail-closed for
+**The asymmetry that governs the fail-closed choice (F5).** Between the two failure modes at
+an upstream side effect, the harms are asymmetric: a **double-executed** side effect (a
+second `delete_repo`) is silent and irreversible, whereas a **stranded** execution is visible
+and recoverable. For a security product the silent-irreversible failure is the one to design
+out. This is why the append-throw case above terminalizes `failed:outcome-ambiguous` rather
+than retrying, and why the deferred process-crash case (removed-marker note above) is left as
+a visible zombie `running` row rather than a speculative auto-recovery that could re-run a
+side effect. The risk-class-aware alternative (fail-open for safe/read calls, fail-closed for
 review/destructive) was rejected for the MVP: it makes riskClass a *safety* trust surface,
-not just a policy default, and adds a second decision path for a marginal reduction in
-stranding — not worth the surface area when re-issuing is cheap. Idempotency keys are the
-principled way to relax this later, per-upstream.
+not just a policy default. Idempotency keys + a worker lease are the principled way to relax
+this later, per-upstream.
 
 ### D9 — Wall-clock budget is per-resume-segment for the MVP (grilling finding)
 
@@ -549,7 +571,7 @@ wall-clock interrupt can never leave a non-prefix journal awaiting resume.
               [paused] ──resume: ATOMIC claim paused→running (F4)──┐
                    │        │ lost claim ─────────▶ [conflict] (no-op, someone else is resuming)
                    │        ▼ won claim
-                   │     [running] ── approved call: write attempt marker (F5) ──▶ call live
+                   │     [running] ── approved call runs live ──▶ call fires
                    │        │   ── result persisted ──▶ continue ─▶ completed | failed | paused(next)
                    │        │   ── result append FAILS after side effect ──▶ [failed: outcome-ambiguous]
                    │   ──resume(deny)──▶ [running] ─▶ … (pending call resolves as ConduitPolicyBlocked)
@@ -559,7 +581,10 @@ wall-clock interrupt can never leave a non-prefix journal awaiting resume.
 `running → paused → running` may cycle N times (one cycle per required approval, D3).
 `completed`, `failed`, `expired` are terminal; `conflict` is a no-op result (the execution
 stays whatever it already is). The atomic claim (F4) guarantees exactly one resume drives
-each pause; the attempt marker (F5) guarantees an approved side effect is never re-run.
+each pause; the append barrier (F5, D8) guarantees an approved side effect whose result
+cannot be journaled terminalizes `failed:outcome-ambiguous` rather than re-running. A host
+crash mid-call leaves the row `running` (never re-driven, since resume claims only `paused`)
+— NO double-execution, but recovery of that zombie row is deferred (D8, §7).
 
 ## 7. Scope
 
@@ -567,8 +592,9 @@ each pause; the attempt marker (F5) guarantees an approved side effect is never 
 **replay-journal projection** distinct from the audit Trace (D4/F1/F7); prefix-journal
 reconstruction (D4); the request-bound one-shot `ApprovalDecisions` seam with
 fail-closed-on-mismatch (D6/F2/F3); the **atomic paused→running claim** on
-`ExecutionRepository` (F4); the **attempt marker + outcome-ambiguous terminal state**
-(D8/F5); **credential scrubbing** of persisted/replayed results (D7/F6);
+`ExecutionRepository` (F4); the **append-barrier outcome-ambiguous terminal state**
+(D8/F5, delivered within the live drive by `captured.ambiguous`);
+**credential scrubbing** of persisted/replayed results (D7/F6);
 **search/describe journaling** (D5); pinning the remaining clock surfaces so honest guests
 replay cleanly (D6/F2); TTL/expiry (D8); the invariant test; the Phase-6 smoke-test
 behavior fix (D2); extension of the smoke test's leak sweep across a pause/resume boundary.
@@ -577,6 +603,12 @@ behavior fix (D2); extension of the smoke test's leak sweep across a pause/resum
 - Multi-worker execution pickup. §5.5 says a *different worker can* resume a paused
   execution (because it is pure data) — true and preserved by this design, but the MVP is
   single-process; no worker-claim/lease is built.
+- **Process-crash recovery of a `running` execution** (D8, Codex pass-4 P1). A host crash
+  mid-call leaves a zombie `running` row; the MVP never re-runs it (resume claims only
+  `paused` → NO double-execution) but also never auto-recovers it. Safely terminalizing a
+  stranded `running` row needs to tell "crashed" from "legitimately running", which requires
+  the deferred multi-worker lease/heartbeat above. Until then a zombie row is a visible
+  operator concern, not a silent hazard.
 - Web pending-approvals view. MVP surfaces approvals via the CLI/API (`get` + `resume`);
   the console is deferred out of the MVP per §17.
 - Input-aware policy rules (§10.3, Phase 2) — unaffected; the seam already carries `input`.
@@ -591,10 +623,12 @@ behavior fix (D2); extension of the smoke test's leak sweep across a pause/resum
   (an unpersisted pause that "looks running" must not be resumable into double-execution).
 - **Lost resume claim (F4):** returns `{ status: "conflict" }`, a pure no-op — no replay,
   no call. Exactly one resume drives each pause.
-- **Approved side effect + result-append failure (F5):** the attempt marker is written
-  before the call; if the result cannot be persisted after the side effect occurred, the
-  execution moves to terminal `failed` with an outcome-ambiguous reason (audited) and is not
-  resumable. A call whose attempt started is never re-run.
+- **Approved side effect + result-append failure (F5):** if a completed live call's result
+  cannot be appended to the replay journal (the append throws *after* the side effect
+  occurred), the drive's `captured.ambiguous` signal moves the execution to terminal `failed`
+  with an outcome-ambiguous reason (audited), not resumable — handled within the live drive,
+  no marker. (A *process crash* mid-call — a different failure — leaves the row `running`;
+  recovery of that is deferred, D8/§7. It is never re-run: resume claims only `paused`.)
 - Deny → the pending call resolves as a terminal `ConduitPolicyBlocked` on the re-run: if
   the guest catches it, its handler runs and the execution may still complete; if uncaught,
   the execution `failed` with the policy reason — an honest terminal state either way.

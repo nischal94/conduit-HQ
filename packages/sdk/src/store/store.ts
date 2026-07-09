@@ -110,24 +110,6 @@ export interface ReplayJournalRow {
 export interface ReplayJournalRepository {
   append(executionId: string, entry: ReplayJournalRow): Promise<void>;
   listByExecution(executionId: string): Promise<ReplayJournalRow[]>;
-  /**
-   * Durable "an upstream `call` is about to fire" marker for one ordinal
-   * (design D8/F5). Written BEFORE the side effect reaches upstream; cleared
-   * once the outcome is durably journaled. If a process crashes in that
-   * window, the marker survives with NO finalized row at its ordinal — proof
-   * the side effect MAY have happened but its result was never recorded.
-   */
-  markAttempt(executionId: string, ordinal: number): Promise<void>;
-  /** Clear the attempt marker once the call's outcome is durably journaled. */
-  clearAttempt(executionId: string, ordinal: number): Promise<void>;
-  /**
-   * The ordinals of every attempt marker NOT yet cleared for this execution.
-   * On resume, a non-empty result means the prior drive crashed between an
-   * upstream side effect and its journal append → the execution is
-   * outcome-ambiguous and (absent an idempotency key, which v1 has not) must
-   * fail closed rather than re-run the side effect.
-   */
-  listAttempts(executionId: string): Promise<number[]>;
 }
 
 export interface SecretRepository {
