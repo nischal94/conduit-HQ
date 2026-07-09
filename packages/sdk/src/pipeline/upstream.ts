@@ -234,17 +234,49 @@ export function createMcpUpstreamCaller(
 const AUTH_SCHEME_WORDS = new Set(["bearer", "basic", "token", "digest", "negotiate", "apikey"]);
 const MIN_TOKEN_LEN = 5;
 
+/**
+ * The SHARED redaction primitive (exported so `execution/scrub.ts` matches
+ * this exact behavior instead of re-inventing it — spec D7 "reuse, not
+ * re-invent"). From a SINGLE secret string, derive every token worth scanning
+ * for: the full value, plus each whitespace-separated segment long enough to
+ * be a real secret (so a bare-token echo — the token without its
+ * `Bearer `/`token ` scheme — is caught too). Scheme words fall below the
+ * length floor or are excluded outright and are never redacted. Empty input
+ * yields no tokens (redacting on "" would destroy the whole text).
+ */
+export function redactionTokens(secret: string): string[] {
+  if (secret === "") {
+    return [];
+  }
+  const tokens = new Set<string>([secret]);
+  for (const segment of secret.split(/\s+/)) {
+    if (segment.length >= MIN_TOKEN_LEN && !AUTH_SCHEME_WORDS.has(segment.toLowerCase())) {
+      tokens.add(segment);
+    }
+  }
+  return [...tokens];
+}
+
+/**
+ * The SHARED redaction loop (exported for `execution/scrub.ts`). Replaces
+ * every token verbatim, longest first so a full value is replaced before its
+ * own sub-token can match a fragment. Callers that build a token list from
+ * multiple sources pass the merged list; the sort here makes order irrelevant
+ * to the caller.
+ */
+export function redactTokens(text: string, tokens: readonly string[]): string {
+  let out = text;
+  for (const token of [...tokens].sort((a, b) => b.length - a.length)) {
+    out = out.split(token).join("[redacted]");
+  }
+  return out;
+}
+
 function credentialTokens(auth: UpstreamAuth): string[] {
   const tokens = new Set<string>();
   for (const value of Object.values(auth.headers)) {
-    if (value === "") {
-      continue;
-    }
-    tokens.add(value);
-    for (const segment of value.split(/\s+/)) {
-      if (segment.length >= MIN_TOKEN_LEN && !AUTH_SCHEME_WORDS.has(segment.toLowerCase())) {
-        tokens.add(segment);
-      }
+    for (const token of redactionTokens(value)) {
+      tokens.add(token);
     }
   }
   return [...tokens].sort((a, b) => b.length - a.length);
@@ -285,10 +317,7 @@ function containsCredential(text: string, auth: UpstreamAuth): boolean {
  * never bisect a redaction.
  */
 function sanitizeUpstreamText(raw: string, auth: UpstreamAuth): string {
-  let text = raw;
-  for (const token of credentialTokens(auth)) {
-    text = text.split(token).join("[redacted]");
-  }
+  const text = redactTokens(raw, credentialTokens(auth));
   const printable = [...text].filter((ch) => ch >= " " && ch !== "\u007f").join("");
   return printable.length > 200 ? `${printable.slice(0, 200)}…` : printable;
 }

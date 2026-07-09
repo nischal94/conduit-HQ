@@ -1,3 +1,5 @@
+import { redactionTokens, redactTokens } from "../pipeline/upstream.js";
+
 /**
  * §5.5 design D7 — best-effort credential scrub for a persisted/replayed
  * call result.
@@ -21,12 +23,13 @@
  * secret past this scan is category (b) (a known limit of a best-effort
  * layer), not a boundary break.
  *
- * Mirrors the shape of the upstream credential-echo scan in
- * pipeline/upstream.ts (`containsCredential` / `sanitizeUpstreamText`), but
- * is simpler: this callsite already has exactly one candidate secret string
- * (not a set of auth-header-derived tokens), so there is no token-extraction
- * step to mirror — only the serialize → verbatim-replace → parse-back shape
- * and the best-effort labeling.
+ * SHARES upstream.ts's token primitive so the two cannot diverge: it derives
+ * the same sub-token list (full value + whitespace-segmented segments >=5
+ * chars, scheme words excluded) via `redactionTokens` and redacts through the
+ * same `redactTokens` loop that `sanitizeUpstreamText` uses. This means a
+ * bare-token echo (the secret's token without its `Bearer `/`token ` scheme)
+ * is scrubbed here exactly as the upstream scan catches it — closing the gap
+ * where a mirror-instead-of-reuse implementation only matched the full string.
  */
 export function scrubCredential(result: unknown, secret: string | undefined): unknown {
   if (secret === undefined || secret === "") {
@@ -38,6 +41,6 @@ export function scrubCredential(result: unknown, secret: string | undefined): un
     // JSON.stringify returns undefined for those; nothing to scrub.
     return result;
   }
-  const scrubbed = serialized.split(secret).join("[redacted]");
+  const scrubbed = redactTokens(serialized, redactionTokens(secret));
   return JSON.parse(scrubbed);
 }
