@@ -147,6 +147,33 @@ describe("SqliteStore", () => {
   });
 
   describe("executions", () => {
+    it("claimForResume: exactly one caller wins the paused→running transition", async () => {
+      await store.executions.put({
+        id: "e",
+        code: "",
+        status: "paused",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+      });
+      const [a, b] = await Promise.all([
+        store.executions.claimForResume("e", "attempt-A"),
+        store.executions.claimForResume("e", "attempt-B"),
+      ]);
+      expect([a, b].filter(Boolean)).toHaveLength(1); // exactly one won
+      expect((await store.executions.get("e"))?.status).toBe("running");
+    });
+
+    it("claimForResume: returns false when not paused", async () => {
+      await store.executions.put({
+        id: "e2",
+        code: "",
+        status: "running",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+      });
+      expect(await store.executions.claimForResume("e2", "x")).toBe(false);
+    });
+
     it("round-trips executions including pause state and seeds", async () => {
       await store.executions.put({
         id: "exec_1",

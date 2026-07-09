@@ -76,7 +76,8 @@ const SCHEMA = [
     seeds TEXT NOT NULL,
     paused_on TEXT,
     started_at INTEGER NOT NULL,
-    ended_at INTEGER
+    ended_at INTEGER,
+    resume_attempt TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS trace_events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -117,6 +118,13 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   const traceColumns = await client.execute("PRAGMA table_info(trace_events)");
   if (!traceColumns.rows.some((row) => row.name === "output")) {
     await client.execute("ALTER TABLE trace_events ADD COLUMN output TEXT");
+  }
+
+  // executions.resume_attempt arrived after the first shipped schema; same
+  // retrofit as trace_events.output above.
+  const executionColumns = await client.execute("PRAGMA table_info(executions)");
+  if (!executionColumns.rows.some((row) => row.name === "resume_attempt")) {
+    await client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT");
   }
 
   return {
@@ -344,6 +352,18 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           execution.endedAt = endedAt;
         }
         return execution;
+      },
+      async claimForResume(id: string, resumeAttemptId: string): Promise<boolean> {
+        // Single guarded UPDATE: the WHERE status = 'paused' clause makes
+        // this a compare-and-swap — SQLite serializes writes, so exactly
+        // one concurrent caller's UPDATE matches the row and affects it.
+        // A read-then-write would race here; this must stay one statement.
+        const rs = await client.execute({
+          sql: `UPDATE executions SET status = 'running', resume_attempt = ?
+                WHERE id = ? AND status = 'paused'`,
+          args: [resumeAttemptId, id],
+        });
+        return rs.rowsAffected === 1;
       },
     },
 
