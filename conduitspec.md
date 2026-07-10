@@ -683,9 +683,12 @@ validation. (Decided 2026-07-08 after a codex adversarial re-pass raised both as
 8. **§11 Trace redaction mechanism (2026-07-10):** ✅ **write-time redaction at
 the Trace append choke point** — a builtin sensitive-key list (normalized exact matching) plus
 per-tool `redactFields` on the Policy row, riding the `PolicyVerdict`. The full
-`TraceEvent.output` is dropped from the Trace (redact-by-not-storing; legacy rows purged) —
-the full result lives only in the §5.5 replay journal, which stays semantically unredacted (D7). Not
-retroactive: policy changes mask future rows only. `PendingApproval.input` stays
+`TraceEvent.output` is dropped from the Trace (redact-by-not-storing). A pre-§11 database
+is migrated once on open: its trace rows' `input` is masked with the then-current builtin +
+per-tool keys, legacy summaries (truncated raw serializations) are replaced wholesale with a marker,
+and the legacy `output` column is dropped — the column's absence marks the migration done.
+The full result lives only in the §5.5 replay journal, which stays semantically unredacted (D7). Not
+retroactive for policy changes: editing `redactFields` later masks future rows only. `PendingApproval.input` stays
 unredacted — the approver decides on real values. Display hygiene, not a boundary: the credential
 boundary remains §9.2's request-scoped, never-persisted credentials.
 
