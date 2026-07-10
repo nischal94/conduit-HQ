@@ -73,7 +73,14 @@ every future reader must remember to redact).
 pure, synchronous, no config reads. Recurses objects and arrays; a
 matched key's entire value (scalar or subtree) becomes the existing
 `"[redacted]"` marker (same marker as `upstream.ts`). Non-object roots
-pass through. **Guards fail closed:** past the depth cap, or on a
+pass through. **Strictly non-mutating — this is load-bearing, not
+style:** `appendTrace` runs BEFORE the manager scrubs and journals the
+same `value` reference (`manager.ts` journal barrier) and before
+`pausedOn.input` is journaled on the approval path; an in-place
+mutation would put the semantically-redacted result into the replay
+journal — replay divergence, the exact D7 violation this design must
+not commit. Pinned by its own test (argument deep-equals its
+pre-call snapshot). **Guards fail closed:** past the depth cap, or on a
 cycle, the subtree is replaced with the marker — never passed through
 unredacted (a fail-open guard would be a redaction bypass via deep
 nesting). Builtin list (normalized; finalized in the plan, pinned by
@@ -127,14 +134,16 @@ that.
 ## Testing
 
 - `redact.ts` unit: normalization variants, nesting, arrays, scalar
-  roots, matched-subtree replacement, depth/cycle fail-closed.
+  roots, matched-subtree replacement, depth/cycle fail-closed,
+  **non-mutation of the argument** (deep-equals pre-call snapshot).
 - Policy engine: `redactFields` present on every verdict shape
   (default/override/unknown/block), independent of `manualOverride`.
 - Invoker integration: refusal + success paths produce redacted
   `input`/`outputSummary`, no `output`.
 - Sqlite: round-trip with `redact_fields`; both migrations (fresh DB;
   legacy DB with populated `output` column → purged).
-- E2E smoke: pause/resume replay still sees unredacted results.
+- E2E (manager pause/resume suite): replay still sees semantically
+  unredacted results after a paused/resumed execution.
 
 ## Deferred (documented, not built)
 
