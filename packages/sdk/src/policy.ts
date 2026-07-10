@@ -192,11 +192,15 @@ export function createStorePolicyEngine(policies: PolicyRepository): PolicyEngin
     async evaluate(request: PolicyEvaluationRequest): Promise<PolicyVerdict> {
       const { target } = request;
       if (target.kind === "unknown") {
+        // §11: a policy row outlives its tool (§7), and its redactFields
+        // still govern the refusal trace row for the vanished tool — the
+        // guest-supplied input is traced either way.
+        const stale = await policies.get(target.toolName);
         return {
           action: "block",
           reason: `Unknown tool "${printableName(target.toolName)}": not in the catalog, so it is blocked. Check the tool name or re-sync the source.`,
           source: "unknown_tool",
-          redactFields: [],
+          redactFields: stale?.redactFields ?? [],
         };
       }
       const tool = target.tool;

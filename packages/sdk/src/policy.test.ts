@@ -317,5 +317,19 @@ describe("createStorePolicyEngine", () => {
     // Unknown tool → empty additions.
     const missing = await engine.evaluate(unknown("acme.ghost"));
     expect(missing.redactFields).toEqual([]);
+
+    // §7: a policy row outlives its tool. A removed tool's surviving row
+    // still governs the refusal trace row for the vanished tool.
+    await policies.upsert({
+      toolName: "acme.removed_tool",
+      action: "allow",
+      seededFrom: "safe",
+      manualOverride: false,
+      redactFields: ["customer_data"],
+    });
+    const removed = await engine.evaluate(unknown("acme.removed_tool"));
+    expect(removed.source).toBe("unknown_tool");
+    expect(removed.action).toBe("block");
+    expect(removed.redactFields).toEqual(["customer_data"]);
   });
 });
