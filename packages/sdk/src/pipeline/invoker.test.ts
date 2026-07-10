@@ -179,10 +179,13 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(trace[0]?.policyVerdict).toBe("block"); // honest audit, not "allow"
   });
 
-  it("a non-serializable result from a custom caller becomes infra, never a raw throw (H1)", async () => {
-    // The A5 extension seam: a caller returning a circular structure makes
-    // JSON.stringify throw. The outermost classification must catch it so no
-    // raw TypeError crosses into the sandbox.
+  it("a non-serializable result from a custom caller no longer faults the call — the trace stores only the cycle-safe summary (H1, revised by §11 R3)", async () => {
+    // The A5 extension seam: pre-§11 the raw result was stringified into
+    // trace_events.output, so a circular structure threw and had to be
+    // classified as infra. §11 drops that field (design R3); the only
+    // stringify left on the trace path is redact-then-slice, and the
+    // redactor replaces back-references with "[redacted]" — so the call
+    // succeeds and no raw TypeError can cross into the sandbox.
     const circular: Record<string, unknown> = {};
     circular.self = circular;
     const badCaller: UpstreamCaller = {
@@ -191,16 +194,10 @@ describe("createToolInvoker (spec §5.3)", () => {
     const log = vi.fn();
     const invoke = createToolInvoker(deps(badCaller), { executionId: "exec_h1", log });
 
-    let thrown: unknown;
-    try {
-      await invoke("github.list_issues", {});
-    } catch (error) {
-      thrown = error;
-    }
-    const error = thrown as Error;
-    expect(error.name).toBe(GUEST_ERROR_NAMES.infra);
-    expect(error.message).not.toMatch(/circular/i); // structure detail stays host-side
-    expect(log).toHaveBeenCalled();
+    const result = await invoke("github.list_issues", {});
+    expect(result).toBe(circular);
+    const [event] = await store.trace.listByExecution("exec_h1");
+    expect(event?.outputSummary).toBe('{"self":"[redacted]"}');
   });
 
   it("proceeds only on allow — a policy-store rejection fails the call as infra, not a verdict", async () => {
@@ -344,7 +341,7 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(requests).toHaveLength(0);
   });
 
-  it("a successful call appends one TraceEvent with output, latency, status, verdict allow", async () => {
+  it("a successful call appends one TraceEvent with summary, latency, status, verdict allow", async () => {
     const upstreamResult = { content: [{ type: "text", text: "3 open issues" }] };
     const { caller } = recordingUpstream(upstreamResult);
     const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
@@ -358,7 +355,6 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(event?.toolName).toBe("github.list_issues");
     expect(event?.connectionPrefix).toBe(PREFIX);
     expect(event?.input).toEqual({ owner: "acme" });
-    expect(event?.output).toEqual(upstreamResult);
     expect(event?.outputSummary).toBe(JSON.stringify(upstreamResult).slice(0, 160));
     expect(event?.upstreamStatus).toBe(200);
     expect(event?.latencyMs).toBe(7);

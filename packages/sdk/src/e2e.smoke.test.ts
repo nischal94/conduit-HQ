@@ -437,21 +437,19 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       ["github.list_issues", "block"],
     ]);
     expect(persistedTrace[0]?.connectionPrefix).toBe(PREFIX);
-    expect(persistedTrace[0]?.output).toEqual(ISSUES_RESULT); // §5.5 replay payload
     expect(persistedTrace[0]?.upstreamStatus).toBe(200);
     expect(JSON.stringify(persistedTrace)).not.toContain("ghp_smoke");
 
     // The require_approval → (approved) allow pair lives under the manager's
     // execution: the pause was audited as a refusal (F1 — the audit Trace records
     // it even though the replay journal does NOT), and the resumed run audited the
-    // approved call as an allow that reached upstream (output present, prefix set).
+    // approved call as an allow that reached upstream (status present, prefix set).
     const managerAudit = await store.trace.listByExecution(managerExecId);
     expect(managerAudit.map((e) => [e.toolName, e.policyVerdict])).toEqual([
       ["github.delete_repo", "require_approval"],
       ["github.delete_repo", "allow"],
     ]);
     expect(managerAudit[1]?.connectionPrefix).toBe(PREFIX);
-    expect(managerAudit[1]?.output).toEqual(ISSUES_RESULT);
     expect(managerAudit[1]?.upstreamStatus).toBe(200);
     expect(JSON.stringify(managerAudit)).not.toContain("ghp_smoke");
 

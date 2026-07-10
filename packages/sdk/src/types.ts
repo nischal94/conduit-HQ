@@ -111,27 +111,20 @@ export interface PendingApproval {
   expiresAt: number;
 }
 
-/** One tool call as recorded for audit — and replayed on resume (spec §11, §5.5). */
+/** One tool call as recorded for audit (spec §11). NOT the replay source —
+ * that is the separate replay journal (§5.5 design D4). */
 export interface TraceEvent {
   callId: string;
   executionId: string;
   /** `namespace.tool` */
   toolName: string;
   connectionPrefix: string;
-  /**
-   * Stored as received in v1; §11 policy redaction is a pending invariant
-   * (INVARIANTS.md) that must scope this field — it is NOT redacted yet.
-   */
+  /** Redacted at append time (§11): builtin sensitive keys + the tool
+   * policy's redactFields are masked before the row is written. */
   input: unknown;
+  /** Display projection: redact-then-slice of the upstream result (§11).
+   * The full result lives only in the replay journal (D4/D7). */
   outputSummary?: unknown;
-  /**
-   * Full upstream result for §5.5 replay, bounded by the MCP caller's
-   * response cap; absent for denied/failed calls. outputSummary remains
-   * the display projection. Deliberately stored UNREDACTED for replay
-   * fidelity: the pending §11 Trace-redaction invariant must scope this
-   * field when it lands (redaction may not destroy the replay payload).
-   */
-  output?: unknown;
   upstreamStatus?: number;
   latencyMs?: number;
   policyVerdict: PolicyAction;

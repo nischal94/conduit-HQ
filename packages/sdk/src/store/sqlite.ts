@@ -88,7 +88,6 @@ const SCHEMA = [
     connection_prefix TEXT NOT NULL,
     input TEXT NOT NULL,
     output_summary TEXT,
-    output TEXT,
     upstream_status INTEGER,
     latency_ms INTEGER,
     policy_verdict TEXT NOT NULL CHECK (policy_verdict IN ('allow', 'require_approval', 'block')),
@@ -114,11 +113,14 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   const { client, secretBox } = options;
   await client.batch(SCHEMA, "write");
 
-  // trace_events.output arrived after the first shipped schema; CREATE TABLE
-  // IF NOT EXISTS never retrofits an existing table, so add the column here.
+  // Pre-§11 schemas carried a full trace_events.output payload for replay;
+  // after the D4 split replay reads only replay_journal, and §11 drops the
+  // field (design R3). Purge any data a legacy DB still holds — the audit
+  // store must not keep full unredacted results. The dead column stays
+  // (SQLite-cheap, never written again).
   const traceColumns = await client.execute("PRAGMA table_info(trace_events)");
-  if (!traceColumns.rows.some((row) => row.name === "output")) {
-    await client.execute("ALTER TABLE trace_events ADD COLUMN output TEXT");
+  if (traceColumns.rows.some((row) => row.name === "output")) {
+    await client.execute("UPDATE trace_events SET output = NULL WHERE output IS NOT NULL");
   }
 
   // executions.resume_attempt arrived after the first shipped schema; same
@@ -404,8 +406,8 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         await client.execute({
           sql: `INSERT INTO trace_events
                   (call_id, execution_id, tool_name, connection_prefix, input,
-                   output_summary, output, upstream_status, latency_ms, policy_verdict, at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                   output_summary, upstream_status, latency_ms, policy_verdict, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
             event.callId,
             event.executionId,
@@ -413,7 +415,6 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             event.connectionPrefix,
             JSON.stringify(event.input ?? null),
             event.outputSummary === undefined ? null : JSON.stringify(event.outputSummary),
-            event.output === undefined ? null : JSON.stringify(event.output),
             event.upstreamStatus ?? null,
             event.latencyMs ?? null,
             event.policyVerdict,
@@ -813,10 +814,6 @@ function rowToTraceEvent(row: Row): TraceEvent {
     event.outputSummary = parseJson(outputSummary, (cause) =>
       traceReadError("output_summary is not valid JSON", cause),
     );
-  }
-  const output = maybeText(row, "output");
-  if (output !== undefined) {
-    event.output = parseJson(output, (cause) => traceReadError("output is not valid JSON", cause));
   }
   const upstreamStatus = maybeInteger(row, "upstream_status");
   if (upstreamStatus !== undefined) {

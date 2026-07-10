@@ -358,7 +358,6 @@ async function appendTrace(
   };
   if (details.outcome !== undefined) {
     const output = details.outcome.result ?? null;
-    event.output = output;
     // §11 R7: redact BEFORE slicing, so a sensitive value's head cannot
     // leak through the 160-char display cap.
     event.outputSummary = JSON.stringify(
