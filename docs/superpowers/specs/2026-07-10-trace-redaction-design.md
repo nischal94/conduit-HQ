@@ -62,7 +62,12 @@ the engine already fetches the policy row per call, so per-tool
 additions ride back at zero extra store reads. `row?.redactFields ??
 []` for known tools regardless of `manualOverride` (redaction tuning
 is independent of action overrides); `[]` for unknown tools. Builtins
-are owned by the redactor and always apply. Rejected: a separate
+are owned by the redactor and always apply. **Resume-path exception
+(found at plan time):** the §5.5 D6 decision branch builds a synthetic
+verdict without reading the policy row; the invoker enriches that
+verdict with a `policies.get(path)` read so the approved call's trace
+row gets the same per-tool redaction — one extra read on the rare
+resume path only, zero on the common path. Rejected: a separate
 `fieldsFor(toolName)` seam (second read of the same row, interface
 sprawl); read-time projection (raw data at rest; fail-open by shape —
 every future reader must remember to redact).
