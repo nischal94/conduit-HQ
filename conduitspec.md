@@ -680,6 +680,14 @@ installs, and a hostile one already holds the secret in its own `call()` scope, 
 smuggling it back through the invoker buys an attacker nothing. If Conduit ever runs
 operator-untrusted caller plugins, this decision reopens and the invoker gains its own output/name
 validation. (Decided 2026-07-08 after a codex adversarial re-pass raised both as findings.)
+8. **§11 Trace redaction mechanism (2026-07-10):** ✅ **write-time redaction at
+the Trace append choke point** — a builtin sensitive-key list (normalized exact matching) plus
+per-tool `redactFields` on the Policy row, riding the `PolicyVerdict`. The full
+`TraceEvent.output` is dropped from the Trace (redact-by-not-storing; legacy rows purged) —
+the full result lives only in the §5.5 replay journal, which stays semantically unredacted (D7). Not
+retroactive: policy changes mask future rows only. `PendingApproval.input` stays
+unredacted — the approver decides on real values. Display hygiene, not a boundary: the credential
+boundary remains §9.2's request-scoped, never-persisted credentials.
 
 ---
 
