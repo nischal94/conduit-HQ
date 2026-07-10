@@ -137,6 +137,7 @@ async function runCall(
           ? `Unknown tool "${path}": not in the catalog, so it is blocked.`
           : verdict.reason,
       source: verdict.source,
+      redactFields: verdict.redactFields,
     };
     await appendTrace(deps, options, log, { path, input, verdict: blocked });
     throw policyError("block", blocked.reason);
@@ -266,9 +267,19 @@ function resolveDecisionVerdict(
     return undefined;
   }
   if (decision.kind === "approve") {
-    return { action: "allow", reason: "operator approved this call on resume", source: "override" };
+    return {
+      action: "allow",
+      reason: "operator approved this call on resume",
+      source: "override",
+      redactFields: [],
+    };
   }
-  return { action: "block", reason: "operator denied this call on resume", source: "override" };
+  return {
+    action: "block",
+    reason: "operator denied this call on resume",
+    source: "override",
+    redactFields: [],
+  };
 }
 
 /**

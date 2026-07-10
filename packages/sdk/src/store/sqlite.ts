@@ -67,7 +67,8 @@ const SCHEMA = [
     tool_name TEXT PRIMARY KEY,
     action TEXT NOT NULL CHECK (action IN ('allow', 'require_approval', 'block')),
     seeded_from TEXT NOT NULL CHECK (seeded_from IN ('safe', 'review', 'destructive')),
-    manual_override INTEGER NOT NULL CHECK (manual_override IN (0, 1))
+    manual_override INTEGER NOT NULL CHECK (manual_override IN (0, 1)),
+    redact_fields TEXT NOT NULL DEFAULT '[]'
   )`,
   `CREATE TABLE IF NOT EXISTS executions (
     id TEXT PRIMARY KEY,
@@ -125,6 +126,15 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   const executionColumns = await client.execute("PRAGMA table_info(executions)");
   if (!executionColumns.rows.some((row) => row.name === "resume_attempt")) {
     await client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT");
+  }
+
+  // policies.redact_fields arrived with §11 redaction; same retrofit
+  // pattern as trace_events.output before it.
+  const policyColumns = await client.execute("PRAGMA table_info(policies)");
+  if (!policyColumns.rows.some((row) => row.name === "redact_fields")) {
+    await client.execute(
+      "ALTER TABLE policies ADD COLUMN redact_fields TEXT NOT NULL DEFAULT '[]'",
+    );
   }
 
   return {
@@ -269,12 +279,19 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
     policies: {
       async upsert(policy: Policy): Promise<void> {
         await client.execute({
-          sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override)
-                VALUES (?, ?, ?, ?)
+          sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override, redact_fields)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(tool_name) DO UPDATE SET
                   action = excluded.action, seeded_from = excluded.seeded_from,
-                  manual_override = excluded.manual_override`,
-          args: [policy.toolName, policy.action, policy.seededFrom, policy.manualOverride ? 1 : 0],
+                  manual_override = excluded.manual_override,
+                  redact_fields = excluded.redact_fields`,
+          args: [
+            policy.toolName,
+            policy.action,
+            policy.seededFrom,
+            policy.manualOverride ? 1 : 0,
+            JSON.stringify(policy.redactFields),
+          ],
         });
       },
       async get(toolName: string): Promise<Policy | undefined> {
@@ -738,7 +755,31 @@ function rowToPolicy(row: Row): Policy {
       `[SqliteStore] Failed to read policy: manual_override must be 0 or 1. Context: { toolName: ${JSON.stringify(toolName)}, got: ${manualOverride} }`,
     );
   }
-  return { toolName, action, seededFrom, manualOverride: manualOverride === 1 };
+  const redactFieldsText = text(row, "redact_fields");
+  let redactFieldsParsed: unknown;
+  try {
+    redactFieldsParsed = JSON.parse(redactFieldsText);
+  } catch (cause) {
+    throw new Error(
+      `[SqliteStore] Failed to read policy: redact_fields is not valid JSON. Context: { toolName: ${JSON.stringify(toolName)} }`,
+      { cause },
+    );
+  }
+  if (
+    !Array.isArray(redactFieldsParsed) ||
+    !redactFieldsParsed.every((field): field is string => typeof field === "string")
+  ) {
+    throw new Error(
+      `[SqliteStore] Failed to read policy: redact_fields must be a JSON array of strings. Context: { toolName: ${JSON.stringify(toolName)} }`,
+    );
+  }
+  return {
+    toolName,
+    action,
+    seededFrom,
+    manualOverride: manualOverride === 1,
+    redactFields: redactFieldsParsed,
+  };
 }
 
 function rowToTraceEvent(row: Row): TraceEvent {

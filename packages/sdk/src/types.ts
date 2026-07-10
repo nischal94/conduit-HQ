@@ -75,6 +75,12 @@ export interface Policy {
   action: PolicyAction;
   seededFrom: RiskClass;
   manualOverride: boolean;
+  /**
+   * §11 per-tool additions to the builtin sensitive-key list: key names
+   * (normalized matching, pipeline/redact.ts) masked in this tool's audit
+   * Trace rows. Operator data — respected independently of manualOverride.
+   */
+  redactFields: string[];
 }
 
 export type ExecutionStatus = "running" | "paused" | "completed" | "failed" | "expired";

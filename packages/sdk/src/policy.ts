@@ -78,6 +78,14 @@ export interface PolicyVerdict {
   readonly action: PolicyAction;
   readonly reason: string;
   readonly source: PolicyVerdictSource;
+  /**
+   * §11 per-tool redaction additions from the policy row, applied by
+   * appendTrace on this call's audit row. Builtins always apply and are
+   * owned by the redactor; this carries only the row's extras. Display
+   * hygiene riding the verdict so the engine's single row read serves
+   * both concerns — never a security decision.
+   */
+  readonly redactFields: readonly string[];
 }
 
 /**
@@ -91,25 +99,28 @@ export interface PolicyVerdict {
  * (the `never` binding keeps the compile-time check: a new legitimate
  * RiskClass member still breaks this build).
  */
-function defaultVerdict(tool: Tool): PolicyVerdict {
+function defaultVerdict(tool: Tool, redactFields: readonly string[]): PolicyVerdict {
   switch (tool.riskClass) {
     case "safe":
       return {
         action: "allow",
         reason: `${tool.name} is allowed: read-only, safe by default.`,
         source: "default",
+        redactFields,
       };
     case "review":
       return {
         action: "require_approval",
         reason: `${tool.name} requires approval: it writes data (review class) and its policy has not been manually set.`,
         source: "default",
+        redactFields,
       };
     case "destructive":
       return {
         action: "require_approval",
         reason: `${tool.name} requires approval: classified destructive by default. Approve or deny via the pending-approvals view.`,
         source: "default",
+        redactFields,
       };
     default: {
       const unexpected: never = tool.riskClass;
@@ -117,6 +128,7 @@ function defaultVerdict(tool: Tool): PolicyVerdict {
         action: "block",
         reason: `${tool.name} is blocked: its riskClass "${String(unexpected)}" is not recognized by this version — catalog data may be corrupt or from a newer schema. Re-sync the source.`,
         source: "default",
+        redactFields,
       };
     }
   }
@@ -125,25 +137,32 @@ function defaultVerdict(tool: Tool): PolicyVerdict {
 /** Same fail-closed `default` discipline as defaultVerdict: an operator row
  * is the one storage the engine trusts, so an unrecognized action there
  * (schema drift, hand-edited row) must block, not vanish. */
-function overrideVerdict(toolName: string, action: PolicyAction): PolicyVerdict {
+function overrideVerdict(
+  toolName: string,
+  action: PolicyAction,
+  redactFields: readonly string[],
+): PolicyVerdict {
   switch (action) {
     case "allow":
       return {
         action,
         reason: `${toolName} is allowed: an operator allowed it manually, overriding its default.`,
         source: "override",
+        redactFields,
       };
     case "require_approval":
       return {
         action,
         reason: `${toolName} requires approval: an operator requires manual approval for it. Approve or deny via the pending-approvals view.`,
         source: "override",
+        redactFields,
       };
     case "block":
       return {
         action,
         reason: `${toolName} is blocked: an operator blocked this tool manually. Ask them to change its policy if you need it.`,
         source: "override",
+        redactFields,
       };
     default: {
       const unexpected: never = action;
@@ -151,6 +170,7 @@ function overrideVerdict(toolName: string, action: PolicyAction): PolicyVerdict 
         action: "block",
         reason: `${toolName} is blocked: its stored policy action "${String(unexpected)}" is not recognized by this version. An operator must reset this tool's policy.`,
         source: "override",
+        redactFields,
       };
     }
   }
@@ -176,19 +196,23 @@ export function createStorePolicyEngine(policies: PolicyRepository): PolicyEngin
           action: "block",
           reason: `Unknown tool "${printableName(target.toolName)}": not in the catalog, so it is blocked. Check the tool name or re-sync the source.`,
           source: "unknown_tool",
+          redactFields: [],
         };
       }
       const tool = target.tool;
       const row = await policies.get(tool.name);
+      // §11: redaction tuning is operator data on the row, respected even
+      // when the row is otherwise inert (no manualOverride).
+      const redactFields = row?.redactFields ?? [];
       if (row?.manualOverride) {
-        return overrideVerdict(tool.name, row.action);
+        return overrideVerdict(tool.name, row.action, redactFields);
       }
       // A row without manualOverride is inert: seeds are derived from the
       // live tool's riskClass, never trusted from storage. This keeps a
       // verdict's action and reason consistent by construction and picks
       // up riskClass changes from source refreshes; only manual overrides
       // are storage-authoritative (§7 protects exactly those).
-      return defaultVerdict(tool);
+      return defaultVerdict(tool, redactFields);
     },
   };
 }

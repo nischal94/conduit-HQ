@@ -111,6 +111,7 @@ describe("createStorePolicyEngine", () => {
       action: "block",
       seededFrom: "safe",
       manualOverride: true,
+      redactFields: [],
     });
     const engine = createStorePolicyEngine(policies);
 
@@ -131,6 +132,7 @@ describe("createStorePolicyEngine", () => {
       action: "allow",
       seededFrom: "destructive",
       manualOverride: true,
+      redactFields: [],
     });
     const engine = createStorePolicyEngine(policies);
 
@@ -151,6 +153,7 @@ describe("createStorePolicyEngine", () => {
       action: "require_approval",
       seededFrom: "safe",
       manualOverride: true,
+      redactFields: [],
     });
     const engine = createStorePolicyEngine(policies);
 
@@ -174,6 +177,7 @@ describe("createStorePolicyEngine", () => {
       action: "allow",
       seededFrom: "safe",
       manualOverride: false,
+      redactFields: [],
     });
     const engine = createStorePolicyEngine(policies);
 
@@ -212,6 +216,7 @@ describe("createStorePolicyEngine", () => {
       action: "warn" as PolicyAction,
       seededFrom: "safe",
       manualOverride: true,
+      redactFields: [],
     });
     const engine = createStorePolicyEngine(policies);
 
@@ -268,10 +273,49 @@ describe("createStorePolicyEngine", () => {
       action: "block",
       seededFrom: "safe",
       manualOverride: true,
+      redactFields: [],
     });
 
     const after = await engine.evaluate(known(tool));
     expect(after.action).toBe("block");
     expect(after.source).toBe("override");
+  });
+
+  it("§11: verdicts carry the row's redactFields on every shape, independent of manualOverride", async () => {
+    const policies = memoryPolicies();
+    const engine = createStorePolicyEngine(policies);
+    const tool = makeTool("safe", "acme.things.redacted");
+
+    // No row → empty additions.
+    const bare = await engine.evaluate(known(tool));
+    expect(bare.redactFields).toEqual([]);
+
+    // Row WITHOUT manualOverride: action stays the default, but redactFields apply.
+    await policies.upsert({
+      toolName: tool.name,
+      action: "allow",
+      seededFrom: "safe",
+      manualOverride: false,
+      redactFields: ["customer_email"],
+    });
+    const tuned = await engine.evaluate(known(tool));
+    expect(tuned.source).toBe("default");
+    expect(tuned.redactFields).toEqual(["customer_email"]);
+
+    // Row WITH manualOverride: override verdict carries them too.
+    await policies.upsert({
+      toolName: tool.name,
+      action: "block",
+      seededFrom: "safe",
+      manualOverride: true,
+      redactFields: ["customer_email", "amount"],
+    });
+    const overridden = await engine.evaluate(known(tool));
+    expect(overridden.source).toBe("override");
+    expect(overridden.redactFields).toEqual(["customer_email", "amount"]);
+
+    // Unknown tool → empty additions.
+    const missing = await engine.evaluate(unknown("acme.ghost"));
+    expect(missing.redactFields).toEqual([]);
   });
 });

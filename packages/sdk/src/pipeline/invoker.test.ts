@@ -140,6 +140,7 @@ describe("createToolInvoker (spec §5.3)", () => {
       action: "block",
       seededFrom: "safe",
       manualOverride: true,
+      redactFields: [],
     });
     await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
       name: GUEST_ERROR_NAMES.policyBlocked,
@@ -160,6 +161,7 @@ describe("createToolInvoker (spec §5.3)", () => {
           action: "allow" as const,
           reason: "allowed by default",
           source: "default" as const,
+          redactFields: [] as const,
         }),
     };
     const { caller, requests } = recordingUpstream();

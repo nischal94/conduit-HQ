@@ -388,6 +388,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       action: "block",
       seededFrom: "safe",
       manualOverride: true,
+      redactFields: [],
     });
     const overridden = await sandbox.execute({
       code: `
@@ -461,6 +462,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       action: "allow",
       seededFrom: "safe",
       manualOverride: true, // operator re-allows; change is live immediately
+      redactFields: [],
     });
     const guardedInvoke = createToolInvoker(
       {
