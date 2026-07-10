@@ -547,4 +547,49 @@ describe("createToolInvoker (spec §5.3)", () => {
       expect(requests).toHaveLength(1);
     });
   });
+
+  it("§11: appendTrace masks builtin + per-tool keys in input and outputSummary, on allowed and refused calls", async () => {
+    await store.policies.upsert({
+      toolName: "github.list_issues",
+      action: "allow",
+      seededFrom: "safe",
+      manualOverride: false,
+      redactFields: ["repo_label"],
+    });
+    const { caller } = recordingUpstream({
+      content: [{ password: "echoed-pw", repoLabel: "internal", ok: true }],
+    });
+    const invoke = createToolInvoker(deps(caller), { executionId: "exec_redact", log: vi.fn() });
+
+    await invoke("github.list_issues", { token: "sk-live", repo_label: "internal", repo: "hq" });
+
+    const [event] = await store.trace.listByExecution("exec_redact");
+    expect(event?.input).toEqual({ token: "[redacted]", repo_label: "[redacted]", repo: "hq" });
+    const summary = String(event?.outputSummary);
+    expect(summary).not.toContain("echoed-pw");
+    expect(summary).not.toContain("internal");
+    expect(summary).toContain("[redacted]");
+
+    // Refusal path: the destructive tool's refusal row is redacted too.
+    // (require_approval surfaces as ConduitPolicyDenied — errors.ts policyError.)
+    const attempt = invoke("github.delete_repo", { password: "pw", repo: "hq" });
+    await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyDenied });
+    const refused = (await store.trace.listByExecution("exec_redact"))[1];
+    expect(refused?.input).toEqual({ password: "[redacted]", repo: "hq" });
+  });
+
+  it("§11: the upstream call itself still receives the UNREDACTED input (redaction is trace-only)", async () => {
+    const { caller, requests } = recordingUpstream();
+    const invoke = createToolInvoker(deps(caller), { executionId: "exec_live", log: vi.fn() });
+    await invoke("github.list_issues", { token: "sk-live", repo: "hq" });
+    expect(requests[0]?.input).toEqual({ token: "sk-live", repo: "hq" });
+  });
+
+  it("§11: a sensitive value's head never leaks through the 160-char summary slice (redact-then-slice, R7)", async () => {
+    const { caller } = recordingUpstream({ secret: `sk-${"x".repeat(400)}`, note: "fine" });
+    const invoke = createToolInvoker(deps(caller), { executionId: "exec_slice", log: vi.fn() });
+    await invoke("github.list_issues", {});
+    const [event] = await store.trace.listByExecution("exec_slice");
+    expect(String(event?.outputSummary)).not.toContain("sk-x");
+  });
 });
