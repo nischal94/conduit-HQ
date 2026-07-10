@@ -870,20 +870,12 @@ console (§12); the desktop app is a thin native shell over the <em>same</em> lo
 capability, and strands no downstream work — Phases 4–5 (Cloud, self-host) do not depend on it. It
 remains a post-launch option enabled by the surface-agnostic core; picking it up later needs no
 rework. (Decided 2026-07-08.)</li>
-</ul>
-<p><strong>Deferred (future phases — none block v0.1 / Phase 0):</strong></p>
-<ol>
-<li><strong>Auth library</strong> for built-in mode (better-auth-equivalent) and the delegated-auth contract — Phase 1.</li>
-<li><strong>Trace storage scale</strong> (SQLite fine locally; Cloud needs a real store + retention tiers) — Phase 4.</li>
-<li><strong>npm allowlist contents</strong>: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.</li>
-<li><strong>Pricing shape</strong> for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.</li>
-<li><strong>Approval push notifications</strong> (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.</li>
 <li><strong>Per-connect egress pinning</strong> (§9.3): ✅ <strong>SHIPPED</strong> 2026-07-08
 (Issue #21 / PR #22, merged early — was slated Phase 1). <code>createPinnedLookup</code> resolves
 once and forces the connection to the vetted resolved IP (canonicalize-then-check), closing both the
 address-encoding bypass and the DNS-rebinding TOCTOU. Pinned by <code>pipeline/egress.test.ts</code>
 (INVARIANTS.md §9.3).</li>
-<li><strong>UpstreamCaller as a trusted dependency</strong> (§5.3, §9.2): the pipeline treats an
+<li><strong>UpstreamCaller as a trusted dependency</strong> (§5.3, §9.2): ✅ the pipeline treats an
 injected <code>UpstreamCaller</code> as trusted infrastructure — the same posture it holds toward the
 store and policy engine — not as an adversary. So the invoker does NOT re-validate a custom caller's
 error name against its kind, nor re-scan a custom caller's success result for the credential; those
@@ -903,6 +895,14 @@ The full result lives only in the §5.5 replay journal, which stays semantically
 retroactive for policy changes: editing <code>redactFields</code> later masks future rows only. <code>PendingApproval.input</code> stays
 unredacted — the approver decides on real values. Display hygiene, not a boundary: the credential
 boundary remains §9.2's request-scoped, never-persisted credentials.</li>
+</ul>
+<p><strong>Deferred (future phases — none block v0.1 / Phase 0):</strong></p>
+<ol>
+<li><strong>Auth library</strong> for built-in mode (better-auth-equivalent) and the delegated-auth contract — Phase 1.</li>
+<li><strong>Trace storage scale</strong> (SQLite fine locally; Cloud needs a real store + retention tiers) — Phase 4.</li>
+<li><strong>npm allowlist contents</strong>: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.</li>
+<li><strong>Pricing shape</strong> for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.</li>
+<li><strong>Approval push notifications</strong> (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.</li>
 </ol>
 <hr>
 <h2 id="19-branding-naming">19. Branding / naming</h2>

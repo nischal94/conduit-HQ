@@ -658,20 +658,12 @@ console (§12); the desktop app is a thin native shell over the *same* local ser
 capability, and strands no downstream work — Phases 4–5 (Cloud, self-host) do not depend on it. It
 remains a post-launch option enabled by the surface-agnostic core; picking it up later needs no
 rework. (Decided 2026-07-08.)
-
-**Deferred (future phases — none block v0.1 / Phase 0):**
-
-1. **Auth library** for built-in mode (better-auth-equivalent) and the delegated-auth contract — Phase 1.
-2. **Trace storage scale** (SQLite fine locally; Cloud needs a real store + retention tiers) — Phase 4.
-3. **npm allowlist contents**: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.
-4. **Pricing shape** for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.
-5. **Approval push notifications** (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.
-6. **Per-connect egress pinning** (§9.3): ✅ **SHIPPED** 2026-07-08
+- **Per-connect egress pinning** (§9.3): ✅ **SHIPPED** 2026-07-08
 (Issue #21 / PR #22, merged early — was slated Phase 1). `createPinnedLookup` resolves
 once and forces the connection to the vetted resolved IP (canonicalize-then-check), closing both the
 address-encoding bypass and the DNS-rebinding TOCTOU. Pinned by `pipeline/egress.test.ts`
 (INVARIANTS.md §9.3).
-7. **UpstreamCaller as a trusted dependency** (§5.3, §9.2): the pipeline treats an
+- **UpstreamCaller as a trusted dependency** (§5.3, §9.2): ✅ the pipeline treats an
 injected `UpstreamCaller` as trusted infrastructure — the same posture it holds toward the
 store and policy engine — not as an adversary. So the invoker does NOT re-validate a custom caller's
 error name against its kind, nor re-scan a custom caller's success result for the credential; those
@@ -680,7 +672,7 @@ installs, and a hostile one already holds the secret in its own `call()` scope, 
 smuggling it back through the invoker buys an attacker nothing. If Conduit ever runs
 operator-untrusted caller plugins, this decision reopens and the invoker gains its own output/name
 validation. (Decided 2026-07-08 after a codex adversarial re-pass raised both as findings.)
-8. **§11 Trace redaction mechanism (2026-07-10):** ✅ **write-time redaction at
+- **§11 Trace redaction mechanism (2026-07-10):** ✅ **write-time redaction at
 the Trace append choke point** — a builtin sensitive-key list (normalized exact matching) plus
 per-tool `redactFields` on the Policy row, riding the `PolicyVerdict`. The full
 `TraceEvent.output` is dropped from the Trace (redact-by-not-storing). A pre-§11 database
@@ -691,6 +683,14 @@ The full result lives only in the §5.5 replay journal, which stays semantically
 retroactive for policy changes: editing `redactFields` later masks future rows only. `PendingApproval.input` stays
 unredacted — the approver decides on real values. Display hygiene, not a boundary: the credential
 boundary remains §9.2's request-scoped, never-persisted credentials.
+
+**Deferred (future phases — none block v0.1 / Phase 0):**
+
+1. **Auth library** for built-in mode (better-auth-equivalent) and the delegated-auth contract — Phase 1.
+2. **Trace storage scale** (SQLite fine locally; Cloud needs a real store + retention tiers) — Phase 4.
+3. **npm allowlist contents**: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.
+4. **Pricing shape** for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.
+5. **Approval push notifications** (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.
 
 ---
 
