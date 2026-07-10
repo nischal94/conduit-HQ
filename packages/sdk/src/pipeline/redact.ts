@@ -19,7 +19,7 @@
 const REDACTED = "[redacted]";
 
 /**
- * Fail-closed recursion cap: past it, the SUBTREE is replaced with the
+ * Fail-closed recursion cap: at or beyond it, the value is replaced with the
  * marker — passing it through unredacted would make deep nesting a
  * redaction bypass (design R5).
  */

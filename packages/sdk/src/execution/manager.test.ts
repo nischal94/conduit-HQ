@@ -1034,6 +1034,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
 
     const journal = await h.store.replayJournal.listByExecution(outcome.executionId);
     const callRow = journal.find((row) => row.op === "call");
+    expect(callRow).toBeDefined();
     // Replay fidelity: the journaled REQUEST carries the raw input.
     expect(callRow?.request).toContain("sk-fixture");
 

@@ -130,6 +130,8 @@ async function runCall(
     // the synthetic verdict carries no per-tool redactFields. Fetch them
     // here — one extra row read on the rare resume path only — so the
     // approved call's audit row is redacted identically to the policy path.
+    // Deliberately fail-closed: a store failure here aborts the call as
+    // infra rather than silently degrading to builtin-only redaction.
     const row = await deps.store.policies.get(path).catch((cause) => {
       throw infraError(cause, log);
     });
