@@ -820,3 +820,67 @@ bots/cross-model are not a formality after a thorough self-review — they are t
 independent-eyes layer that finds the class of bug self-review is structurally blind
 to. Budget for them to find real things; treat "opened the PR" as the START of review,
 not the end.
+
+## 2026-07-10 — §11 Trace redaction (PR #27): design → SDD build → converged cross-model round, one session
+
+### 1. The recurring cross-model blind spot has a name: lifecycle edges
+
+Same-model review (five lenses + a whole-branch opus pass + /security-review) cleared
+the branch; the real codex passes then found two P2s, and both were the same SHAPE:
+reasoning covered the write path forward in time, and missed data that ALREADY EXISTS
+— a policy row surviving its deleted tool (§7 makes rows outlive tools), and pre-§11
+trace rows written before redaction existed. PR #26's cross-model catch (crash leaves
+`running`, not `paused`) was the same shape. When prompting any future adversarial
+pass, explicitly ask: "what about rows/state that predate this change or outlive
+their parent?" — lifecycle edges beat logic edges as this codebase's blind spot.
+
+### 2. Make migrations one-time by construction, not by guard
+
+The pre-§11 fix's key move: after masking legacy rows, DROP the legacy column — its
+absence IS the completion marker. No schema-version counter, no re-scan on every
+open, no "is it done?" guard that can drift. Same family as the convergence rule's
+canonicalize-then-check: encode the state transition in the structure itself.
+(Corollary honestly documented in PR #27: a READONLY legacy DB now fails open()
+closed — fail-closed posture, dead data, revisit only if readonly opens become a
+product surface.)
+
+### 3. Aliasing is a design-review question, not a code-review question
+
+The one hard integration hazard — the manager journals the SAME object reference
+after appendTrace runs, so an in-place-mutating redactor would silently poison the
+replay journal (D7 violation) — was caught at DESIGN time by tracing execution order
+against reference flow, then pinned as an explicit non-mutation contract + test.
+Every later reviewer verified it in minutes because the contract was named. Passing
+shared references through a "display-only" transform is where display concerns become
+data corruption; name the non-mutation requirement in the spec, don't leave it as
+"pure is good style".
+
+### 4. `codex exec` operational update: background + stdin, and feed re-passes the fix list
+
+A foreground positional-arg run on this branch's diff hit the Bash 600s cap with zero
+output. The reliable shape: background run, prompt via stdin redirect, stdout/stderr
+to stable scratchpad files, and a re-pass prompt that (a) lists already-fixed findings
+so it hunts NEW issues, (b) demands a literal "CONVERGED — SHIP"/"NOT CONVERGED"
+final line. Three passes ran clean this way (find → fix → find → fix → converge),
+closing the loop the convergence rule requires.
+
+### 5. Tell subagents what NOT to do with git — specifically, no stash
+
+An SDD implementer stashed mid-task to check baseline behavior; the permission guard
+then blocked `stash pop` for the subagent AND the controller (correctly — pop is on
+the confirm list), stalling the task on a human decision (`git stash apply`, drop
+after commit). Cost: one interrupted task and a user interrupt. Since then every
+dispatch carries "do NOT use git stash — work directly on the tree", and none
+recurred. Generalization: subagent briefs should preempt the permission-gated verbs
+the task might tempt them into, not just describe the happy path.
+
+### 6. Bounded-claim curation is allowed to grow the list — deliberately
+
+Greptile flagged access_token/refresh_token missing from the builtin denylist. Under
+adversarial-convergence discipline the reflex is "never extend a denylist per
+finding" — but that rule targets unbounded ENCODING chases. This was list CURATION
+at review time (ubiquitous names, exact-match semantics, safe-by-default posture):
+we added them with an explicit sign-off note. The distinction to keep: extending
+against a new *spelling of the same value* = whack-a-mole (refuse); extending
+against a newly-recognized *field name in the bounded vocabulary* = curation (fine,
+deliberate, test-pinned).
