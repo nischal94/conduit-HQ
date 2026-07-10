@@ -884,3 +884,45 @@ we added them with an explicit sign-off note. The distinction to keep: extending
 against a new *spelling of the same value* = whack-a-mole (refuse); extending
 against a newly-recognized *field name in the bounded vocabulary* = curation (fine,
 deliberate, test-pinned).
+
+## 2026-07-10 — §18 list hygiene (PR #28): stacked PR through a squash-merge, and a mid-session worktree collision
+
+Short session in a spawned worktree: moved three locked decisions (egress pinning,
+UpstreamCaller trust, §11 redaction) out of §18's Deferred list into Resolved, spec
+pair regenerated, PR #28 merged. The lessons are all workflow, not product.
+
+### 1. Stacking a PR on an open branch works — until the parent squash-merges
+
+PR #28 was based on `feat/trace-redaction` (its §11 entry only existed there) with
+the PR targeted at the parent branch, correctly keeping the review diff minimal.
+Then #27 squash-merged: the parent's commits vanished from main's history, the
+child's merge-base stayed at the old fork point, and the auto-retargeted PR's diff
+swallowed all of #27. The fix is surgical, not a re-do: `git rebase --onto
+origin/main <old-parent-tip>` replants only the child's own commits (conflict-free
+here — the squash landed byte-identical content). Two repo-specific corollaries:
+(a) this repo squash-merges, so every stacked PR here will need this rebase after
+its parent lands — plan on it; (b) CodeRabbit auto-review skips PRs not based on
+main, so the routing rule's "CodeRabbit review" gate needs a manual `@coderabbitai
+review` after the retarget — the skip caveat rode as a PR comment so the merge
+sequence carried it.
+
+### 2. Two sessions, one `.git`: a companion session's cleanup can orphan a live worktree
+
+Mid-session, git died with "not a git repository": the spawning session's worktree
+cleanup had deleted `.git/worktrees/` — the shared admin dir — out from under this
+still-running session (later it removed the worktree directory and session branch
+too). Repair was three files: recreate `.git/worktrees/<id>/{HEAD,commondir,gitdir}`,
+then rebuild the index with `git read-tree HEAD` (not reset — read-tree leaves the
+working tree alone). Nothing was lost because everything was already pushed, which
+is the durable lesson: in multi-session work on this repo, push early — local-only
+state is the only thing a concurrent cleanup can actually destroy. Diagnostic
+shortcut: when git fails strangely inside a worktree, run
+`git -C <main-checkout> worktree list` first.
+
+### 3. When a decision flips status, move its spec entry in the same commit
+
+The §18 inconsistency existed because three decisions were LOCKED in prose but
+their entries stayed where they'd been drafted — the Deferred list — since that's
+where recent decisions were being appended (recency, not status). Cheap rule: the
+commit that records a decision's status change also moves it to the list that says
+so; placement is part of the decision record, not cosmetics.

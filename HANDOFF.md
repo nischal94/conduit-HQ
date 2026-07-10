@@ -84,14 +84,13 @@ LEARNINGS 2026-07-10 #4), /explain-diff + full-pass quiz, human-named merge.
 ### Housekeeping carry-overs (optional, not blocking)
 
 - ~~spec §18 list labeling~~ **DONE** — PR #28 (merged 2026-07-10, separate
-  spawned session) moved the locked decisions out of the "Deferred" list;
-  main is `ea42710`. Residue on this machine, if not already cleaned: the
-  spawned session's leftover worktree directory
-  `.claude/worktrees/youthful-leakey-b2ce69` (unregistered from git, contents
-  fully on main — safe to `rm -rf`) and its merged local branch
-  `claude/youthful-leakey-b2ce69` (safe to `git branch -d`). Also a stale
-  local branch `docs/execution-manager-design` from the CLOSED PR #25 —
-  deleting that one discards nothing merged, so it's the user's call (`-D`).
+  spawned session) moved the locked decisions out of the "Deferred" list.
+  All residue from that work is CLEANED (verified 2026-07-10, same session):
+  the spawned worktree, its registration, and its session branch are gone;
+  `docs/execution-manager-design` (closed PR #25) was deleted with the
+  user's explicit OK; orphaned `branch.*` git-config sections removed. Local
+  branches are exactly `main`. Nothing left to clean from this item —
+  workflow lessons recorded in LEARNINGS 2026-07-10 (§18 list hygiene).
 - Aikido SAST MCP still not connected (needs `/aikido:setup` in the user's
   terminal) — CI Socket + secrets scan cover supply-chain/secrets meanwhile.
 
