@@ -186,6 +186,11 @@ describe("createToolInvoker (spec §5.3)", () => {
     // stringify left on the trace path is redact-then-slice, and the
     // redactor replaces back-references with "[redacted]" — so the call
     // succeeds and no raw TypeError can cross into the sandbox.
+    // Module-boundary note: this pins invoker-level behavior only — a
+    // circular upstream result still faults system-wide one layer up, since
+    // the manager's untouched credential scrub (execution/scrub.ts, called
+    // from the manager.ts journal barrier) throws on JSON.stringify of a
+    // circular value and that gets classified as infra.
     const circular: Record<string, unknown> = {};
     circular.self = circular;
     const badCaller: UpstreamCaller = {
@@ -544,7 +549,7 @@ describe("createToolInvoker (spec §5.3)", () => {
     });
   });
 
-  it("§11: appendTrace masks builtin + per-tool keys in input and outputSummary, on allowed and refused calls", async () => {
+  it("INVARIANT §11: Trace inputs and output summaries are redacted per policy (builtins + redactFields) on every verdict path, and the Trace stores no full output", async () => {
     await store.policies.upsert({
       toolName: "github.list_issues",
       action: "allow",
@@ -572,6 +577,9 @@ describe("createToolInvoker (spec §5.3)", () => {
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyDenied });
     const refused = (await store.trace.listByExecution("exec_redact"))[1];
     expect(refused?.input).toEqual({ password: "[redacted]", repo: "hq" });
+
+    const all = await store.trace.listByExecution("exec_redact");
+    expect(all.every((event) => !("output" in event))).toBe(true);
   });
 
   it("§11: the upstream call itself still receives the UNREDACTED input (redaction is trace-only)", async () => {
