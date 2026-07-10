@@ -1,4 +1,5 @@
 import type { Client, Row } from "@libsql/client";
+import { redactSensitiveFields } from "../pipeline/redact.js";
 import type { SecretBox } from "../secrets.js";
 import type {
   Connection,
@@ -67,7 +68,8 @@ const SCHEMA = [
     tool_name TEXT PRIMARY KEY,
     action TEXT NOT NULL CHECK (action IN ('allow', 'require_approval', 'block')),
     seeded_from TEXT NOT NULL CHECK (seeded_from IN ('safe', 'review', 'destructive')),
-    manual_override INTEGER NOT NULL CHECK (manual_override IN (0, 1))
+    manual_override INTEGER NOT NULL CHECK (manual_override IN (0, 1)),
+    redact_fields TEXT NOT NULL DEFAULT '[]'
   )`,
   `CREATE TABLE IF NOT EXISTS executions (
     id TEXT PRIMARY KEY,
@@ -87,7 +89,6 @@ const SCHEMA = [
     connection_prefix TEXT NOT NULL,
     input TEXT NOT NULL,
     output_summary TEXT,
-    output TEXT,
     upstream_status INTEGER,
     latency_ms INTEGER,
     policy_verdict TEXT NOT NULL CHECK (policy_verdict IN ('allow', 'require_approval', 'block')),
@@ -113,18 +114,65 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   const { client, secretBox } = options;
   await client.batch(SCHEMA, "write");
 
-  // trace_events.output arrived after the first shipped schema; CREATE TABLE
-  // IF NOT EXISTS never retrofits an existing table, so add the column here.
-  const traceColumns = await client.execute("PRAGMA table_info(trace_events)");
-  if (!traceColumns.rows.some((row) => row.name === "output")) {
-    await client.execute("ALTER TABLE trace_events ADD COLUMN output TEXT");
-  }
-
   // executions.resume_attempt arrived after the first shipped schema; same
-  // retrofit as trace_events.output above.
+  // retrofit as trace_events.output below.
   const executionColumns = await client.execute("PRAGMA table_info(executions)");
   if (!executionColumns.rows.some((row) => row.name === "resume_attempt")) {
     await client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT");
+  }
+
+  // policies.redact_fields arrived with §11 redaction; same retrofit
+  // pattern as trace_events.output below. Must run BEFORE the trace_events
+  // migration below, which SELECTs this column to build per-tool masking.
+  const policyColumns = await client.execute("PRAGMA table_info(policies)");
+  if (!policyColumns.rows.some((row) => row.name === "redact_fields")) {
+    await client.execute(
+      "ALTER TABLE policies ADD COLUMN redact_fields TEXT NOT NULL DEFAULT '[]'",
+    );
+  }
+
+  // Pre-§11 schemas carried a full trace_events.output payload for replay;
+  // after the D4 split replay reads only replay_journal, and §11 drops the
+  // field (design R3). A DB that still has the column predates §11 entirely,
+  // so its trace rows were written unredacted: mask them once (input via
+  // the current builtin + per-tool keys; summaries are truncated raw
+  // serializations — unscannable scalars — so they are replaced wholesale),
+  // then DROP the column. The column's absence marks the migration done.
+  // Runs AFTER the policies.redact_fields retrofit above (this block SELECTs
+  // that column).
+  const traceColumns = await client.execute("PRAGMA table_info(trace_events)");
+  if (traceColumns.rows.some((row) => row.name === "output")) {
+    const policyRows = await client.execute("SELECT tool_name, redact_fields FROM policies");
+    const extrasByTool = new Map<string, string[]>();
+    for (const row of policyRows.rows) {
+      try {
+        const parsed: unknown = JSON.parse(String(row.redact_fields));
+        if (Array.isArray(parsed) && parsed.every((f): f is string => typeof f === "string")) {
+          extrasByTool.set(String(row.tool_name), parsed);
+        }
+      } catch {
+        // A malformed row fails the policy read path loudly elsewhere;
+        // for the one-time migration, builtins-only is the fail-closed floor.
+      }
+    }
+    const traceRows = await client.execute(
+      "SELECT call_id, tool_name, input, output_summary FROM trace_events",
+    );
+    for (const row of traceRows.rows) {
+      const extras = extrasByTool.get(String(row.tool_name)) ?? [];
+      let input: string;
+      try {
+        input = JSON.stringify(redactSensitiveFields(JSON.parse(String(row.input)), extras));
+      } catch {
+        input = JSON.stringify("[redacted:pre-§11]"); // unparseable → fail closed
+      }
+      const summary = row.output_summary === null ? null : JSON.stringify("[redacted:pre-§11]");
+      await client.execute({
+        sql: "UPDATE trace_events SET input = ?, output_summary = ?, output = NULL WHERE call_id = ?",
+        args: [input, summary, String(row.call_id)],
+      });
+    }
+    await client.execute("ALTER TABLE trace_events DROP COLUMN output");
   }
 
   return {
@@ -269,12 +317,19 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
     policies: {
       async upsert(policy: Policy): Promise<void> {
         await client.execute({
-          sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override)
-                VALUES (?, ?, ?, ?)
+          sql: `INSERT INTO policies (tool_name, action, seeded_from, manual_override, redact_fields)
+                VALUES (?, ?, ?, ?, ?)
                 ON CONFLICT(tool_name) DO UPDATE SET
                   action = excluded.action, seeded_from = excluded.seeded_from,
-                  manual_override = excluded.manual_override`,
-          args: [policy.toolName, policy.action, policy.seededFrom, policy.manualOverride ? 1 : 0],
+                  manual_override = excluded.manual_override,
+                  redact_fields = excluded.redact_fields`,
+          args: [
+            policy.toolName,
+            policy.action,
+            policy.seededFrom,
+            policy.manualOverride ? 1 : 0,
+            JSON.stringify(policy.redactFields),
+          ],
         });
       },
       async get(toolName: string): Promise<Policy | undefined> {
@@ -387,8 +442,8 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         await client.execute({
           sql: `INSERT INTO trace_events
                   (call_id, execution_id, tool_name, connection_prefix, input,
-                   output_summary, output, upstream_status, latency_ms, policy_verdict, at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                   output_summary, upstream_status, latency_ms, policy_verdict, at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
             event.callId,
             event.executionId,
@@ -396,7 +451,6 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             event.connectionPrefix,
             JSON.stringify(event.input ?? null),
             event.outputSummary === undefined ? null : JSON.stringify(event.outputSummary),
-            event.output === undefined ? null : JSON.stringify(event.output),
             event.upstreamStatus ?? null,
             event.latencyMs ?? null,
             event.policyVerdict,
@@ -738,7 +792,31 @@ function rowToPolicy(row: Row): Policy {
       `[SqliteStore] Failed to read policy: manual_override must be 0 or 1. Context: { toolName: ${JSON.stringify(toolName)}, got: ${manualOverride} }`,
     );
   }
-  return { toolName, action, seededFrom, manualOverride: manualOverride === 1 };
+  const redactFieldsText = text(row, "redact_fields");
+  let redactFieldsParsed: unknown;
+  try {
+    redactFieldsParsed = JSON.parse(redactFieldsText);
+  } catch (cause) {
+    throw new Error(
+      `[SqliteStore] Failed to read policy: redact_fields is not valid JSON. Context: { toolName: ${JSON.stringify(toolName)} }`,
+      { cause },
+    );
+  }
+  if (
+    !Array.isArray(redactFieldsParsed) ||
+    !redactFieldsParsed.every((field): field is string => typeof field === "string")
+  ) {
+    throw new Error(
+      `[SqliteStore] Failed to read policy: redact_fields must be a JSON array of strings. Context: { toolName: ${JSON.stringify(toolName)} }`,
+    );
+  }
+  return {
+    toolName,
+    action,
+    seededFrom,
+    manualOverride: manualOverride === 1,
+    redactFields: redactFieldsParsed,
+  };
 }
 
 function rowToTraceEvent(row: Row): TraceEvent {
@@ -769,13 +847,13 @@ function rowToTraceEvent(row: Row): TraceEvent {
   };
   const outputSummary = maybeText(row, "output_summary");
   if (outputSummary !== undefined) {
-    event.outputSummary = parseJson(outputSummary, (cause) =>
+    const parsed = parseJson(outputSummary, (cause) =>
       traceReadError("output_summary is not valid JSON", cause),
     );
-  }
-  const output = maybeText(row, "output");
-  if (output !== undefined) {
-    event.output = parseJson(output, (cause) => traceReadError("output is not valid JSON", cause));
+    if (typeof parsed !== "string") {
+      throw traceReadError("output_summary is not a string");
+    }
+    event.outputSummary = parsed;
   }
   const upstreamStatus = maybeInteger(row, "upstream_status");
   if (upstreamStatus !== undefined) {

@@ -12,6 +12,7 @@ import {
   policyError,
   upstreamError,
 } from "./errors.js";
+import { redactSensitiveFields } from "./redact.js";
 import type { UpstreamCaller, UpstreamOutcome } from "./upstream.js";
 
 /**
@@ -114,7 +115,7 @@ async function runCall(
   // 2. Policy. Allow-list discipline (policy.ts contract): proceed ONLY on
   //    "allow"; a store rejection is a failed call, never a verdict. Skipped
   //    entirely when an operator decision already resolved this call.
-  const verdict =
+  let verdict =
     decisionVerdict ??
     (await deps.policy
       .evaluate({
@@ -124,6 +125,18 @@ async function runCall(
       .catch((cause) => {
         throw infraError(cause, log);
       }));
+  if (decisionVerdict !== undefined) {
+    // §11 (design R4): the D6 decision branch skips the policy engine, so
+    // the synthetic verdict carries no per-tool redactFields. Fetch them
+    // here — one extra row read on the rare resume path only — so the
+    // approved call's audit row is redacted identically to the policy path.
+    // Deliberately fail-closed: a store failure here aborts the call as
+    // infra rather than silently degrading to builtin-only redaction.
+    const row = await deps.store.policies.get(path).catch((cause) => {
+      throw infraError(cause, log);
+    });
+    verdict = { ...decisionVerdict, redactFields: row?.redactFields ?? [] };
+  }
   // Unknown tool: fail closed as blocked regardless of the verdict. The
   // built-in engine returns block/unknown_tool here; a custom engine that
   // returns "allow" for a tool absent from the catalog still cannot proceed
@@ -137,6 +150,7 @@ async function runCall(
           ? `Unknown tool "${path}": not in the catalog, so it is blocked.`
           : verdict.reason,
       source: verdict.source,
+      redactFields: verdict.redactFields,
     };
     await appendTrace(deps, options, log, { path, input, verdict: blocked });
     throw policyError("block", blocked.reason);
@@ -266,9 +280,19 @@ function resolveDecisionVerdict(
     return undefined;
   }
   if (decision.kind === "approve") {
-    return { action: "allow", reason: "operator approved this call on resume", source: "override" };
+    return {
+      action: "allow",
+      reason: "operator approved this call on resume",
+      source: "override",
+      redactFields: [],
+    };
   }
-  return { action: "block", reason: "operator denied this call on resume", source: "override" };
+  return {
+    action: "block",
+    reason: "operator denied this call on resume",
+    source: "override",
+    redactFields: [],
+  };
 }
 
 /**
@@ -327,14 +351,20 @@ async function appendTrace(
     // Refusals are traced before any connection is engaged: empty prefix
     // records exactly that.
     connectionPrefix: details.connection?.prefix ?? "",
-    input: details.input,
+    // §11: the audit row is redacted at append time (builtins + the
+    // verdict's per-tool additions). Non-mutating by contract (redact.ts)
+    // — the caller's `input` reference is journaled for replay later.
+    input: redactSensitiveFields(details.input, details.verdict.redactFields),
     policyVerdict: details.verdict.action,
     at: Date.now(),
   };
   if (details.outcome !== undefined) {
     const output = details.outcome.result ?? null;
-    event.output = output;
-    event.outputSummary = JSON.stringify(output).slice(0, 160);
+    // §11 R7: redact BEFORE slicing, so a sensitive value's head cannot
+    // leak through the 160-char display cap.
+    event.outputSummary = JSON.stringify(
+      redactSensitiveFields(output, details.verdict.redactFields),
+    ).slice(0, 160);
     event.upstreamStatus = details.outcome.status;
     event.latencyMs = details.outcome.latencyMs;
   }

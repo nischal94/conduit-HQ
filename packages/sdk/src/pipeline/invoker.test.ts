@@ -140,6 +140,7 @@ describe("createToolInvoker (spec §5.3)", () => {
       action: "block",
       seededFrom: "safe",
       manualOverride: true,
+      redactFields: [],
     });
     await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
       name: GUEST_ERROR_NAMES.policyBlocked,
@@ -160,6 +161,7 @@ describe("createToolInvoker (spec §5.3)", () => {
           action: "allow" as const,
           reason: "allowed by default",
           source: "default" as const,
+          redactFields: [] as const,
         }),
     };
     const { caller, requests } = recordingUpstream();
@@ -177,10 +179,18 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(trace[0]?.policyVerdict).toBe("block"); // honest audit, not "allow"
   });
 
-  it("a non-serializable result from a custom caller becomes infra, never a raw throw (H1)", async () => {
-    // The A5 extension seam: a caller returning a circular structure makes
-    // JSON.stringify throw. The outermost classification must catch it so no
-    // raw TypeError crosses into the sandbox.
+  it("a non-serializable result from a custom caller no longer faults the call — the trace stores only the cycle-safe summary (H1, revised by §11 R3)", async () => {
+    // The A5 extension seam: pre-§11 the raw result was stringified into
+    // trace_events.output, so a circular structure threw and had to be
+    // classified as infra. §11 drops that field (design R3); the only
+    // stringify left on the trace path is redact-then-slice, and the
+    // redactor replaces back-references with "[redacted]" — so the call
+    // succeeds and no raw TypeError can cross into the sandbox.
+    // Module-boundary note: this pins invoker-level behavior only — a
+    // circular upstream result still faults system-wide one layer up, since
+    // the manager's untouched credential scrub (execution/scrub.ts, called
+    // from the manager.ts journal barrier) throws on JSON.stringify of a
+    // circular value and that gets classified as infra.
     const circular: Record<string, unknown> = {};
     circular.self = circular;
     const badCaller: UpstreamCaller = {
@@ -189,16 +199,10 @@ describe("createToolInvoker (spec §5.3)", () => {
     const log = vi.fn();
     const invoke = createToolInvoker(deps(badCaller), { executionId: "exec_h1", log });
 
-    let thrown: unknown;
-    try {
-      await invoke("github.list_issues", {});
-    } catch (error) {
-      thrown = error;
-    }
-    const error = thrown as Error;
-    expect(error.name).toBe(GUEST_ERROR_NAMES.infra);
-    expect(error.message).not.toMatch(/circular/i); // structure detail stays host-side
-    expect(log).toHaveBeenCalled();
+    const result = await invoke("github.list_issues", {});
+    expect(result).toBe(circular);
+    const [event] = await store.trace.listByExecution("exec_h1");
+    expect(event?.outputSummary).toBe('{"self":"[redacted]"}');
   });
 
   it("proceeds only on allow — a policy-store rejection fails the call as infra, not a verdict", async () => {
@@ -342,7 +346,7 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(requests).toHaveLength(0);
   });
 
-  it("a successful call appends one TraceEvent with output, latency, status, verdict allow", async () => {
+  it("a successful call appends one TraceEvent with summary, latency, status, verdict allow", async () => {
     const upstreamResult = { content: [{ type: "text", text: "3 open issues" }] };
     const { caller } = recordingUpstream(upstreamResult);
     const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
@@ -356,7 +360,6 @@ describe("createToolInvoker (spec §5.3)", () => {
     expect(event?.toolName).toBe("github.list_issues");
     expect(event?.connectionPrefix).toBe(PREFIX);
     expect(event?.input).toEqual({ owner: "acme" });
-    expect(event?.output).toEqual(upstreamResult);
     expect(event?.outputSummary).toBe(JSON.stringify(upstreamResult).slice(0, 160));
     expect(event?.upstreamStatus).toBe(200);
     expect(event?.latencyMs).toBe(7);
@@ -544,5 +547,53 @@ describe("createToolInvoker (spec §5.3)", () => {
       await expect(denied).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyDenied });
       expect(requests).toHaveLength(1);
     });
+  });
+
+  it("INVARIANT §11: Trace inputs and output summaries are redacted per policy (builtins + redactFields) on every verdict path, and the Trace stores no full output", async () => {
+    await store.policies.upsert({
+      toolName: "github.list_issues",
+      action: "allow",
+      seededFrom: "safe",
+      manualOverride: false,
+      redactFields: ["repo_label"],
+    });
+    const { caller } = recordingUpstream({
+      content: [{ password: "echoed-pw", repoLabel: "internal", ok: true }],
+    });
+    const invoke = createToolInvoker(deps(caller), { executionId: "exec_redact", log: vi.fn() });
+
+    await invoke("github.list_issues", { token: "sk-live", repo_label: "internal", repo: "hq" });
+
+    const [event] = await store.trace.listByExecution("exec_redact");
+    expect(event?.input).toEqual({ token: "[redacted]", repo_label: "[redacted]", repo: "hq" });
+    const summary = String(event?.outputSummary);
+    expect(summary).not.toContain("echoed-pw");
+    expect(summary).not.toContain("internal");
+    expect(summary).toContain("[redacted]");
+
+    // Refusal path: the destructive tool's refusal row is redacted too.
+    // (require_approval surfaces as ConduitPolicyDenied — errors.ts policyError.)
+    const attempt = invoke("github.delete_repo", { password: "pw", repo: "hq" });
+    await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyDenied });
+    const refused = (await store.trace.listByExecution("exec_redact"))[1];
+    expect(refused?.input).toEqual({ password: "[redacted]", repo: "hq" });
+
+    const all = await store.trace.listByExecution("exec_redact");
+    expect(all.every((event) => !("output" in event))).toBe(true);
+  });
+
+  it("§11: the upstream call itself still receives the UNREDACTED input (redaction is trace-only)", async () => {
+    const { caller, requests } = recordingUpstream();
+    const invoke = createToolInvoker(deps(caller), { executionId: "exec_live", log: vi.fn() });
+    await invoke("github.list_issues", { token: "sk-live", repo: "hq" });
+    expect(requests[0]?.input).toEqual({ token: "sk-live", repo: "hq" });
+  });
+
+  it("§11: a sensitive value's head never leaks through the 160-char summary slice (redact-then-slice, R7)", async () => {
+    const { caller } = recordingUpstream({ secret: `sk-${"x".repeat(400)}`, note: "fine" });
+    const invoke = createToolInvoker(deps(caller), { executionId: "exec_slice", log: vi.fn() });
+    await invoke("github.list_issues", {});
+    const [event] = await store.trace.listByExecution("exec_slice");
+    expect(String(event?.outputSummary)).not.toContain("sk-x");
   });
 });

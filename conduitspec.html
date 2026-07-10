@@ -892,6 +892,17 @@ installs, and a hostile one already holds the secret in its own <code>call()</co
 smuggling it back through the invoker buys an attacker nothing. If Conduit ever runs
 operator-untrusted caller plugins, this decision reopens and the invoker gains its own output/name
 validation. (Decided 2026-07-08 after a codex adversarial re-pass raised both as findings.)</li>
+<li><strong>§11 Trace redaction mechanism (2026-07-10):</strong> ✅ <strong>write-time redaction at
+the Trace append choke point</strong> — a builtin sensitive-key list (normalized exact matching) plus
+per-tool <code>redactFields</code> on the Policy row, riding the <code>PolicyVerdict</code>. The full
+<code>TraceEvent.output</code> is dropped from the Trace (redact-by-not-storing). A pre-§11 database
+is migrated once on open: its trace rows' <code>input</code> is masked with the then-current builtin +
+per-tool keys, legacy summaries (truncated raw serializations) are replaced wholesale with a marker,
+and the legacy <code>output</code> column is dropped — the column's absence marks the migration done.
+The full result lives only in the §5.5 replay journal, which stays semantically unredacted (D7). Not
+retroactive for policy changes: editing <code>redactFields</code> later masks future rows only. <code>PendingApproval.input</code> stays
+unredacted — the approver decides on real values. Display hygiene, not a boundary: the credential
+boundary remains §9.2's request-scoped, never-persisted credentials.</li>
 </ol>
 <hr>
 <h2 id="19-branding-naming">19. Branding / naming</h2>

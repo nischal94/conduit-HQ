@@ -133,6 +133,7 @@ describe("SqliteStore", () => {
         action: "block",
         seededFrom: "review",
         manualOverride: true,
+        redactFields: [],
       });
 
       // Source refresh: tool re-ingested (schema changed upstream).
@@ -143,6 +144,39 @@ describe("SqliteStore", () => {
       const policy = await store.policies.get("github.issues.create");
       expect(policy?.action).toBe("block");
       expect(policy?.manualOverride).toBe(true);
+    });
+
+    it("§11: policies round-trip redactFields, and a pre-§11 DB is retrofitted with the column", async () => {
+      // Round-trip on a fresh store.
+      await store.policies.upsert({
+        toolName: "github.list_issues",
+        action: "allow",
+        seededFrom: "safe",
+        manualOverride: false,
+        redactFields: ["customer_email"],
+      });
+      const row = await store.policies.get("github.list_issues");
+      expect(row?.redactFields).toEqual(["customer_email"]);
+
+      // Legacy DB: create a policies table WITHOUT redact_fields, then reopen.
+      const legacy = createClient({ url: ":memory:" });
+      await legacy.execute(`CREATE TABLE policies (
+        tool_name TEXT PRIMARY KEY,
+        action TEXT NOT NULL CHECK (action IN ('allow', 'require_approval', 'block')),
+        seeded_from TEXT NOT NULL CHECK (seeded_from IN ('safe', 'review', 'destructive')),
+        manual_override INTEGER NOT NULL CHECK (manual_override IN (0, 1))
+      )`);
+      await legacy.execute({
+        sql: "INSERT INTO policies (tool_name, action, seeded_from, manual_override) VALUES (?, ?, ?, ?)",
+        args: ["github.delete_repo", "block", "destructive", 1],
+      });
+      const reopened = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+      const migrated = await reopened.policies.get("github.delete_repo");
+      expect(migrated?.redactFields).toEqual([]);
+      expect(migrated?.manualOverride).toBe(true);
     });
   });
 
@@ -224,23 +258,21 @@ describe("SqliteStore", () => {
       expect(events.map((e) => e.toolName)).toEqual(["a.first", "a.second", "a.third"]);
     });
 
-    it("round-trips TraceEvent.output through the trace table", async () => {
+    it("round-trips TraceEvent.outputSummary through the trace table", async () => {
       await store.trace.append({
         callId: "call_out",
         executionId: "exec_out",
         toolName: "a.tool",
         connectionPrefix: "a.org.main",
         input: { q: 1 },
-        output: { issues: [{ id: 1, title: "Fix login bug" }] },
-        outputSummary: { truncated: true },
+        outputSummary: '{"truncated":true}',
         upstreamStatus: 200,
         latencyMs: 12,
         policyVerdict: "allow",
         at: 1,
       });
       const [event] = await store.trace.listByExecution("exec_out");
-      expect(event?.output).toEqual({ issues: [{ id: 1, title: "Fix login bug" }] });
-      expect(event?.outputSummary).toEqual({ truncated: true });
+      expect(event?.outputSummary).toBe('{"truncated":true}');
     });
 
     it("omits output on rows that never had one (denied/failed calls)", async () => {
@@ -255,6 +287,82 @@ describe("SqliteStore", () => {
       });
       const [event] = await store.trace.listByExecution("exec_denied");
       expect(event && "output" in event).toBe(false);
+    });
+
+    it("§11: a pre-§11 trace table is masked once on open and the legacy output column is dropped", async () => {
+      // Legacy DB with a populated output column (pre-§11 schema) and a
+      // sensitive input that predates redaction entirely.
+      const legacy = createClient({ url: ":memory:" });
+      await legacy.execute(`CREATE TABLE trace_events (
+        seq INTEGER PRIMARY KEY AUTOINCREMENT,
+        call_id TEXT NOT NULL UNIQUE,
+        execution_id TEXT NOT NULL,
+        tool_name TEXT NOT NULL,
+        connection_prefix TEXT NOT NULL,
+        input TEXT NOT NULL,
+        output_summary TEXT,
+        output TEXT,
+        upstream_status INTEGER,
+        latency_ms INTEGER,
+        policy_verdict TEXT NOT NULL CHECK (policy_verdict IN ('allow', 'require_approval', 'block')),
+        at INTEGER NOT NULL
+      )`);
+      await legacy.execute({
+        sql: `INSERT INTO trace_events
+                (call_id, execution_id, tool_name, connection_prefix, input,
+                 output_summary, output, policy_verdict, at)
+              VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        args: [
+          "c1",
+          "e1",
+          "github.list_issues",
+          "p",
+          '{"token":"sk-legacy","repo":"hq"}',
+          '"s"',
+          '{"password":"leak"}',
+          "allow",
+          1,
+        ],
+      });
+      const reopened = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+
+      // (a) the legacy output column is gone entirely — its absence is the
+      // migration's completion marker.
+      const columns = await legacy.execute("PRAGMA table_info(trace_events)");
+      expect(columns.rows.some((row) => row.name === "output")).toBe(false);
+
+      // (b) the legacy row is masked, not merely purged: sensitive input
+      // fields are redacted, and the summary — an unscannable truncated
+      // scalar — is replaced wholesale.
+      const [migratedEvent] = await reopened.trace.listByExecution("e1");
+      expect(migratedEvent?.input).toEqual({ token: "[redacted]", repo: "hq" });
+      expect(migratedEvent?.outputSummary).toBe("[redacted:pre-§11]");
+
+      // (c) idempotent: a second reopen against the now-columnless table is
+      // a no-op (the migration block is skipped) and does not throw.
+      const reopenedAgain = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+      const stillMasked = await reopenedAgain.trace.listByExecution("e1");
+      expect(stillMasked[0]?.input).toEqual({ token: "[redacted]", repo: "hq" });
+
+      // (d) new writes still work and carry no output.
+      await reopenedAgain.trace.append({
+        callId: "c2",
+        executionId: "e1",
+        toolName: "github.list_issues",
+        connectionPrefix: "p",
+        input: { a: 1 },
+        policyVerdict: "allow",
+        at: 2,
+      });
+      const events = await reopenedAgain.trace.listByExecution("e1");
+      expect(events).toHaveLength(2);
+      expect(events.every((event) => !("output" in event))).toBe(true);
     });
   });
 
@@ -456,6 +564,7 @@ describe("SqliteStore", () => {
         action: "block",
         seededFrom: "review",
         manualOverride: true,
+        redactFields: [],
       });
       // manual_override 0 is the other legal boundary value: it must read
       // back as false, never be rejected by the 0/1 guard.
@@ -465,6 +574,7 @@ describe("SqliteStore", () => {
         action: "allow",
         seededFrom: "safe",
         manualOverride: false,
+        redactFields: [],
       });
     });
 
@@ -494,12 +604,19 @@ describe("SqliteStore", () => {
       for (const [i, action] of actions.entries()) {
         for (const [j, seededFrom] of riskClasses.entries()) {
           const toolName = `vocab.a${i}s${j}`;
-          await store.policies.upsert({ toolName, action, seededFrom, manualOverride: true });
+          await store.policies.upsert({
+            toolName,
+            action,
+            seededFrom,
+            manualOverride: true,
+            redactFields: [],
+          });
           expect(await store.policies.get(toolName)).toEqual({
             toolName,
             action,
             seededFrom,
             manualOverride: true,
+            redactFields: [],
           });
         }
       }
@@ -548,9 +665,9 @@ describe("SqliteStore", () => {
       );
     });
 
-    it("opens a legacy database created without the output column and reads NULL as absent", async () => {
-      // The legacy fixture's trace_events predates TraceEvent.output;
-      // openSqliteStore's ALTER-if-missing migration ran in beforeEach.
+    it("opens a legacy database that never had an output column without error", async () => {
+      // The legacy fixture's trace_events predates the (now-removed) output
+      // column entirely; the purge-if-present migration is a no-op here.
       await legacy.execute({
         sql: `INSERT INTO trace_events
                 (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at)
@@ -560,63 +677,6 @@ describe("SqliteStore", () => {
       const [event] = await legacyStore.trace.listByExecution("exec_legacy");
       expect(event?.callId).toBe("call_legacy");
       expect(event && "output" in event).toBe(false);
-    });
-
-    it("migrates the legacy trace table so new appends can store output", async () => {
-      await legacyStore.trace.append({
-        callId: "call_migrated",
-        executionId: "exec_migrated",
-        toolName: "x.search",
-        connectionPrefix: "x.acme.prod",
-        input: null,
-        output: { hits: 3 },
-        policyVerdict: "allow",
-        at: 1000,
-      });
-      const [event] = await legacyStore.trace.listByExecution("exec_migrated");
-      expect(event?.output).toEqual({ hits: 3 });
-    });
-
-    it("re-opening an already-migrated legacy database is idempotent", async () => {
-      // The production upgrade path: the ALTER ran once in beforeEach; a
-      // second open must detect the column and not re-run it.
-      const reopened = await openSqliteStore({
-        client: legacy,
-        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
-      });
-      await reopened.trace.append({
-        callId: "call_reopen",
-        executionId: "exec_reopen",
-        toolName: "x.search",
-        connectionPrefix: "x.acme.prod",
-        input: null,
-        output: { ok: true },
-        policyVerdict: "allow",
-        at: 1000,
-      });
-      const [event] = await reopened.trace.listByExecution("exec_reopen");
-      expect(event?.output).toEqual({ ok: true });
-    });
-
-    it("corrupt JSON in output fails loudly with the [SqliteStore] format", async () => {
-      await legacy.execute({
-        sql: `INSERT INTO trace_events
-                (call_id, execution_id, tool_name, connection_prefix, input, output, policy_verdict, at)
-              VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-        args: [
-          "call_bad",
-          "exec_bad",
-          "x.search",
-          "x.acme.prod",
-          "null",
-          "{not json",
-          "allow",
-          1000,
-        ],
-      });
-      await expect(legacyStore.trace.listByExecution("exec_bad")).rejects.toThrow(
-        /\[SqliteStore\] Failed to read trace event: output is not valid JSON/,
-      );
     });
 
     it("accepts every source type, execution status, and trace verdict (exhaustiveness pin)", async () => {

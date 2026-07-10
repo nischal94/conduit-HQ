@@ -1020,4 +1020,26 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const retry = await manager.resume(id, { kind: "approve" });
     expect(retry.status).toBe("conflict");
   });
+
+  it("§11 (D7 guard): the replay journal keeps the semantically-unredacted request while the Trace row is redacted", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+
+    // list_issues is riskClass safe → auto-allowed. The input carries a
+    // builtin-sensitive key: the journal must keep it, the Trace must mask it.
+    const code = `return await tools.github.list_issues({ owner: "acme", token: "sk-fixture" });`;
+    const outcome = await manager.start(code);
+    expect(outcome.status).toBe("completed");
+
+    const journal = await h.store.replayJournal.listByExecution(outcome.executionId);
+    const callRow = journal.find((row) => row.op === "call");
+    expect(callRow).toBeDefined();
+    // Replay fidelity: the journaled REQUEST carries the raw input.
+    expect(callRow?.request).toContain("sk-fixture");
+
+    const [trace] = await h.store.trace.listByExecution(outcome.executionId);
+    expect(JSON.stringify(trace?.input)).not.toContain("sk-fixture");
+    expect(JSON.stringify(trace?.input)).toContain("[redacted]");
+  });
 });
