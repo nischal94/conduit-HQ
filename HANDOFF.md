@@ -83,12 +83,15 @@ LEARNINGS 2026-07-10 #4), /explain-diff + full-pass quiz, human-named merge.
 
 ### Housekeeping carry-overs (optional, not blocking)
 
-- **spec §18 list labeling:** three fully-locked decisions (egress pinning,
-  UpstreamCaller trust, §11 mechanism) sit under the "Deferred" `<ol>` — move
-  them to "Resolved (locked)" or retitle (prose-only spec edit + `html2md.py`,
-  PR route since the spec pair is protected-floor). A session chip was spawned
-  for this (task_0a726531) but chips don't survive restarts — this line is the
-  durable record.
+- ~~spec §18 list labeling~~ **DONE** — PR #28 (merged 2026-07-10, separate
+  spawned session) moved the locked decisions out of the "Deferred" list;
+  main is `ea42710`. Residue on this machine, if not already cleaned: the
+  spawned session's leftover worktree directory
+  `.claude/worktrees/youthful-leakey-b2ce69` (unregistered from git, contents
+  fully on main — safe to `rm -rf`) and its merged local branch
+  `claude/youthful-leakey-b2ce69` (safe to `git branch -d`). Also a stale
+  local branch `docs/execution-manager-design` from the CLOSED PR #25 —
+  deleting that one discards nothing merged, so it's the user's call (`-D`).
 - Aikido SAST MCP still not connected (needs `/aikido:setup` in the user's
   terminal) — CI Socket + secrets scan cover supply-chain/secrets meanwhile.
 
