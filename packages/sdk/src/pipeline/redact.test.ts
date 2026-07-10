@@ -8,6 +8,8 @@ describe("redactSensitiveFields (spec §11, design R2/R5)", () => {
       password: "hunter2",
       nested: { api_key: "sk-123", keep: "visible" },
       items: [{ "X-API-Key": "sk-456", id: 7 }, { Authorization: "Bearer abc" }],
+      access_token: "at-1",
+      refresh_token: "rt-1",
     };
     const out = redactSensitiveFields(input, []) as Record<string, unknown>;
     expect(out).toEqual({
@@ -15,6 +17,8 @@ describe("redactSensitiveFields (spec §11, design R2/R5)", () => {
       password: "[redacted]",
       nested: { api_key: "[redacted]", keep: "visible" },
       items: [{ "X-API-Key": "[redacted]", id: 7 }, { Authorization: "[redacted]" }],
+      access_token: "[redacted]",
+      refresh_token: "[redacted]",
     });
   });
 

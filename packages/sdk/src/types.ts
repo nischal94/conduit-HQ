@@ -122,9 +122,10 @@ export interface TraceEvent {
   /** Redacted at append time (§11): builtin sensitive keys + the tool
    * policy's redactFields are masked before the row is written. */
   input: unknown;
-  /** Display projection: redact-then-slice of the upstream result (§11).
-   * The full result lives only in the replay journal (D4/D7). */
-  outputSummary?: unknown;
+  /** Display projection: redact-then-slice of the upstream result (§11),
+   * always a serialized string. The full result lives only in the replay
+   * journal (D4/D7). */
+  outputSummary?: string;
   upstreamStatus?: number;
   latencyMs?: number;
   policyVerdict: PolicyAction;

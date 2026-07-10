@@ -265,14 +265,14 @@ describe("SqliteStore", () => {
         toolName: "a.tool",
         connectionPrefix: "a.org.main",
         input: { q: 1 },
-        outputSummary: { truncated: true },
+        outputSummary: '{"truncated":true}',
         upstreamStatus: 200,
         latencyMs: 12,
         policyVerdict: "allow",
         at: 1,
       });
       const [event] = await store.trace.listByExecution("exec_out");
-      expect(event?.outputSummary).toEqual({ truncated: true });
+      expect(event?.outputSummary).toBe('{"truncated":true}');
     });
 
     it("omits output on rows that never had one (denied/failed calls)", async () => {
@@ -289,8 +289,9 @@ describe("SqliteStore", () => {
       expect(event && "output" in event).toBe(false);
     });
 
-    it("§11: a legacy trace_events.output column is purged on open, and new writes never populate it", async () => {
-      // Legacy DB with a populated output column (pre-§11 schema).
+    it("§11: a pre-§11 trace table is masked once on open and the legacy output column is dropped", async () => {
+      // Legacy DB with a populated output column (pre-§11 schema) and a
+      // sensitive input that predates redaction entirely.
       const legacy = createClient({ url: ":memory:" });
       await legacy.execute(`CREATE TABLE trace_events (
         seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -316,7 +317,7 @@ describe("SqliteStore", () => {
           "e1",
           "github.list_issues",
           "p",
-          '{"a":1}',
+          '{"token":"sk-legacy","repo":"hq"}',
           '"s"',
           '{"password":"leak"}',
           "allow",
@@ -327,11 +328,30 @@ describe("SqliteStore", () => {
         client: legacy,
         secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
       });
-      const purged = await legacy.execute("SELECT output FROM trace_events WHERE call_id = 'c1'");
-      expect(purged.rows[0]?.output).toBeNull();
 
-      // New writes carry no output; reads return events without the field.
-      await reopened.trace.append({
+      // (a) the legacy output column is gone entirely — its absence is the
+      // migration's completion marker.
+      const columns = await legacy.execute("PRAGMA table_info(trace_events)");
+      expect(columns.rows.some((row) => row.name === "output")).toBe(false);
+
+      // (b) the legacy row is masked, not merely purged: sensitive input
+      // fields are redacted, and the summary — an unscannable truncated
+      // scalar — is replaced wholesale.
+      const [migratedEvent] = await reopened.trace.listByExecution("e1");
+      expect(migratedEvent?.input).toEqual({ token: "[redacted]", repo: "hq" });
+      expect(migratedEvent?.outputSummary).toBe("[redacted:pre-§11]");
+
+      // (c) idempotent: a second reopen against the now-columnless table is
+      // a no-op (the migration block is skipped) and does not throw.
+      const reopenedAgain = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+      const stillMasked = await reopenedAgain.trace.listByExecution("e1");
+      expect(stillMasked[0]?.input).toEqual({ token: "[redacted]", repo: "hq" });
+
+      // (d) new writes still work and carry no output.
+      await reopenedAgain.trace.append({
         callId: "c2",
         executionId: "e1",
         toolName: "github.list_issues",
@@ -340,7 +360,7 @@ describe("SqliteStore", () => {
         policyVerdict: "allow",
         at: 2,
       });
-      const events = await reopened.trace.listByExecution("e1");
+      const events = await reopenedAgain.trace.listByExecution("e1");
       expect(events).toHaveLength(2);
       expect(events.every((event) => !("output" in event))).toBe(true);
     });

@@ -37,6 +37,8 @@ export const BUILTIN_REDACT_KEYS: readonly string[] = [
   "apikey",
   "xapikey",
   "accesskey",
+  "accesstoken",
+  "refreshtoken",
   "secretkey",
   "privatekey",
   "clientsecret",
