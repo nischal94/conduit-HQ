@@ -492,6 +492,12 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           args: [Date.now(), JSON.stringify({ name: "ConduitInternalError", message: reason }), id],
         });
       },
+      async listPaused(): Promise<Execution[]> {
+        const rs = await client.execute(
+          "SELECT * FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC",
+        );
+        return rs.rows.map((row) => hydrateExecutionRow(row, text(row, "id")));
+      },
     },
 
     trace: {

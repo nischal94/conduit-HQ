@@ -87,6 +87,8 @@ export interface ExecutionRepository {
    * terminal or re-claimed, which is fine.
    */
   failClaimedResume(id: string, reason: string): Promise<void>;
+  /** Paused executions awaiting a human, oldest-first (spec §10.2 approval queue). */
+  listPaused(): Promise<Execution[]>;
 }
 
 export interface TraceRepository {

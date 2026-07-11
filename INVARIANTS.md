@@ -32,6 +32,7 @@ promise the product makes but does not yet enforce.
 | §4.2 — `check_execution` definition stays ≤ 256 estimated tokens (the M1 design's status-check counterpart to the execute token pin above) | `packages/mcp/src/payloads.test.ts` | ✅ pinned |
 | /mcp M4 — outcome persistence: a stored `failed` row always explains itself (synthetic `ConduitPersistError` fallback on a faulted settle write) | `packages/sdk/src/execution/manager.test.ts` (credential-echo persisted-outcome facet covered in `packages/sdk/src/e2e.smoke.test.ts` — "runs the whole prototype flow with no secret leakage", Phase 11) | ✅ pinned |
 | §4.2 — execute surface stays within the one-tool token budget (~1,044) with a capped connection listing | `packages/sdk/src/execute.test.ts` | ✅ pinned |
+| /mcp CLI — approvals queue lists paused executions oldest-first (deterministic (started_at, id)) | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
 
 ---
 

@@ -326,6 +326,19 @@ describe("SqliteStore", () => {
       expect(row?.error).toEqual({ name: "ConduitInternalError", message: "prep failed" });
     });
 
+    it("INVARIANT: listPaused returns only paused rows, oldest-first with id tiebreak", async () => {
+      const store = await openTestStore();
+      const base = { code: "x", seeds: { now: 1, random: 1 }, startedAt: 0 } as const;
+      const pending = { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9e12 };
+      // two paused rows with the SAME startedAt → id tiebreak must order them
+      await store.executions.put({ ...base, id: "exec_b", status: "paused", startedAt: 100, pausedOn: pending });
+      await store.executions.put({ ...base, id: "exec_a", status: "paused", startedAt: 100, pausedOn: pending });
+      await store.executions.put({ ...base, id: "exec_old", status: "paused", startedAt: 50, pausedOn: pending });
+      await store.executions.put({ ...base, id: "exec_done", status: "completed", startedAt: 10 });
+      const paused = await store.executions.listPaused();
+      expect(paused.map((e) => e.id)).toEqual(["exec_old", "exec_a", "exec_b"]);
+    });
+
     it("migrates a legacy db: columns added, legacy completed row reads with result undefined", async () => {
       const { client } = await legacyDb();
       const store = await openSqliteStore({ client, secretBox: await testSecretBox() });
