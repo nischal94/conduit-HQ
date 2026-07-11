@@ -152,6 +152,15 @@ describe("createConduitMcpServer", () => {
         code: ErrorCode.InvalidParams,
       },
     );
+    // both executionId and requestKey
+    await expect(
+      client.callTool({
+        name: "check_execution",
+        arguments: { executionId: "exec_x", requestKey: "rk-1" },
+      }),
+    ).rejects.toMatchObject({
+      code: ErrorCode.InvalidParams,
+    });
   });
 
   it("a new connection appears on the NEXT tools/list without restart (M6)", async () => {
