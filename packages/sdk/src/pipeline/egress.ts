@@ -68,8 +68,8 @@ export async function assertEgressAllowed(target: URL, options: EgressOptions = 
  * split — guard resolves + checks, then `fetch` re-resolves independently —
  * left two gaps that this closes together:
  *   1. Encoding bypasses: every textual spelling of an address (decimal,
- *      hex, v4-mapped, NAT64) resolves to the same bytes, which is what the
- *      classifier now sees. There is no spelling left to add.
+ *      hex, v4-mapped, v4-compatible, NAT64) resolves to the same bytes, which
+ *      is what the classifier now sees. There is no spelling left to add.
  *   2. DNS-rebinding TOCTOU: there is no second, independent resolution to
  *      disagree with the checked one — the socket connects to a member of
  *      the vetted set (spec §18 item 6).
@@ -164,23 +164,27 @@ export function isPrivateAddress(address: string): boolean {
   if (groups === undefined) {
     return true;
   }
-  // Both v4-mapped (::ffff:0:0/96) and NAT64 (64:ff9b::/96) embed an IPv4
-  // address in the low 32 bits; classify by the embedded v4 so a NAT64
-  // literal like 64:ff9b::a9fe:a9fe (169.254.169.254, the metadata endpoint)
-  // is blocked on NAT64-capable networks, not read as public.
-  const isV4Mapped = groups.slice(0, 5).every((g) => g === 0) && groups[5] === 0xffff;
+  // Three IPv6 forms embed an IPv4 address in the low 32 bits; classify each
+  // by that embedded v4 so a private/loopback target cannot hide behind an
+  // IPv6 spelling. A NAT64 literal like 64:ff9b::a9fe:a9fe (169.254.169.254,
+  // the metadata endpoint) is blocked on NAT64-capable networks, and the two
+  // all-zero-high-half forms are blocked symmetrically:
+  //   - v4-mapped     ::ffff:0:0/96  (groups[5] == 0xffff)
+  //   - v4-compatible ::/96          (groups[5] == 0; RFC 4291 §2.5.5.1,
+  //     deprecated + special-use per RFC 5156, never global public). This
+  //     also subsumes :: (embedded 0.0.0.0) and ::1 (embedded 0.0.0.1), both
+  //     caught by isPrivateV4's "this network" / a===0 rule.
+  // Without the v4-compatible case, ::127.0.0.1 read as public while its
+  // v4-mapped twin ::ffff:127.0.0.1 was blocked — a fail-open asymmetry.
+  const highHalfZero = groups.slice(0, 5).every((g) => g === 0);
+  const isV4Mapped = highHalfZero && groups[5] === 0xffff;
+  const isV4Compatible = highHalfZero && groups[5] === 0;
   const isNat64 =
     groups[0] === 0x0064 && groups[1] === 0xff9b && groups.slice(2, 6).every((g) => g === 0);
-  if (isV4Mapped || isNat64) {
+  if (isV4Mapped || isV4Compatible || isNat64) {
     const hi = groups[6] ?? 0;
     const lo = groups[7] ?? 0;
     return isPrivateV4([hi >> 8, hi & 0xff, lo >> 8, lo & 0xff]);
-  }
-  if (groups.every((g) => g === 0)) {
-    return true; // :: unspecified
-  }
-  if (groups.slice(0, 7).every((g) => g === 0) && groups[7] === 1) {
-    return true; // ::1 loopback
   }
   const first = groups[0] ?? 0;
   return (

@@ -701,7 +701,20 @@ rework. (Decided 2026-07-08.)
 (Issue #21 / PR #22, merged early — was slated Phase 1). `createPinnedLookup` resolves
 once and forces the connection to the vetted resolved IP (canonicalize-then-check), closing both the
 address-encoding bypass and the DNS-rebinding TOCTOU. Pinned by `pipeline/egress.test.ts`
-(INVARIANTS.md §9.3).
+(INVARIANTS.md §9.3). The classifier is symmetric across all three embedded-IPv4 IPv6 forms —
+v4-mapped (`::ffff:0:0/96`), v4-compatible (`::/96`, deprecated per RFC 4291
+§2.5.5.1; special-use, "should not appear on the public Internet" per RFC 5156), and NAT64
+(`64:ff9b::/96`) — each decoded by its embedded v4 (fix 2026-07-11, codex re-pass:
+`::127.0.0.1` had read as public while its v4-mapped twin was blocked).
+**Custom-prefix NAT64 (RFC 6052 network-specific prefixes) is out of scope:** a custom
+prefix carries no globally-fixed NAT64 meaning, so an address under it is ordinary global-unicast
+IPv6 that reaches a private target *only* if the operator's own network runs a translator for
+that prefix — an environmental precondition Conduit cannot observe. This is a documented scope
+boundary, **not** the `allowPrivate` opt-in (that is an explicit call-site
+authorization); blanket-blocking every global IPv6 whose low bits spell a private v4 would be a
+denylist over unbounded input and false-positive-block the legitimate IPv6 internet. Only the
+globally-reserved `64:ff9b::/96` prefix belongs in the canonical classifier.
+(Custom-NAT64 classification confirmed out-of-scope by codex adversarial pass 2026-07-11.)
 - **UpstreamCaller as a trusted dependency** (§5.3, §9.2): ✅ the pipeline treats an
 injected `UpstreamCaller` as trusted infrastructure — the same posture it holds toward the
 store and policy engine — not as an adversary. So the invoker does NOT re-validate a custom caller's
