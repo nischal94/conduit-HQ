@@ -1,8 +1,7 @@
 #!/usr/bin/env node
-import { openSqliteStore, SecretBox } from "@conduithq/sdk";
-import { createClient } from "@libsql/client";
-import { ensureDbDir, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
+import { KEYGEN_ONE_LINER } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
+import { openStoreFromEnv } from "./store-open.js";
 
 const VERSION = "0.1.0";
 const HELP = `conduit-mcp ${VERSION} — Conduit MCP server (stdio)
@@ -10,17 +9,6 @@ Env: CONDUIT_DB (default ~/.conduit/conduit.db) · CONDUIT_MASTER_KEY (base64, 3
 generate: ${KEYGEN_ONE_LINER}) · CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1 (dev/demo ONLY)
 · CONDUIT_APPROVAL_TTL (milliseconds)
 Flags: --version · --help · --doctor (validate config without an MCP client)`;
-
-async function openStoreFromEnv() {
-  const env = resolveEnv(process.env);
-  ensureDbDir(env.dbPath);
-  const client = createClient({ url: `file:${env.dbPath}` });
-  const store = await openSqliteStore({
-    client,
-    secretBox: await SecretBox.fromKeyBytes(env.keyBytes),
-  });
-  return { env, store };
-}
 
 async function doctor(): Promise<number> {
   try {

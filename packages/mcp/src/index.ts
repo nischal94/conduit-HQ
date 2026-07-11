@@ -7,3 +7,4 @@ export {
 } from "./payloads.js";
 export { runStdioServer } from "./runtime-stdio.js";
 export { type ConduitMcpServerOptions, createConduitMcpServer } from "./server.js";
+export { openStoreFromEnv } from "./store-open.js";
