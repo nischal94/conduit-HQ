@@ -23,6 +23,44 @@ at session start.
 
 ---
 
+## Current handoff — written 2026-07-11 (MID-BUILD checkpoint: /mcp stdio server, SDD tasks 1-5 of 12 done)
+
+### Where things stand (rate-limit checkpoint — session may have been cut mid-build)
+
+- **Branch `feat/mcp-stdio-server`** carries the full reviewed chain:
+  design doc rev 2 (`docs/superpowers/specs/2026-07-11-mcp-stdio-server-design.md`,
+  M1-M9, multi-voice review CONVERGED) → implementation plan rev 2
+  (`docs/superpowers/plans/2026-07-11-mcp-stdio-server.md`, 12 tasks, codex plan
+  review converged after shape-fix) → SDD build in progress.
+- **SDD ledger is the authority: `.superpowers/sdd/progress.md`** (new section for
+  this plan, after the §11 section). Tasks 1-5 COMPLETE (storage columns+requestKey,
+  WAL/schema-race, manager outcome-aware terminals, capped listing, packages/mcp
+  scaffold + user install done). Suite 313/313. Last commit: scaffold `60190bb`.
+- **NEXT: SDD Task 6 (payloads module)**, then 7 (server), 8 (bin), 9 (scripts .mjs),
+  10 (ring-2 integration), 11 (docs+spec+INVARIANTS), 12 (credential-echo invariant),
+  then final whole-branch review (most capable model) per
+  superpowers:subagent-driven-development. Task briefs auto-extract via the skill's
+  task-brief script; per-task flow = implementer (sonnet; haiku for verbatim-code
+  tasks) → review-package → task reviewer (sonnet) → ledger line.
+- Implementer dispatches MUST carry: vitest/tsc unsandboxed (loopback hang quirk),
+  pre-commit hook authoritative, NEVER git stash, exact binaries, stage-only-changed.
+- Post-build gates (unchanged): PR routing, Tier 2 + /security-review + codex exec
+  pass, /explain-diff + quiz, human-named merge. §17 gate-one manual acceptance after.
+- Housekeeping: gstack update available (1.5.1→1.60.1) — user-run, low priority.
+
+### Kickoff prompt for a resumed session
+
+> Continue the /mcp stdio server SDD build in ~/projects/conduit-HQ on branch
+> feat/mcp-stdio-server. Read .superpowers/sdd/progress.md FIRST (this plan's
+> section, after the §11 section) — tasks marked complete are DONE, do not redo.
+> Resume with superpowers:subagent-driven-development at the first task not in the
+> ledger, using docs/superpowers/plans/2026-07-11-mcp-stdio-server.md. Inherit the
+> session quirks below verbatim into every implementer dispatch.
+
+---
+
+## Previous handoff (2026-07-10, superseded but quirks still valid)
+
 ## Current handoff — written 2026-07-10 (§11 Trace redaction MERGED — PHASE 0 COMPLETE; next MVP step = /mcp server, stdio)
 
 ### Where things stand
