@@ -41,8 +41,8 @@ packages/mcp/
   src/payloads.test.ts, src/server.test.ts, src/env.test.ts (create — ring 1)
   src/integration.test.ts  (create — ring 2, spawned bin)
   README.md                (create — M7/M8 doc obligations)
-scripts/seed-demo.ts       (create)
-scripts/approve-demo.ts    (create)
+scripts/seed-demo.mjs       (create)
+scripts/approve-demo.mjs    (create)
 conduitspec.html + conduitspec.md (modify — §14/§18/§20; regenerate via html2md.py)
 INVARIANTS.md              (modify — new rows)
 ```
@@ -61,9 +61,37 @@ INVARIANTS.md              (modify — new rows)
 - Consumes: existing `Execution`, `SandboxError`, sqlite helpers (`text`, `maybeText`, `integer`, `maybeInteger`, `parseJson`).
 - Produces: `Execution.result?: unknown`, `Execution.error?: SandboxError`, `Execution.requestKey?: string`; `ExecutionRepository.getByRequestKey(key: string): Promise<Execution | undefined>`; columns `result TEXT`, `error TEXT`, `request_key TEXT` + unique index `idx_executions_request_key`.
 
-- [ ] **Step 1: Write the failing tests** — append to `packages/sdk/src/store/sqlite.test.ts` (follow the file's existing `openStore()` fixture conventions):
+- [ ] **Step 1: Write the failing tests** — append to `packages/sdk/src/store/sqlite.test.ts`. The file's existing fixture is module-level `store`/`client` over `:memory:` in a `beforeEach` — the new blocks need their OWN helpers; define them at the top of the new describe block:
 
 ```ts
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+// (merge with the file's existing imports; createClient/openSqliteStore/SecretBox are already imported)
+
+const KEY_BYTES = SecretBox.generateKeyBytes();
+async function testSecretBox() {
+  return SecretBox.fromKeyBytes(KEY_BYTES);
+}
+async function openTestStore(url = ":memory:") {
+  return openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() });
+}
+function tempFileDbUrl(): string {
+  return `file:${join(mkdtempSync(join(tmpdir(), "conduit-m4-")), "t.db")}`;
+}
+/** Builds a pre-M4 executions table on a temp FILE db; returns { url, client }. */
+async function legacyDb() {
+  const url = tempFileDbUrl();
+  const client = createClient({ url });
+  await client.execute(`CREATE TABLE executions (
+    id TEXT PRIMARY KEY, code TEXT NOT NULL, status TEXT NOT NULL,
+    seeds TEXT NOT NULL, paused_on TEXT, started_at INTEGER NOT NULL,
+    ended_at INTEGER, resume_attempt TEXT)`);
+  await client.execute(`INSERT INTO executions (id, code, status, seeds, started_at, ended_at)
+    VALUES ('exec_old', '1', 'completed', '{"now":1,"random":0.5}', 1, 2)`);
+  return { url, client };
+}
+
 describe("execution outcome persistence (mcp design M4)", () => {
   it("round-trips result, error, and requestKey", async () => {
     const store = await openTestStore(); // use the file's existing helper name
@@ -112,21 +140,21 @@ describe("execution outcome persistence (mcp design M4)", () => {
   });
 
   it("migrates a legacy db: columns added, legacy completed row reads with result undefined", async () => {
-    // Build a pre-M4 executions table by hand, then openSqliteStore over it.
-    const client = createClient({ url: legacyDbUrl() }); // fresh temp file
-    await client.execute(`CREATE TABLE executions (
-      id TEXT PRIMARY KEY, code TEXT NOT NULL, status TEXT NOT NULL,
-      seeds TEXT NOT NULL, paused_on TEXT, started_at INTEGER NOT NULL,
-      ended_at INTEGER, resume_attempt TEXT)`);
-    await client.execute({
-      sql: `INSERT INTO executions (id, code, status, seeds, started_at, ended_at)
-            VALUES ('exec_old', '1', 'completed', '{"now":1,"random":0.5}', 1, 2)`,
-      args: [],
-    });
+    const { client } = await legacyDb();
     const store = await openSqliteStore({ client, secretBox: await testSecretBox() });
     const old = await store.executions.get("exec_old");
     expect(old?.status).toBe("completed");
     expect(old?.result).toBeUndefined(); // legacy NULL — accepted (design M1)
+  });
+
+  it("a near-§16-cap result survives persist + re-read (design M9)", async () => {
+    const store = await openTestStore();
+    const big = "x".repeat(900_000); // just under the 1MB output cap
+    await store.executions.put({
+      id: "exec_big", code: "1", status: "completed",
+      seeds: { now: 1, random: 0.5 }, startedAt: 1, endedAt: 2, result: { big },
+    });
+    expect(((await store.executions.get("exec_big"))?.result as { big: string }).big.length).toBe(900_000);
   });
 });
 ```
@@ -161,7 +189,7 @@ Expected: FAIL — unknown columns / `getByRequestKey` not a function.
 `store/sqlite.ts`:
 1. `CREATE TABLE executions` gains `result TEXT, error TEXT, request_key TEXT` and after the CREATE statements add `CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_request_key ON executions(request_key)` (SQLite unique indexes ignore NULLs — multiple NULL keys are fine).
 2. Retrofit block (same pattern as the existing `resume_attempt` retrofit): `PRAGMA table_info(executions)` → for each missing column of `result`/`error`/`request_key`, `ALTER TABLE executions ADD COLUMN …`, then the `CREATE UNIQUE INDEX IF NOT EXISTS`.
-3. `put`: extend the INSERT column list + args with `execution.result === undefined ? null : JSON.stringify(execution.result)`, `execution.error === undefined ? null : JSON.stringify(execution.error)`, `execution.requestKey ?? null`.
+3. `put`: the statement is `INSERT … ON CONFLICT(id) DO UPDATE SET <explicit list>` — extend **BOTH** halves: add `result, error, request_key` to the INSERT column list + `?` placeholders + args (`execution.result === undefined ? null : JSON.stringify(execution.result)`, `execution.error === undefined ? null : JSON.stringify(execution.error)`, `execution.requestKey ?? null`) **and** add `result = excluded.result, error = excluded.error, request_key = excluded.request_key` to the `DO UPDATE SET` list — `finish()`'s settle is the UPDATE arm; without this the outcome never lands on the existing row.
 4. `get`: after `endedAt`, hydrate the three fields via `maybeText(row, "result")` / `"error"` / `"request_key"` with the file's `parseJson` + `executionReadError` pattern (`request_key` is a plain string, no JSON parse).
 5. `getByRequestKey(key)`: `SELECT * FROM executions WHERE request_key = ?` sharing `get`'s row-hydration (extract the existing hydration body into a local `hydrateExecutionRow(row, id)` used by both).
 6. `failClaimedResume(id, reason)`: the UPDATE gains `error = ?` with `JSON.stringify({ name: "ConduitInternalError", message: reason })` (drop the `_` prefix from the parameter).
@@ -187,7 +215,7 @@ git commit -m "feat(sdk): persist execution outcome + requestKey (mcp design M4/
 
 **Interfaces:**
 - Consumes: Task 1's retrofit blocks.
-- Produces: every `openSqliteStore` on a `file:` URL runs `PRAGMA busy_timeout = 5000` then `PRAGMA journal_mode = WAL` **before any schema statement**; every retrofit `ALTER TABLE` is wrapped in `tolerateDuplicateColumn()`.
+- Produces: every `openSqliteStore` on a `file:` URL runs `PRAGMA busy_timeout = 5000` then `PRAGMA journal_mode = WAL` **before any schema statement**; every conditional schema statement (ADD retrofits AND the §11 `DROP COLUMN output`) is wrapped in `tolerateSchemaRace()`.
 
 - [ ] **Step 1: Failing tests** (append to `sqlite.test.ts`):
 
@@ -204,7 +232,7 @@ describe("multi-process store hygiene (mcp design M5)", () => {
   });
 
   it("two simultaneous opens of a legacy db both succeed (migration race, M5)", async () => {
-    const url = legacyDbUrlWithPreM4Executions(); // reuse Task 1's legacy fixture builder
+    const { url } = await legacyDb(); // Task 1's fixture — a FILE db, shared by both clients
     const [a, b] = await Promise.all([
       openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
       openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
@@ -212,10 +240,17 @@ describe("multi-process store hygiene (mcp design M5)", () => {
     expect(a).toBeDefined();
     expect(b).toBeDefined();
   });
+
+  it("two simultaneous opens of a pre-§11 db (legacy `output` column) both succeed", async () => {
+    // The §11 mask-then-DROP migration is also a cross-process race surface:
+    // the DROP loser sees "no such column". Build a trace_events table WITH the
+    // legacy `output` column per the §11 pre-migration shape (copy the CREATE from
+    // sqlite.ts and add `output TEXT`), then open twice concurrently as above.
+  });
 });
 ```
 
-- [ ] **Step 2: Run to verify failure** — the pragma test fails (journal_mode = delete); the race test may pass flakily — that is exactly why the fix must be by construction, not by observed pass.
+- [ ] **Step 2: Run to verify failure** — the pragma test fails (journal_mode = delete); the race tests may pass flakily — that is exactly why the fix must be by construction, not by observed pass. Every retrofit `ALTER` wrapped in `tolerateSchemaRace` IS the by-construction guarantee; the tests are tripwires.
 
 - [ ] **Step 3: Implement** in `openSqliteStore`, first statements before any CREATE/PRAGMA table_info:
 
@@ -226,20 +261,22 @@ describe("multi-process store hygiene (mcp design M5)", () => {
   await client.execute("PRAGMA journal_mode = WAL").catch(() => {});
 ```
 
-Add the helper and wrap EVERY retrofit `ALTER TABLE` in the file (Task 1's three plus the existing `resume_attempt`, `redact_fields` retrofits):
+Add the helper and wrap EVERY conditional schema statement in the file — Task 1's three ADDs, the existing `resume_attempt` and `redact_fields` ADD retrofits, **and the §11 `DROP COLUMN output` migration** (its loser in a two-process race sees "no such column"; the pre-DROP masking UPDATEs are idempotent and need no wrapping):
 
 ```ts
 /**
  * M5: the PRAGMA table_info → ALTER ladder is idempotent sequentially but
- * races across processes (two fresh servers at login both see the column
- * missing; one ALTER loses). Duplicate-column is therefore SUCCESS, not
- * failure — the column exists, which is all the retrofit promises.
+ * races across processes (two fresh servers at login both see the schema
+ * delta pending; one ALTER loses). For ADD COLUMN the loser sees "duplicate
+ * column name"; for DROP COLUMN it sees "no such column". Either way the
+ * schema is already in the state the retrofit promises — SUCCESS, not failure.
  */
-async function tolerateDuplicateColumn(run: () => Promise<unknown>): Promise<void> {
+async function tolerateSchemaRace(run: () => Promise<unknown>): Promise<void> {
   try {
     await run();
   } catch (error) {
-    if (!String(error).includes("duplicate column name")) {
+    const text = String(error);
+    if (!text.includes("duplicate column name") && !text.includes("no such column")) {
       throw error;
     }
   }
@@ -282,7 +319,14 @@ describe("outcome persistence (mcp design M4)", () => {
   });
 
   it("INVARIANT M4: a stored failed row always explains itself — fallback carries ConduitPersistError", async () => {
-    // store fixture whose put() throws ONCE on the settle write, then succeeds
+    // store fixture whose put() throws ONCE on the settle write, then succeeds.
+    // Run the SAME fault-injection against EVERY terminal path (design M9):
+    // (a) completed settle faulted, (b) failed settle faulted, (c) paused
+    // persistence faulted, (d) expired persistence faulted. Parameterize with
+    // it.each over sandbox fixtures {completing, failing, pausing} + the
+    // clock-advanced resume for (d). In all four cases the stored row must be
+    // status "failed" (or "expired"'s fallback "failed") WITH error.name ===
+    // "ConduitPersistError" — never a payload-less terminal row.
     const outcome = await flakyStoreManager.start("return 1");
     const row = await store.executions.get(outcome.executionId);
     expect(row?.status).toBe("failed");
@@ -654,9 +698,16 @@ export interface ExecutePayload {
   message?: string;
 }
 
-export type CheckPayload =
-  | { status: "not_found" }
-  | (ExecutePayload & { status: "running" | "completed" | "failed" | "paused" | "expired" });
+/** Independent of ExecutePayload — check adds "running"/"not_found" states. */
+export interface CheckPayloadBody {
+  status: "running" | "completed" | "failed" | "paused" | "expired";
+  executionId: string;
+  result?: unknown;
+  error?: ErrorEnvelope;
+  pending?: PendingView;
+  message?: string;
+}
+export type CheckPayload = { status: "not_found" } | CheckPayloadBody;
 
 /** ~4 chars/token heuristic, same shape as the sdk's estimateTokens. */
 export function estimateDefinitionTokens(definition: unknown): number {
@@ -959,17 +1010,38 @@ export interface ConduitMcpServerOptions {
   log?: (line: string) => void;
 }
 
-/** One line per namespace by construction — §18 v1: single connection per namespace. */
-async function listConnections(store: ConduitStore): Promise<{ prefix: string; label: string }[]> {
+/**
+ * One line per namespace by construction — §18 v1: single connection per
+ * namespace; the invoker FAILS CLOSED on multi-connection integrations, so an
+ * integration with >1 connection is deliberately NOT advertised ("every
+ * advertised connection is selectable" — design M6). Ambiguous namespaces get
+ * one stderr line so the operator knows why they're absent.
+ */
+async function listConnections(
+  store: ConduitStore,
+  log: (line: string) => void,
+): Promise<{ prefix: string; label: string }[]> {
   const [connections, integrations] = await Promise.all([
     store.connections.list(),
     store.integrations.list(),
   ]);
   const namespaceById = new Map(integrations.map((i) => [i.id, i.namespace]));
-  return connections.map((c) => ({
-    prefix: c.prefix,
-    label: `${namespaceById.get(c.integrationId) ?? "unknown"} tools`,
-  }));
+  const byIntegration = new Map<string, typeof connections>();
+  for (const c of connections) {
+    byIntegration.set(c.integrationId, [...(byIntegration.get(c.integrationId) ?? []), c]);
+  }
+  const listed: { prefix: string; label: string }[] = [];
+  for (const [integrationId, group] of byIntegration) {
+    const namespace = namespaceById.get(integrationId) ?? "unknown";
+    if (group.length === 1 && group[0] !== undefined) {
+      listed.push({ prefix: group[0].prefix, label: `${namespace} tools` });
+    } else {
+      log(
+        `[ConduitMcp] namespace ${namespace} has ${group.length} connections — v1 addressing is single-connection per namespace (§18); not advertised.`,
+      );
+    }
+  }
+  return listed;
 }
 
 async function hydrateCatalog(store: ConduitStore): Promise<InMemoryCatalog> {
@@ -996,16 +1068,33 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
 
   server.setRequestHandler(ListToolsRequestSchema, async () => {
     const definition = extendExecuteDefinition(
-      buildExecuteTool({ connections: await listConnections(store) }),
+      buildExecuteTool({ connections: await listConnections(store, log) }),
     );
     return { tools: [definition, CHECK_EXECUTION_TOOL] };
   });
 
+  /** M2: the low-level API validates nothing — the handler owns it, including
+   * unknown-key rejection (`additionalProperties: false` is advertisement,
+   * not enforcement). */
+  function assertOnlyKeys(args: unknown, allowed: readonly string[], tool: string): Record<string, unknown> {
+    if (typeof args !== "object" || args === null || Array.isArray(args)) {
+      throw new McpError(ErrorCode.InvalidParams, `[ConduitMcp] ${tool}: arguments must be an object.`);
+    }
+    const record = args as Record<string, unknown>;
+    for (const key of Object.keys(record)) {
+      if (!allowed.includes(key)) {
+        throw new McpError(ErrorCode.InvalidParams, `[ConduitMcp] ${tool}: unknown argument ${JSON.stringify(key)}.`);
+      }
+    }
+    return record;
+  }
+
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
     const { name, arguments: args } = request.params;
     if (name === "execute") {
-      const code = (args as Record<string, unknown> | undefined)?.code;
-      const requestKey = (args as Record<string, unknown> | undefined)?.requestKey;
+      const record = assertOnlyKeys(args ?? {}, ["code", "requestKey"], "execute");
+      const code = record.code;
+      const requestKey = record.requestKey;
       if (typeof code !== "string" || code === "") {
         throw new McpError(ErrorCode.InvalidParams, "[ConduitMcp] execute requires a non-empty string `code`.");
       }
@@ -1036,13 +1125,19 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
       return toTextResult(outcomeToPayload(outcome));
     }
     if (name === "check_execution") {
-      const a = (args ?? {}) as Record<string, unknown>;
+      const a = assertOnlyKeys(args ?? {}, ["executionId", "requestKey"], "check_execution");
       const executionId = a.executionId;
       const requestKey = a.requestKey;
       if (typeof executionId !== "string" && typeof requestKey !== "string") {
         throw new McpError(
           ErrorCode.InvalidParams,
-          "[ConduitMcp] check_execution requires `executionId` or `requestKey`.",
+          "[ConduitMcp] check_execution requires `executionId` or `requestKey` (exactly one; strings).",
+        );
+      }
+      if (typeof executionId === "string" && typeof requestKey === "string") {
+        throw new McpError(
+          ErrorCode.InvalidParams,
+          "[ConduitMcp] check_execution takes `executionId` OR `requestKey`, not both.",
         );
       }
       const execution =
@@ -1061,9 +1156,12 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
 `packages/mcp/src/index.ts`:
 
 ```ts
+export { ensureDbDir, KEYGEN_ONE_LINER, resolveEnv, type ResolvedEnv } from "./env.js";
 export { CHECK_EXECUTION_TOOL, executionToCheckPayload, extendExecuteDefinition, outcomeToPayload } from "./payloads.js";
 export { type ConduitMcpServerOptions, createConduitMcpServer } from "./server.js";
 ```
+
+(The `./env.js` line lands with Task 8, which creates that file — add it there; noted here so the export list is complete in one place. `doctor` stays bin-internal: it is a CLI mode, not library API.)
 
 (Verify at implementation time: `McpError`/`ErrorCode` export names and the `CallToolRequestSchema` handler return type in v1.29.0 — if the SDK names differ, adapt the import, keep the behavior. This is the only file that touches the SDK's server API.)
 
@@ -1091,12 +1189,15 @@ git commit -m "feat(mcp): createConduitMcpServer — two-tool surface over the S
 ```ts
 export interface ResolvedEnv {
   dbPath: string;            // default ~/.conduit/conduit.db
-  keyBytes: Uint8Array;      // base64-decoded, exactly 32 bytes
+  keyBytes: Uint8Array;      // canonical base64-decoded, exactly 32 bytes
   allowPrivateEgress: boolean;
 }
 export function resolveEnv(env: NodeJS.ProcessEnv): ResolvedEnv; // throws per-cause messages
-export function doctor(env: NodeJS.ProcessEnv): Promise<{ ok: boolean; lines: string[] }>;
+export function ensureDbDir(dbPath: string): void;               // 0700 parent dir
+// (doctor is bin-internal — a CLI mode in bin.ts, not exported library API)
 ```
+
+Task 8 also appends the env exports to `index.ts` (see Task 7's complete export list).
 
 - [ ] **Step 1: Failing tests** — `packages/mcp/src/env.test.ts`:
 
@@ -1119,6 +1220,10 @@ describe("resolveEnv (design M7/M8)", () => {
   it("malformed key (wrong length) → per-cause message", () => {
     expect(() => resolveEnv({ CONDUIT_MASTER_KEY: Buffer.alloc(16).toString("base64") }))
       .toThrow(/32 bytes/);
+  });
+  it("non-canonical base64 (invalid characters) → per-cause message, not silent 32 bytes", () => {
+    const valid = Buffer.alloc(32, 7).toString("base64");
+    expect(() => resolveEnv({ CONDUIT_MASTER_KEY: `!!${valid.slice(2)}` })).toThrow(/canonical|encoding/i);
   });
   it("egress opt-in", () => {
     expect(resolveEnv({ CONDUIT_MASTER_KEY: KEY, CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1" }).allowPrivateEgress).toBe(true);
@@ -1154,10 +1259,15 @@ export function resolveEnv(env: NodeJS.ProcessEnv): ResolvedEnv {
         `Generate one with: ${KEYGEN_ONE_LINER}`,
     );
   }
-  const keyBytes = Buffer.from(raw.trim(), "base64");
-  if (keyBytes.length !== 32) {
+  const trimmed = raw.trim();
+  const keyBytes = Buffer.from(trimmed, "base64");
+  // Canonical-encoding check (design M8): Buffer.from silently ignores
+  // invalid base64 characters — re-encode and compare so a corrupted key is
+  // a loud per-cause failure, not 32 quietly-wrong bytes.
+  if (keyBytes.length !== 32 || keyBytes.toString("base64") !== trimmed) {
     throw new Error(
-      `[ConduitMcp] Malformed CONDUIT_MASTER_KEY: expected base64 of exactly 32 bytes, got ${keyBytes.length}. ` +
+      `[ConduitMcp] Malformed CONDUIT_MASTER_KEY: expected canonical base64 of exactly 32 bytes ` +
+        `(got ${keyBytes.length} bytes${keyBytes.toString("base64") !== trimmed ? ", non-canonical encoding" : ""}). ` +
         `Generate a valid key with: ${KEYGEN_ONE_LINER}`,
     );
   }
@@ -1217,7 +1327,7 @@ async function doctor(): Promise<number> {
     const sources = await store.sources.list();
     console.error(`ok: key decodes (32 bytes)`);
     console.error(`ok: database opens at ${env.dbPath}`);
-    console.error(`ok: ${sources.length} source(s) in catalog${sources.length === 0 ? " — seed with scripts/seed-demo.ts" : ""}`);
+    console.error(`ok: ${sources.length} source(s) in catalog${sources.length === 0 ? " — seed with scripts/seed-demo.mjs" : ""}`);
     console.error(`egress opt-in: ${env.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`);
     return 0;
   } catch (error) {
@@ -1255,7 +1365,7 @@ async function main(): Promise<void> {
     );
   }
   if ((await store.sources.list()).length === 0) {
-    console.error("[ConduitMcp] 0 sources in catalog — seed with scripts/seed-demo.ts");
+    console.error("[ConduitMcp] 0 sources in catalog — seed with scripts/seed-demo.mjs");
   }
   const server = createConduitMcpServer({ store, allowPrivateEgress: env.allowPrivateEgress });
   await server.connect(new StdioServerTransport());
@@ -1280,13 +1390,40 @@ git commit -m "feat(mcp): conduit-mcp bin — env contract, --doctor, stderr dis
 
 ---
 
-### Task 9: Ring 2 — integration tests against the spawned bin
+### Task 9: seed + interim approve scripts
+
+**Files:**
+- Create: `scripts/seed-demo.mjs`, `scripts/approve-demo.mjs`
+
+(Deviation from the design's `.ts` filenames, recorded: the workspace has no TS
+script runner and Node 20 has no stable strip-types — plain `.mjs` importing the
+**built dists** (`packages/sdk/dist/index.js`, `packages/mcp/dist/index.js`) runs
+with bare `node` on the Node ≥ 20 baseline, zero new dependencies. Both packages
+must be built first: `pnpm -r build`. The README and all doc snippets use the
+`.mjs` names.)
+
+**Interfaces:**
+- Consumes: built dists of both packages; the same `CONDUIT_DB`/`CONDUIT_MASTER_KEY` env contract as the bin (`resolveEnv`/`ensureDbDir` are exported from `@conduithq/mcp` — Task 7/8 export list).
+- Produces: `scripts/seed-demo.mjs <upstream-mcp-url>` — seeds source + integration + connection + secret + tools (via `normalizeMcp` against the upstream's `tools/list`, or an inline tool fixture for the demo), upserts **allow-only `Policy` rows for every seeded tool** (check `types.ts` `Policy` exact shape at implementation), prints (stderr) a ready-to-paste client config snippet with the honest command (`node <absolute repo path>/packages/mcp/dist/bin.js`) and env vars. `scripts/approve-demo.mjs <executionId>` — opens the store from the same env, composes a manager exactly as `server.ts` does, calls `resume(executionId, { kind: "approve" })`, prints the outcome status. Task 10's ring-2 suite execs `approve-demo.mjs` as its cross-process approver.
+
+- [ ] **Step 1: Write both scripts** (complete, runnable with bare `node` after `pnpm -r build`).
+- [ ] **Step 2: Exercise manually against a temp DB** (unsandboxed): seed → `node packages/mcp/dist/bin.js --doctor` shows 1 source → pause/approve/poll once by hand.
+- [ ] **Step 3: Commit**
+
+```bash
+git add scripts/seed-demo.mjs scripts/approve-demo.mjs
+git commit -m "feat(scripts): demo seed (allow-only policies, config snippet) + interim approve"
+```
+
+---
+
+### Task 10: Ring 2 — integration tests against the spawned bin
 
 **Files:**
 - Create: `packages/mcp/src/integration.test.ts`
 
 **Interfaces:**
-- Consumes: built `dist/bin.js` (the test builds first via `execFile` of tsup, or a `pretest` hook — implementer's degree of freedom, but the test MUST spawn the **compiled bin**, not tsx, or the stdout-purity claim is weakened).
+- Consumes: built `dist/bin.js` (the test builds first via `execFile` of tsup, or a `pretest` hook — implementer's degree of freedom, but the test MUST spawn the **compiled bin**, not a TS runner, or the stdout-purity claim is weakened); `scripts/approve-demo.mjs` from Task 9 (the cross-process approver).
 - Produces: the M9 ring-2 suite.
 
 - [ ] **Step 1: Write the suite** (test-first is impractical for pure integration — write it, watch it fail against gaps, fix). Reuse `e2e.smoke.test.ts`'s loopback MCP upstream fixture pattern (copy the `startMcpServer` helper shape — a `node:http` server answering JSON-RPC `tools/call`; keep the fixture local to this file). Cases:
@@ -1308,12 +1445,11 @@ it("stdout purity: every stdout byte the client transport did NOT consume is pro
   // the protocol conversation succeeded (a corrupted stdout kills the session).
 
 it("pause → approve from a SEPARATE child process → poll sees the persisted result", ...);
-  // policy require_approval on one tool; execute pauses; run a one-shot child:
-  //   node -e 'import("@conduithq/sdk").then(async (sdk) => { /* open store,
-  //   createExecutionManager with the same wiring, resume(id, {kind:"approve"}) */ })'
-  // (write the child as a small fixture file scripts/approve-demo.ts — Task 10 —
-  // and exec it here); then check_execution via the STILL-RUNNING first bin
-  // returns { status: "completed", result: ... }.
+  // policy require_approval on one tool; execute pauses; exec Task 9's
+  // scripts/approve-demo.mjs <executionId> as the one-shot child process
+  // (execFile("node", ["scripts/approve-demo.mjs", executionId], { env }));
+  // then check_execution via the STILL-RUNNING first bin returns
+  // { status: "completed", result: ... }.
 
 it("client timeout on a slow call: server survives; the row settles; requestKey recovers it", ...);
   // execute code that busy-waits ~3s with a client timeout of 1s and
@@ -1342,26 +1478,6 @@ git commit -m "test(mcp): ring-2 integration — spawned bin, stdout purity, cro
 
 ---
 
-### Task 10: seed + interim approve scripts
-
-**Files:**
-- Create: `scripts/seed-demo.ts`, `scripts/approve-demo.ts`
-
-**Interfaces:**
-- Consumes: sdk exports (`openSqliteStore`, `SecretBox`, `normalizeMcp`), the same `CONDUIT_DB`/`CONDUIT_MASTER_KEY` env contract as the bin (import `resolveEnv`/`ensureDbDir` from `@conduithq/mcp`).
-- Produces: `seed-demo.ts` — seeds source+integration+connection+secret+tools with **allow-only policies** (upsert `{ toolName, action: "allow" }`-shaped `Policy` rows for every seeded tool — check `types.ts` `Policy` exact shape at implementation) against a target MCP upstream URL given as argv[2]; prints (stderr) a ready-to-paste client config snippet with the **honest command** (`node <absolute repo path>/packages/mcp/dist/bin.js`) and the env vars. `approve-demo.ts <executionId>` — opens the store, composes a manager exactly as `server.ts` does, calls `resume(executionId, { kind: "approve" })`, prints the outcome status.
-
-- [ ] **Step 1: Write both scripts** (complete, runnable with `node --experimental-strip-types` or via `pnpm tsx` — match how the repo runs `html2py`-adjacent scripts; if no TS runner exists in the workspace, emit them as plain `.mjs` importing built dists — implementer verifies which runs cleanly and keeps the doc snippet consistent).
-- [ ] **Step 2: Exercise manually against a temp DB** (unsandboxed): seed → `conduit-mcp --doctor` shows 1 source → run the ring-2 approve flow once by hand.
-- [ ] **Step 3: Commit**
-
-```bash
-git add scripts/seed-demo.ts scripts/approve-demo.ts
-git commit -m "feat(scripts): demo seed (allow-only policies, config snippet) + interim approve"
-```
-
----
-
 ### Task 11: Docs — README, spec §14/§18/§20, INVARIANTS.md
 
 **Files:**
@@ -1372,7 +1488,7 @@ git commit -m "feat(scripts): demo seed (allow-only policies, config snippet) + 
 **Interfaces:** none — prose, but load-bearing per design "Spec/doc obligations".
 
 - [ ] **Step 1: README.md** — sections: what it is (one paragraph); Quick start (keygen one-liner → seed script → config snippet with honest command → restart client per §14); env table **with units** (`CONDUIT_DB` path default / `CONDUIT_MASTER_KEY` base64 32 bytes / `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` dev-demo only / `CONDUIT_APPROVAL_TTL` **milliseconds**, default 259200000); `--doctor`; Troubleshooting (tools don't appear → restart + client MCP log path `~/Library/Logs/Claude/mcp-server-*.log` on macOS; egress blocked → the env var, named HERE; wrong key fails at first decrypt, not startup; call timed out → `check_execution`/`requestKey`; back up the single db file before upgrading; upstreams: MCP-over-HTTP only in v1).
-- [ ] **Step 2: conduitspec.html** — §18 resolved entries (two-tool surface wording; outcome persistence + retention deferral; `packages/mcp` in §20 monorepo list; `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS`; poll-is-skeleton-mechanism with MCP completion signaling as Phase-1 successor); §14 gains the config snippet pointer + keygen + restart caveat. Run `python3 html2md.py`. **Follow `~/.claude/rules/source-faithfulness.md`: quote the design doc's exact decision sentences when composing the §18 entries.**
+- [ ] **Step 2: conduitspec.html** — §18 resolved entries (two-tool surface wording; outcome persistence + retention deferral; `packages/mcp` in §20 monorepo list; `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS`; poll-is-skeleton-mechanism with MCP completion signaling as Phase-1 successor). §14 gains ALL of the design's "Spec/doc obligations": the config snippet pointer with the honest pre-publish command, the keygen one-liner + base64-of-32-bytes encoding statement, `chmod 600` on the client config, the seed and interim-approve invocations (`node scripts/seed-demo.mjs <url>` / `node scripts/approve-demo.mjs <execId>`), the env-var table **with units** (`CONDUIT_APPROVAL_TTL` in milliseconds), the restart caveat, and the troubleshooting pointers. Run `python3 html2md.py` in the same commit (spec-drift hook enforces). **Source-faithfulness discipline: before composing each §18 entry, re-read the design doc's exact decision sentences and quote them verbatim — compose against the source, never a paraphrase from memory.**
 - [ ] **Step 3: INVARIANTS.md** — add rows (✅ pinned in the same PR): M1 human-only approval seam (`server.test.ts` no-resume-tool test); M8 stdout protocol purity (`integration.test.ts`); M1 `check_execution` ≤256 tokens (`payloads.test.ts`); M4 outcome persistence on every terminal path (`manager.test.ts`); §4.2 capped-listing budget (`execute.test.ts`).
 - [ ] **Step 4: Commit**
 
