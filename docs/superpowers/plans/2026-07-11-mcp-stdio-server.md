@@ -261,7 +261,7 @@ describe("multi-process store hygiene (mcp design M5)", () => {
   await client.execute("PRAGMA journal_mode = WAL").catch(() => {});
 ```
 
-Add the helper and wrap EVERY conditional schema statement in the file — Task 1's three ADDs, the existing `resume_attempt` and `redact_fields` ADD retrofits, **and the §11 `DROP COLUMN output` migration** (its loser in a two-process race sees "no such column"; the pre-DROP masking UPDATEs are idempotent and need no wrapping):
+Add the helper and wrap EVERY conditional schema statement in the file — Task 1's three ADDs, the existing `resume_attempt` and `redact_fields` ADD retrofits, **and the ENTIRE §11 detect→mask→drop migration block** (shape rule, not per-statement patching: the §11 design defines the `output` column's ABSENCE as the migration-done marker, so a "no such column" error at ANY step of that block — the masking `UPDATE`s included, which race a concurrent opener's completed `DROP` — means another process finished the migration; that is SUCCESS, skip the rest of the block):
 
 ```ts
 /**
@@ -282,6 +282,13 @@ async function tolerateSchemaRace(run: () => Promise<unknown>): Promise<void> {
   }
 }
 ```
+
+For the §11 block specifically, wrap the WHOLE detect→mask→drop sequence in one
+`tolerateSchemaRace(async () => { /* mask UPDATEs; DROP */ })` call — a
+"no such column" from any inner statement aborts the remainder of the block as
+already-done (the column absence IS the §11 done marker), rather than wrapping
+each statement individually (which would let a later statement run after an
+earlier one proved the migration complete).
 
 - [ ] **Step 4: Run to verify pass** (unsandboxed, full sdk suite + tsc) → green.
 
