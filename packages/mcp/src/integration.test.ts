@@ -463,3 +463,52 @@ describe("ring-2: spawned bin integration", () => {
     expect(payload.error.message).not.toContain("CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS");
   });
 });
+
+describe("ring-2: bin flag and doctor exit paths", () => {
+  it("--version exits 0, prints to stderr only, stdout empty (INVARIANT M8 stdout purity)", async () => {
+    const { stdout, stderr } = await execFileAsync("node", [binPath, "--version"], {
+      env: { ...process.env, ...baseEnv() },
+    });
+    expect(stdout).toBe("");
+    expect(stderr.trim()).toBe("0.1.0");
+  });
+
+  it("--help exits 0, prints to stderr only, stdout empty (INVARIANT M8 stdout purity)", async () => {
+    const { stdout, stderr } = await execFileAsync("node", [binPath, "--help"], {
+      env: { ...process.env, ...baseEnv() },
+    });
+    expect(stdout).toBe("");
+    expect(stderr).toMatch(/conduit-mcp/);
+    expect(stderr).toMatch(/--doctor/);
+  });
+
+  it("--doctor against a missing CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
+    const env: Record<string, string | undefined> = { ...process.env, ...baseEnv() };
+    delete env.CONDUIT_MASTER_KEY;
+    await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("Missing CONDUIT_MASTER_KEY"),
+    });
+  });
+
+  it("--doctor against a malformed CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
+    const env = {
+      ...process.env,
+      ...baseEnv(),
+      CONDUIT_MASTER_KEY: "not-valid-base64-and-wrong-length",
+    };
+    await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("Malformed CONDUIT_MASTER_KEY"),
+    });
+  });
+
+  it("no flag + missing CONDUIT_MASTER_KEY: startup fails fast, exits 1 with a stderr diagnostic", async () => {
+    const env: Record<string, string | undefined> = { ...process.env, ...baseEnv() };
+    delete env.CONDUIT_MASTER_KEY;
+    await expect(execFileAsync("node", [binPath], { env })).rejects.toMatchObject({
+      code: 1,
+      stderr: expect.stringContaining("Missing CONDUIT_MASTER_KEY"),
+    });
+  });
+});
