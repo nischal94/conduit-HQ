@@ -17,6 +17,7 @@ import type { Sandbox } from "../sandbox/sandbox.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
+import type { Execution } from "../types.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
 import { createExecutionManager, type ExecutionManagerDeps } from "./manager.js";
 
@@ -1041,5 +1042,222 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const [trace] = await h.store.trace.listByExecution(outcome.executionId);
     expect(JSON.stringify(trace?.input)).not.toContain("sk-fixture");
     expect(JSON.stringify(trace?.input)).toContain("[redacted]");
+  });
+});
+
+/**
+ * Wrap `store.executions.put` so its (n+1)th call — 0-indexed by `faultAt` —
+ * throws once, then all subsequent calls (including the retry from
+ * `persistOrFinalizeFailed`'s fallback) pass through to the real store. This
+ * targets the SETTLE write specifically (the second `put` in every scenario
+ * below: `start`/`claimForResume` already durably wrote the first `running`
+ * row through a DIFFERENT path — a raw put or the guarded UPDATE — so the
+ * fault lands exactly on the terminal/paused/expired write under test).
+ */
+function withPutFaultAt(store: ConduitStore, faultAt: number): ConduitStore {
+  const realPut = store.executions.put.bind(store.executions);
+  let calls = 0;
+  return {
+    ...store,
+    executions: {
+      ...store.executions,
+      put: async (execution: Execution) => {
+        const at = calls;
+        calls += 1;
+        if (at === faultAt) {
+          throw new Error("[test] simulated executions.put fault on the settle write");
+        }
+        return realPut(execution);
+      },
+    },
+  };
+}
+
+describe("outcome persistence (mcp design M4)", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+  });
+
+  it("persists result on completed and error on failed", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+
+    const completed = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+    );
+    expect(completed.status).toBe("completed");
+    const completedRow = await h.store.executions.get(completed.executionId);
+    expect(completedRow?.result).toEqual({ ok: true, tool: "list_issues" });
+
+    // An uncaught guest-side throw settles the execution `failed` with a
+    // real SandboxError — no upstream call or approval gate involved.
+    const failed = await manager.start(`throw new TypeError("boom");`);
+    expect(failed.status).toBe("failed");
+    const failedRow = await h.store.executions.get(failed.executionId);
+    expect(failedRow?.error?.name).toBeTruthy();
+  });
+
+  it.each([
+    {
+      label: "completed settle faulted",
+      code: `return 1;`,
+      sandbox: (): Sandbox => ({
+        execute: (request) =>
+          Promise.resolve({
+            status: "completed",
+            value: 1,
+            seeds: request.seeds ?? { now: 1, random: 2 },
+            journal: [...(request.journal ?? [])],
+          }),
+      }),
+    },
+    {
+      label: "failed settle faulted",
+      code: `throw new TypeError("boom");`,
+      sandbox: (): Sandbox => ({
+        execute: (request) =>
+          Promise.resolve({
+            status: "failed",
+            error: { name: "TypeError", message: "boom" },
+            seeds: request.seeds ?? { now: 1, random: 2 },
+            journal: [...(request.journal ?? [])],
+          }),
+      }),
+    },
+  ])("INVARIANT M4: a stored failed row always explains itself — fallback carries ConduitPersistError ($label)", async ({
+    code,
+    sandbox,
+  }) => {
+    const store = await makeBareStore();
+    // Fault the SECOND put (index 1): the first (index 0) is `start`'s
+    // initial `running` row; the second is the settle write under test.
+    const faultyStore = withPutFaultAt(store, 1);
+    const deps = makeStubDeps(faultyStore, sandbox(), { newId: () => "settle_fault" });
+    const manager = createExecutionManager(deps);
+
+    await expect(manager.start(code)).rejects.toThrow(
+      "[test] simulated executions.put fault on the settle write",
+    );
+    // Not swallowed: the fault surfaces to the caller. But the fallback
+    // write in persistOrFinalizeFailed still lands the row terminal.
+    const row = await store.executions.get("exec_settle_fault");
+    expect(row?.status).toBe("failed");
+    expect(row?.error?.name).toBe("ConduitPersistError");
+  });
+
+  it("INVARIANT M4: paused persistence faulted — fallback carries ConduitPersistError", async () => {
+    const h = await makeHarness();
+    active = h;
+    // Fault the SECOND put (index 1): the first (index 0) is `start`'s
+    // initial `running` row; the second is the `paused` write in drive().
+    const faultyStore = withPutFaultAt(h.store, 1);
+    // Deterministic id so the row can be recovered after `start` rejects.
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      store: faultyStore,
+      newId: () => "paused_fault",
+    };
+    const manager = createExecutionManager(deps);
+
+    await expect(
+      manager.start(`return await tools.github.create_issue({ title: "from agent" });`),
+    ).rejects.toThrow("[test] simulated executions.put fault on the settle write");
+
+    const row = await h.store.executions.get("exec_paused_fault");
+    expect(row?.status).toBe("failed");
+    expect(row?.error?.name).toBe("ConduitPersistError");
+  });
+
+  it("INVARIANT M4: expired persistence faulted — fallback carries ConduitPersistError", async () => {
+    const h = await makeHarness();
+    active = h;
+    let clock = 1_000_000;
+    const deps: ExecutionManagerDeps = { ...h.deps, now: () => clock };
+    const manager = createExecutionManager(deps);
+
+    const paused = await manager.start(
+      `return await tools.github.create_issue({ title: "stale" });`,
+    );
+    expect(paused.status).toBe("paused");
+    if (paused.status !== "paused") {
+      return;
+    }
+    clock = paused.pending.expiresAt + 1;
+
+    // Fault the settle write on RESUME: resume's expiry branch does exactly
+    // one `executions.put` before reaching persistOrFinalizeFailed's fallback.
+    const faultyStore = withPutFaultAt(h.store, 0);
+    const resumeDeps: ExecutionManagerDeps = { ...deps, store: faultyStore };
+    const resumeManager = createExecutionManager(resumeDeps);
+
+    await expect(resumeManager.resume(paused.executionId, { kind: "approve" })).rejects.toThrow(
+      "[test] simulated executions.put fault on the settle write",
+    );
+    const row = await h.store.executions.get(paused.executionId);
+    expect(row?.status).toBe("failed");
+    expect(row?.error?.name).toBe("ConduitPersistError");
+  });
+
+  it("expired rows carry neither result nor error", async () => {
+    const h = await makeHarness();
+    active = h;
+    let clock = 1_000_000;
+    const deps: ExecutionManagerDeps = { ...h.deps, now: () => clock };
+    const manager = createExecutionManager(deps);
+
+    const paused = await manager.start(
+      `return await tools.github.create_issue({ title: "stale" });`,
+    );
+    expect(paused.status).toBe("paused");
+    if (paused.status !== "paused") {
+      return;
+    }
+    clock = paused.pending.expiresAt + 1;
+    await manager.resume(paused.executionId, { kind: "approve" });
+    const row = await h.store.executions.get(paused.executionId);
+    expect(row?.status).toBe("expired");
+    expect(row?.result).toBeUndefined();
+    expect(row?.error).toBeUndefined();
+  });
+});
+
+describe("requestKey (mcp design M1)", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+  });
+
+  it("persists the key BEFORE the sandbox runs", async () => {
+    const store = await makeBareStore();
+    const throwingSandbox: Sandbox = {
+      execute: () => Promise.reject(new Error("sandbox threw synchronously")),
+    };
+    const manager = createExecutionManager(makeStubDeps(store, throwingSandbox));
+
+    await expect(manager.start("x", { requestKey: "k1" })).rejects.toThrow();
+    expect(await store.executions.getByRequestKey("k1")).toBeDefined();
+  });
+
+  it("duplicate key → conflict with the existing execution's id, no second run", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+
+    const first = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+      { requestKey: "k2" },
+    );
+    expect(first.status).toBe("completed");
+    const second = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "other" });`,
+      { requestKey: "k2" },
+    );
+    expect(second).toEqual({ status: "conflict", executionId: first.executionId });
+    // The second start never drove a sandbox run: exactly one upstream call.
+    expect(h.calls).toHaveLength(1);
   });
 });

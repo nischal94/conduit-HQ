@@ -38,7 +38,10 @@ import { scrubCredential } from "./scrub.js";
  */
 export interface ExecutionManager {
   /** Begin a new execution. Persists it, drives the sandbox, returns the settled state. */
-  start(code: string, opts?: { limits?: Partial<SandboxLimits> }): Promise<ExecutionOutcome>;
+  start(
+    code: string,
+    opts?: { limits?: Partial<SandboxLimits>; requestKey?: string },
+  ): Promise<ExecutionOutcome>;
   /** Resume a paused execution after a human decision. */
   resume(executionId: string, decision: ApprovalDecision): Promise<ExecutionOutcome>;
   /** Inspect the persisted execution (CLI / API surface). */
@@ -369,6 +372,14 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
    * ALSO throws (the store is genuinely down, not transient), we cannot persist
    * anything; re-throw the original — there is no better recovery than
    * surfacing the fault.
+   *
+   * mcp design M4/M9: the fallback row is itself a `failed` terminal and must
+   * ALWAYS carry an error payload (never a payload-less terminal row). If the
+   * execution already had a real error (e.g. drive()'s own catch already set
+   * one before calling in), preserve it; otherwise synthesize
+   * `ConduitPersistError` naming the write fault as the reason the outcome
+   * could not be durably recorded — this fires on every terminal path that
+   * routes through this guard (completed/failed settle, paused, expired).
    */
   async function persistOrFinalizeFailed(
     execution: Execution,
@@ -377,7 +388,15 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     try {
       await write();
     } catch (cause) {
-      const failed: Execution = { ...execution, status: "failed", endedAt: now() };
+      const failed: Execution = {
+        ...execution,
+        status: "failed",
+        endedAt: now(),
+        error: execution.error ?? {
+          name: "ConduitPersistError",
+          message: `[ExecutionManager] Settle write failed; outcome not persisted. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+        },
+      };
       delete failed.pausedOn;
       try {
         await deps.store.executions.put(failed);
@@ -513,6 +532,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       ...execution,
       status: outcome.status,
       endedAt: now(),
+      // mcp design M4: fold the settle-state into the persisted row. A
+      // completed row carries its result (`undefined` normalized to `null` at
+      // persistence — the M1 undefined→null rule); a failed row ALWAYS
+      // carries its error, so a stored failed row can always explain itself.
+      ...(outcome.status === "completed" ? { result: outcome.value ?? null } : {}),
+      ...(outcome.status === "failed" ? { error: outcome.error } : {}),
     };
     // A settled execution carries no pending approval.
     delete persisted.pausedOn;
@@ -530,8 +555,31 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         status: "running",
         seeds: generateSeeds(),
         startedAt: now(),
+        ...(opts?.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
       };
-      await deps.store.executions.put(execution);
+      try {
+        await deps.store.executions.put(execution);
+      } catch (cause) {
+        // mcp design M1: requestKey is persisted BEFORE the sandbox runs, so a
+        // duplicate key is caught here as a UNIQUE constraint violation on
+        // `executions.request_key` — never a second execution. Recognize the
+        // store's raw SQLite message (verified by the store's own unit test)
+        // rather than a typed error, since the store seam is engine-agnostic.
+        if (
+          opts?.requestKey !== undefined &&
+          String(cause).includes("UNIQUE constraint failed: executions.request_key")
+        ) {
+          const existing = await deps.store.executions.getByRequestKey(opts.requestKey);
+          if (existing !== undefined) {
+            return { status: "conflict", executionId: existing.id };
+          }
+          // The unique violation fired but the row it collided with cannot be
+          // found — a store fault (e.g. a read-after-write inconsistency),
+          // not a legitimate conflict. Surface the original error rather than
+          // fabricate a conflict with no execution behind it.
+        }
+        throw cause;
+      }
       const invoke = deps.makeInvoker({ executionId: execution.id });
       return drive(execution, invoke, [], undefined, opts?.limits);
     },
