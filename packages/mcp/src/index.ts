@@ -1,3 +1,4 @@
+export { ensureDbDir, KEYGEN_ONE_LINER, type ResolvedEnv, resolveEnv } from "./env.js";
 export {
   CHECK_EXECUTION_TOOL,
   executionToCheckPayload,
