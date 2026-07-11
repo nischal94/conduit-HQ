@@ -33,8 +33,16 @@ untouched, so the git staleness tripwire is SILENT about this work by design (th
 LEARNINGS #21 blind spot). **At session start: check out
 `docs/conduit-cli-design` (it exists on origin too); `gh pr list` will show
 nothing — the branch is pushed but no PR is open.** Do NOT start the CLI on
-`main` or a new branch, and do NOT open the PR yet (the CLI ships as one PR after
-the build completes). The SDD ledger (`.superpowers/sdd/progress.md`) is
+`main` or a new branch, and do NOT open a PR yet. **Ship strategy (decided
+2026-07-12): TWO PRs — Lane A (the SDK/mcp seams) merges FIRST, then Lane B (the
+CLI package) on top.** Rationale: Lane A refactors already-shipped, security-
+sensitive code (the SDK store + the live /mcp server's startup/manager
+composition), so a regression there can break the SHIPPED server — it deserves
+its own focused "did behavior change?" review, provable against the existing mcp
+suite, before the additive CLI is layered on. Lane B is purely additive (a new
+package that only CALLS the seams) and can only break itself. The design doc
+rides with the Lane A PR (it's the whole feature's decision record). The SDD
+ledger (`.superpowers/sdd/progress.md`) is
 git-ignored so it did NOT push — it's reconstructable from `git log` on the
 pushed branch, which is what the SDD resume step does.
 
@@ -103,11 +111,10 @@ The three tweakable interface signatures (listPaused DONE, provisionSource DONE,
 ### Doc-routing note for THIS handoff
 
 HANDOFF.md/LEARNINGS.md are `.pushallowlist`ed (direct-push-to-main eligible),
-but they're being edited on `docs/conduit-cli-design` alongside the build. Two
-clean options for the next session: (a) keep them on the branch so the whole CLI
-work (design + build + these docs) lands in one PR — simplest, one story; or (b)
-cherry-pick just the HANDOFF/LEARNINGS edits to main via `scripts/push-docs`.
-Recommend (a): fold everything into the one CLI PR.
+but they're being edited on `docs/conduit-cli-design` alongside the build. They
+ride with the **Lane A PR** (the first to merge) along with the design doc — no
+separate docs-push needed; keeping them with the build keeps one coherent story
+per PR.
 
 ### Carry-overs (unchanged from 2026-07-11, still valid)
 
@@ -141,10 +148,16 @@ Recommend (a): fold everything into the one CLI PR.
 > Per-task: fresh implementer → verify → two-verdict review → ledger. COMMIT WITH
 > SANDBOX DISABLED (never --no-verify — hook mktemp is sandbox-denied); mcp/cli
 > tasks verify via unsandboxed vitest (hook covers sdk only). createApprovalRuntime
-> (T5) is a STOP-and-ask frozen signature. After T9: final whole-branch review →
-> finishing-a-development-branch → the load-bearing PR (Tier 2 + /security-review
-> + real codex exec + /explain-diff quiz + human-named merge). Fold design + build
-> + HANDOFF/LEARNINGS into the ONE CLI PR.
+> (T5) is a STOP-and-ask frozen signature.
+>
+> **SHIP IN TWO PRs (decided 2026-07-12): Lane A (seams) merges FIRST, then Lane B
+> (CLI) on top.** Lane A refactors shipped/security-sensitive code (SDK store +
+> the live /mcp server) → its own focused behavior-preserving review, provable
+> against the existing mcp suite. Lane B is additive-only. Each PR: final review →
+> finishing-a-development-branch → load-bearing route (Tier 2 + /security-review +
+> real codex exec + /explain-diff quiz + human-named merge). Design doc +
+> HANDOFF/LEARNINGS ride with the Lane A PR. Practically: after T5, cut the Lane A
+> PR from the branch (or split the branch); build Lane B on top of merged Lane A.
 
 ---
 
