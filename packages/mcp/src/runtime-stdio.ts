@@ -18,15 +18,25 @@ export async function runStdioServer(opts: { env?: NodeJS.ProcessEnv } = {}): Pr
   console.warn = toStderr;
   console.error = toStderr;
 
-  const env = resolveEnv(opts.env ?? process.env);
   // openStoreFromEnv sequence, inlined for now — Task 4 factors this out
-  // into a shared module alongside bin.ts's copy.
-  ensureDbDir(env.dbPath);
-  const client = createClient({ url: `file:${env.dbPath}` });
-  const store = await openSqliteStore({
-    client,
-    secretBox: await SecretBox.fromKeyBytes(env.keyBytes),
-  });
+  // into a shared module alongside bin.ts's copy. Old bin.ts wrapped this
+  // in a local try/catch that prints the bare error and exits BEFORE
+  // main().catch() can add its "[ConduitMcp] Fatal:" prefix — reproduce
+  // that exactly so serve-path startup failures are byte-identical.
+  let env: ReturnType<typeof resolveEnv>;
+  let store: Awaited<ReturnType<typeof openSqliteStore>>;
+  try {
+    env = resolveEnv(opts.env ?? process.env);
+    ensureDbDir(env.dbPath);
+    const client = createClient({ url: `file:${env.dbPath}` });
+    store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(env.keyBytes),
+    });
+  } catch (error) {
+    console.error(String(error instanceof Error ? error.message : error));
+    process.exit(1);
+  }
 
   if (env.allowPrivateEgress) {
     console.error(
