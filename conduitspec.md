@@ -513,9 +513,12 @@ before Conduit's tools appear.
 `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`.
 2. **Config snippet, honest pre-publish command:** nothing is on npm yet, so the client
 config's `command`/`args` point at the built file directly — `node
-<abs path>/packages/mcp/dist/bin.js` — with `CONDUIT_DB` and
-`CONDUIT_MASTER_KEY` in its `env` block. `chmod 600` the client
-config file afterward — it now holds the master key.
+<abs path>/packages/mcp/dist/bin.js` — with `CONDUIT_MASTER_KEY` in its
+`env` block. Leave `CONDUIT_DB` out of the snippet: the built-in default
+already resolves to an absolute path via `homedir()`, and Node never expands
+`~`, so a literal `~/.conduit/conduit.db` in `env` would be
+read as relative to the client's own working directory and fail to start. `chmod 600`
+the client config file afterward — it now holds the master key.
 3. **Seed a demo source** so there's something to call:
 `node scripts/seed-demo.mjs <upstream-mcp-url>` (allow-only policies, so the walking
 skeleton can't strand on an unapproved pause). It prints the ready-to-paste config snippet above.
@@ -529,7 +532,7 @@ applies here too.
 
 | Var | Meaning | Default |
 | --- | --- | --- |
-| `CONDUIT_DB` | SQLite database path. | `~/.conduit/conduit.db` (created on first run) |
+| `CONDUIT_DB` | SQLite database path. Node does not expand `~` — if set, use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run) |
 | `CONDUIT_MASTER_KEY` | SecretBox key, base64 encoding of exactly 32 bytes. Required. | none (required) |
 | `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Allow loopback/private-network upstreams. Dev/demo only. | off (fail-closed) |
 | `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72h) |

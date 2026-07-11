@@ -35,13 +35,19 @@ package adds no core logic of its own; it is a thin transport shell over
          "command": "node",
          "args": ["<abs path>/packages/mcp/dist/bin.js"],
          "env": {
-           "CONDUIT_DB": "~/.conduit/conduit.db",
            "CONDUIT_MASTER_KEY": "<your key>"
          }
        }
      }
    }
    ```
+
+   `CONDUIT_DB` is omitted deliberately: Node never expands `~`, so a literal
+   `~/.conduit/conduit.db` would be treated as a relative path from the MCP
+   client's own working directory (often `/`), and the server fails to start.
+   The built-in default already resolves to an absolute path via `homedir()`
+   — see the env vars table below. If you need a custom location, use an
+   absolute path (e.g. `/Users/you/.conduit/conduit.db`), never `~`.
 
    `chmod 600` the client config file after editing it — it now holds your
    master key.
@@ -64,7 +70,7 @@ package adds no core logic of its own; it is a thin transport shell over
 
 | Var | Meaning | Default |
 | --- | --- | --- |
-| `CONDUIT_DB` | Path to the SQLite database file. | `~/.conduit/conduit.db` (created on first run, directory mode `0700`) |
+| `CONDUIT_DB` | Path to the SQLite database file. Node does not expand `~` — if you set this yourself, use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
 | `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. Required — the process exits nonzero at startup if missing or malformed. | none (required) |
 | `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only** — prints a loud stderr warning at startup when enabled. | off (fail-closed; §9.3) |
 | `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72 hours) |

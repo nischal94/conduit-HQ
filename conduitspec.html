@@ -736,9 +736,12 @@ before Conduit&#39;s tools appear.</li>
 <code>node -e &quot;console.log(require('node:crypto').randomBytes(32).toString('base64'))&quot;</code>.</li>
 <li><strong>Config snippet, honest pre-publish command:</strong> nothing is on npm yet, so the client
 config's <code>command</code>/<code>args</code> point at the built file directly — <code>node
-&lt;abs path&gt;/packages/mcp/dist/bin.js</code> — with <code>CONDUIT_DB</code> and
-<code>CONDUIT_MASTER_KEY</code> in its <code>env</code> block. <code>chmod 600</code> the client
-config file afterward — it now holds the master key.</li>
+&lt;abs path&gt;/packages/mcp/dist/bin.js</code> — with <code>CONDUIT_MASTER_KEY</code> in its
+<code>env</code> block. Leave <code>CONDUIT_DB</code> out of the snippet: the built-in default
+already resolves to an absolute path via <code>homedir()</code>, and Node never expands
+<code>~</code>, so a literal <code>~/.conduit/conduit.db</code> in <code>env</code> would be
+read as relative to the client's own working directory and fail to start. <code>chmod 600</code>
+the client config file afterward — it now holds the master key.</li>
 <li><strong>Seed a demo source</strong> so there's something to call:
 <code>node scripts/seed-demo.mjs &lt;upstream-mcp-url&gt;</code> (allow-only policies, so the walking
 skeleton can't strand on an unapproved pause). It prints the ready-to-paste config snippet above.</li>
@@ -760,8 +763,8 @@ applies here too.</li>
 <tbody>
 <tr>
 <td><code>CONDUIT_DB</code></td>
-<td>SQLite database path.</td>
-<td><code>~/.conduit/conduit.db</code> (created on first run)</td>
+<td>SQLite database path. Node does not expand <code>~</code> — if set, use an absolute path.</td>
+<td><code>~/.conduit/conduit.db</code>, resolved via <code>homedir()</code> (created on first run)</td>
 </tr>
 <tr>
 <td><code>CONDUIT_MASTER_KEY</code></td>
