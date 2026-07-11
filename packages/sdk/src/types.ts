@@ -86,6 +86,18 @@ export interface Policy {
 export type ExecutionStatus = "running" | "paused" | "completed" | "failed" | "expired";
 
 /**
+ * A guest error, reduced to data (spec §16 sandbox boundary — no handles or
+ * engine objects escape). Structural duplicate of sandbox/sandbox.ts's
+ * SandboxError: importing that type here would cycle (sandbox.ts imports
+ * Execution from this file), so the shape is pinned independently and both
+ * sides must stay in agreement.
+ */
+export interface ExecutionError {
+  name: string;
+  message: string;
+}
+
+/**
  * One invocation of the `execute` tool. Pause/resume works by deterministic
  * replay (spec §5.5): the journal of tool-call results is the resume state —
  * on resume the code re-runs from the top against memoized results.
@@ -100,6 +112,12 @@ export interface Execution {
   pausedOn?: PendingApproval;
   startedAt: number;
   endedAt?: number;
+  /** Caller-generated correlation key (mcp design M1); unique, persisted before the sandbox runs. */
+  requestKey?: string;
+  /** Persisted settle-state (mcp design M4): completed → result. undefined normalized to null at the surface. */
+  result?: unknown;
+  /** Persisted settle-state (mcp design M4): failed → error, ALWAYS present on a stored failed row. */
+  error?: ExecutionError;
 }
 
 /** A call waiting on a human (spec §10.2). Expires per CONDUIT_APPROVAL_TTL (spec §5.5). */

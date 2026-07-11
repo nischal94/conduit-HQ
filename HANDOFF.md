@@ -23,6 +23,70 @@ at session start.
 
 ---
 
+## Current handoff — written 2026-07-11 (/mcp stdio server: SDD tasks 1-9 of 12 DONE; next = Task 10 ring-2 integration)
+
+### Where things stand
+
+- **Branch `feat/mcp-stdio-server`** carries the full reviewed chain:
+  design doc rev 2 (`docs/superpowers/specs/2026-07-11-mcp-stdio-server-design.md`,
+  M1-M9, multi-voice autoplan review CONVERGED: codex trajectory 14→9→8→2→1(a)) →
+  implementation plan rev 2 (`docs/superpowers/plans/2026-07-11-mcp-stdio-server.md`,
+  12 tasks; codex plan review 12 findings fixed + §11-block shape-fix, converged) →
+  SDD build, tasks 1-9 complete, every task with a clean two-verdict review.
+- **SDD ledger is the authority: `.superpowers/sdd/progress.md`** (this plan's
+  section, after the §11 section — per-task commits, sanctioned deviations, Minor
+  roll-up for the final review). Suite green throughout: sdk 313/313 + mcp 25/25.
+  Last commit: `d5f5fb5` (Task 9 scripts).
+- **DONE (commits 263c847..d5f5fb5):** T1 storage (result/error/request_key +
+  getByRequestKey), T2 WAL/busy_timeout + tolerateSchemaRace (incl. §11 block as one
+  unit), T3 manager outcome-aware terminals + requestKey conflict, T4 capped
+  connection listing (§4.2 pin holds at 100 connections), T5 packages/mcp scaffold
+  (user install via sfw done; MCP SDK exact-pinned 1.29.0 + @libsql/client), T6
+  payloads (CheckPayloadBody union; token pins), T7 createConduitMcpServer (per-call
+  composition, XOR validation, no-resume-tool invariant), T8 env+bin (canonical-b64
+  key check, --doctor, stderr discipline, live-smoked), T9 seed-demo.mjs +
+  approve-demo.mjs (allow-only policies, config snippet; approve composition
+  char-identical to server.ts incl. egress env).
+- **NEXT: SDD Task 10** (ring-2 integration suite — spawned bin via Client +
+  StdioClientTransport, 4-step workflow e2e, stdout purity, pause → approve via
+  `node scripts/approve-demo.mjs <execId>` in a separate process → poll, client
+  timeout + requestKey recovery, parallel executes, egress fail-closed without the
+  opt-in env). Then T11 (README + conduitspec.html §14/§18/§20 + html2md.py same
+  commit + INVARIANTS rows), T12 (credential-echo invariant in e2e.smoke — STOP if
+  it fails, that falsifies the design's M4 posture claim). Then final whole-branch
+  review on the MOST CAPABLE model (opus precedent) fed the ledger's Minor roll-up.
+- Per-task flow: skill's `scripts/task-brief PLAN N` → implementer (sonnet; haiku
+  only for verbatim-transcription tasks) → `scripts/review-package BASE HEAD` →
+  task reviewer (sonnet) → ledger line. Record BASE before each dispatch.
+- **Implementer dispatches MUST carry:** vitest/tsc UNSANDBOXED (loopback suites
+  hang sandboxed — Task 10 doubly so: sockets + spawned processes); pre-commit hook
+  authoritative; NEVER git stash; binaries `packages/{sdk,mcp}/node_modules/.bin/
+  {vitest,tsc}` + repo-root biome; stage-only-changed; **stale-dist trap: the
+  workspace resolves @conduithq/sdk against packages/sdk/dist — rebuild via tsup
+  after any sdk source change** (`cd packages/sdk && node_modules/.bin/tsup
+  src/index.ts --format esm --dts --sourcemap`).
+- Post-build gates (unchanged): push → PR routing → Tier 2 + /security-review +
+  real codex exec pass (background, stdin prompt, scratchpad outputs) →
+  /explain-diff + FULL quiz pass → human-named merge. §17 gate-one manual
+  acceptance (real Claude Desktop) after; gate two after steps 3-4.
+- Housekeeping: gstack update available (1.5.1→1.60.1) — user-run, low priority.
+
+### Kickoff prompt for the next session
+
+> Continue the /mcp stdio server SDD build in ~/projects/conduit-HQ on branch
+> feat/mcp-stdio-server. Read .superpowers/sdd/progress.md FIRST (this plan's
+> section, after the §11 section) — tasks 1-9 are DONE, do not redo them. Resume
+> superpowers:subagent-driven-development at Task 10 using
+> docs/superpowers/plans/2026-07-11-mcp-stdio-server.md (task-brief script per
+> task). Inherit every quirk in HANDOFF's dispatch checklist verbatim into each
+> implementer dispatch — especially UNSANDBOXED vitest and the stale-dist rebuild.
+> After Task 12: final whole-branch review (most capable model, feed it the
+> ledger's Minor roll-up), then the post-build gates. Merge only on my say-so.
+
+---
+
+## Previous handoff (2026-07-10, superseded but quirks still valid)
+
 ## Current handoff — written 2026-07-10 (§11 Trace redaction MERGED — PHASE 0 COMPLETE; next MVP step = /mcp server, stdio)
 
 ### Where things stand

@@ -4,6 +4,7 @@ import type { SecretBox } from "../secrets.js";
 import type {
   Connection,
   Execution,
+  ExecutionError,
   ExecutionStatus,
   Integration,
   JsonSchema,
@@ -29,6 +30,8 @@ export interface SqliteStoreOptions {
   client: Client;
   /** Encrypts SecretRepository contents at rest (spec §9.2). */
   secretBox: SecretBox;
+  /** Host-side sink for infra diagnostics (e.g. a WAL-pragma failure); NEVER guest-visible. */
+  log?: (message: string) => void;
 }
 
 // The CHECK vocabularies below protect fresh schemas only: CREATE TABLE
@@ -79,7 +82,10 @@ const SCHEMA = [
     paused_on TEXT,
     started_at INTEGER NOT NULL,
     ended_at INTEGER,
-    resume_attempt TEXT
+    resume_attempt TEXT,
+    result TEXT,
+    error TEXT,
+    request_key TEXT
   )`,
   `CREATE TABLE IF NOT EXISTS trace_events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -110,24 +116,89 @@ const SCHEMA = [
   )`,
 ];
 
+/**
+ * M5: the PRAGMA table_info → ALTER ladder is idempotent sequentially but
+ * races across processes (two fresh servers at login both see the schema
+ * delta pending; one ALTER loses). For ADD COLUMN the loser sees "duplicate
+ * column name"; for DROP COLUMN it sees "no such column". Either way the
+ * schema is already in the state the retrofit promises — SUCCESS, not failure.
+ */
+async function tolerateSchemaRace(run: () => Promise<unknown>): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    const text = String(error);
+    if (!text.includes("duplicate column name") && !text.includes("no such column")) {
+      throw error;
+    }
+  }
+}
+
 export async function openSqliteStore(options: SqliteStoreOptions): Promise<ConduitStore> {
   const { client, secretBox } = options;
+  const log = options.log ?? ((message: string) => console.error(message));
+
+  // M5: multi-process hygiene — BEFORE the first schema statement so the
+  // migration itself benefits. WAL is a legitimate no-op on :memory: (SQLite
+  // reports "memory" regardless of the PRAGMA), so a failure or a non-"wal"
+  // result is only actionable when the mode ISN'T "memory" — i.e. a
+  // file-backed DB where M5's multi-process safety silently doesn't apply.
+  // Never throws: a WAL-less file DB still works single-process, just
+  // without the cross-process guarantee, so this is a warning, not a fail.
+  await client.execute("PRAGMA busy_timeout = 5000").catch(() => {});
+  try {
+    const result = await client.execute("PRAGMA journal_mode = WAL");
+    const mode = String(Object.values(result.rows[0] ?? {})[0] ?? "").toLowerCase();
+    if (mode !== "wal" && mode !== "memory") {
+      log(
+        `[SqliteStore] WARNING: PRAGMA journal_mode = WAL did not take effect (reported "${mode}") — ` +
+          "M5 multi-process safety does NOT apply to this database; single-process use only.",
+      );
+    }
+  } catch (cause) {
+    log(
+      `[SqliteStore] WARNING: PRAGMA journal_mode = WAL failed — M5 multi-process safety does NOT ` +
+        `apply to this database; single-process use only. Context: { cause: ${String(cause)} }`,
+    );
+  }
+
   await client.batch(SCHEMA, "write");
 
   // executions.resume_attempt arrived after the first shipped schema; same
   // retrofit as trace_events.output below.
   const executionColumns = await client.execute("PRAGMA table_info(executions)");
   if (!executionColumns.rows.some((row) => row.name === "resume_attempt")) {
-    await client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT");
+    await tolerateSchemaRace(() =>
+      client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT"),
+    );
   }
+
+  // executions.result/error/request_key arrived with the mcp design (M1/M4);
+  // same retrofit pattern. The unique index is created after the columns
+  // exist on both fresh and legacy schemas (SQLite unique indexes ignore
+  // NULLs, so multiple legacy rows with no request_key coexist fine).
+  if (!executionColumns.rows.some((row) => row.name === "result")) {
+    await tolerateSchemaRace(() => client.execute("ALTER TABLE executions ADD COLUMN result TEXT"));
+  }
+  if (!executionColumns.rows.some((row) => row.name === "error")) {
+    await tolerateSchemaRace(() => client.execute("ALTER TABLE executions ADD COLUMN error TEXT"));
+  }
+  if (!executionColumns.rows.some((row) => row.name === "request_key")) {
+    await tolerateSchemaRace(() =>
+      client.execute("ALTER TABLE executions ADD COLUMN request_key TEXT"),
+    );
+  }
+  await client.execute(
+    "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_request_key ON executions(request_key)",
+  );
 
   // policies.redact_fields arrived with §11 redaction; same retrofit
   // pattern as trace_events.output below. Must run BEFORE the trace_events
   // migration below, which SELECTs this column to build per-tool masking.
   const policyColumns = await client.execute("PRAGMA table_info(policies)");
   if (!policyColumns.rows.some((row) => row.name === "redact_fields")) {
-    await client.execute(
-      "ALTER TABLE policies ADD COLUMN redact_fields TEXT NOT NULL DEFAULT '[]'",
+    await tolerateSchemaRace(() =>
+      client.execute("ALTER TABLE policies ADD COLUMN redact_fields TEXT NOT NULL DEFAULT '[]'"),
     );
   }
 
@@ -140,39 +211,48 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   // then DROP the column. The column's absence marks the migration done.
   // Runs AFTER the policies.redact_fields retrofit above (this block SELECTs
   // that column).
+  //
+  // M5: the whole detect→mask→drop sequence is ONE tolerateSchemaRace unit,
+  // not per-statement wrapping. The masking UPDATEs race a concurrent
+  // opener's completed DROP: a "no such column" from ANY inner statement
+  // (including a masking UPDATE, not just the final DROP) means the other
+  // process already finished the migration — stop immediately rather than
+  // let a later statement run after the schema has moved on.
   const traceColumns = await client.execute("PRAGMA table_info(trace_events)");
   if (traceColumns.rows.some((row) => row.name === "output")) {
-    const policyRows = await client.execute("SELECT tool_name, redact_fields FROM policies");
-    const extrasByTool = new Map<string, string[]>();
-    for (const row of policyRows.rows) {
-      try {
-        const parsed: unknown = JSON.parse(String(row.redact_fields));
-        if (Array.isArray(parsed) && parsed.every((f): f is string => typeof f === "string")) {
-          extrasByTool.set(String(row.tool_name), parsed);
+    await tolerateSchemaRace(async () => {
+      const policyRows = await client.execute("SELECT tool_name, redact_fields FROM policies");
+      const extrasByTool = new Map<string, string[]>();
+      for (const row of policyRows.rows) {
+        try {
+          const parsed: unknown = JSON.parse(String(row.redact_fields));
+          if (Array.isArray(parsed) && parsed.every((f): f is string => typeof f === "string")) {
+            extrasByTool.set(String(row.tool_name), parsed);
+          }
+        } catch {
+          // A malformed row fails the policy read path loudly elsewhere;
+          // for the one-time migration, builtins-only is the fail-closed floor.
         }
-      } catch {
-        // A malformed row fails the policy read path loudly elsewhere;
-        // for the one-time migration, builtins-only is the fail-closed floor.
       }
-    }
-    const traceRows = await client.execute(
-      "SELECT call_id, tool_name, input, output_summary FROM trace_events",
-    );
-    for (const row of traceRows.rows) {
-      const extras = extrasByTool.get(String(row.tool_name)) ?? [];
-      let input: string;
-      try {
-        input = JSON.stringify(redactSensitiveFields(JSON.parse(String(row.input)), extras));
-      } catch {
-        input = JSON.stringify("[redacted:pre-§11]"); // unparseable → fail closed
+      const traceRows = await client.execute(
+        "SELECT call_id, tool_name, input, output_summary FROM trace_events",
+      );
+      for (const row of traceRows.rows) {
+        const extras = extrasByTool.get(String(row.tool_name)) ?? [];
+        let input: string;
+        try {
+          input = JSON.stringify(redactSensitiveFields(JSON.parse(String(row.input)), extras));
+        } catch {
+          input = JSON.stringify("[redacted:pre-§11]"); // unparseable → fail closed
+        }
+        const summary = row.output_summary === null ? null : JSON.stringify("[redacted:pre-§11]");
+        await client.execute({
+          sql: "UPDATE trace_events SET input = ?, output_summary = ?, output = NULL WHERE call_id = ?",
+          args: [input, summary, String(row.call_id)],
+        });
       }
-      const summary = row.output_summary === null ? null : JSON.stringify("[redacted:pre-§11]");
-      await client.execute({
-        sql: "UPDATE trace_events SET input = ?, output_summary = ?, output = NULL WHERE call_id = ?",
-        args: [input, summary, String(row.call_id)],
-      });
-    }
-    await client.execute("ALTER TABLE trace_events DROP COLUMN output");
+      await client.execute("ALTER TABLE trace_events DROP COLUMN output");
+    });
   }
 
   return {
@@ -348,12 +428,14 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
     executions: {
       async put(execution: Execution): Promise<void> {
         await client.execute({
-          sql: `INSERT INTO executions (id, code, status, seeds, paused_on, started_at, ended_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+          sql: `INSERT INTO executions
+                  (id, code, status, seeds, paused_on, started_at, ended_at, result, error, request_key)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(id) DO UPDATE SET
                   code = excluded.code, status = excluded.status, seeds = excluded.seeds,
                   paused_on = excluded.paused_on, started_at = excluded.started_at,
-                  ended_at = excluded.ended_at`,
+                  ended_at = excluded.ended_at, result = excluded.result,
+                  error = excluded.error, request_key = excluded.request_key`,
           args: [
             execution.id,
             execution.code,
@@ -362,6 +444,9 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             execution.pausedOn === undefined ? null : JSON.stringify(execution.pausedOn),
             execution.startedAt,
             execution.endedAt ?? null,
+            execution.result === undefined ? null : JSON.stringify(execution.result),
+            execution.error === undefined ? null : JSON.stringify(execution.error),
+            execution.requestKey ?? null,
           ],
         });
       },
@@ -371,42 +456,15 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           args: [id],
         });
         const row = rs.rows[0];
-        if (row === undefined) {
-          return undefined;
-        }
-        const status = text(row, "status");
-        if (!isOneOf(status, EXECUTION_STATUSES)) {
-          // An impossible status must never reach §5.5 pause/resume
-          // handling, where default-less switches would ignore it.
-          throw new Error(
-            `[SqliteStore] Failed to read execution: unrecognized status ${JSON.stringify(status)}. Context: { id: ${JSON.stringify(id)} }`,
-          );
-        }
-        const executionReadError = (detail: string, cause?: unknown) =>
-          new Error(
-            `[SqliteStore] Failed to read execution: ${detail}. Context: { id: ${JSON.stringify(id)} }`,
-            cause === undefined ? undefined : { cause },
-          );
-        const execution: Execution = {
-          id: text(row, "id"),
-          code: text(row, "code"),
-          status,
-          seeds: parseJson(text(row, "seeds"), (cause) =>
-            executionReadError("seeds is not valid JSON", cause),
-          ) as Execution["seeds"],
-          startedAt: integer(row, "started_at"),
-        };
-        const pausedOn = maybeText(row, "paused_on");
-        if (pausedOn !== undefined) {
-          execution.pausedOn = parseJson(pausedOn, (cause) =>
-            executionReadError("paused_on is not valid JSON", cause),
-          ) as PendingApproval;
-        }
-        const endedAt = maybeInteger(row, "ended_at");
-        if (endedAt !== undefined) {
-          execution.endedAt = endedAt;
-        }
-        return execution;
+        return row === undefined ? undefined : hydrateExecutionRow(row, id);
+      },
+      async getByRequestKey(key: string): Promise<Execution | undefined> {
+        const rs = await client.execute({
+          sql: "SELECT * FROM executions WHERE request_key = ?",
+          args: [key],
+        });
+        const row = rs.rows[0];
+        return row === undefined ? undefined : hydrateExecutionRow(row, text(row, "id"));
       },
       async claimForResume(id: string, resumeAttemptId: string): Promise<boolean> {
         // Single guarded UPDATE: the WHERE status = 'paused' clause makes
@@ -420,19 +478,18 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         });
         return rs.rowsAffected === 1;
       },
-      async failClaimedResume(id: string, _reason: string): Promise<void> {
+      async failClaimedResume(id: string, reason: string): Promise<void> {
         // Guarded terminalizer for a row THIS resume claimed (design §8/F5).
         // The `WHERE status='running'` clause means it ONLY finalizes a row a
         // successful `claimForResume` left `running` — never a row another
         // actor already moved to a terminal or re-`paused` state. No parsed
         // Execution is needed (the fault may be corrupt stored JSON), so this
-        // writes columns directly. `_reason` is the caller-facing failure
-        // detail (surfaced in the thrown/returned error); the executions table
-        // has no reason column in v1, so it is not persisted here.
+        // writes columns directly. `reason` becomes the stored error payload
+        // (mcp design M4) so a caller reading the failed row sees why.
         await client.execute({
-          sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL
+          sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL, error = ?
                 WHERE id = ? AND status = 'running'`,
-          args: [Date.now(), id],
+          args: [Date.now(), JSON.stringify({ name: "ConduitInternalError", message: reason }), id],
         });
       },
     },
@@ -817,6 +874,59 @@ function rowToPolicy(row: Row): Policy {
     manualOverride: manualOverride === 1,
     redactFields: redactFieldsParsed,
   };
+}
+
+/** Shared row→Execution hydration for `get` and `getByRequestKey`. */
+function hydrateExecutionRow(row: Row, id: string): Execution {
+  const status = text(row, "status");
+  if (!isOneOf(status, EXECUTION_STATUSES)) {
+    // An impossible status must never reach §5.5 pause/resume
+    // handling, where default-less switches would ignore it.
+    throw new Error(
+      `[SqliteStore] Failed to read execution: unrecognized status ${JSON.stringify(status)}. Context: { id: ${JSON.stringify(id)} }`,
+    );
+  }
+  const executionReadError = (detail: string, cause?: unknown) =>
+    new Error(
+      `[SqliteStore] Failed to read execution: ${detail}. Context: { id: ${JSON.stringify(id)} }`,
+      cause === undefined ? undefined : { cause },
+    );
+  const execution: Execution = {
+    id: text(row, "id"),
+    code: text(row, "code"),
+    status,
+    seeds: parseJson(text(row, "seeds"), (cause) =>
+      executionReadError("seeds is not valid JSON", cause),
+    ) as Execution["seeds"],
+    startedAt: integer(row, "started_at"),
+  };
+  const pausedOn = maybeText(row, "paused_on");
+  if (pausedOn !== undefined) {
+    execution.pausedOn = parseJson(pausedOn, (cause) =>
+      executionReadError("paused_on is not valid JSON", cause),
+    ) as PendingApproval;
+  }
+  const endedAt = maybeInteger(row, "ended_at");
+  if (endedAt !== undefined) {
+    execution.endedAt = endedAt;
+  }
+  const result = maybeText(row, "result");
+  if (result !== undefined) {
+    execution.result = parseJson(result, (cause) =>
+      executionReadError("result is not valid JSON", cause),
+    );
+  }
+  const error = maybeText(row, "error");
+  if (error !== undefined) {
+    execution.error = parseJson(error, (cause) =>
+      executionReadError("error is not valid JSON", cause),
+    ) as ExecutionError;
+  }
+  const requestKey = maybeText(row, "request_key");
+  if (requestKey !== undefined) {
+    execution.requestKey = requestKey;
+  }
+  return execution;
 }
 
 function rowToTraceEvent(row: Row): TraceEvent {

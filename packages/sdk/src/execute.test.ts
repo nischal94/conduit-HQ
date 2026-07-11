@@ -42,6 +42,16 @@ describe("buildExecuteTool", () => {
     const definition = buildExecuteTool({ connections: [] });
     expect(definition.description).toContain("(none configured yet)");
   });
+
+  it("INVARIANT §4.2: the definition stays under budget with 100 connections (capped listing)", () => {
+    const connections = Array.from({ length: 100 }, (_, i) => ({
+      prefix: `service${i}.org.main`,
+      label: `Service ${i} connection with a fairly long label`,
+    }));
+    const definition = buildExecuteTool({ connections });
+    expect(estimateTokens(definition)).toBeLessThanOrEqual(1_044);
+    expect(definition.description).toContain("…and 90 more — search the catalog");
+  });
 });
 
 describe("createCatalogToolHost", () => {

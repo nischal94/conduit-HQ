@@ -1,3 +1,6 @@
+import { mkdtempSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { beforeEach, describe, expect, it } from "vitest";
 import { SecretBox } from "../secrets.js";
@@ -228,6 +231,193 @@ describe("SqliteStore", () => {
       expect(loaded?.seeds.random).toBe(0.42);
       expect(loaded?.pausedOn?.reason).toBe("Policy requires approval");
       expect(loaded && "endedAt" in loaded).toBe(false);
+    });
+  });
+
+  describe("execution outcome persistence (mcp design M4)", () => {
+    const KEY_BYTES = SecretBox.generateKeyBytes();
+    async function testSecretBox() {
+      return SecretBox.fromKeyBytes(KEY_BYTES);
+    }
+    async function openTestStore(url = ":memory:") {
+      return openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() });
+    }
+    function tempFileDbUrl(): string {
+      return `file:${join(mkdtempSync(join(tmpdir(), "conduit-m4-")), "t.db")}`;
+    }
+    /** Builds a pre-M4 executions table on a temp FILE db; returns { url, client }. */
+    async function legacyDb() {
+      const url = tempFileDbUrl();
+      const client = createClient({ url });
+      await client.execute(`CREATE TABLE executions (
+        id TEXT PRIMARY KEY, code TEXT NOT NULL, status TEXT NOT NULL,
+        seeds TEXT NOT NULL, paused_on TEXT, started_at INTEGER NOT NULL,
+        ended_at INTEGER, resume_attempt TEXT)`);
+      await client.execute(`INSERT INTO executions (id, code, status, seeds, started_at, ended_at)
+        VALUES ('exec_old', '1', 'completed', '{"now":1,"random":0.5}', 1, 2)`);
+      return { url, client };
+    }
+
+    it("round-trips result, error, and requestKey", async () => {
+      const store = await openTestStore();
+      await store.executions.put({
+        id: "exec_a",
+        code: "return 1",
+        status: "completed",
+        seeds: { now: 1, random: 0.5 },
+        startedAt: 1,
+        endedAt: 2,
+        result: { ok: true },
+        requestKey: "key_a",
+      });
+      const a = await store.executions.get("exec_a");
+      expect(a?.result).toEqual({ ok: true });
+      expect(a?.requestKey).toBe("key_a");
+      await store.executions.put({
+        id: "exec_b",
+        code: "throw",
+        status: "failed",
+        seeds: { now: 1, random: 0.5 },
+        startedAt: 1,
+        endedAt: 2,
+        error: { name: "ConduitExecutionError", message: "boom" },
+      });
+      expect((await store.executions.get("exec_b"))?.error?.message).toBe("boom");
+    });
+
+    it("resolves by requestKey and rejects duplicates", async () => {
+      const store = await openTestStore();
+      await store.executions.put({
+        id: "exec_k1",
+        code: "1",
+        status: "running",
+        seeds: { now: 1, random: 0.5 },
+        startedAt: 1,
+        requestKey: "dup",
+      });
+      expect((await store.executions.getByRequestKey("dup"))?.id).toBe("exec_k1");
+      expect(await store.executions.getByRequestKey("nope")).toBeUndefined();
+      await expect(
+        store.executions.put({
+          id: "exec_k2",
+          code: "1",
+          status: "running",
+          seeds: { now: 1, random: 0.5 },
+          startedAt: 1,
+          requestKey: "dup",
+        }),
+      ).rejects.toThrow(/UNIQUE|unique/);
+    });
+
+    it("failClaimedResume records its reason as the error payload", async () => {
+      const store = await openTestStore();
+      await store.executions.put({
+        id: "exec_f",
+        code: "1",
+        status: "paused",
+        seeds: { now: 1, random: 0.5 },
+        startedAt: 1,
+        pausedOn: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
+      });
+      await store.executions.claimForResume("exec_f", "attempt");
+      await store.executions.failClaimedResume("exec_f", "prep failed");
+      const row = await store.executions.get("exec_f");
+      expect(row?.status).toBe("failed");
+      expect(row?.error).toEqual({ name: "ConduitInternalError", message: "prep failed" });
+    });
+
+    it("migrates a legacy db: columns added, legacy completed row reads with result undefined", async () => {
+      const { client } = await legacyDb();
+      const store = await openSqliteStore({ client, secretBox: await testSecretBox() });
+      const old = await store.executions.get("exec_old");
+      expect(old?.status).toBe("completed");
+      expect(old?.result).toBeUndefined(); // legacy NULL — accepted (design M1)
+    });
+
+    it("a near-§16-cap result survives persist + re-read (design M9)", async () => {
+      const store = await openTestStore();
+      const big = "x".repeat(900_000); // just under the 1MB output cap
+      await store.executions.put({
+        id: "exec_big",
+        code: "1",
+        status: "completed",
+        seeds: { now: 1, random: 0.5 },
+        startedAt: 1,
+        endedAt: 2,
+        result: { big },
+      });
+      expect(((await store.executions.get("exec_big"))?.result as { big: string }).big.length).toBe(
+        900_000,
+      );
+    });
+
+    describe("multi-process store hygiene (mcp design M5)", () => {
+      it("sets WAL and busy_timeout on file databases", async () => {
+        const url = tempFileDbUrl();
+        const client = createClient({ url });
+        await openSqliteStore({ client, secretBox: await testSecretBox() });
+        const mode = await client.execute("PRAGMA journal_mode");
+        expect(String(Object.values(mode.rows[0] ?? {})[0]).toLowerCase()).toBe("wal");
+        const busy = await client.execute("PRAGMA busy_timeout");
+        expect(Number(Object.values(busy.rows[0] ?? {})[0])).toBe(5000);
+      });
+
+      it("two simultaneous opens of a legacy db both succeed (migration race, M5)", async () => {
+        const { url } = await legacyDb(); // Task 1's fixture — a FILE db, shared by both clients
+        const [a, b] = await Promise.all([
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+        ]);
+        expect(a).toBeDefined();
+        expect(b).toBeDefined();
+      });
+
+      it("two simultaneous opens of a pre-§11 db (legacy `output` column) both succeed", async () => {
+        // The §11 mask-then-DROP migration is also a cross-process race surface:
+        // the DROP loser sees "no such column". Build a trace_events table WITH the
+        // legacy `output` column per the §11 pre-migration shape, plus a row with a
+        // non-null output so the masking UPDATEs actually execute during the race.
+        const url = tempFileDbUrl();
+        const client = createClient({ url });
+        await client.execute(`CREATE TABLE trace_events (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          call_id TEXT NOT NULL UNIQUE,
+          execution_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          connection_prefix TEXT NOT NULL,
+          input TEXT NOT NULL,
+          output_summary TEXT,
+          upstream_status INTEGER,
+          latency_ms INTEGER,
+          policy_verdict TEXT NOT NULL CHECK (policy_verdict IN ('allow', 'require_approval', 'block')),
+          at INTEGER NOT NULL,
+          output TEXT
+        )`);
+        await client.execute({
+          sql: `INSERT INTO trace_events
+                  (call_id, execution_id, tool_name, connection_prefix, input,
+                   output_summary, policy_verdict, at, output)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            "call_pre11",
+            "exec_pre11",
+            "a.tool",
+            "a.org.main",
+            JSON.stringify({ q: 1 }),
+            null,
+            "allow",
+            1,
+            JSON.stringify({ secret: "raw output payload" }),
+          ],
+        });
+
+        const [a, b] = await Promise.all([
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+        ]);
+        expect(a).toBeDefined();
+        expect(b).toBeDefined();
+      });
     });
   });
 
