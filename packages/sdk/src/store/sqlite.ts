@@ -114,15 +114,41 @@ const SCHEMA = [
   )`,
 ];
 
+/**
+ * M5: the PRAGMA table_info → ALTER ladder is idempotent sequentially but
+ * races across processes (two fresh servers at login both see the schema
+ * delta pending; one ALTER loses). For ADD COLUMN the loser sees "duplicate
+ * column name"; for DROP COLUMN it sees "no such column". Either way the
+ * schema is already in the state the retrofit promises — SUCCESS, not failure.
+ */
+async function tolerateSchemaRace(run: () => Promise<unknown>): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    const text = String(error);
+    if (!text.includes("duplicate column name") && !text.includes("no such column")) {
+      throw error;
+    }
+  }
+}
+
 export async function openSqliteStore(options: SqliteStoreOptions): Promise<ConduitStore> {
   const { client, secretBox } = options;
+
+  // M5: multi-process hygiene — BEFORE the first schema statement so the
+  // migration itself benefits. WAL is a no-op error on :memory:; tolerate.
+  await client.execute("PRAGMA busy_timeout = 5000").catch(() => {});
+  await client.execute("PRAGMA journal_mode = WAL").catch(() => {});
+
   await client.batch(SCHEMA, "write");
 
   // executions.resume_attempt arrived after the first shipped schema; same
   // retrofit as trace_events.output below.
   const executionColumns = await client.execute("PRAGMA table_info(executions)");
   if (!executionColumns.rows.some((row) => row.name === "resume_attempt")) {
-    await client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT");
+    await tolerateSchemaRace(() =>
+      client.execute("ALTER TABLE executions ADD COLUMN resume_attempt TEXT"),
+    );
   }
 
   // executions.result/error/request_key arrived with the mcp design (M1/M4);
@@ -130,13 +156,15 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   // exist on both fresh and legacy schemas (SQLite unique indexes ignore
   // NULLs, so multiple legacy rows with no request_key coexist fine).
   if (!executionColumns.rows.some((row) => row.name === "result")) {
-    await client.execute("ALTER TABLE executions ADD COLUMN result TEXT");
+    await tolerateSchemaRace(() => client.execute("ALTER TABLE executions ADD COLUMN result TEXT"));
   }
   if (!executionColumns.rows.some((row) => row.name === "error")) {
-    await client.execute("ALTER TABLE executions ADD COLUMN error TEXT");
+    await tolerateSchemaRace(() => client.execute("ALTER TABLE executions ADD COLUMN error TEXT"));
   }
   if (!executionColumns.rows.some((row) => row.name === "request_key")) {
-    await client.execute("ALTER TABLE executions ADD COLUMN request_key TEXT");
+    await tolerateSchemaRace(() =>
+      client.execute("ALTER TABLE executions ADD COLUMN request_key TEXT"),
+    );
   }
   await client.execute(
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_request_key ON executions(request_key)",
@@ -147,8 +175,8 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   // migration below, which SELECTs this column to build per-tool masking.
   const policyColumns = await client.execute("PRAGMA table_info(policies)");
   if (!policyColumns.rows.some((row) => row.name === "redact_fields")) {
-    await client.execute(
-      "ALTER TABLE policies ADD COLUMN redact_fields TEXT NOT NULL DEFAULT '[]'",
+    await tolerateSchemaRace(() =>
+      client.execute("ALTER TABLE policies ADD COLUMN redact_fields TEXT NOT NULL DEFAULT '[]'"),
     );
   }
 
@@ -161,39 +189,48 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   // then DROP the column. The column's absence marks the migration done.
   // Runs AFTER the policies.redact_fields retrofit above (this block SELECTs
   // that column).
+  //
+  // M5: the whole detect→mask→drop sequence is ONE tolerateSchemaRace unit,
+  // not per-statement wrapping. The masking UPDATEs race a concurrent
+  // opener's completed DROP: a "no such column" from ANY inner statement
+  // (including a masking UPDATE, not just the final DROP) means the other
+  // process already finished the migration — stop immediately rather than
+  // let a later statement run after the schema has moved on.
   const traceColumns = await client.execute("PRAGMA table_info(trace_events)");
   if (traceColumns.rows.some((row) => row.name === "output")) {
-    const policyRows = await client.execute("SELECT tool_name, redact_fields FROM policies");
-    const extrasByTool = new Map<string, string[]>();
-    for (const row of policyRows.rows) {
-      try {
-        const parsed: unknown = JSON.parse(String(row.redact_fields));
-        if (Array.isArray(parsed) && parsed.every((f): f is string => typeof f === "string")) {
-          extrasByTool.set(String(row.tool_name), parsed);
+    await tolerateSchemaRace(async () => {
+      const policyRows = await client.execute("SELECT tool_name, redact_fields FROM policies");
+      const extrasByTool = new Map<string, string[]>();
+      for (const row of policyRows.rows) {
+        try {
+          const parsed: unknown = JSON.parse(String(row.redact_fields));
+          if (Array.isArray(parsed) && parsed.every((f): f is string => typeof f === "string")) {
+            extrasByTool.set(String(row.tool_name), parsed);
+          }
+        } catch {
+          // A malformed row fails the policy read path loudly elsewhere;
+          // for the one-time migration, builtins-only is the fail-closed floor.
         }
-      } catch {
-        // A malformed row fails the policy read path loudly elsewhere;
-        // for the one-time migration, builtins-only is the fail-closed floor.
       }
-    }
-    const traceRows = await client.execute(
-      "SELECT call_id, tool_name, input, output_summary FROM trace_events",
-    );
-    for (const row of traceRows.rows) {
-      const extras = extrasByTool.get(String(row.tool_name)) ?? [];
-      let input: string;
-      try {
-        input = JSON.stringify(redactSensitiveFields(JSON.parse(String(row.input)), extras));
-      } catch {
-        input = JSON.stringify("[redacted:pre-§11]"); // unparseable → fail closed
+      const traceRows = await client.execute(
+        "SELECT call_id, tool_name, input, output_summary FROM trace_events",
+      );
+      for (const row of traceRows.rows) {
+        const extras = extrasByTool.get(String(row.tool_name)) ?? [];
+        let input: string;
+        try {
+          input = JSON.stringify(redactSensitiveFields(JSON.parse(String(row.input)), extras));
+        } catch {
+          input = JSON.stringify("[redacted:pre-§11]"); // unparseable → fail closed
+        }
+        const summary = row.output_summary === null ? null : JSON.stringify("[redacted:pre-§11]");
+        await client.execute({
+          sql: "UPDATE trace_events SET input = ?, output_summary = ?, output = NULL WHERE call_id = ?",
+          args: [input, summary, String(row.call_id)],
+        });
       }
-      const summary = row.output_summary === null ? null : JSON.stringify("[redacted:pre-§11]");
-      await client.execute({
-        sql: "UPDATE trace_events SET input = ?, output_summary = ?, output = NULL WHERE call_id = ?",
-        args: [input, summary, String(row.call_id)],
-      });
-    }
-    await client.execute("ALTER TABLE trace_events DROP COLUMN output");
+      await client.execute("ALTER TABLE trace_events DROP COLUMN output");
+    });
   }
 
   return {

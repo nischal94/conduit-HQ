@@ -350,6 +350,75 @@ describe("SqliteStore", () => {
         900_000,
       );
     });
+
+    describe("multi-process store hygiene (mcp design M5)", () => {
+      it("sets WAL and busy_timeout on file databases", async () => {
+        const url = tempFileDbUrl();
+        const client = createClient({ url });
+        await openSqliteStore({ client, secretBox: await testSecretBox() });
+        const mode = await client.execute("PRAGMA journal_mode");
+        expect(String(Object.values(mode.rows[0] ?? {})[0]).toLowerCase()).toBe("wal");
+        const busy = await client.execute("PRAGMA busy_timeout");
+        expect(Number(Object.values(busy.rows[0] ?? {})[0])).toBe(5000);
+      });
+
+      it("two simultaneous opens of a legacy db both succeed (migration race, M5)", async () => {
+        const { url } = await legacyDb(); // Task 1's fixture — a FILE db, shared by both clients
+        const [a, b] = await Promise.all([
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+        ]);
+        expect(a).toBeDefined();
+        expect(b).toBeDefined();
+      });
+
+      it("two simultaneous opens of a pre-§11 db (legacy `output` column) both succeed", async () => {
+        // The §11 mask-then-DROP migration is also a cross-process race surface:
+        // the DROP loser sees "no such column". Build a trace_events table WITH the
+        // legacy `output` column per the §11 pre-migration shape, plus a row with a
+        // non-null output so the masking UPDATEs actually execute during the race.
+        const url = tempFileDbUrl();
+        const client = createClient({ url });
+        await client.execute(`CREATE TABLE trace_events (
+          seq INTEGER PRIMARY KEY AUTOINCREMENT,
+          call_id TEXT NOT NULL UNIQUE,
+          execution_id TEXT NOT NULL,
+          tool_name TEXT NOT NULL,
+          connection_prefix TEXT NOT NULL,
+          input TEXT NOT NULL,
+          output_summary TEXT,
+          upstream_status INTEGER,
+          latency_ms INTEGER,
+          policy_verdict TEXT NOT NULL CHECK (policy_verdict IN ('allow', 'require_approval', 'block')),
+          at INTEGER NOT NULL,
+          output TEXT
+        )`);
+        await client.execute({
+          sql: `INSERT INTO trace_events
+                  (call_id, execution_id, tool_name, connection_prefix, input,
+                   output_summary, policy_verdict, at, output)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            "call_pre11",
+            "exec_pre11",
+            "a.tool",
+            "a.org.main",
+            JSON.stringify({ q: 1 }),
+            null,
+            "allow",
+            1,
+            JSON.stringify({ secret: "raw output payload" }),
+          ],
+        });
+
+        const [a, b] = await Promise.all([
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+        ]);
+        expect(a).toBeDefined();
+        expect(b).toBeDefined();
+      });
+    });
   });
 
   describe("trace", () => {
