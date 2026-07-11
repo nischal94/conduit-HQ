@@ -926,3 +926,54 @@ their entries stayed where they'd been drafted — the Deferred list — since t
 where recent decisions were being appended (recency, not status). Cheap rule: the
 commit that records a decision's status change also moves it to the list that says
 so; placement is part of the decision record, not cosmetics.
+
+## 2026-07-11 — /mcp stdio server: converged design+plan reviews, SDD tasks 1-9 (branch feat/mcp-stdio-server, unmerged)
+
+### 1. Review the PLAN as hard as the design — 12 of 13 defects lived only in the plan
+
+The design converged (autoplan CEO/Eng/DX + codex voices, trajectory 14→9→8→2→1(a)),
+then a single codex pass over the IMPLEMENTATION PLAN found 12 more defects the
+design review structurally could not see: an upsert whose `ON CONFLICT DO UPDATE
+SET` list omitted the new columns (outcomes would silently never land on existing
+rows), a task consuming a later task's script, test fixtures that didn't exist,
+an untypeable union. A plan carries new artifacts — concrete code, exact
+signatures, task ordering — so it needs its own adversarial pass; "the design
+converged" transfers nothing to the plan. Cost: one background codex run; the
+alternative was 12 subagents faithfully transcribing bugs.
+
+### 2. The convergence stop-line works when applied as classification, not string-chasing
+
+Both review loops ended by CLASSIFYING the final findings rather than re-running
+until the literal "CONVERGED — SHIP" string appeared: the design's last finding was
+answered verbatim by a locked §18 decision (category (a) → converged by
+definition); the plan's last was a narrower recurrence of the schema-race class →
+shape-fix (wrap the whole §11 migration block; column absence IS the done-marker),
+with the executable confirmation delegated to Task 2's concurrent-open tests
+instead of a third prose pass. Executable confirmation beats another review read.
+
+### 3. Workspace packages resolve against dist, not source — the stale-dist trap
+
+packages/mcp imports @conduithq/sdk via its exports map → packages/sdk/dist. Tasks
+1-4 changed sdk SOURCE; the Jul-8 dist stayed stale and Task 6 failed on missing
+exports until rebuilt. Any task changing sdk source must rebuild
+(`node_modules/.bin/tsup src/index.ts --format esm --dts --sourcemap`) before a
+dependent package typechecks. Also real: `Buffer.from()` types as
+`Uint8Array<ArrayBufferLike>` but SecretBox requires `Uint8Array<ArrayBuffer>` —
+`Uint8Array.from()` copies into the narrower type.
+
+### 4. Rate-limit cuts are survivable if the checkpoint is durable BEFORE the cliff
+
+The 5-hour window hit 97% mid-build; committing the mid-build HANDOFF checkpoint +
+ledger line before dispatching anything else meant the actual cut (a Task 6
+subagent died mid-fix) cost one SendMessage resume, zero rework. The SDD ledger +
+per-task commits are the recovery map; the discipline is writing them BEFORE the
+next dispatch, not after. Corollary: a cut subagent resumes from its transcript
+with SendMessage — re-dispatching fresh would have re-paid its whole context.
+
+### 5. Feedback codified: state the skill inventory before choosing
+
+User correction (memory: feedback-state-skill-inventory-before-choosing): when a
+task could be served by multiple skills, LIST the relevant candidates with
+one-line summaries + fit analysis, THEN pick — a silent good pick still denies the
+redirect. Applied twice this session (autoplan stack; plan-review menu) after the
+correction.
