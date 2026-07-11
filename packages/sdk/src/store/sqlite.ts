@@ -30,6 +30,8 @@ export interface SqliteStoreOptions {
   client: Client;
   /** Encrypts SecretRepository contents at rest (spec §9.2). */
   secretBox: SecretBox;
+  /** Host-side sink for infra diagnostics (e.g. a WAL-pragma failure); NEVER guest-visible. */
+  log?: (message: string) => void;
 }
 
 // The CHECK vocabularies below protect fresh schemas only: CREATE TABLE
@@ -134,11 +136,31 @@ async function tolerateSchemaRace(run: () => Promise<unknown>): Promise<void> {
 
 export async function openSqliteStore(options: SqliteStoreOptions): Promise<ConduitStore> {
   const { client, secretBox } = options;
+  const log = options.log ?? ((message: string) => console.error(message));
 
   // M5: multi-process hygiene — BEFORE the first schema statement so the
-  // migration itself benefits. WAL is a no-op error on :memory:; tolerate.
+  // migration itself benefits. WAL is a legitimate no-op on :memory: (SQLite
+  // reports "memory" regardless of the PRAGMA), so a failure or a non-"wal"
+  // result is only actionable when the mode ISN'T "memory" — i.e. a
+  // file-backed DB where M5's multi-process safety silently doesn't apply.
+  // Never throws: a WAL-less file DB still works single-process, just
+  // without the cross-process guarantee, so this is a warning, not a fail.
   await client.execute("PRAGMA busy_timeout = 5000").catch(() => {});
-  await client.execute("PRAGMA journal_mode = WAL").catch(() => {});
+  try {
+    const result = await client.execute("PRAGMA journal_mode = WAL");
+    const mode = String(Object.values(result.rows[0] ?? {})[0] ?? "").toLowerCase();
+    if (mode !== "wal" && mode !== "memory") {
+      log(
+        `[SqliteStore] WARNING: PRAGMA journal_mode = WAL did not take effect (reported "${mode}") — ` +
+          "M5 multi-process safety does NOT apply to this database; single-process use only.",
+      );
+    }
+  } catch (cause) {
+    log(
+      `[SqliteStore] WARNING: PRAGMA journal_mode = WAL failed — M5 multi-process safety does NOT ` +
+        `apply to this database; single-process use only. Context: { cause: ${String(cause)} }`,
+    );
+  }
 
   await client.batch(SCHEMA, "write");
 
