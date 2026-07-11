@@ -617,6 +617,75 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         await client.execute({ sql: "DELETE FROM secrets WHERE ref = ?", args: [ref] });
       },
     },
+
+    async provisionSource(input: {
+      source: Source;
+      integration: Integration;
+      connection: Connection;
+      secret?: { ref: string; value: string };
+      tools: readonly Tool[];
+    }): Promise<void> {
+      // The seal MUST happen before the batch is built — `client.batch`
+      // takes a plain statement array, so nothing inside it can be awaited.
+      const sealed =
+        input.secret === undefined ? undefined : await secretBox.seal(input.secret.value);
+
+      const { source, integration, connection, tools } = input;
+      const statements = [
+        {
+          sql: `INSERT INTO sources (id, type, namespace, location, base_url)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  type = excluded.type, namespace = excluded.namespace,
+                  location = excluded.location, base_url = excluded.base_url`,
+          args: [source.id, source.type, source.namespace, source.location, source.baseUrl ?? null],
+        },
+        {
+          sql: `INSERT INTO integrations (id, source_id, namespace) VALUES (?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  source_id = excluded.source_id, namespace = excluded.namespace`,
+          args: [integration.id, integration.sourceId, integration.namespace],
+        },
+        {
+          sql: `INSERT INTO connections (id, integration_id, prefix, credential_ref)
+                VALUES (?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  integration_id = excluded.integration_id, prefix = excluded.prefix,
+                  credential_ref = excluded.credential_ref`,
+          args: [
+            connection.id,
+            connection.integrationId,
+            connection.prefix,
+            connection.credentialRef ?? null,
+          ],
+        },
+        ...(input.secret === undefined
+          ? []
+          : [
+              {
+                sql: `INSERT INTO secrets (ref, sealed, created_at) VALUES (?, ?, ?)
+                      ON CONFLICT(ref) DO UPDATE SET sealed = excluded.sealed`,
+                args: [input.secret.ref, sealed as string, Date.now()],
+              },
+            ]),
+        { sql: "DELETE FROM tools WHERE namespace = ?", args: [integration.namespace] },
+        ...tools.map((tool) => ({
+          sql: `INSERT INTO tools
+                  (name, namespace, description, input_schema, output_schema, risk_class, source_semantics)
+                VALUES (?, ?, ?, ?, ?, ?, ?)`,
+          args: [
+            tool.name,
+            tool.namespace,
+            tool.description ?? null,
+            JSON.stringify(tool.inputSchema),
+            JSON.stringify(tool.outputSchema),
+            tool.riskClass,
+            JSON.stringify(tool.sourceSemantics),
+          ],
+        })),
+      ];
+      await client.batch(statements, "write");
+    },
   };
 }
 

@@ -27,6 +27,25 @@ export interface ConduitStore {
   readonly trace: TraceRepository;
   readonly replayJournal: ReplayJournalRepository;
   readonly secrets: SecretRepository;
+
+  /**
+   * Atomic §5.3 provisioning chain for the CLI's `add-mcp` command: writes
+   * source, integration, connection — and, iff a NEW secret is being stored
+   * this run, the secret — plus the namespace's tools, all in one
+   * transaction. All-or-nothing: a failure anywhere in the chain (e.g. a
+   * malformed tool row) leaves zero rows behind. Writes NO policy rows;
+   * policy seeding is a separate step the caller drives explicitly.
+   */
+  provisionSource(input: {
+    source: Source;
+    integration: Integration;
+    /** `connection.credentialRef` is already resolved by the CALLER — this
+     * method does not read existing state. */
+    connection: Connection;
+    /** Present iff a NEW secret is stored this run. */
+    secret?: { ref: string; value: string };
+    tools: readonly Tool[];
+  }): Promise<void>;
 }
 
 export interface SourceRepository {

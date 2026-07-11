@@ -331,9 +331,27 @@ describe("SqliteStore", () => {
       const base = { code: "x", seeds: { now: 1, random: 1 }, startedAt: 0 } as const;
       const pending = { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9e12 };
       // two paused rows with the SAME startedAt → id tiebreak must order them
-      await store.executions.put({ ...base, id: "exec_b", status: "paused", startedAt: 100, pausedOn: pending });
-      await store.executions.put({ ...base, id: "exec_a", status: "paused", startedAt: 100, pausedOn: pending });
-      await store.executions.put({ ...base, id: "exec_old", status: "paused", startedAt: 50, pausedOn: pending });
+      await store.executions.put({
+        ...base,
+        id: "exec_b",
+        status: "paused",
+        startedAt: 100,
+        pausedOn: pending,
+      });
+      await store.executions.put({
+        ...base,
+        id: "exec_a",
+        status: "paused",
+        startedAt: 100,
+        pausedOn: pending,
+      });
+      await store.executions.put({
+        ...base,
+        id: "exec_old",
+        status: "paused",
+        startedAt: 50,
+        pausedOn: pending,
+      });
       await store.executions.put({ ...base, id: "exec_done", status: "completed", startedAt: 10 });
       const paused = await store.executions.listPaused();
       expect(paused.map((e) => e.id)).toEqual(["exec_old", "exec_a", "exec_b"]);
@@ -1243,6 +1261,81 @@ describe("SqliteStore", () => {
           }),
         ).rejects.toThrow(/check/i);
       });
+    });
+  });
+
+  describe("provisionSource (CLI add-mcp, §5.3 chain)", () => {
+    it("INVARIANT: provisionSource is atomic — a mid-chain failure leaves 0 rows", async () => {
+      const goodTool = tool({ name: "x.search", namespace: "x" });
+      // Violates the tools.risk_class CHECK vocabulary (sqlite.ts ~line 66:
+      // CHECK (risk_class IN ('safe', 'review', 'destructive'))) to force the
+      // batch to fail partway through the tools INSERT statements.
+      const badTool = { ...goodTool, name: "x.broken", riskClass: "nonsense" } as unknown as Tool;
+
+      await expect(
+        store.provisionSource({
+          source: { id: "src_x", type: "mcp", namespace: "x", location: "http://u" },
+          integration: { id: "int_x", sourceId: "src_x", namespace: "x" },
+          connection: {
+            id: "conn_x",
+            integrationId: "int_x",
+            prefix: "x.acme.prod",
+            credentialRef: "cred_x",
+          },
+          secret: { ref: "cred_x", value: "Bearer t" },
+          tools: [goodTool, badTool],
+        }),
+      ).rejects.toThrow();
+
+      expect(await store.sources.get("src_x")).toBeUndefined();
+      expect(await store.connections.getByPrefix("x.acme.prod")).toBeUndefined();
+      expect(await store.secrets.reveal("cred_x")).toBeUndefined();
+    });
+
+    it("writes the full §5.3 chain in one shot and seeds NO policy rows", async () => {
+      await store.provisionSource({
+        source: { id: "src_y", type: "mcp", namespace: "y", location: "http://u" },
+        integration: { id: "int_y", sourceId: "src_y", namespace: "y" },
+        connection: {
+          id: "conn_y",
+          integrationId: "int_y",
+          prefix: "y.acme.prod",
+          credentialRef: "cred_y",
+        },
+        secret: { ref: "cred_y", value: "Bearer t" },
+        tools: [
+          tool({ name: "y.search", namespace: "y" }),
+          tool({ name: "y.create", namespace: "y", riskClass: "destructive" }),
+        ],
+      });
+
+      expect(await store.sources.get("src_y")).toMatchObject({ id: "src_y", namespace: "y" });
+      expect(await store.integrations.getByNamespace("y")).toMatchObject({ id: "int_y" });
+      const conn = await store.connections.getByPrefix("y.acme.prod");
+      expect(conn).toMatchObject({ id: "conn_y", credentialRef: "cred_y" });
+      expect(await store.secrets.reveal("cred_y")).toBe("Bearer t");
+      expect(await store.tools.list("y")).toHaveLength(2);
+      expect(await store.policies.list()).toEqual([]);
+    });
+
+    it("omits the secrets INSERT when no new secret is provided (connection.credentialRef pre-resolved)", async () => {
+      await store.provisionSource({
+        source: { id: "src_z", type: "mcp", namespace: "z", location: "http://u" },
+        integration: { id: "int_z", sourceId: "src_z", namespace: "z" },
+        connection: {
+          id: "conn_z",
+          integrationId: "int_z",
+          prefix: "z.acme.prod",
+          credentialRef: "cred_existing",
+        },
+        tools: [tool({ name: "z.search", namespace: "z" })],
+      });
+
+      expect(await store.connections.getByPrefix("z.acme.prod")).toMatchObject({
+        credentialRef: "cred_existing",
+      });
+      expect(await store.secrets.reveal("cred_existing")).toBeUndefined();
+      expect(await store.tools.list("z")).toHaveLength(1);
     });
   });
 });
