@@ -23,7 +23,127 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-11 (/mcp stdio server MERGED — PR #29 → main `c56ed7d`; next MVP step = §17 step 3, the `conduit` CLI; egress `::/96` fix MERGED — PR #30 → main `1d95074`)
+## Current handoff — written 2026-07-12 (§17 step 3 `conduit` CLI — DESIGN + PLAN committed, BUILD IN PROGRESS on local branch `docs/conduit-cli-design`: Lane A T1-T2 of 9 landed, sdk 318/318)
+
+### ⚠️ READ FIRST — the build lives on an UNMERGED LOCAL branch (tripwire blind spot)
+
+The CLI work is on branch **`docs/conduit-cli-design`** (4 commits ahead of
+`origin/main`, NOT pushed, NO PR yet). `main` is untouched, so the git
+staleness tripwire is SILENT about this work by design (the LEARNINGS #21 blind
+spot). **At session start: `git branch` → check out `docs/conduit-cli-design`;
+`gh pr list` will show nothing.** Do NOT start the CLI on `main` or a new branch.
+
+### Where things stand
+
+- **Design + plan COMMITTED** (on the branch): design
+  `docs/superpowers/specs/2026-07-12-conduit-cli-design.md`; plan
+  `docs/superpowers/plans/2026-07-12-conduit-cli.md`. Both went through
+  brainstorming → grilling → plan-eng-review (+ real codex cross-model outside
+  voice) → coherence audit. Read the design first — it is the authoritative
+  decision record (D1-D5, E1-E4, C1-C7, the "Re-run/existing-state" §4).
+- **Build IN PROGRESS via superpowers:subagent-driven-development.** The SDD
+  ledger `.superpowers/sdd/progress.md` (git-ignored) is the RECOVERY MAP — it
+  names every landed commit and the operational rules. Resume from it, not from
+  memory. Prior PR#29 ledger archived alongside as `progress.mcp-stdio-pr29.archive.md`.
+- **Landed clean (SPEC ✅ + QUALITY Approved each):**
+  - **T1 `listPaused`** (commit `838109b`) — `ExecutionRepository.listPaused():
+    Promise<Execution[]>`, `ORDER BY started_at ASC, id ASC`, via existing
+    `hydrateExecutionRow`. INVARIANT pinned.
+  - **T2 `provisionSource`** (commit `ccc237c`) — atomic §5.3 chain via one
+    `client.batch(...,"write")`, seal-before-batch, NO policy rows; atomicity
+    test violates `tools.risk_class` CHECK mid-batch → 0 rows. INVARIANT pinned.
+  - Suite: **sdk 318/318**, tsc + biome clean.
+
+### NEXT TASK — resume the SDD build at Lane A Task 3
+
+The plan's 9 tasks, in TWO lanes (**Lane A MUST fully land before Lane B**):
+- **Lane A (SDK/mcp seams) — remaining: T3, T4, T5.**
+  - **T3** — extract `runStdioServer` in packages/mcp; fold the `console.*`→stderr
+    M8 redirect INTO it as its first runtime action (not module top-level); the
+    `conduit-mcp` bin drops its own redirect and becomes a shim. Existing ring-2
+    M8 test must stay green.
+  - **T4** — extract `openStoreFromEnv` (env→store) from the bin; shared by all.
+  - **T5** — extract `createApprovalRuntime({store, allowPrivateEgress})` — the
+    manager composition currently inlined at server.ts:184-200; server.ts + the
+    CLI's approvals both call it.
+- **Lane B (the CLI, consumes Lane A) — T6 scaffold+dispatch, T7 serve, T8
+  add-mcp, T9 approvals.**
+- After T9: final whole-branch review (most capable model) →
+  superpowers:finishing-a-development-branch.
+
+The three tweakable interface signatures (listPaused DONE, provisionSource DONE,
+`createApprovalRuntime` — T5) are STOP-and-ask if reality forces a change.
+
+### Session quirks worth inheriting (build-specific)
+
+- **Commit with the sandbox DISABLED, never `--no-verify`.** The pre-commit hook
+  calls `mktemp` (githooks/pre-commit:15), which the Bash sandbox denies → hook
+  fails closed. T1's implementer reached for `--no-verify` (a documented
+  incident); the FIX (in the ledger, carried in every dispatch T2+) is to
+  disable the sandbox for the `git commit` so the hook runs the full sdk suite.
+- **Hook covers packages/sdk ONLY.** For mcp/cli tasks (T3-T9): run that
+  package's `node_modules/.bin/vitest run` with the sandbox disabled (hermetic
+  local suite — the sanctioned exception), paste output for the reviewer. CI is
+  the post-push authority for mcp/cli.
+- **Rebuild `packages/sdk/dist` (tsup) after sdk source changes** a downstream
+  task consumes — the workspace resolves against dist. (T1/T2 were sdk-internal;
+  Lane B consumes the new sdk seams, so rebuild before Lane B verification.)
+- SDD artifacts are namespaced `cli-task-N-*` (the bare `task-N-*` files in
+  `.superpowers/sdd/` are the archived PR#29 set — don't confuse them).
+- git network ops need the sandbox override; `grep -v certificate-25291` noise.
+- Session-end docs push (`scripts/push-docs`) requires being ON main — but this
+  session's HANDOFF/LEARNINGS edits are on the CLI branch with the build. See
+  the routing note below.
+
+### Doc-routing note for THIS handoff
+
+HANDOFF.md/LEARNINGS.md are `.pushallowlist`ed (direct-push-to-main eligible),
+but they're being edited on `docs/conduit-cli-design` alongside the build. Two
+clean options for the next session: (a) keep them on the branch so the whole CLI
+work (design + build + these docs) lands in one PR — simplest, one story; or (b)
+cherry-pick just the HANDOFF/LEARNINGS edits to main via `scripts/push-docs`.
+Recommend (a): fold everything into the one CLI PR.
+
+### Carry-overs (unchanged from 2026-07-11, still valid)
+
+- **§17 gate-one manual acceptance NOT done** (real Claude Desktop against the
+  merged /mcp server). Human step before MVP is "shipped".
+- **Tracked SDK design items surfaced by the CLI review (out of scope for the
+  CLI PR):** C4 — MCP transport maturity (stateless POST vs init/session/
+  pagination); C5 — normalizeMcp lossy non-round-trippable tool names (store
+  upstreamName or reject). Both pre-existing SDK concerns; file properly when
+  touched. Also C3-structural (re-key policies by source identity) — the CLI
+  ships the `--replace` flag-gate as the MVP answer.
+- **Minor roll-up for the CLI final review:** tools INSERT SQL now duplicated in
+  `replaceNamespace` + `provisionSource` (T2) — extraction judged speculative at
+  2 call sites; revisit at a 3rd.
+- Aikido SAST MCP still not connected (`/aikido:setup` in the user's terminal).
+- gstack update available — user-run, low priority.
+
+### Kickoff prompt for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first.
+> **The §17 step-3 `conduit` CLI build is IN PROGRESS on local branch
+> `docs/conduit-cli-design` (NOT main, NOT pushed) — check it out first; the git
+> tripwire is silent because work is off main.** Design + plan are committed
+> there; the SDD ledger `.superpowers/sdd/progress.md` is the recovery map.
+> **Landed: Lane A T1 (listPaused) + T2 (provisionSource), sdk 318/318, both
+> reviewed clean. Do NOT re-implement them.**
+>
+> **NEXT: resume superpowers:subagent-driven-development at Lane A Task 3**
+> (extract runStdioServer + fold in the M8 redirect), then T4 (openStoreFromEnv),
+> T5 (createApprovalRuntime) — Lane A MUST finish before Lane B (T6-T9 the CLI).
+> Per-task: fresh implementer → verify → two-verdict review → ledger. COMMIT WITH
+> SANDBOX DISABLED (never --no-verify — hook mktemp is sandbox-denied); mcp/cli
+> tasks verify via unsandboxed vitest (hook covers sdk only). createApprovalRuntime
+> (T5) is a STOP-and-ask frozen signature. After T9: final whole-branch review →
+> finishing-a-development-branch → the load-bearing PR (Tier 2 + /security-review
+> + real codex exec + /explain-diff quiz + human-named merge). Fold design + build
+> + HANDOFF/LEARNINGS into the ONE CLI PR.
+
+---
+
+## Previous handoff — written 2026-07-11 (/mcp stdio server MERGED — PR #29 → main `c56ed7d`; next MVP step = §17 step 3, the `conduit` CLI; egress `::/96` fix MERGED — PR #30 → main `1d95074`)
 
 ### Where things stand
 
