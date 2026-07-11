@@ -132,6 +132,24 @@ describe("egress guard (spec §9.3)", () => {
     expect(isPrivateAddress("64:ff9b::5db8:d822")).toBe(false); // 93.184.216.34, public
   });
 
+  it("INVARIANT §9.3: IPv4-compatible IPv6 (::/96) is classified by its embedded IPv4 (codex re-pass)", () => {
+    // Symmetry with the v4-mapped twin above: ::127.0.0.1 (::7f00:1) embeds the
+    // SAME loopback as the blocked ::ffff:127.0.0.1, so it must block too. The
+    // deprecated ::/96 form (RFC 4291 §2.5.5.1) is special-use, never global
+    // public space (RFC 5156); a fail-closed classifier must not read an
+    // embedded private/loopback target as public just because of the spelling.
+    expect(isPrivateAddress("::127.0.0.1")).toBe(true); // ::7f00:1 loopback
+    expect(isPrivateAddress("::7f00:1")).toBe(true); // same, hex form
+    expect(isPrivateAddress("::10.0.0.1")).toBe(true); // RFC1918
+    expect(isPrivateAddress("::169.254.169.254")).toBe(true); // metadata via ::/96
+    // :: and ::1 live inside ::/96 and stay blocked (embedded 0.0.0.0 / 0.0.0.1).
+    expect(isPrivateAddress("::")).toBe(true);
+    expect(isPrivateAddress("::1")).toBe(true);
+    // A public embedded v4 is not forced private by the range alone — decoded,
+    // like the v4-mapped case, so behavior is consistent across both forms.
+    expect(isPrivateAddress("::5db8:d822")).toBe(false); // ::93.184.216.34, public
+  });
+
   it("classifies unparseable addresses as private (fail closed)", () => {
     expect(isPrivateAddress("garbage")).toBe(true);
     expect(isPrivateAddress("1.2.3.4.5")).toBe(true);
