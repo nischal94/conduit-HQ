@@ -262,7 +262,7 @@ describe("ring-2: spawned bin integration", () => {
     });
   });
 
-  it("stdout purity: every stdout byte the client transport did NOT consume is protocol-framed", async () => {
+  it("INVARIANT M8: stdout purity — every stdout byte the client transport did NOT consume is protocol-framed", async () => {
     // A bin against a FRESH, UNSEEDED db (its own temp CONDUIT_DB) with the
     // egress opt-in set: startup writes BOTH diagnostics the brief names —
     // the egress WARNING and the empty-catalog "0 sources" hint (bin.ts) —
