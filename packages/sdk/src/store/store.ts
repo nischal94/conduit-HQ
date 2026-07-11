@@ -71,6 +71,8 @@ export interface PolicyRepository {
 export interface ExecutionRepository {
   put(execution: Execution): Promise<void>;
   get(id: string): Promise<Execution | undefined>;
+  /** Resolve by the caller-generated correlation key (mcp design M1). */
+  getByRequestKey(key: string): Promise<Execution | undefined>;
   /** Atomic paused→running for a single resume. Returns true iff THIS caller won (design F4). */
   claimForResume(id: string, resumeAttemptId: string): Promise<boolean>;
   /**
