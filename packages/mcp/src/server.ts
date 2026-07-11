@@ -1,16 +1,8 @@
 import {
   buildExecuteTool,
   type ConduitStore,
-  createCatalogToolHost,
-  createExecutionManager,
-  createMcpUpstreamCaller,
-  createStoreCredentialResolver,
-  createStorePolicyEngine,
-  createToolInvoker,
   type Execution,
   type ExecutionOutcome,
-  InMemoryCatalog,
-  QuickJSSandbox,
 } from "@conduithq/sdk";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
@@ -27,6 +19,7 @@ import {
   outcomeToPayload,
   toTextResult,
 } from "./payloads.js";
+import { createApprovalRuntime } from "./runtime.js";
 
 export interface ConduitMcpServerOptions {
   store: ConduitStore;
@@ -70,12 +63,6 @@ async function listConnections(
   return listed;
 }
 
-async function hydrateCatalog(store: ConduitStore): Promise<InMemoryCatalog> {
-  const catalog = new InMemoryCatalog();
-  catalog.upsert(await store.tools.list());
-  return catalog;
-}
-
 /**
  * Boundary cast (design note, mcp task 7): the sdk's `JsonSchema` is kept
  * structural (`Record<string, unknown>`, shared with OpenAPI/MCP ingestion —
@@ -116,12 +103,6 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
   const { store } = options;
   const log = options.log ?? ((line: string) => console.error(line));
   const now = options.now ?? (() => Date.now());
-  const sandbox = new QuickJSSandbox();
-  const policy = createStorePolicyEngine(store.policies);
-  const credentials = createStoreCredentialResolver(store.secrets);
-  const upstream = createMcpUpstreamCaller(
-    options.allowPrivateEgress === true ? { egress: { allowPrivate: true } } : {},
-  );
 
   const server = new Server(
     { name: "conduit", version: "0.1.0" },
@@ -181,22 +162,10 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
       }
       // M6: fresh catalog snapshot + fresh manager per call (sync makeToolHost
       // is fixed at manager creation; composing per-call is the recorded fix).
-      const catalog = await hydrateCatalog(store);
-      const manager = createExecutionManager({
+      const { manager } = await createApprovalRuntime({
         store,
-        sandbox,
-        makeInvoker: ({ executionId, decisions }) =>
-          createToolInvoker(
-            {
-              store,
-              policy,
-              credentials,
-              upstream,
-              ...(decisions !== undefined ? { decisions } : {}),
-            },
-            { executionId, log },
-          ),
-        makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
+        allowPrivateEgress: options.allowPrivateEgress === true,
+        log,
       });
       let outcome: ExecutionOutcome;
       try {
