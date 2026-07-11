@@ -19,6 +19,9 @@ import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
  * exercise. Each `it` spawns its own bin (or two, for the approval case) so
  * failures stay isolated; the shared fixtures below (db path, key, upstream
  * server) are set up once in beforeAll and reused across cases.
+ *
+ * NOT safe for `.concurrent`: cases mutate the shared `src_gh` source row
+ * (policy flips, the slow-upstream repoint) and must run sequentially.
  */
 
 const execFileAsync = promisify(execFile);
@@ -260,16 +263,17 @@ describe("ring-2: spawned bin integration", () => {
   });
 
   it("stdout purity: every stdout byte the client transport did NOT consume is protocol-framed", async () => {
-    // The spawned bin's env carries the unsafe egress opt-in, which prints a
-    // WARNING line to stderr at startup (bin.ts), and the run below also
-    // drives a catalog-miss (an empty-catalog hint's sibling case) — both
-    // MUST land on stderr only. A corrupted stdout kills the whole JSON-RPC
-    // session, so the fact that the full protocol conversation below
-    // succeeds is itself the stdout-purity proof.
+    // A bin against a FRESH, UNSEEDED db (its own temp CONDUIT_DB) with the
+    // egress opt-in set: startup writes BOTH diagnostics the brief names —
+    // the egress WARNING and the empty-catalog "0 sources" hint (bin.ts) —
+    // and both MUST land on stderr only. A corrupted stdout kills the whole
+    // JSON-RPC session, so the full protocol conversation below succeeding
+    // is itself the stdout-purity proof.
+    const emptyDbPath = join(scratch, "empty-purity.db"); // cleaned with scratch in afterAll
     const transport = new StdioClientTransport({
       command: "node",
       args: [binPath],
-      env: baseEnv(),
+      env: { ...baseEnv(), CONDUIT_DB: emptyDbPath },
       stderr: "pipe",
     });
     transports.push(transport);
@@ -277,39 +281,27 @@ describe("ring-2: spawned bin integration", () => {
     await client.connect(transport);
     clients.push(client);
 
-    // A call that misses the catalog: the resulting guest-catchable error
-    // still round-trips through a clean protocol frame.
-    const missResult = await client.callTool({
+    // Drive a full call against the empty catalog: search legitimately
+    // returns zero items and the execution completes — a clean protocol
+    // round-trip while both diagnostics sit on stderr.
+    const res = await client.callTool({
       name: "execute",
       arguments: {
-        code: `
-          try {
-            await tools.github.no_such_tool({});
-            return "UNREACHABLE";
-          } catch (error) {
-            return { name: error.name };
-          }
-        `,
+        code: 'const { items } = await tools.search({ query: "anything" }); return items.length;',
       },
     });
-    const missPayload = textPayload(missResult) as { status: string };
-    expect(missPayload.status).toBe("completed");
-
-    // A real call, so the egress warning line (env has the unsafe opt-in) is
-    // guaranteed to have been written to stderr by the time the bin started.
-    const goodResult = await client.callTool({
-      name: "execute",
-      arguments: { code: 'return await tools.github.list_issues({ owner: "a", repo: "b" });' },
-    });
-    expect((textPayload(goodResult) as { status: string }).status).toBe("completed");
+    const payload = textPayload(res) as { status: string; result: unknown };
+    expect(payload.status).toBe("completed");
+    expect(payload.result).toBe(0);
 
     const stderr = await drainStderr(transport);
-    expect(stderr).toMatch(/CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS/);
+    expect(stderr).toMatch(/CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS/); // egress warning
+    expect(stderr).toMatch(/0 sources in catalog/); // empty-catalog hint
 
-    // The protocol conversation succeeded end-to-end (listTools + two
-    // callTool round-trips) — if any diagnostic line had leaked onto stdout,
-    // the client's JSON-RPC framing would have desynced and this would have
-    // thrown or hung instead.
+    // The protocol conversation succeeded end-to-end (initialize + callTool +
+    // listTools round-trips) — if either diagnostic line had leaked onto
+    // stdout, the client's JSON-RPC framing would have desynced and this
+    // would have thrown or hung instead.
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
   });
