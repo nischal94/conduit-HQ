@@ -35,9 +35,16 @@ export interface BuildExecuteToolOptions {
  * model gets up front; all else is discovered from inside the sandbox.
  */
 export function buildExecuteTool(options: BuildExecuteToolOptions): ExecuteToolDefinition {
+  const MAX_LISTED_CONNECTIONS = 10;
+  // Cap the listing to keep the description within the token budget (spec §4.2).
+  const listed = options.connections.slice(0, MAX_LISTED_CONNECTIONS);
+  const overflow = options.connections.length - listed.length;
   const connectionLines =
     options.connections.length > 0
-      ? options.connections.map((c) => `- ${c.prefix} : ${c.label}`).join("\n")
+      ? [
+          ...listed.map((c) => `- ${c.prefix} : ${c.label}`),
+          ...(overflow > 0 ? [`- …and ${overflow} more — search the catalog`] : []),
+        ].join("\n")
       : "- (none configured yet)";
 
   const description = `Execute TypeScript in a sandboxed runtime with access to configured API tools.
@@ -53,7 +60,9 @@ Search with concrete nouns and verbs ("create issue", "refund charge"); if resul
 Your code runs as an async function body; its return value is the execution result.
 
 Available connections:
-${connectionLines}`;
+${connectionLines}
+
+Connection list is as of your client's last refresh; search the catalog for current tools.`;
 
   return {
     name: "execute",
