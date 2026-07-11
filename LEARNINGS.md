@@ -1029,3 +1029,55 @@ flat and let the fixer share a helper (internalErrorFor) across two of them. The
 type-design agent's discriminated-union theme was real but a broad cross-package
 refactor: tracked as its own PR, not smuggled into this one. Scope discipline at the
 fix-wave stage is as load-bearing as at the build stage.
+
+## 2026-07-11 (cont. 2) — egress ::/96 fix from a #29 review finding (PR #30 → main 1d95074)
+
+A cross-model review during PR #29 filed a custom-prefix NAT64 gap in the §9.3
+egress classifier, left as a HANDOFF carry-over. Evaluated it, found it
+out-of-scope, but the evaluation surfaced a real adjacent bug. Fixed that;
+documented the NAT64 call in spec §18. Shipped through the full Tier-2 gauntlet.
+
+### 1. A finding can be wrong about the bug and right about the neighborhood
+
+The filed NAT64 finding was out-of-scope (below). But taking it seriously —
+reading `isPrivateAddress` line by line to disprove it — is what exposed the
+genuine bug next door: `::/96` IPv4-compatible IPv6 (`::127.0.0.1`) read as
+public while its v4-mapped twin `::ffff:127.0.0.1` was blocked. Evaluate a
+security finding by re-deriving the classifier's behavior from the code, not by
+pattern-matching the finding's framing. The re-derivation is the value even when
+the headline claim is wrong.
+
+### 2. Out-of-scope is a decision with a shape, not a shrug
+
+Custom-prefix NAT64 went to spec §18 as out-of-scope on a specific argument: a
+custom prefix has no globally-fixed meaning, so the address is ordinary
+global-unicast IPv6 that reaches a private target only if the operator's OWN
+network runs a translator — unobservable to Conduit. Defending it means a
+denylist over unbounded input (the anti-pattern adversarial-convergence.md
+forbids). Codex's caveat sharpened it: out-of-scope ≠ `allowPrivate:true`.
+`allowPrivate` is explicit call-site authorization; out-of-scope is a documented
+boundary of the classifier's responsibility. The spec now says which is which.
+
+### 3. Fold-in deletions need a positive control, not just a passing test
+
+The fix let `::` and `::1` fall into the embedded-v4 decode and deleted their
+explicit checks. "Tests still pass" is not enough — a blanket block-all-`::/96`
+would also pass. The `::5db8:d822` (public `::93.184.216.34` → expected false)
+assertion is the control that forces the code to DECODE rather than range-block,
+staying symmetric with how v4-mapped treats a public embedded v4. A refactor
+that removes a guard must add the test that would fail if the removal weakened it.
+
+### 4. Re-read the durable surface at write time, and re-verify branch after any interruption
+
+Two drift incidents in one session, both caught by an audit pass rather than by
+luck. (a) A model-quota interruption mid-`/security-review` left local `main`
+moved by concurrent merges; the review's first context read was stale pre-fix
+code from `main`, not the fixed branch — briefly looking like the fix had
+vanished. Recovery: `git branch --show-current` + `git show HEAD:<file>` to see
+what's actually checked out. (b) When updating HANDOFF/LEARNINGS at session end,
+the draft was composed against the session-start read of HANDOFF — but a prior
+`561408e` session had already rewritten it (closed /mcp, filed this very finding
+as a carry-over). The "deep audit" trigger forced a re-read of the CURRENT file,
+which turned a wrong header-rewrite into three surgical edits (mark the carry-over
+DONE). Compose derivative docs against the file as it is NOW, never against a
+remembered version.

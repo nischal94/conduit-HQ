@@ -23,7 +23,7 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-11 (/mcp stdio server MERGED — PR #29 → main `c56ed7d`; next MVP step = §17 step 3, the `conduit` CLI)
+## Current handoff — written 2026-07-11 (/mcp stdio server MERGED — PR #29 → main `c56ed7d`; next MVP step = §17 step 3, the `conduit` CLI; egress `::/96` fix MERGED — PR #30 → main `1d95074`)
 
 ### Where things stand
 
@@ -80,14 +80,17 @@ merge instruction).
   (`packages/mcp/README.md`) has the onboarding; `scripts/seed-demo.mjs <url>`
   prints a ready config snippet. This is a human step — do it before calling the
   MVP shipped.
-- **NAT64 egress hardening (background task `task_8adbd0de`, may still be running
-  in a separate session):** codex's out-of-scope High — `isPrivateAddress` in
-  `packages/sdk/src/pipeline/egress.ts` only handles the well-known `64:ff9b::/96`
-  NAT64 prefix, missing RFC 6052 custom prefixes (private-egress bypass on a
-  custom-NAT64 network; fail-closed-by-default + operator-network precondition, so
-  not a live default leak). A session already started on branch
-  `fix/egress-v4-compatible-ipv6` (commit `ab7dad0` present locally). CHECK its PR
-  state before starting anything egress-adjacent.
+- **NAT64 egress hardening — DONE (PR #30 → main `1d95074`, merged 2026-07-11).**
+  The filed finding (codex's out-of-scope High: `isPrivateAddress` handles only
+  the well-known `64:ff9b::/96` prefix, not RFC 6052 custom prefixes) was
+  evaluated and recorded in **spec §18 as out-of-scope** — a custom NAT64 prefix
+  has no globally-fixed meaning, so reaching a private target needs the
+  operator's OWN network translator, which Conduit cannot observe (and this is
+  distinct from the `allowPrivate` opt-in). Evaluating it surfaced a REAL
+  adjacent bug, which PR #30 fixed: IPv4-compatible `::/96` (`::127.0.0.1`,
+  `::169.254.169.254`) was classified public while its v4-mapped twin was
+  blocked. Full Tier-2 gauntlet (codex CONVERGED, /security-review clean,
+  explainer+quiz, 9 CI checks). No egress carry-over remains.
 - **Type-design follow-up (tracked, unfiled):** the Tier-2 type-design agent's
   theme — `ExecutePayload`/`CheckPayloadBody`/`Execution` status fields are flat
   interfaces, not discriminated unions, so illegal states (e.g. `status:"failed"`
@@ -117,8 +120,8 @@ merge instruction).
 > Trace viewer, or Phases 2-5. Each piece: branch from origin/main, PR routing,
 > Tier 2 + /security-review + real codex exec pass, /explain-diff + full-pass quiz,
 > **human-named merge**. Before declaring the MVP shipped: do §17 gate-one (real
-> Claude Desktop acceptance against the merged /mcp server — see carry-overs) and
-> check the NAT64 follow-up (`fix/egress-v4-compatible-ipv6`) PR state.
+> Claude Desktop acceptance against the merged /mcp server — see carry-overs).
+> (The NAT64 egress follow-up is DONE — PR #30 merged.)
 
 ---
 
