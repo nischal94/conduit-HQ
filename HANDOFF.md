@@ -27,11 +27,16 @@ at session start.
 
 ### ⚠️ READ FIRST — the build lives on an UNMERGED LOCAL branch (tripwire blind spot)
 
-The CLI work is on branch **`docs/conduit-cli-design`** (4 commits ahead of
-`origin/main`, NOT pushed, NO PR yet). `main` is untouched, so the git
-staleness tripwire is SILENT about this work by design (the LEARNINGS #21 blind
-spot). **At session start: `git branch` → check out `docs/conduit-cli-design`;
-`gh pr list` will show nothing.** Do NOT start the CLI on `main` or a new branch.
+The CLI work is on branch **`docs/conduit-cli-design`** (ahead of `origin/main`,
+PUSHED to `origin` with upstream tracking as a backup, but NO PR yet). `main` is
+untouched, so the git staleness tripwire is SILENT about this work by design (the
+LEARNINGS #21 blind spot). **At session start: check out
+`docs/conduit-cli-design` (it exists on origin too); `gh pr list` will show
+nothing — the branch is pushed but no PR is open.** Do NOT start the CLI on
+`main` or a new branch, and do NOT open the PR yet (the CLI ships as one PR after
+the build completes). The SDD ledger (`.superpowers/sdd/progress.md`) is
+git-ignored so it did NOT push — it's reconstructable from `git log` on the
+pushed branch, which is what the SDD resume step does.
 
 ### Where things stand
 
