@@ -977,3 +977,55 @@ task could be served by multiple skills, LIST the relevant candidates with
 one-line summaries + fit analysis, THEN pick — a silent good pick still denies the
 redirect. Applied twice this session (autoplan stack; plan-review menu) after the
 correction.
+
+## 2026-07-11 (cont.) — /mcp stdio server: tasks 10-12, review gauntlet, MERGED (PR #29 → main c56ed7d)
+
+Continuation of the same-day entry above (tasks 1-9). This session finished the
+build (Task 10 ring-2 integration, Task 11 docs+spec+invariants, Task 12
+credential-echo falsification), ran the full post-PR gauntlet, and merged.
+296→ suite grew to sdk 313 + mcp 37; ALL prior invariants held.
+
+### 6. A "fix by comment rewrite" is a spec-compliance failure, not a resolution
+
+Two task reviews caught the same shape: an implementer noticed a test's comment
+referenced a path the test never drove (empty-catalog stderr) or a title that
+lacked the ledger's INVARIANT prefix, and made the *text* consistent instead of
+covering the *behavior*. The two-verdict review (spec vs quality) exists to catch
+exactly this — code quality was fine, but "the brief's named acceptance criterion
+must be exercised" is a spec check judged against the brief's literal words. Fix:
+drive the path (spawn a bin against a fresh unseeded db and assert the stderr
+line), don't reword the comment to match the gap.
+
+### 7. Convergence classification stopped an out-of-scope codex High from blocking merge
+
+The real cross-model pass returned NOT CONVERGED on a NAT64 egress-classifier gap.
+Two facts, verified in the same turn, kept it from being a false merge-blocker:
+(a) `git diff main...HEAD` showed egress.ts is UNCHANGED by the branch — codex
+reached outside the diff it was scoped to, so it's a pre-existing finding, not a
+PR #29 regression; (b) it's the denylist-shape class (another address encoding the
+canonicalizer doesn't collapse) against a fail-closed-by-default control needing an
+operator-network precondition. Routed to a tracked follow-up on egress.ts (its true
+home), not chat. Lesson: an adversarial finding against code your diff didn't touch
+is a real bug report but NOT this PR's gate — verify the file is in the diff before
+treating a finding as merge-blocking, and file the rest where the fixing session
+will see it.
+
+### 8. Two independent review agents converging on one finding is the strongest signal
+
+The test-coverage agent and the silent-failure agent independently flagged the same
+gap: check_execution's store reads lacked the correlation-id redaction wrap that
+execute already had (a raw store fault, possibly with a file path, could reach the
+client). Neither the per-task SDD reviews nor the whole-branch review had caught it
+across 12 tasks. When two differently-motivated reviewers land on the same line,
+that finding jumps the queue — it was the first of the four in-scope fixes.
+
+### 9. The fix wave is ONE dispatch with the whole list, not one-per-finding
+
+Five Tier-2 agents + security-review + codex produced a mixed bag: 4 in-scope fixes,
+several track-post-merge, several accept-as-is, one out-of-scope. Triaging the full
+set FIRST (fix / track / accept, with a reason each) then handing one subagent the
+four in-scope fixes together — rather than a fixer per finding — kept context cost
+flat and let the fixer share a helper (internalErrorFor) across two of them. The
+type-design agent's discriminated-union theme was real but a broad cross-package
+refactor: tracked as its own PR, not smuggled into this one. Scope discipline at the
+fix-wave stage is as load-bearing as at the build stage.

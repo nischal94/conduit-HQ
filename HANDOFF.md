@@ -23,65 +23,102 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-11 (/mcp stdio server: SDD tasks 1-9 of 12 DONE; next = Task 10 ring-2 integration)
+## Current handoff — written 2026-07-11 (/mcp stdio server MERGED — PR #29 → main `c56ed7d`; next MVP step = §17 step 3, the `conduit` CLI)
 
 ### Where things stand
 
-- **Branch `feat/mcp-stdio-server`** carries the full reviewed chain:
-  design doc rev 2 (`docs/superpowers/specs/2026-07-11-mcp-stdio-server-design.md`,
-  M1-M9, multi-voice autoplan review CONVERGED: codex trajectory 14→9→8→2→1(a)) →
-  implementation plan rev 2 (`docs/superpowers/plans/2026-07-11-mcp-stdio-server.md`,
-  12 tasks; codex plan review 12 findings fixed + §11-block shape-fix, converged) →
-  SDD build, tasks 1-9 complete, every task with a clean two-verdict review.
-- **SDD ledger is the authority: `.superpowers/sdd/progress.md`** (this plan's
-  section, after the §11 section — per-task commits, sanctioned deviations, Minor
-  roll-up for the final review). Suite green throughout: sdk 313/313 + mcp 25/25.
-  Last commit: `d5f5fb5` (Task 9 scripts).
-- **DONE (commits 263c847..d5f5fb5):** T1 storage (result/error/request_key +
-  getByRequestKey), T2 WAL/busy_timeout + tolerateSchemaRace (incl. §11 block as one
-  unit), T3 manager outcome-aware terminals + requestKey conflict, T4 capped
-  connection listing (§4.2 pin holds at 100 connections), T5 packages/mcp scaffold
-  (user install via sfw done; MCP SDK exact-pinned 1.29.0 + @libsql/client), T6
-  payloads (CheckPayloadBody union; token pins), T7 createConduitMcpServer (per-call
-  composition, XOR validation, no-resume-tool invariant), T8 env+bin (canonical-b64
-  key check, --doctor, stderr discipline, live-smoked), T9 seed-demo.mjs +
-  approve-demo.mjs (allow-only policies, config snippet; approve composition
-  char-identical to server.ts incl. egress env).
-- **NEXT: SDD Task 10** (ring-2 integration suite — spawned bin via Client +
-  StdioClientTransport, 4-step workflow e2e, stdout purity, pause → approve via
-  `node scripts/approve-demo.mjs <execId>` in a separate process → poll, client
-  timeout + requestKey recovery, parallel executes, egress fail-closed without the
-  opt-in env). Then T11 (README + conduitspec.html §14/§18/§20 + html2md.py same
-  commit + INVARIANTS rows), T12 (credential-echo invariant in e2e.smoke — STOP if
-  it fails, that falsifies the design's M4 posture claim). Then final whole-branch
-  review on the MOST CAPABLE model (opus precedent) fed the ledger's Minor roll-up.
-- Per-task flow: skill's `scripts/task-brief PLAN N` → implementer (sonnet; haiku
-  only for verbatim-transcription tasks) → `scripts/review-package BASE HEAD` →
-  task reviewer (sonnet) → ledger line. Record BASE before each dispatch.
-- **Implementer dispatches MUST carry:** vitest/tsc UNSANDBOXED (loopback suites
-  hang sandboxed — Task 10 doubly so: sockets + spawned processes); pre-commit hook
-  authoritative; NEVER git stash; binaries `packages/{sdk,mcp}/node_modules/.bin/
-  {vitest,tsc}` + repo-root biome; stage-only-changed; **stale-dist trap: the
-  workspace resolves @conduithq/sdk against packages/sdk/dist — rebuild via tsup
-  after any sdk source change** (`cd packages/sdk && node_modules/.bin/tsup
-  src/index.ts --format esm --dts --sourcemap`).
-- Post-build gates (unchanged): push → PR routing → Tier 2 + /security-review +
-  real codex exec pass (background, stdin prompt, scratchpad outputs) →
-  /explain-diff + FULL quiz pass → human-named merge. §17 gate-one manual
-  acceptance (real Claude Desktop) after; gate two after steps 3-4.
-- Housekeeping: gstack update available (1.5.1→1.60.1) — user-run, low priority.
+- **PR #29 MERGED (squash) → main is `c56ed7d`.** The /mcp stdio server (spec §17
+  build order **step 2**) is landed: `packages/mcp` (two tools — `execute` +
+  `check_execution`), the one SDK change (persisted outcome columns
+  result/error/request_key + WAL + outcome-aware terminals + capped listing), demo
+  scripts (`scripts/{seed-demo,approve-demo}.mjs`). Branch `feat/mcp-stdio-server`
+  deleted. Suite: **sdk 313/313 + mcp 37/37**, tsc + biome clean, all prior
+  INVARIANTS still ✅ plus new rows (M1 seam, M8 stdout purity, M4 outcome
+  persistence, check_execution ≤256 tokens, §4.2 capped-listing).
+- **Full build+review trail lives in `.superpowers/sdd/progress.md`** (this plan's
+  section — 12 tasks, per-task two-verdict reviews, final whole-branch review, the
+  POST-PR REVIEW GAUNTLET block). Design: `docs/superpowers/specs/2026-07-11-mcp-stdio-server-design.md`
+  (M1-M9). Explainer artifact (quiz passed):
+  https://claude.ai/code/artifact/dda68c25-6965-46d5-87c7-5cc595622ba6
+- **Review gauntlet outcome (all clean or fixed):** Tier 2 (5 agents) — general
+  review ready-to-merge; /security-review 0 findings; real codex pass found 1 High
+  that was **out of scope** (NAT64 gap in egress.ts, which this branch never
+  touched — filed as a follow-up, see below). Four in-scope findings fixed in the
+  branch before merge (commits fae7e23..9ededd8): check_execution store-fault
+  redaction (shared `internalErrorFor` helper), WAL-pragma made loud, INVARIANTS
+  M1 label collision, bin flag/doctor exit-path tests. CI green.
+
+### NEXT TASK — spec §17 step 3: the minimal `conduit` CLI
+
+§17 build order after the /mcp server: **(3) a minimal `conduit` CLI** — `serve`,
+`add-mcp`, `approvals list|approve|deny`. The merged execution manager's
+`resume(execId, {approve|deny})` is the engine `approvals` drives; `scripts/approve-demo.mjs`
+is the throwaway interim approver whose composition the CLI's `approvals approve`
+formalizes (read it — it's char-identical to server.ts's pipeline wiring incl. the
+egress env). This is a **§5.5-scale piece — START WITH BRAINSTORM + PLAN**
+(`superpowers:brainstorming` → `writing-plans`); do NOT jump to code. Known surfaces:
+where `serve` overlaps the existing `conduit-mcp` bin (reuse, don't duplicate the
+env contract in `packages/mcp/src/env.ts`), how `add-mcp` writes source/integration/
+connection/secret rows (mirror `scripts/seed-demo.mjs`), and the approvals TTL/expiry
+presentation (the manager already lazily expires on resume).
+
+**Then (spec §17):** (4) the §4.2 before/after token demo. Do NOT build the web
+console, FTS5, Trace viewer, or Phases 2-5. **MVP is done only when BOTH §17 gates
+pass** — gate one: built through the front door (real Claude Desktop manual
+acceptance against the merged /mcp server — NOT yet done, see carry-overs); gate
+two: converged edge-case pass on the running skeleton.
+
+Each piece is load-bearing: branch from origin/main, PR per commit routing, Tier 2
++ /security-review + real `codex exec` pass, /explain-diff + full-pass quiz,
+**human-named merge** (merge authority is the human's — a general "wrap up" is not a
+merge instruction).
+
+### Carry-overs (not blocking the CLI, but track them)
+
+- **§17 gate-one manual acceptance NOT done:** nobody has yet driven the merged
+  /mcp server from a real Claude Desktop/Cursor config end-to-end. The README
+  (`packages/mcp/README.md`) has the onboarding; `scripts/seed-demo.mjs <url>`
+  prints a ready config snippet. This is a human step — do it before calling the
+  MVP shipped.
+- **NAT64 egress hardening (background task `task_8adbd0de`, may still be running
+  in a separate session):** codex's out-of-scope High — `isPrivateAddress` in
+  `packages/sdk/src/pipeline/egress.ts` only handles the well-known `64:ff9b::/96`
+  NAT64 prefix, missing RFC 6052 custom prefixes (private-egress bypass on a
+  custom-NAT64 network; fail-closed-by-default + operator-network precondition, so
+  not a live default leak). A session already started on branch
+  `fix/egress-v4-compatible-ipv6` (commit `ab7dad0` present locally). CHECK its PR
+  state before starting anything egress-adjacent.
+- **Type-design follow-up (tracked, unfiled):** the Tier-2 type-design agent's
+  theme — `ExecutePayload`/`CheckPayloadBody`/`Execution` status fields are flat
+  interfaces, not discriminated unions, so illegal states (e.g. `status:"failed"`
+  with no `error`) are representable and guarded by tests, not the compiler. A real
+  quality improvement, deliberately NOT folded into PR #29 (broad cross-package
+  refactor). Consider a dedicated PR mirroring `ExecutionOutcome`'s discrimination.
+- Aikido SAST MCP still not connected (needs `/aikido:setup` in the user's
+  terminal) — CI Socket + secrets scan cover supply-chain/secrets meanwhile.
+- gstack update available (1.5.1→1.60.1) — user-run, low priority.
 
 ### Kickoff prompt for the next session
 
-> Continue the /mcp stdio server SDD build in ~/projects/conduit-HQ on branch
-> feat/mcp-stdio-server. Read .superpowers/sdd/progress.md FIRST (this plan's
-> section, after the §11 section) — tasks 1-9 are DONE, do not redo them. Resume
-> superpowers:subagent-driven-development at Task 10 using
-> docs/superpowers/plans/2026-07-11-mcp-stdio-server.md (task-brief script per
-> task). Inherit every quirk in HANDOFF's dispatch checklist verbatim into each
-> implementer dispatch — especially UNSANDBOXED vitest and the stale-dist rebuild.
-> After Task 12: final whole-branch review (most capable model, feed it the
-> ledger's Minor roll-up), then the post-build gates. Merge only on my say-so.
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (including `gh pr list --state all --limit 5`). **State: the
+> /mcp stdio server is MERGED (PR #29, squash) → main `c56ed7d`; sdk 313/313 + mcp
+> 37/37 green. Do NOT re-implement it.**
+>
+> **NEXT TASK: spec §17 step 3 — the minimal `conduit` CLI** (`serve`, `add-mcp`,
+> `approvals list|approve|deny`). It's a §5.5-scale piece: START WITH
+> `superpowers:brainstorming` then `writing-plans`; surface unknowns first (overlap
+> with the conduit-mcp bin's env contract, how add-mcp writes store rows à la
+> seed-demo.mjs, approvals expiry presentation). The merged manager's
+> resume(execId,{approve|deny}) is the approvals engine; approve-demo.mjs is the
+> interim approver to formalize. Then subagent-driven build per the plan.
+>
+> **Then (spec §17):** (4) the §4.2 token demo. Do NOT build the web console, FTS5,
+> Trace viewer, or Phases 2-5. Each piece: branch from origin/main, PR routing,
+> Tier 2 + /security-review + real codex exec pass, /explain-diff + full-pass quiz,
+> **human-named merge**. Before declaring the MVP shipped: do §17 gate-one (real
+> Claude Desktop acceptance against the merged /mcp server — see carry-overs) and
+> check the NAT64 follow-up (`fix/egress-v4-compatible-ipv6`) PR state.
 
 ---
 
