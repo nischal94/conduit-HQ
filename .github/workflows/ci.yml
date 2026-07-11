@@ -64,6 +64,7 @@ jobs:
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
       - run: pnpm lint
+      - run: pnpm build
       - run: pnpm typecheck
       - name: Spec drift check (conduitspec.md is derived from the HTML)
         run: |
@@ -78,7 +79,7 @@ jobs:
         with:
           persist-credentials: false
       - name: shellcheck the git hooks and repo scripts
-        run: shellcheck githooks/* scripts/*
+        run: shellcheck githooks/* scripts/push-docs scripts/routing-lib.sh
       - name: actionlint (lints this workflow itself)
         run: docker run --rm -v "$PWD:/repo" --workdir /repo rhysd/actionlint:1.7.7@sha256:887a259a5a534f3c4f36cb02dca341673c6089431057242cdc931e9f133147e9 -color
 
@@ -95,6 +96,7 @@ jobs:
           node-version-file: .nvmrc
           cache: pnpm
       - run: pnpm install --frozen-lockfile --ignore-scripts
+      - run: pnpm build
       - run: pnpm test
 
   build:
