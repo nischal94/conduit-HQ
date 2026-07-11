@@ -7,6 +7,7 @@ import {
   createStoreCredentialResolver,
   createStorePolicyEngine,
   createToolInvoker,
+  type Execution,
   type ExecutionOutcome,
   InMemoryCatalog,
   QuickJSSandbox,
@@ -91,6 +92,24 @@ function toMcpTool(definition: {
   inputSchema: Record<string, unknown>;
 }): McpToolDefinition {
   return definition as unknown as McpToolDefinition;
+}
+
+/**
+ * Shared infra-fault redaction (finding 1, PR #29 review): an internal fault
+ * (store/hydrate/upstream) must never hand the client a raw cause — same
+ * treatment `execute`'s manager.start catch already applied, now shared with
+ * check_execution's store reads. Generates a fresh correlation id, logs the
+ * raw cause to the operator log, and returns the generic client-facing error.
+ */
+function internalErrorFor(log: (line: string) => void, context: string, cause: unknown): McpError {
+  const correlationId = `mcp_${Math.random().toString(36).slice(2, 10)}`;
+  log(
+    `[ConduitMcp] ${context} failed with an infra fault. Context: { correlationId: ${correlationId}, cause: ${String(cause)} }`,
+  );
+  return new McpError(
+    ErrorCode.InternalError,
+    `[ConduitMcp] Internal error (correlation ${correlationId}).`,
+  );
 }
 
 export function createConduitMcpServer(options: ConduitMcpServerOptions): Server {
@@ -183,14 +202,7 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
       try {
         outcome = await manager.start(code, requestKey !== undefined ? { requestKey } : undefined);
       } catch (cause) {
-        const correlationId = `mcp_${Math.random().toString(36).slice(2, 10)}`;
-        log(
-          `[ConduitMcp] execute failed with an infra fault. Context: { correlationId: ${correlationId}, cause: ${String(cause)} }`,
-        );
-        throw new McpError(
-          ErrorCode.InternalError,
-          `[ConduitMcp] Internal error (correlation ${correlationId}).`,
-        );
+        throw internalErrorFor(log, "execute", cause);
       }
       return toTextResult(outcomeToPayload(outcome));
     }
@@ -210,10 +222,15 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
           "[ConduitMcp] check_execution takes `executionId` OR `requestKey`, not both.",
         );
       }
-      const execution =
-        typeof executionId === "string"
-          ? await store.executions.get(executionId)
-          : await store.executions.getByRequestKey(requestKey as string);
+      let execution: Execution | undefined;
+      try {
+        execution =
+          typeof executionId === "string"
+            ? await store.executions.get(executionId)
+            : await store.executions.getByRequestKey(requestKey as string);
+      } catch (cause) {
+        throw internalErrorFor(log, "check_execution", cause);
+      }
       return toTextResult(executionToCheckPayload(execution, now()));
     }
     throw new McpError(ErrorCode.InvalidParams, `[ConduitMcp] Unknown tool: ${name}`);

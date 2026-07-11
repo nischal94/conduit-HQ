@@ -181,6 +181,25 @@ describe("createConduitMcpServer", () => {
     expect(tools.find((t) => t.name === "execute")?.description).toContain("stripe.acme.live");
   });
 
+  it("check_execution store fault is redacted behind a correlation id (no raw cause leaks)", async () => {
+    const rawCause = "ENOENT: no such file or directory, corrupt-column-blowup";
+    store.executions.get = async () => {
+      throw new Error(rawCause);
+    };
+    const client = await connect(server);
+    await expect(
+      client.callTool({ name: "check_execution", arguments: { executionId: "exec_x" } }),
+    ).rejects.toMatchObject({
+      code: ErrorCode.InternalError,
+      message: expect.stringMatching(/correlation \w+/),
+    });
+    await expect(
+      client.callTool({ name: "check_execution", arguments: { executionId: "exec_x" } }),
+    ).rejects.not.toMatchObject({
+      message: expect.stringContaining(rawCause),
+    });
+  });
+
   it("a require_approval policy pauses; payload carries pending + stop-and-report message", async () => {
     const client = await connect(server);
     const res = await client.callTool({
