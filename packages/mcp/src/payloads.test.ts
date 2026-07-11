@@ -11,7 +11,7 @@ import {
 const seeds = { now: 1, random: 0.5 };
 
 describe("tool definitions", () => {
-  it("INVARIANT: check_execution definition ≤ 256 estimated tokens", () => {
+  it("INVARIANT §4.2: check_execution definition ≤ 256 estimated tokens", () => {
     expect(estimateDefinitionTokens(CHECK_EXECUTION_TOOL)).toBeLessThanOrEqual(256);
   });
   it("INVARIANT §4.2: extended execute definition (requestKey) stays ≤ 1044 tokens", () => {

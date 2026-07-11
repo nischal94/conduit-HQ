@@ -29,7 +29,7 @@ promise the product makes but does not yet enforce.
 | §10.2 — policy defaults: safe→Allow, review/destructive→Require approval; block never seeded | `packages/sdk/src/policy.test.ts` | ✅ pinned |
 | /mcp M1 — the human-only approval seam: no resume/approve tool on the MCP surface | `packages/mcp/src/server.test.ts` | ✅ pinned |
 | /mcp M8 — stdout purity: every stdout byte the client transport did NOT consume is protocol-framed | `packages/mcp/src/integration.test.ts` | ✅ pinned |
-| /mcp M1 — `check_execution` definition stays ≤ 256 estimated tokens | `packages/mcp/src/payloads.test.ts` | ✅ pinned |
+| §4.2 — `check_execution` definition stays ≤ 256 estimated tokens (the M1 design's status-check counterpart to the execute token pin above) | `packages/mcp/src/payloads.test.ts` | ✅ pinned |
 | /mcp M4 — outcome persistence: a stored `failed` row always explains itself (synthetic `ConduitPersistError` fallback on a faulted settle write) | `packages/sdk/src/execution/manager.test.ts` (credential-echo persisted-outcome facet covered in `packages/sdk/src/e2e.smoke.test.ts` — "runs the whole prototype flow with no secret leakage", Phase 11) | ✅ pinned |
 | §4.2 — execute surface stays within the one-tool token budget (~1,044) with a capped connection listing | `packages/sdk/src/execute.test.ts` | ✅ pinned |
 
