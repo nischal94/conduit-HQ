@@ -95,6 +95,25 @@ function startMcpServer(): Promise<{
         res.end(JSON.stringify({ error: "bad token", echoed: req.headers.authorization }));
         return;
       }
+      if (req.url === "/echoInBody") {
+        // A hostile-but-200 upstream: instead of rejecting auth (like
+        // /echo401), it ACCEPTS the call and echoes the credential back
+        // inside a successful JSON-RPC *result* body (Task 12 — the M4
+        // falsification probe). Any 200 response still passes through the
+        // §9.2 containsCredential tripwire (upstream.ts), so this exercises
+        // the same defense-in-depth on the success path, one step earlier
+        // than /echo401's error-body path.
+        const payload = JSON.parse(body) as { id: string };
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: { leaked: SECRET },
+          }),
+        );
+        return;
+      }
       const payload = JSON.parse(body) as {
         id: string;
         params: { name: string; arguments: unknown };
@@ -113,6 +132,27 @@ function startMcpServer(): Promise<{
       resolve({ server, port: (server.address() as AddressInfo).port, upstreamCalls });
     });
   });
+}
+
+/**
+ * §9.2 at-rest sweep: dump every table's every row/column into one string.
+ * Generic over the schema — new tables/columns (e.g. Task 1's
+ * `executions.result`/`error`) are picked up automatically via
+ * `sqlite_master`, no helper changes needed when the schema grows.
+ */
+async function dumpAllTablesRaw(client: ReturnType<typeof createClient>): Promise<string> {
+  const tables = await client.execute("SELECT name FROM sqlite_master WHERE type = 'table'");
+  let rawDump = "";
+  for (const row of tables.rows) {
+    const dump = await client.execute(`SELECT * FROM ${String(row.name)}`);
+    for (const r of dump.rows) {
+      for (const value of Object.values(r)) {
+        rawDump +=
+          value instanceof ArrayBuffer ? Buffer.from(value).toString("latin1") : String(value);
+      }
+    }
+  }
+  return rawDump;
 }
 
 async function openStore(): Promise<{
@@ -180,19 +220,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     await first.store.tools.replaceNamespace("github", tools);
 
     // §9.2 at rest: dump every table raw; plaintext must appear nowhere.
-    const tables = await first.client.execute(
-      "SELECT name FROM sqlite_master WHERE type = 'table'",
-    );
-    let rawDump = "";
-    for (const row of tables.rows) {
-      const dump = await first.client.execute(`SELECT * FROM ${String(row.name)}`);
-      for (const r of dump.rows) {
-        for (const value of Object.values(r)) {
-          rawDump +=
-            value instanceof ArrayBuffer ? Buffer.from(value).toString("latin1") : String(value);
-        }
-      }
-    }
+    const rawDump = await dumpAllTablesRaw(first.client);
     expect(rawDump).not.toContain(SECRET);
     expect(rawDump).not.toContain("ghp_smoke");
 
@@ -532,5 +560,58 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     // The host-side log never saw it either: the secret lived only in the
     // fetch argument scope (spec §9.2).
     expect(hostLog.join("\n")).not.toContain(SECRET);
+
+    // ── Phase 11: INVARIANT M4 — a hostile upstream that ACCEPTS the call
+    // and echoes the credential inside a successful result body must not
+    // leak it into the newly persisted outcome columns (executions.result/
+    // error, Task 1). Phase 10 proved the echo goes nowhere for a REJECTED
+    // (401) call surfaced as a guest-catchable error; this phase drives the
+    // SAME echo through a managed, PERSISTED execution (manager.start) so
+    // the assertion lands on the actual on-disk row, not just the in-memory
+    // return value — the upstream caller's §9.2 containsCredential tripwire
+    // is the same code path either way (upstream.ts), but this pins that its
+    // protection extends all the way to the store, matching the journal's
+    // existing guarantee (Phase 6/8's replayJournal/Trace sweeps).
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: "github",
+      location: `http://127.0.0.1:${port}/echoInBody`,
+    });
+    const echoOutcome = await manager.start(`
+      try {
+        await tools.github.list_issues({ owner: "acme", repo: "site" });
+        return "UNREACHABLE";
+      } catch (error) {
+        return { name: error.name, message: String(error.message ?? error) };
+      }
+    `);
+    expect(echoOutcome.status).toBe("completed");
+    if (echoOutcome.status === "completed") {
+      const value = echoOutcome.value as { name: string; message: string };
+      // The §9.2 best-effort tripwire (upstream.ts containsCredential) fires
+      // on the echoed credential in the 200 result body, refusing to deliver
+      // it — the call surfaces as an upstream error, not a completed value
+      // carrying the secret.
+      expect(value.name).toBe(GUEST_ERROR_NAMES.upstream);
+      expect(value.message).toContain("echoed the connection's credential");
+    }
+    expect(JSON.stringify(echoOutcome)).not.toContain(SECRET);
+    expect(JSON.stringify(echoOutcome)).not.toContain("ghp_smoke");
+
+    // The persisted `executions` row for this run — whichever settle path
+    // fired — must not carry the secret in its `result` or `error` column.
+    const echoRow = await manager.get(echoOutcome.executionId);
+    expect(echoRow?.status).toBe("completed");
+    expect(JSON.stringify(echoRow)).not.toContain(SECRET);
+    expect(JSON.stringify(echoRow)).not.toContain("ghp_smoke");
+
+    // The falsification probe itself: re-run the full raw-table dump (now
+    // covering the populated executions.result/error columns) and assert
+    // the secret is nowhere on disk — the upstream sanitize layer protects
+    // the new outcome columns exactly as it protects the journal.
+    const rawDumpAfterEcho = await dumpAllTablesRaw(client);
+    expect(rawDumpAfterEcho).not.toContain(SECRET);
+    expect(rawDumpAfterEcho).not.toContain("ghp_smoke");
   });
 });
