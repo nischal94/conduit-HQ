@@ -729,6 +729,66 @@ client and writes its config. The Connect card shows the exact command prefilled
 startup; after adding Conduit, the user may need to <strong>restart the client / open a new chat</strong>
 before Conduit&#39;s tools appear.</li>
 </ul>
+<p><strong><code>/mcp</code> stdio server onboarding (§17 build-order step 2 — see
+<code>packages/mcp/README.md</code> for the full walkthrough):</strong></p>
+<ol>
+<li><strong>Generate a master key</strong> — base64 encoding of exactly 32 random bytes:
+<code>node -e &quot;console.log(require('node:crypto').randomBytes(32).toString('base64'))&quot;</code>.</li>
+<li><strong>Config snippet, honest pre-publish command:</strong> nothing is on npm yet, so the client
+config's <code>command</code>/<code>args</code> point at the built file directly — <code>node
+&lt;abs path&gt;/packages/mcp/dist/bin.js</code> — with <code>CONDUIT_DB</code> and
+<code>CONDUIT_MASTER_KEY</code> in its <code>env</code> block. <code>chmod 600</code> the client
+config file afterward — it now holds the master key.</li>
+<li><strong>Seed a demo source</strong> so there's something to call:
+<code>node scripts/seed-demo.mjs &lt;upstream-mcp-url&gt;</code> (allow-only policies, so the walking
+skeleton can't strand on an unapproved pause). It prints the ready-to-paste config snippet above.</li>
+<li><strong>Interim approve/resume</strong> (stands in for the step-3 <code>conduit approvals</code>
+CLI, not yet built): <code>node scripts/approve-demo.mjs &lt;execId&gt;</code>, run from a separate
+process while the agent is waiting.</li>
+<li><strong>Restart the client</strong> after editing its config — the startup-reload caveat above
+applies here too.</li>
+</ol>
+<p><strong><code>/mcp</code> env vars (with units):</strong></p>
+<table>
+<thead>
+<tr>
+<th>Var</th>
+<th>Meaning</th>
+<th>Default</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>CONDUIT_DB</code></td>
+<td>SQLite database path.</td>
+<td><code>~/.conduit/conduit.db</code> (created on first run)</td>
+</tr>
+<tr>
+<td><code>CONDUIT_MASTER_KEY</code></td>
+<td>SecretBox key, base64 encoding of exactly 32 bytes. Required.</td>
+<td>none (required)</td>
+</tr>
+<tr>
+<td><code>CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS</code></td>
+<td>Allow loopback/private-network upstreams. Dev/demo only.</td>
+<td>off (fail-closed)</td>
+</tr>
+<tr>
+<td><code>CONDUIT_APPROVAL_TTL</code></td>
+<td>How long a paused execution stays approvable, in <strong>milliseconds</strong>.</td>
+<td><code>259200000</code> (72h)</td>
+</tr>
+</tbody>
+</table>
+<ul>
+<li><strong><code>/mcp</code> troubleshooting:</strong> tools don't appear → restart the client (macOS
+Claude Desktop server logs: <code>~/Library/Logs/Claude/mcp-server-*.log</code>); egress blocked → set
+<code>CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1</code> for a loopback/demo upstream (the agent-visible
+error deliberately doesn't name this var); a wrong master key fails at first secret decrypt, not
+startup; a call that timed out may have finished — pass a <code>requestKey</code> to
+<code>execute</code> and recover the outcome via <code>check_execution</code>; back up the single
+SQLite database file before upgrading; v1 calls MCP-over-HTTP upstreams only.</li>
+</ul>
 <hr>
 <h2 id="15-public-api-cli-surface-initial">15. Public API / CLI surface (initial)</h2>
 <pre><code>conduit install                         # durable background service
@@ -895,6 +955,36 @@ The full result lives only in the §5.5 replay journal, which stays semantically
 retroactive for policy changes: editing <code>redactFields</code> later masks future rows only. <code>PendingApproval.input</code> stays
 unredacted — the approver decides on real values. Display hygiene, not a boundary: the credential
 boundary remains §9.2's request-scoped, never-persisted credentials.</li>
+<li><strong>/mcp stdio surface — two-tool shape (2026-07-11):</strong> ✅ the client sees exactly two
+tools: <strong><code>execute</code></strong> (the existing <code>execute</code> definition, plus an
+optional <code>requestKey</code> correlation input) and <strong><code>check_execution</code></strong>
+(resolves by <code>executionId</code> or by <code>requestKey</code>). The §4.2 "one tool" story becomes
+"one tool + a status check": the execute definition's ≤1,044-token invariant holds by capping the
+connection listing (first N connections plus "…and K more — search the catalog"), and
+<code>check_execution</code> gets its own ≤256-token pin. <code>resume</code>/approve is deliberately
+NOT an MCP tool — the §10.2 approval seam stays human-only; an agent must never approve its own paused
+call.</li>
+<li><strong>/mcp execution-outcome persistence (2026-07-11):</strong> ✅ <code>Execution</code> gains
+persisted settle-state (<code>result</code>/<code>error</code> columns, plus the nullable unique
+<code>request_key</code> column) so <code>check_execution</code> is a pure store read, correct
+regardless of which process resumed. Every terminal transition is outcome-aware: a stored
+<code>failed</code> row always explains itself (a synthetic <code>ConduitPersistError</code> covers a
+faulted settle-write fallback), a <code>completed</code> row always carries a result (<code>null</code>
+is legitimate and distinct from absent), and <code>expired</code> carries neither. Retention/GC of
+these settled outcomes is <strong>explicitly deferred</strong>, alongside the existing trace-retention
+deferral (below) — the accumulation is a visible decision, not silence.</li>
+<li><strong><code>packages/mcp</code> joins the monorepo (2026-07-11):</strong> ✅ a new workspace
+package, <code>@conduithq/mcp</code> — the stdio MCP server (§17 build-order step 2). §20's monorepo
+list gains it.</li>
+<li><strong><code>CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS</code> opt-in (2026-07-11):</strong> ✅ an
+env var read by <code>packages/mcp</code>, default <strong>off</strong> (§9.3 fail-closed stands); set
+to <code>1</code> to allow the loopback-upstream dev/demo case, which otherwise cannot run at all.
+Enabling it prints a loud stderr warning at startup. Dev/demo-only framing in the docs; the Phase-1
+shape is per-connection egress policy.</li>
+<li><strong>/mcp completion signaling — poll is the skeleton mechanism (2026-07-11):</strong> ✅ the
+poll design (<code>check_execution</code>) is skeleton-scoped: MCP-native completion signaling
+(progress notifications / task semantics) is the recorded Phase-1 successor — deferred, not
+forgotten.</li>
 </ul>
 <p><strong>Deferred (future phases — none block v0.1 / Phase 0):</strong></p>
 <ol>
@@ -903,6 +993,9 @@ boundary remains §9.2's request-scoped, never-persisted credentials.</li>
 <li><strong>npm allowlist contents</strong>: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.</li>
 <li><strong>Pricing shape</strong> for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.</li>
 <li><strong>Approval push notifications</strong> (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.</li>
+<li><strong>Settled execution-outcome retention/GC</strong> (<code>/mcp</code> M4) — persisted
+<code>result</code>/<code>error</code> columns accumulate with no GC yet; same shape as the trace-retention
+deferral above — Phase 4.</li>
 </ol>
 <hr>
 <h2 id="19-branding-naming">19. Branding / naming</h2>
@@ -919,6 +1012,7 @@ scope <code>@conduithq</code> confirmed available.</li>
 <ul>
 <li><strong>Language:</strong> TypeScript everywhere (strict mode, ESM-only). <strong>Node.js ≥ 20.</strong></li>
 <li><strong>Monorepo:</strong> pnpm workspaces — <code>packages/sdk</code>, <code>packages/cli</code>,
+<code>packages/mcp</code> (the stdio MCP server, §17 build-order step 2),
 <code>apps/host-selfhost</code>, <code>apps/host-cloudflare</code> (later: <code>apps/desktop</code>, web console).</li>
 <li><strong>QuickJS binding:</strong> <code>quickjs-emscripten</code> — the same WASM build runs in Node and in
 Cloudflare Workers, which is what makes §13 deployment parity real rather than aspirational.</li>

@@ -27,6 +27,11 @@ promise the product makes but does not yet enforce.
 | §16 — runaway executions interrupted (time / memory / output caps) | `packages/sdk/src/sandbox/quickjs.test.ts` | ✅ pinned |
 | §5.5 — pause/resume via deterministic replay (journaled results, seeded non-determinism) | `packages/sdk/src/execution/manager.test.ts` | ✅ pinned |
 | §10.2 — policy defaults: safe→Allow, review/destructive→Require approval; block never seeded | `packages/sdk/src/policy.test.ts` | ✅ pinned |
+| /mcp M1 — the human-only approval seam: no resume/approve tool on the MCP surface | `packages/mcp/src/server.test.ts` | ✅ pinned |
+| /mcp M8 — stdout protocol purity: every stdout byte the client transport did not consume is protocol-framed | `packages/mcp/src/integration.test.ts` | ✅ pinned |
+| /mcp M1 — `check_execution` definition stays ≤ 256 estimated tokens | `packages/mcp/src/payloads.test.ts` | ✅ pinned |
+| /mcp M4 — outcome persistence: a stored `failed` row always explains itself (synthetic `ConduitPersistError` fallback on a faulted settle write) | `packages/sdk/src/execution/manager.test.ts` | ✅ pinned |
+| §4.2 — execute surface stays within the one-tool token budget (~1,044) with a capped connection listing | `packages/sdk/src/execute.test.ts` | ✅ pinned |
 
 ---
 

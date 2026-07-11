@@ -506,6 +506,42 @@ client and writes its config. The Connect card shows the exact command prefilled
 startup; after adding Conduit, the user may need to **restart the client / open a new chat**
 before Conduit's tools appear.
 
+**`/mcp` stdio server onboarding (§17 build-order step 2 — see
+`packages/mcp/README.md` for the full walkthrough):**
+
+1. **Generate a master key** — base64 encoding of exactly 32 random bytes:
+`node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`.
+2. **Config snippet, honest pre-publish command:** nothing is on npm yet, so the client
+config's `command`/`args` point at the built file directly — `node
+<abs path>/packages/mcp/dist/bin.js` — with `CONDUIT_DB` and
+`CONDUIT_MASTER_KEY` in its `env` block. `chmod 600` the client
+config file afterward — it now holds the master key.
+3. **Seed a demo source** so there's something to call:
+`node scripts/seed-demo.mjs <upstream-mcp-url>` (allow-only policies, so the walking
+skeleton can't strand on an unapproved pause). It prints the ready-to-paste config snippet above.
+4. **Interim approve/resume** (stands in for the step-3 `conduit approvals`
+CLI, not yet built): `node scripts/approve-demo.mjs <execId>`, run from a separate
+process while the agent is waiting.
+5. **Restart the client** after editing its config — the startup-reload caveat above
+applies here too.
+
+**`/mcp` env vars (with units):**
+
+| Var | Meaning | Default |
+| --- | --- | --- |
+| `CONDUIT_DB` | SQLite database path. | `~/.conduit/conduit.db` (created on first run) |
+| `CONDUIT_MASTER_KEY` | SecretBox key, base64 encoding of exactly 32 bytes. Required. | none (required) |
+| `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Allow loopback/private-network upstreams. Dev/demo only. | off (fail-closed) |
+| `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72h) |
+
+- **`/mcp` troubleshooting:** tools don't appear → restart the client (macOS
+Claude Desktop server logs: `~/Library/Logs/Claude/mcp-server-*.log`); egress blocked → set
+`CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1` for a loopback/demo upstream (the agent-visible
+error deliberately doesn't name this var); a wrong master key fails at first secret decrypt, not
+startup; a call that timed out may have finished — pass a `requestKey` to
+`execute` and recover the outcome via `check_execution`; back up the single
+SQLite database file before upgrading; v1 calls MCP-over-HTTP upstreams only.
+
 ---
 
 ## 15. Public API / CLI surface (initial)
@@ -683,6 +719,36 @@ The full result lives only in the §5.5 replay journal, which stays semantically
 retroactive for policy changes: editing `redactFields` later masks future rows only. `PendingApproval.input` stays
 unredacted — the approver decides on real values. Display hygiene, not a boundary: the credential
 boundary remains §9.2's request-scoped, never-persisted credentials.
+- **/mcp stdio surface — two-tool shape (2026-07-11):** ✅ the client sees exactly two
+tools: **`execute`** (the existing `execute` definition, plus an
+optional `requestKey` correlation input) and **`check_execution`**
+(resolves by `executionId` or by `requestKey`). The §4.2 "one tool" story becomes
+"one tool + a status check": the execute definition's ≤1,044-token invariant holds by capping the
+connection listing (first N connections plus "…and K more — search the catalog"), and
+`check_execution` gets its own ≤256-token pin. `resume`/approve is deliberately
+NOT an MCP tool — the §10.2 approval seam stays human-only; an agent must never approve its own paused
+call.
+- **/mcp execution-outcome persistence (2026-07-11):** ✅ `Execution` gains
+persisted settle-state (`result`/`error` columns, plus the nullable unique
+`request_key` column) so `check_execution` is a pure store read, correct
+regardless of which process resumed. Every terminal transition is outcome-aware: a stored
+`failed` row always explains itself (a synthetic `ConduitPersistError` covers a
+faulted settle-write fallback), a `completed` row always carries a result (`null`
+is legitimate and distinct from absent), and `expired` carries neither. Retention/GC of
+these settled outcomes is **explicitly deferred**, alongside the existing trace-retention
+deferral (below) — the accumulation is a visible decision, not silence.
+- **`packages/mcp` joins the monorepo (2026-07-11):** ✅ a new workspace
+package, `@conduithq/mcp` — the stdio MCP server (§17 build-order step 2). §20's monorepo
+list gains it.
+- **`CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` opt-in (2026-07-11):** ✅ an
+env var read by `packages/mcp`, default **off** (§9.3 fail-closed stands); set
+to `1` to allow the loopback-upstream dev/demo case, which otherwise cannot run at all.
+Enabling it prints a loud stderr warning at startup. Dev/demo-only framing in the docs; the Phase-1
+shape is per-connection egress policy.
+- **/mcp completion signaling — poll is the skeleton mechanism (2026-07-11):** ✅ the
+poll design (`check_execution`) is skeleton-scoped: MCP-native completion signaling
+(progress notifications / task semantics) is the recorded Phase-1 successor — deferred, not
+forgotten.
 
 **Deferred (future phases — none block v0.1 / Phase 0):**
 
@@ -691,6 +757,9 @@ boundary remains §9.2's request-scoped, never-persisted credentials.
 3. **npm allowlist contents**: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.
 4. **Pricing shape** for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.
 5. **Approval push notifications** (webhook/Slack) beyond console/CLI/agent surfacing — Phase 2.
+6. **Settled execution-outcome retention/GC** (`/mcp` M4) — persisted
+`result`/`error` columns accumulate with no GC yet; same shape as the trace-retention
+deferral above — Phase 4.
 
 ---
 
@@ -709,6 +778,7 @@ scope `@conduithq` confirmed available.
 
 - **Language:** TypeScript everywhere (strict mode, ESM-only). **Node.js ≥ 20.**
 - **Monorepo:** pnpm workspaces — `packages/sdk`, `packages/cli`,
+`packages/mcp` (the stdio MCP server, §17 build-order step 2),
 `apps/host-selfhost`, `apps/host-cloudflare` (later: `apps/desktop`, web console).
 - **QuickJS binding:** `quickjs-emscripten` — the same WASM build runs in Node and in
 Cloudflare Workers, which is what makes §13 deployment parity real rather than aspirational.
