@@ -90,6 +90,10 @@ quiz + HUMAN-NAMED merge — the agent does NOT merge).
   `gh pr checks <n>` (plain, tab-delimited `pass/fail/pending`) or verify the
   `--json state` enum values before filtering.
 
+### Session debrief (this session, full narrative)
+
+https://claude.ai/code/artifact/a1e9fd6c-5930-47a1-947a-e67ecdd88d10
+
 ### ⚠️ Historical note — the OLD current handoff below (Lane A in-progress on the unmerged branch) is SUPERSEDED by the above. Kept for the session-quirks it still carries.
 
 ## Superseded handoff — written 2026-07-12 earlier (Lane A T1-T2 in progress on `docs/conduit-cli-design`, now MERGED as PR #31)
