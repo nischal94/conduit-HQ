@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { serve } from "./commands/serve.js";
 import { type Command, dispatch } from "./dispatch.js";
 
 // NOTE: this bin does NOT redirect stdout globally. Only `conduit serve`
@@ -8,8 +9,8 @@ import { type Command, dispatch } from "./dispatch.js";
 async function runCommand(command: Command, _args: string[]): Promise<number> {
   switch (command) {
     case "serve":
-      console.error("conduit serve: not yet implemented");
-      return 1;
+      await serve();
+      return 0;
     case "add-mcp":
       console.error("conduit add-mcp: not yet implemented");
       return 1;

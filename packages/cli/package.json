@@ -30,6 +30,7 @@
     "@libsql/client": "^0.14.0"
   },
   "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
     "@types/node": "26.0.1",
     "tsup": "^8.3.5",
     "typescript": "^5.7.2",

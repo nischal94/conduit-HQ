@@ -34,6 +34,7 @@ promise the product makes but does not yet enforce.
 | §4.2 — execute surface stays within the one-tool token budget (~1,044) with a capped connection listing | `packages/sdk/src/execute.test.ts` | ✅ pinned |
 | /mcp CLI — approvals queue lists paused executions oldest-first (deterministic (started_at, id)) | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
 | /mcp CLI — add-mcp provisioning is atomic + seeds NO policy rows | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
+| /mcp M8 — stdout purity holds through `conduit serve` (shared runStdioServer) | `packages/cli/src/integration.test.ts` | ✅ pinned |
 
 ---
 
