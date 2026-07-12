@@ -123,6 +123,43 @@ describe("runAddMcp", () => {
     expect(await store.sources.list()).toEqual([]);
   });
 
+  it("INVARIANT /cli add-mcp: an oversized upstream tools/list body fails loud with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({
+      store,
+      // mcp-fetch.ts enforces the byte cap itself; this pins runAddMcp's
+      // handling of that failure through the SAME fail-loud/0-writes path
+      // as every other fetchTools rejection.
+      fetchTools: vi.fn(async () => {
+        throw new Error(
+          "[conduit add-mcp] upstream tools/list response exceeds the 5242880-byte cap; nothing was written.",
+        );
+      }),
+    });
+
+    const result = await runAddMcp(BASE_ARGS, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(await store.sources.list()).toEqual([]);
+  });
+
+  it("INVARIANT /cli add-mcp: an over-count upstream tools/list body fails loud with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({
+      store,
+      fetchTools: vi.fn(async () => {
+        throw new Error(
+          "[conduit add-mcp] upstream tools/list response exceeds the 1024-tool cap (got 2000); nothing was written.",
+        );
+      }),
+    });
+
+    const result = await runAddMcp(BASE_ARGS, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(await store.sources.list()).toEqual([]);
+  });
+
   it("duplicate-after-namespacing tool names (normalizeMcp throws) also fail loud with 0 writes", async () => {
     const store = await openTestStore();
     const deps = makeDeps({
@@ -268,15 +305,19 @@ describe("runAddMcp", () => {
     expect(await store.secrets.reveal(existingRef)).toBeUndefined();
   });
 
-  it("--clear-credential: a provisionSource failure leaves the old secret and old credentialRef fully intact", async () => {
+  it("--clear-credential: a REJECTING provisionSource leaves the old secret and old credentialRef fully intact (batch rollback, not ordering)", async () => {
     const store = await openTestStore();
     await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer tok123" } }));
     const connectionsBefore = await store.connections.list();
     const existingRef = connectionsBefore.find((c) => c.integrationId === "int_github")
       ?.credentialRef as string;
 
-    // Wrap the real store so provisionSource rejects — the removal must not
-    // have already fired before this point.
+    // Wrap the real store so provisionSource rejects. The secret DELETE is
+    // now issued INSIDE provisionSource's own atomic batch (T-I2 amendment)
+    // via removeSecretRef, so a rejecting provisionSource guarantees the
+    // delete never lands — this is a storage-layer rollback guarantee, not
+    // a call-ordering discipline in add-mcp.ts (there is no longer a
+    // separate post-success `store.secrets.remove` call to order against).
     const failingStore: ConduitStore = {
       ...store,
       provisionSource: async () => {
@@ -292,7 +333,8 @@ describe("runAddMcp", () => {
     ).rejects.toThrow("simulated provisionSource failure");
 
     // Old connection still carries the old ref, and the old secret still
-    // reveals — nothing was removed by the failed attempt.
+    // reveals — the rejected batch rolled back the delete along with
+    // everything else.
     const connectionsAfter = await store.connections.list();
     const conn = connectionsAfter.find((c) => c.integrationId === "int_github");
     expect(conn?.credentialRef).toBe(existingRef);

@@ -195,17 +195,18 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
   const suppliedSecret = deps.env.CONDUIT_ADD_SECRET;
   let credentialRef: string | undefined;
   let secretToStore: { ref: string; value: string } | undefined;
-  // The only deliberate deauth path: the removal is deferred until AFTER
-  // provisionSource succeeds (below), not performed here. If provisionSource
-  // throws, the old secret + old connection are left fully intact instead of
-  // being an orphaned dangling ref; a remove failure after success at worst
-  // leaves an orphaned sealed secret, which is the fail-safe direction.
-  let secretToRemove: string | undefined;
+  // The deliberate deauth path (T-I2 amendment, user-approved): the old
+  // secret's DELETE now travels INSIDE the same atomic provisionSource batch
+  // as the source/integration/connection/tools write, via removeSecretRef.
+  // A failure anywhere in that batch rolls back the delete too, so the old
+  // secret + old connection stay fully intact on rejection — this is now a
+  // storage-layer guarantee (batch rollback), not an ordering discipline.
+  let secretRefToRemove: string | undefined;
 
   if (args.clearCredential) {
     credentialRef = undefined;
     if (existingConnection?.credentialRef !== undefined) {
-      secretToRemove = existingConnection.credentialRef;
+      secretRefToRemove = existingConnection.credentialRef;
     }
   } else if (suppliedSecret !== undefined && suppliedSecret.trim() !== "") {
     credentialRef = derivedCredentialRef;
@@ -232,12 +233,9 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     integration,
     connection,
     ...(secretToStore !== undefined ? { secret: secretToStore } : {}),
+    ...(secretRefToRemove !== undefined ? { removeSecretRef: secretRefToRemove } : {}),
     tools,
   });
-
-  if (secretToRemove !== undefined) {
-    await store.secrets.remove(secretToRemove);
-  }
 
   // Step 7: success output — counts only, never per-tool names, never the secret.
   const counts = countsByRiskClass(tools);
