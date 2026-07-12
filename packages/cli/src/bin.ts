@@ -1,0 +1,50 @@
+#!/usr/bin/env node
+import { type Command, dispatch } from "./dispatch.js";
+
+// NOTE: this bin does NOT redirect stdout globally. Only `conduit serve`
+// redirects stdout (via runStdioServer, so MCP framing isn't corrupted) —
+// see design §6. Every other command prints normally.
+
+async function runCommand(command: Command, _args: string[]): Promise<number> {
+  switch (command) {
+    case "serve":
+      console.error("conduit serve: not yet implemented");
+      return 1;
+    case "add-mcp":
+      console.error("conduit add-mcp: not yet implemented");
+      return 1;
+    case "approvals":
+      console.error("conduit approvals: not yet implemented");
+      return 1;
+    default: {
+      const _exhaustive: never = command;
+      return _exhaustive;
+    }
+  }
+}
+
+async function main(): Promise<void> {
+  const argv = process.argv.slice(2);
+  const result = dispatch(argv);
+
+  switch (result.kind) {
+    case "help":
+      process.stdout.write(result.stdout);
+      return;
+    case "version":
+      process.stdout.write(result.stdout);
+      return;
+    case "error":
+      process.stderr.write(result.stderr);
+      process.exitCode = result.exitCode;
+      return;
+    case "route":
+      process.exitCode = await runCommand(result.command, result.args);
+      return;
+  }
+}
+
+main().catch((error) => {
+  console.error(`[conduit] Fatal: ${String(error instanceof Error ? error.message : error)}`);
+  process.exitCode = 1;
+});
