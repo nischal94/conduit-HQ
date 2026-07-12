@@ -163,6 +163,17 @@ export async function runDecide(
     deps.stderr(`${EXPIRED_LINE}\n`);
     return { exitCode: 0 };
   }
+  if (outcome.status === "paused") {
+    // The approved call ran, and the resumed execution reached ANOTHER
+    // require_approval call (manager re-enters the drive loop on resume) —
+    // a fresh pausedOn is persisted and a second human decision is needed.
+    deps.stderr(
+      `[conduit approvals] Execution paused again on a new approval: ` +
+        `${outcome.pending.toolName} (${outcome.pending.reason}). ` +
+        `Run "conduit approvals list" to see the queue and decide again.\n`,
+    );
+    return { exitCode: 0 };
+  }
   if (outcome.status === "conflict" || outcome.status === "failed") {
     if (outcome.status === "failed") {
       deps.stderr(

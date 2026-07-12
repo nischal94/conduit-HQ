@@ -281,6 +281,72 @@ describe("conduit approvals approve|deny — real runtime", () => {
     expect(upstream.calls).toHaveLength(0);
   });
 
+  it("re-pause: approving the first of two require_approval calls surfaces the NEW pending approval and the execution is back in listPaused", async () => {
+    await setup();
+    // TWO sequential review-class calls (sdk manager.test.ts design D3
+    // precedent): approving #1 resumes into #2, which pauses again with a
+    // fresh persisted pausedOn.
+    const runtime = await createApprovalRuntime({ store, allowPrivateEgress: true });
+    const first = await runtime.manager.start(`
+      const one = await tools.github.delete_repo({ repo: "one" });
+      const two = await tools.github.delete_repo({ repo: "two" });
+      return { one, two };
+    `);
+    if (first.status !== "paused") {
+      throw new Error(`expected paused, got ${first.status}`);
+    }
+    const executionId = first.executionId;
+
+    const deps = makeDeps({
+      store,
+      allowPrivateEgress: true,
+      createRuntime: (opts) => createApprovalRuntime(opts),
+    });
+    const result = await runDecide("approve", executionId, deps);
+
+    // Not an error: the first call ran, the run paused again on the second.
+    expect(result.exitCode).toBe(0);
+    expect(deps.stdoutLines.join("")).toBe("paused\n");
+    expect(deps.stderrLines.join("")).toMatch(/paused again on a new approval/i);
+    expect(deps.stderrLines.join("")).toMatch(/github\.delete_repo/);
+    expect(deps.stderrLines.join("")).toMatch(/conduit approvals list/);
+
+    // Only the APPROVED first call reached upstream; the new pending did not.
+    expect(upstream.calls.map((c) => c.name)).toEqual(["delete_repo"]);
+
+    // The execution is back in the queue with the fresh pausedOn persisted.
+    const queued = await store.executions.listPaused();
+    expect(queued.map((e) => e.id)).toContain(executionId);
+    const row = await store.executions.get(executionId);
+    expect(row?.status).toBe("paused");
+    expect(row?.pausedOn?.input).toEqual({ repo: "two" });
+  });
+
+  it("conflict for REAL: a second approve of an already-completed execution exits non-zero with the conflict message", async () => {
+    await setup();
+    const executionId = await pauseOne();
+    const deps = makeDeps({
+      store,
+      allowPrivateEgress: true,
+      createRuntime: (opts) => createApprovalRuntime(opts),
+    });
+
+    const first = await runDecide("approve", executionId, deps);
+    expect(first.exitCode).toBe(0);
+
+    // Second approve of the same id: claimForResume finds no paused row →
+    // a genuine conflict outcome through the real runtime path (sdk
+    // manager.test.ts double-resume precedent).
+    const second = await runDecide("approve", executionId, deps);
+    expect(second.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("completed\nconflict\n");
+    expect(deps.stderrLines.join("")).toMatch(/not in a resumable \(paused\) state/);
+
+    // The approved tool call fired exactly once — the conflicted second
+    // decision never re-executed it.
+    expect(upstream.calls.map((c) => c.name)).toEqual(["delete_repo"]);
+  });
+
   it("missing execution-id exits 1 without opening the store", async () => {
     await setup();
     const openStore = vi.fn();
