@@ -1,5 +1,5 @@
 import { openStoreFromEnv } from "@conduithq/mcp";
-import { type ConduitStore, normalizeMcp, type RiskClass } from "@conduithq/sdk";
+import { type ConduitStore, normalizeMcp, type RiskClass, type Tool } from "@conduithq/sdk";
 import { fetchToolsList } from "../mcp-fetch.js";
 
 /**
@@ -116,7 +116,11 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     return { exitCode: 1 };
   }
 
-  // Step 2: fetch tools/list — a hard precondition BEFORE any store write.
+  // Step 2: fetch + normalize tools/list — a hard precondition BEFORE any
+  // store write. Both failure classes take the same fail-loud path (design
+  // §2.2): an unreachable upstream and a reachable-but-schema-invalid one
+  // each get a `[conduit add-mcp] ... nothing was written` line + non-zero
+  // exit, never bin.ts's generic fatal handler.
   let rawTools: unknown[];
   try {
     rawTools = await deps.fetchTools(url);
@@ -126,7 +130,17 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     );
     return { exitCode: 1 };
   }
-  const tools = normalizeMcp({ namespace, tools: rawTools });
+  let tools: Tool[];
+  try {
+    tools = normalizeMcp({ namespace, tools: rawTools });
+  } catch (cause) {
+    const detail = cause instanceof Error ? cause.message : String(cause);
+    deps.stderr(
+      `[conduit add-mcp] upstream at ${url} returned an invalid tools/list; nothing was written. ` +
+        `Re-run when the upstream is fixed. Context: { cause: ${JSON.stringify(detail)} }\n`,
+    );
+    return { exitCode: 1 };
+  }
 
   // Step 3: open the store and READ existing state.
   const { store } = await deps.openStore(deps.env);
@@ -141,20 +155,21 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     ? (await store.connections.list()).find((c) => c.integrationId === existingIntegration.id)
     : undefined;
 
-  // Step 4: C3 gate — refuse a silent retarget without --replace.
-  if (
+  // Step 4: C3 gate — refuse a silent retarget without --replace. The same
+  // "does url/prefix actually differ" condition gates the --replace warning
+  // below, so --replace on an unchanged source stays quiet.
+  const isRetarget =
     existingSource !== undefined &&
     (existingSource.location !== url ||
-      (existingConnection !== undefined && existingConnection.prefix !== prefix)) &&
-    !args.replace
-  ) {
+      (existingConnection !== undefined && existingConnection.prefix !== prefix));
+  if (isRetarget && !args.replace) {
     deps.stderr(
       `[conduit add-mcp] Namespace "${namespace}" already exists with a different url/prefix. ` +
         `Re-run with --replace to retarget it, or choose a different --namespace.\n`,
     );
     return { exitCode: 1 };
   }
-  if (existingSource !== undefined && args.replace) {
+  if (isRetarget && args.replace) {
     deps.stderr(
       `[conduit add-mcp] --replace: retargeting namespace "${namespace}" to a new upstream. ` +
         `Manual policy overrides (keyed by tool name) will carry over to the new upstream.\n`,

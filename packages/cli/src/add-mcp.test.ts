@@ -105,6 +105,44 @@ describe("runAddMcp", () => {
     expect(await store.sources.list()).toEqual([]);
   });
 
+  it("schema-invalid tools/list body (fetch OK, normalizeMcp throws) goes through the fail-loud path with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({
+      store,
+      // HTTP-level success: an array, so the fetch layer's shape check
+      // passes — but a non-string tool name fails normalizeMcp's envelope.
+      fetchTools: vi.fn(async () => [{ name: 42 }]),
+    });
+
+    const result = await runAddMcp(BASE_ARGS, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    const stderr = deps.stderrLines.join("");
+    expect(stderr).toMatch(/^\[conduit add-mcp\]/);
+    expect(stderr).toMatch(/nothing was written/);
+    expect(await store.sources.list()).toEqual([]);
+  });
+
+  it("duplicate-after-namespacing tool names (normalizeMcp throws) also fail loud with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({
+      store,
+      // Both normalize to `github.a.b` — normalizeMcp refuses.
+      fetchTools: vi.fn(async () => [
+        { name: "a/b", inputSchema: { type: "object" } },
+        { name: "a.b", inputSchema: { type: "object" } },
+      ]),
+    });
+
+    const result = await runAddMcp(BASE_ARGS, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    const stderr = deps.stderrLines.join("");
+    expect(stderr).toMatch(/^\[conduit add-mcp\]/);
+    expect(stderr).toMatch(/nothing was written/);
+    expect(await store.sources.list()).toEqual([]);
+  });
+
   it("existing namespace with a differing --url, no --replace, refuses with 0 writes", async () => {
     const store = await openTestStore();
     // First run: seeds the namespace.
@@ -135,6 +173,17 @@ describe("runAddMcp", () => {
     expect(result.exitCode).toBe(0);
     const source = await store.sources.get("src_github");
     expect(source?.location).toBe("http://127.0.0.1:9/mcp-new");
+  });
+
+  it("--replace on an UNCHANGED url/prefix prints no retargeting warning", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store }));
+
+    const deps = makeDeps({ store });
+    const result = await runAddMcp({ ...BASE_ARGS, replace: true }, deps);
+
+    expect(result.exitCode).toBe(0);
+    expect(deps.stderrLines.join("")).not.toMatch(/retargeting/);
   });
 
   it("re-sync with no CONDUIT_ADD_SECRET but an existing credentialRef preserves it", async () => {
