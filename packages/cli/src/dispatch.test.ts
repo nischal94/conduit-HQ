@@ -65,6 +65,24 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
+  it("-v → behaves like --version (version on stdout)", () => {
+    const result = dispatch(["-v"]);
+    expect(result.kind).toBe("version");
+    if (result.kind === "version") {
+      expect(result.stdout.trim()).toBe(VERSION);
+    }
+  });
+
+  it("-h → behaves like --help (lists all three commands)", () => {
+    const result = dispatch(["-h"]);
+    expect(result.kind).toBe("help");
+    if (result.kind === "help") {
+      for (const command of COMMANDS) {
+        expect(result.stdout).toContain(command);
+      }
+    }
+  });
+
   it("COMMANDS contains exactly the three routed commands", () => {
     expect(COMMANDS).toEqual(["serve", "add-mcp", "approvals"]);
   });

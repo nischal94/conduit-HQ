@@ -175,6 +175,46 @@ describe("runAddMcp", () => {
     expect(source?.location).toBe("http://127.0.0.1:9/mcp-new");
   });
 
+  it("INVARIANT /cli add-mcp: cross-namespace --prefix collision fails loud with 0 writes to the new namespace, and does not disturb the existing owner", async () => {
+    const store = await openTestStore();
+    // Namespace A seeds prefix P.
+    await runAddMcp(BASE_ARGS, makeDeps({ store }));
+
+    // Namespace B tries to claim the same prefix P.
+    const deps = makeDeps({ store });
+    const result = await runAddMcp(
+      { ...BASE_ARGS, namespace: "gitlab", url: "http://127.0.0.1:9/mcp-other" },
+      deps,
+    );
+
+    expect(result.exitCode).not.toBe(0);
+    const stderr = deps.stderrLines.join("");
+    expect(stderr).toMatch(/^\[conduit add-mcp\]/);
+    expect(stderr).toMatch(/prefix github\.acme\.prod is already used by another source/);
+    expect(stderr).toMatch(/nothing was written/);
+
+    // Namespace B got 0 rows.
+    expect(await store.sources.get("src_gitlab")).toBeUndefined();
+
+    // Namespace A (the original owner) is untouched.
+    const sourceA = await store.sources.get("src_github");
+    expect(sourceA?.location).toBe(BASE_ARGS.url);
+    const connA = (await store.connections.list()).find((c) => c.integrationId === "int_github");
+    expect(connA?.prefix).toBe(BASE_ARGS.prefix);
+  });
+
+  it("same-namespace re-sync with the SAME prefix still succeeds (prefix collision check does not false-positive on self)", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store }));
+
+    // Re-run: same namespace, same prefix — idempotent re-sync path.
+    const result = await runAddMcp(BASE_ARGS, makeDeps({ store }));
+
+    expect(result.exitCode).toBe(0);
+    const source = await store.sources.get("src_github");
+    expect(source?.location).toBe(BASE_ARGS.url);
+  });
+
   it("--replace on an UNCHANGED url/prefix prints no retargeting warning", async () => {
     const store = await openTestStore();
     await runAddMcp(BASE_ARGS, makeDeps({ store }));

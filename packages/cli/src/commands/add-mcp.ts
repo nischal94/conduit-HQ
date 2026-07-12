@@ -155,6 +155,21 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     ? (await store.connections.list()).find((c) => c.integrationId === existingIntegration.id)
     : undefined;
 
+  // Step 3b: cross-namespace prefix collision — `connections.prefix` is
+  // UNIQUE in the schema, so a DIFFERENT namespace already owning the
+  // requested --prefix would otherwise surface as a raw UNIQUE constraint
+  // error out of provisionSource, falling through to bin.ts's generic
+  // `[conduit] Fatal:` handler. Checked here (read-first, before any write)
+  // so it takes the same fail-loud path as every other precondition.
+  const prefixOwner = await store.connections.getByPrefix(prefix);
+  if (prefixOwner !== undefined && prefixOwner.integrationId !== integrationId) {
+    deps.stderr(
+      `[conduit add-mcp] prefix ${prefix} is already used by another source; nothing was written. ` +
+        `Choose a different --prefix.\n`,
+    );
+    return { exitCode: 1 };
+  }
+
   // Step 4: C3 gate — refuse a silent retarget without --replace. The same
   // "does url/prefix actually differ" condition gates the --replace warning
   // below, so --replace on an unchanged source stays quiet.
@@ -164,15 +179,15 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
       (existingConnection !== undefined && existingConnection.prefix !== prefix));
   if (isRetarget && !args.replace) {
     deps.stderr(
-      `[conduit add-mcp] Namespace "${namespace}" already exists with a different url/prefix. ` +
+      `[conduit add-mcp] Namespace "${namespace}" already exists with a different url or prefix. ` +
         `Re-run with --replace to retarget it, or choose a different --namespace.\n`,
     );
     return { exitCode: 1 };
   }
   if (isRetarget && args.replace) {
     deps.stderr(
-      `[conduit add-mcp] --replace: retargeting namespace "${namespace}" to a new upstream. ` +
-        `Manual policy overrides (keyed by tool name) will carry over to the new upstream.\n`,
+      `[conduit add-mcp] --replace: retargeting namespace "${namespace}" to a new url or prefix. ` +
+        `Manual policy overrides (keyed by tool name) will carry over to the retargeted source.\n`,
     );
   }
 
