@@ -289,6 +289,8 @@ Expected: all PASS — proves the extraction preserved observable behavior (M8 o
 - [ ] **Step 4** — `npm run build` then run integration → PASS.
 - [ ] **Step 5** — Add INVARIANTS row: `| /mcp M8 — stdout purity holds through \`conduit serve\` (shared runStdioServer) | packages/cli/src/integration.test.ts | ✅ pinned |`. Commit: `feat: conduit serve — stdio MCP server via shared runStdioServer`
 
+> **Lane A PR #31 review carry-over (Greptile P2, runtime-stdio.ts:19):** `runStdioServer`'s `console.*` redirect is process-permanent by design (scoped to the call, not module-top-level). Lane B ring-2 tests spawn a SEPARATE bin process, so they're unaffected — but any IN-PROCESS test that imports `@conduithq/mcp` and calls `runStdioServer` before a stdout write would silence that write. Do NOT call `runStdioServer` in-process before asserting CLI stdout; drive serve only via the spawned bin (as this task's ring-2 test already does). This is the tripwire to remember when writing serve.ts's tests.
+
 ### Task 8: `conduit add-mcp` (read-first, atomic, credential-safe)
 
 **Files:** Create `packages/cli/src/commands/add-mcp.ts`, `src/mcp-fetch.ts` (tools/list fetch + timeout); Test: unit `add-mcp.test.ts` + ring-2.
@@ -327,7 +329,7 @@ Expected: all PASS — proves the extraction preserved observable behavior (M8 o
 - [ ] **Step 4** — Run unit → PASS. Ring-2: drive a `require_approval` tool through `conduit serve` (or seed a paused execution), `approvals list` shows it, `approvals approve` resumes it to completion.
 - [ ] **Step 5** — Commit: `feat: conduit approvals list|approve|deny — the human approval queue`
 
----
+> **Lane A PR #31 review carry-over (Greptile P2 + opus whole-branch Minor, runtime.test.ts:30):** `createApprovalRuntime` is the single home for the §9.3 egress wiring, but Lane A's `runtime.test.ts` only proves the manager runs trivial code — the egress conditional (`allowPrivateEgress:false` → fail-closed `{}`) is pinned only TRANSITIVELY via server.test.ts. Two independent reviewers flagged this. Task 9 adds the SECOND caller (the CLI's approvals), so this is the point to add a DIRECT test pinning the invariant to the function that owns it: assert `createApprovalRuntime({store, allowPrivateEgress:false})`'s manager blocks a private-address upstream call, and that `true` opts in. Put it in `runtime.test.ts` (mcp) or a cli-side test — the seam is shared, so pin it once at the seam. Also covers the `runtime.ts:38` `log`-default path (Lane B's approvals caller omits `log`, exercising the default for the first time).
 
 ## Deviations log (fill during implementation — scratchpad)
 Per entry: what forced the deviation, the conservative call taken, what to fold into the PR "Deviations" heading.

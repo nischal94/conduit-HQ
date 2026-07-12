@@ -1082,7 +1082,7 @@ which turned a wrong header-rewrite into three surgical edits (mark the carry-ov
 DONE). Compose derivative docs against the file as it is NOW, never against a
 remembered version.
 
-## 2026-07-12 — §17 step-3 conduit CLI: design→plan→build (branch docs/conduit-cli-design, IN PROGRESS T1-T2 of 9)
+## 2026-07-12 — §17 step-3 conduit CLI: design→plan→build (Lane A T1-T5 MERGED as PR #31 → main `0e333b6`; Lane B T6-T9 next on `feat/conduit-cli-lane-b`)
 
 ### 1. Cross-model review finds interaction bugs a same-model grilling can't
 
@@ -1149,3 +1149,58 @@ off main, check out the branch first" would strand the next session re-deriving
 state. Lesson: when a session ends mid-build on an unmerged local branch, the
 FIRST line of the handoff must be the branch name and the "tripwire is silent"
 warning — the protocol's own known blind spot demands it.
+
+### 6. Pass the `codex exec` prompt INLINE — a `$TMPDIR` file misfires silently
+
+The real-codex adversarial gate misfired the first time: I wrote the prompt to
+`$TMPDIR/codex-laneA-prompt.txt` in one Bash call, then ran `codex exec "$(cat
+$TMPDIR/...)"` in a later `dangerouslyDisableSandbox` call. `$TMPDIR` resolves
+differently across sandbox-disabled invocations, so `cat` found nothing, codex
+got an EMPTY prompt, and its output was the interactive banner "What would you
+like to work on?" — exit 0, no error. It *looked* like it ran. The re-run passed
+the whole prompt INLINE in the same `codex exec` command and codex genuinely
+analyzed the diff (stderr showed it inspecting the hunks) → CONVERGED — SHIP.
+Lesson: the codex-one-path rule's invocation takes the prompt as a positional
+arg — keep it inline. If a prompt is too big to inline comfortably, write AND read
+it in the SAME command (or use a stable absolute path, not `$TMPDIR`), and always
+sanity-check codex's output isn't the empty-prompt banner before trusting a
+verdict. (Also: my `grep -qiE 'auth'` over stderr false-positived on the phrase
+"additional input" — don't treat that heuristic as authoritative.)
+
+### 7. `gh pr checks --json state` enum casing broke a CI Monitor (silent timeout)
+
+I armed a Monitor to emit each CI check as it went terminal, filtering
+`gh pr checks 31 --json name,state` on `.state != "PENDING"` etc. The `--json
+state` enum tokens didn't match my guessed casing, so `comm` saw no terminal
+lines, nothing emitted, and the monitor ran to its 900s timeout looking exactly
+like "CI still running." A direct `gh pr checks 31` (plain, tab-delimited
+`pass/fail/pending`) showed all 9 already green. Lesson: before filtering a
+`--json` field in a long-lived Monitor, verify the field's actual value tokens on
+one sample — a mismatched filter fails SILENT (empty stream = indistinguishable
+from "no events yet"), which is the worst failure mode for a watch. For CI, the
+plain tab-delimited `gh pr checks` output is simpler and less error-prone than
+`--json state`.
+
+### 8. A squash-merge concatenates ALL branch commit messages — an AI co-author trailer in ANY of them lands on main
+
+The merged squash commit (`49f9c4b`) showed "nischal94 and claude authored" on
+GitHub. Root cause: GitHub's squash-merge concatenates every branch commit's
+message into the squash body, and TWO earlier-session commits (`838109b` T1,
+`87d32ac` a handoff) carried `Co-Authored-By: Claude Opus 4.8
+<noreply@anthropic.com>` — GitHub parses that trailer and attributes co-authorship.
+This VIOLATES the standing "never attribute commit co-authorship to an AI" rule;
+this session's own commits correctly omitted it, but the old ones poisoned the
+squash. Fix (user-approved): `git commit --amend` main's tip to strip both trailer
+lines (message-only, identical tree), `git push --force-with-lease origin main`
+(main's tip, private repo, nothing else depended on it), then `git rebase --onto`
+the Lane B branch onto the corrected commit and fix the now-stale `49f9c4b`
+references in HANDOFF/LEARNINGS content. PREVENTION: added `githooks/commit-msg`
+that rejects any `Co-authored-by:` trailer naming claude/anthropic/noreply@anthropic
+(tested: rejects the AI trailer, allows human co-authors and claude.ai URLs).
+Lessons: (1) a squash's provenance is the UNION of the branch's commit messages —
+one bad trailer anywhere taints it; the guard must run at commit-msg time, on
+every commit, because the author who wrote the trailer is often a past session.
+(2) When you rewrite a merged commit, the fix isn't done until the CHILDREN are
+re-parented AND every durable-doc reference to the old SHA is corrected — a stale
+SHA in HANDOFF/LEARNINGS content is live misinformation the next session's
+tripwire reads, not just cosmetic history.

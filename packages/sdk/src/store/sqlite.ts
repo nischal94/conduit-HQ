@@ -623,8 +623,15 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       integration: Integration;
       connection: Connection;
       secret?: { ref: string; value: string };
+      removeSecretRef?: string;
       tools: readonly Tool[];
     }): Promise<void> {
+      if (input.secret !== undefined && input.removeSecretRef !== undefined) {
+        throw new Error(
+          "[ConduitStore] provisionSource: `secret` and `removeSecretRef` are mutually exclusive.",
+        );
+      }
+
       // The seal MUST happen before the batch is built — `client.batch`
       // takes a plain statement array, so nothing inside it can be awaited.
       const sealed =
@@ -668,6 +675,9 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
                 args: [input.secret.ref, sealed as string, Date.now()],
               },
             ]),
+        ...(input.removeSecretRef === undefined
+          ? []
+          : [{ sql: "DELETE FROM secrets WHERE ref = ?", args: [input.removeSecretRef] }]),
         { sql: "DELETE FROM tools WHERE namespace = ?", args: [integration.namespace] },
         ...tools.map((tool) => ({
           sql: `INSERT INTO tools

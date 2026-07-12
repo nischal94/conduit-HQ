@@ -1,0 +1,33 @@
+#!/bin/sh
+# commit-msg gate: reject AI co-authorship trailers.
+# Enabled via: git config core.hooksPath githooks
+#
+# Enforces the standing rule "never mention Claude/an AI as a commit co-author"
+# mechanically, at the one point the message can be inspected before the commit
+# is finalized. The trailer has slipped in from generated commit messages before
+# (it reached main via a squash-merge); this makes that structurally impossible.
+#
+# Scope: matches a `Co-authored-by:` trailer naming Claude/Anthropic or the
+# anthropic noreply address. A human co-author trailer passes UNLESS it happens
+# to contain "claude"/"anthropic" (e.g. a teammate literally named Claude) — a
+# deliberate false positive: this is a safety guard, so it fails conservative
+# (over-block a vanishingly-rare human "Claude" rather than under-block a future
+# AI-trailer format variant). The over-block is loud and recoverable; a missed
+# AI trailer silently reaching main is the incident this exists to prevent.
+# Do NOT loosen this to key only on the @anthropic email — trailer formats drift.
+set -e
+
+msg_file="$1"
+
+# Case-insensitive: a Co-authored-by trailer that names Claude/Anthropic,
+# or uses the anthropic noreply commit identity.
+if grep -iqE '^[[:space:]]*co-authored-by:.*(claude|anthropic|noreply@anthropic\.com)' "$msg_file"; then
+  echo "commit-msg: rejected — the message carries an AI co-authorship trailer." >&2
+  echo "  Offending line(s):" >&2
+  grep -inE '^[[:space:]]*co-authored-by:.*(claude|anthropic|noreply@anthropic\.com)' "$msg_file" | sed 's/^/    /' >&2
+  echo "  Remove the 'Co-Authored-By: Claude ...' trailer and commit again." >&2
+  echo "  (Standing rule: never attribute commit co-authorship to an AI.)" >&2
+  exit 1
+fi
+
+exit 0

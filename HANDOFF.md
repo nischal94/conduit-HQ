@@ -23,7 +23,85 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-12 (§17 step 3 `conduit` CLI — DESIGN + PLAN committed, BUILD IN PROGRESS on local branch `docs/conduit-cli-design`: Lane A T1-T2 of 9 landed, sdk 318/318)
+## Current handoff — written 2026-07-12 (§17 step 3 `conduit` CLI — LANE A MERGED (PR #31 → main `0e333b6`); NEXT = build Lane B, the CLI package, on `feat/conduit-cli-lane-b`)
+
+### Where things stand
+
+- **Lane A MERGED (squash) → main is `0e333b6`.** All 5 shared seams shipped:
+  (Note: the squash commit was force-corrected from `49f9c4b` → `0e333b6` post-merge
+  to strip an AI co-authorship trailer that GitHub scooped from two earlier-session
+  commit messages; message-only change, identical tree. A `githooks/commit-msg`
+  guard now blocks that trailer. See LEARNINGS 2026-07-12 #8.)
+  T1 `listPaused` (deterministic approvals queue) + T2 `provisionSource` (atomic
+  §5.3 chain, no policy rows) on the SDK store; T3 `runStdioServer` (+ M8 redirect
+  folded in) + T4 `openStoreFromEnv` + T5 `createApprovalRuntime` (§9.3 egress +
+  M6 preserved) extracted in `packages/mcp`. Suite at merge: **sdk 318/318 + mcp
+  40/40**, tsc + biome clean, 2 new INVARIANT rows (approvals-queue determinism;
+  add-mcp atomic + no-policy). Full load-bearing gauntlet passed: whole-branch opus
+  review (0 Critical/Important), /security-review (0 findings), real codex exec
+  (CONVERGED — SHIP), /explain-diff quiz
+  (https://claude.ai/code/artifact/88d95622-e05e-4919-b57e-fa0515503ae0), 9 CI
+  checks green (incl. CodeRabbit + Greptile). The 2 Greptile P2s were non-blocking,
+  adjudicated in-thread, and FOLDED INTO THE PLAN (Lane B Tasks 7 & 9 — see below).
+- **Branch hygiene done:** `docs/conduit-cli-design` (Lane A's branch) DELETED
+  local + remote (merged, content on main). Local branches now: `main`,
+  `feat/conduit-cli-lane-b`. No stray stashes.
+- **SDD ledger `.superpowers/sdd/progress.md`** (git-ignored) is the fine-grained
+  recovery map through Task 5 + the whole gauntlet. Resume Lane B from it.
+
+### NEXT TASK — build Lane B (the CLI), Tasks 6-9, on `feat/conduit-cli-lane-b`
+
+**The Lane B branch already exists** — `feat/conduit-cli-lane-b`, cut fresh off
+merged main (`0e333b6`), carrying a few doc commits: the two Greptile P2
+carry-overs folded into the plan (Tasks 7 & 9), this HANDOFF, the session
+closeout, and the `githooks/commit-msg` guard. **Check it out first** (`git
+checkout feat/conduit-cli-lane-b`). Do NOT reuse the deleted `docs/conduit-cli-design`.
+
+Resume **superpowers:subagent-driven-development** at plan
+`docs/superpowers/plans/2026-07-12-conduit-cli.md` **Task 6**. Lane B is purely
+additive (a new `packages/cli` that only CALLS Lane A's merged seams — it can only
+break itself):
+- **T6** — `packages/cli` scaffold + `conduit` bin dispatch (`serve|add-mcp|approvals`
+  + `--help`/`--version`). ZERO new third-party deps (workspace:* + existing
+  versions). If the workspace needs `pnpm install` to link the new package, STOP
+  and hand the USER the command (agent never installs).
+- **T7** — `conduit serve` (calls `runStdioServer`). **Carry-over baked into the
+  plan:** don't call `runStdioServer` in-process before asserting CLI stdout — its
+  console.* redirect is process-permanent; drive serve only via the spawned bin.
+- **T8** — `conduit add-mcp` (read-first, atomic, credential-safe; calls
+  `provisionSource` + `normalizeMcp`). The security/edge unit tests are the point.
+- **T9** — `conduit approvals list|approve|deny` (calls `listPaused` +
+  `createApprovalRuntime` → `manager.resume`). **Carry-over baked into the plan:**
+  add a DIRECT egress test at the `createApprovalRuntime` seam (currently pinned
+  only transitively via server.test.ts) — Task 9 adds the second caller.
+
+Per-task: fresh implementer → verify (mcp/cli suites via unsandboxed vitest — hook
+covers sdk only) → two-verdict review → ledger. COMMIT WITH SANDBOX DISABLED (hook
+mktemp is sandbox-denied; never --no-verify). **Rebuild `packages/sdk/dist` (tsup)
+before Lane B verification** — Lane B consumes the merged sdk seams via dist.
+After T9: whole-branch review → finishing-a-development-branch → Lane B PR (its own
+load-bearing gauntlet: Tier 2 + /security-review + real codex exec + /explain-diff
+quiz + HUMAN-NAMED merge — the agent does NOT merge).
+
+### Two workflow LESSONS from this session (also going to LEARNINGS)
+
+- **codex prompt must be passed INLINE** in the `codex exec` command, NOT via a
+  `$TMPDIR` file read with `cat` — `$TMPDIR` differs across sandbox-disabled Bash
+  invocations, so the file isn't found and codex gets an empty prompt (silent
+  misfire: "What would you like to work on?"). First codex attempt this session
+  misfired exactly this way; the inline re-run worked.
+- **CI-watch `jq` on `gh pr checks --json state`**: the state token casing didn't
+  match my filter, so the Monitor emitted nothing and timed out. Use
+  `gh pr checks <n>` (plain, tab-delimited `pass/fail/pending`) or verify the
+  `--json state` enum values before filtering.
+
+### Session debrief (this session, full narrative)
+
+https://claude.ai/code/artifact/a1e9fd6c-5930-47a1-947a-e67ecdd88d10
+
+### ⚠️ Historical note — the OLD current handoff below (Lane A in-progress on the unmerged branch) is SUPERSEDED by the above. Kept for the session-quirks it still carries.
+
+## Superseded handoff — written 2026-07-12 earlier (Lane A T1-T2 in progress on `docs/conduit-cli-design`, now MERGED as PR #31)
 
 ### ⚠️ READ FIRST — the build lives on an UNMERGED LOCAL branch (tripwire blind spot)
 

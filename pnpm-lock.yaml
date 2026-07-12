@@ -12,6 +12,34 @@ importers:
         specifier: ^2.5.1
         version: 2.5.1
 
+  packages/cli:
+    dependencies:
+      '@conduithq/mcp':
+        specifier: workspace:*
+        version: link:../mcp
+      '@conduithq/sdk':
+        specifier: workspace:*
+        version: link:../sdk
+      '@libsql/client':
+        specifier: ^0.14.0
+        version: 0.14.0
+    devDependencies:
+      '@modelcontextprotocol/sdk':
+        specifier: 1.29.0
+        version: 1.29.0(zod@3.25.76)
+      '@types/node':
+        specifier: 26.0.1
+        version: 26.0.1
+      tsup:
+        specifier: ^8.3.5
+        version: 8.5.1(postcss@8.5.15)(typescript@5.9.3)
+      typescript:
+        specifier: ^5.7.2
+        version: 5.9.3
+      vitest:
+        specifier: ^3.2.6
+        version: 3.2.6(@types/node@26.0.1)
+
   packages/mcp:
     dependencies:
       '@conduithq/sdk':

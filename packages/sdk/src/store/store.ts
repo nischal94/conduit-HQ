@@ -31,10 +31,12 @@ export interface ConduitStore {
   /**
    * Atomic §5.3 provisioning chain for the CLI's `add-mcp` command: writes
    * source, integration, connection — and, iff a NEW secret is being stored
-   * this run, the secret — plus the namespace's tools, all in one
-   * transaction. All-or-nothing: a failure anywhere in the chain (e.g. a
-   * malformed tool row) leaves zero rows behind. Writes NO policy rows;
-   * policy seeding is a separate step the caller drives explicitly.
+   * this run, the secret; or, iff `removeSecretRef` is present, DELETEs that
+   * sealed secret — plus the namespace's tools, all in one transaction.
+   * All-or-nothing: a failure anywhere in the chain (e.g. a malformed tool
+   * row) leaves zero rows behind, INCLUDING the secret delete. Writes NO
+   * policy rows; policy seeding is a separate step the caller drives
+   * explicitly.
    */
   provisionSource(input: {
     source: Source;
@@ -44,6 +46,10 @@ export interface ConduitStore {
     connection: Connection;
     /** Present iff a NEW secret is stored this run. */
     secret?: { ref: string; value: string };
+    /** When present, the sealed secret at this ref is DELETEd inside the
+     * same atomic batch (the `--clear-credential` path); mutually exclusive
+     * with `secret`. */
+    removeSecretRef?: string;
     tools: readonly Tool[];
   }): Promise<void>;
 }

@@ -33,7 +33,13 @@ promise the product makes but does not yet enforce.
 | /mcp M4 — outcome persistence: a stored `failed` row always explains itself (synthetic `ConduitPersistError` fallback on a faulted settle write) | `packages/sdk/src/execution/manager.test.ts` (credential-echo persisted-outcome facet covered in `packages/sdk/src/e2e.smoke.test.ts` — "runs the whole prototype flow with no secret leakage", Phase 11) | ✅ pinned |
 | §4.2 — execute surface stays within the one-tool token budget (~1,044) with a capped connection listing | `packages/sdk/src/execute.test.ts` | ✅ pinned |
 | /mcp CLI — approvals queue lists paused executions oldest-first (deterministic (started_at, id)) | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
-| /mcp CLI — add-mcp provisioning is atomic + seeds NO policy rows | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
+| /mcp CLI — add-mcp provisioning is atomic (source/integration/connection/tools, plus an optional `removeSecretRef` secret DELETE for the `--clear-credential` path — T-I2 amendment) + seeds NO policy rows | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
+| /mcp M8 — stdout purity holds through `conduit serve` (shared runStdioServer) | `packages/cli/src/integration.test.ts` | ✅ pinned |
+| /cli add-mcp — an unreachable/dead upstream fails loud and writes 0 rows | `packages/cli/src/add-mcp.test.ts` ("INVARIANT /cli add-mcp: unreachable --url fails loud and writes nothing") + `packages/cli/src/integration.test.ts` ("INVARIANT /cli add-mcp: a dead url exits non-zero and writes 0 rows") | ✅ pinned |
+| /cli add-mcp — the credential is never echoed to stdout/stderr on any path (success, warn) | `packages/cli/src/add-mcp.test.ts` ("INVARIANT /cli add-mcp: secret is never echoed to stdout or stderr on a successful add" + the `--replace` warning-path variant) | ✅ pinned |
+| /cli add-mcp — re-sync with no `CONDUIT_ADD_SECRET` preserves an existing `credentialRef` (read-then-rewrite, never NULLed) | `packages/cli/src/add-mcp.test.ts` ("re-sync with no CONDUIT_ADD_SECRET but an existing credentialRef preserves it") | ✅ pinned |
+| §9.3 — `createApprovalRuntime`'s egress wiring, pinned DIRECTLY at the seam both callers (mcp server + cli approvals) share, not just transitively | `packages/mcp/src/runtime.test.ts` ("INVARIANT §9.3: allowPrivateEgress:false BLOCKS a loopback upstream call without naming the env var" + the `true` opt-in counterpart) | ✅ pinned |
+| /cli approvals — `approvals list` is read-only: expiry is presentation, computed at display time from `pausedOn.expiresAt`, never a write | `packages/cli/src/approvals.test.ts` ("INVARIANT /cli approvals: list renders paused rows oldest-first, with EXPIRED and time-remaining labels, and performs no write") | ✅ pinned |
 
 ---
 

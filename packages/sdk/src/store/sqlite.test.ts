@@ -1337,5 +1337,63 @@ describe("SqliteStore", () => {
       expect(await store.secrets.reveal("cred_existing")).toBeUndefined();
       expect(await store.tools.list("z")).toHaveLength(1);
     });
+
+    it("removeSecretRef DELETEs the sealed secret in the SAME atomic batch (T-I2 amendment)", async () => {
+      // Seed a secret out-of-band (simulating a prior add-mcp run), then
+      // provisionSource this run with removeSecretRef pointing at it — the
+      // --clear-credential path.
+      await store.secrets.put("cred_w_old", "Bearer old-token");
+      expect(await store.secrets.reveal("cred_w_old")).toBe("Bearer old-token");
+
+      await store.provisionSource({
+        source: { id: "src_w", type: "mcp", namespace: "w", location: "http://u" },
+        integration: { id: "int_w", sourceId: "src_w", namespace: "w" },
+        connection: { id: "conn_w", integrationId: "int_w", prefix: "w.acme.prod" },
+        removeSecretRef: "cred_w_old",
+        tools: [tool({ name: "w.search", namespace: "w" })],
+      });
+
+      expect(await store.secrets.reveal("cred_w_old")).toBeUndefined();
+      expect(await store.sources.get("src_w")).toMatchObject({ id: "src_w" });
+      expect(await store.tools.list("w")).toHaveLength(1);
+    });
+
+    it("INVARIANT: a failing batch with removeSecretRef rolls back the delete — the old secret still reveals", async () => {
+      await store.secrets.put("cred_v_old", "Bearer old-token");
+
+      const goodTool = tool({ name: "v.search", namespace: "v" });
+      // Same mid-chain-failure trick as the atomicity test above: an
+      // out-of-vocabulary risk_class forces the batch to fail partway
+      // through the tools INSERTs, AFTER the secrets DELETE statement.
+      const badTool = { ...goodTool, name: "v.broken", riskClass: "nonsense" } as unknown as Tool;
+
+      await expect(
+        store.provisionSource({
+          source: { id: "src_v", type: "mcp", namespace: "v", location: "http://u" },
+          integration: { id: "int_v", sourceId: "src_v", namespace: "v" },
+          connection: { id: "conn_v", integrationId: "int_v", prefix: "v.acme.prod" },
+          removeSecretRef: "cred_v_old",
+          tools: [goodTool, badTool],
+        }),
+      ).rejects.toThrow();
+
+      // Rollback covers the whole batch, including the DELETE — the old
+      // secret still reveals, and no other chain rows were written.
+      expect(await store.secrets.reveal("cred_v_old")).toBe("Bearer old-token");
+      expect(await store.sources.get("src_v")).toBeUndefined();
+    });
+
+    it("throws when both `secret` and `removeSecretRef` are provided (contract violation)", async () => {
+      await expect(
+        store.provisionSource({
+          source: { id: "src_u", type: "mcp", namespace: "u", location: "http://u" },
+          integration: { id: "int_u", sourceId: "src_u", namespace: "u" },
+          connection: { id: "conn_u", integrationId: "int_u", prefix: "u.acme.prod" },
+          secret: { ref: "cred_u_new", value: "Bearer new" },
+          removeSecretRef: "cred_u_old",
+          tools: [tool({ name: "u.search", namespace: "u" })],
+        }),
+      ).rejects.toThrow(/\[ConduitStore\].*mutually exclusive/);
+    });
   });
 });

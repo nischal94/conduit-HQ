@@ -1,0 +1,39 @@
+{
+  "name": "@conduithq/cli",
+  "version": "0.1.0",
+  "description": "Conduit CLI — the conduit command dispatcher.",
+  "license": "MIT",
+  "type": "module",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "bin": {
+    "conduit": "./dist/bin.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsup",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@conduithq/mcp": "workspace:*",
+    "@conduithq/sdk": "workspace:*",
+    "@libsql/client": "^0.14.0"
+  },
+  "devDependencies": {
+    "@modelcontextprotocol/sdk": "1.29.0",
+    "@types/node": "26.0.1",
+    "tsup": "^8.3.5",
+    "typescript": "^5.7.2",
+    "vitest": "^3.2.6"
+  }
+}
