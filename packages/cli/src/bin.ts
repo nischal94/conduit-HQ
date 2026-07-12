@@ -1,5 +1,6 @@
 #!/usr/bin/env node
 import { addMcp } from "./commands/add-mcp.js";
+import { approvals } from "./commands/approvals.js";
 import { serve } from "./commands/serve.js";
 import { type Command, dispatch } from "./dispatch.js";
 
@@ -15,8 +16,7 @@ async function runCommand(command: Command, args: string[]): Promise<number> {
     case "add-mcp":
       return addMcp(args);
     case "approvals":
-      console.error("conduit approvals: not yet implemented");
-      return 1;
+      return approvals(args);
     default: {
       const _exhaustive: never = command;
       return _exhaustive;

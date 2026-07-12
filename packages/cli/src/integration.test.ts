@@ -375,3 +375,104 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
     close();
   });
 });
+
+describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop through conduit serve", () => {
+  const approvalsDbPath = join(scratch, "approvals-it.db"); // cleaned with scratch in afterAll
+
+  async function runApprovals(
+    args: string[],
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const { stdout, stderr } = await execFileAsync("node", [cliBinPath, "approvals", ...args], {
+        env: { ...process.env, ...baseEnv(), CONDUIT_DB: approvalsDbPath },
+      });
+      return { stdout, stderr, exitCode: 0 };
+    } catch (error) {
+      const err = error as { stdout?: string; stderr?: string; code?: number };
+      return { stdout: err.stdout ?? "", stderr: err.stderr ?? "", exitCode: err.code ?? 1 };
+    }
+  }
+
+  beforeAll(async () => {
+    const client = createClient({ url: `file:${approvalsDbPath}` });
+    const store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(masterKey),
+    });
+    const tools = normalizeMcp({ namespace: NAMESPACE, tools: mcpToolsList });
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: NAMESPACE,
+      location: mcpLocation,
+    });
+    await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: NAMESPACE });
+    await store.connections.upsert({
+      id: "conn_gh",
+      integrationId: "int_gh",
+      prefix: PREFIX,
+      credentialRef: "cred_gh",
+    });
+    await store.secrets.put("cred_gh", SECRET);
+    await store.tools.replaceNamespace(NAMESPACE, tools);
+    await store.policies.upsert({
+      toolName: `${NAMESPACE}.list_issues`,
+      action: "allow",
+      seededFrom: "safe",
+      manualOverride: true,
+      redactFields: [],
+    });
+    // The one policy override that matters for this suite: delete_repo
+    // requires a human decision, unlike the "allow" seeded in seedStore()'s db.
+    await store.policies.upsert({
+      toolName: `${NAMESPACE}.delete_repo`,
+      action: "require_approval",
+      seededFrom: "destructive",
+      manualOverride: true,
+      redactFields: [],
+    });
+    client.close();
+  }, 30_000);
+
+  it("workflow: execute pauses on require_approval → approvals list shows it → approvals approve resumes it to completion", async () => {
+    const client = await spawnClient({ ...baseEnv(), CONDUIT_DB: approvalsDbPath });
+    const paused = await client.callTool({
+      name: "execute",
+      arguments: {
+        code: 'return await tools.github.delete_repo({ repo: "prod" });',
+        requestKey: "rk-ring2-approve",
+      },
+    });
+    const pausedPayload = textPayload(paused) as { status: string; executionId: string };
+    expect(pausedPayload.status).toBe("paused");
+    const { executionId } = pausedPayload;
+
+    // `approvals list` (a SEPARATE spawned process — the server child above
+    // is still holding the MCP session) shows the paused execution.
+    const listResult = await runApprovals(["list", "--json"]);
+    expect(listResult.exitCode).toBe(0);
+    const rows = JSON.parse(listResult.stdout) as Array<{ executionId: string; tool: string }>;
+    expect(rows.some((r) => r.executionId === executionId && r.tool === "github.delete_repo")).toBe(
+      true,
+    );
+
+    // `approvals approve` (another separate spawned process) resumes it.
+    const approveResult = await runApprovals(["approve", executionId]);
+    expect(approveResult.exitCode).toBe(0);
+    expect(approveResult.stdout.trim()).toBe("completed");
+    expect(upstream.upstreamCalls.some((c) => c.name === "delete_repo")).toBe(true);
+
+    // The original session's check_execution confirms the persisted result.
+    const checked = await client.callTool({
+      name: "check_execution",
+      arguments: { executionId },
+    });
+    const checkedPayload = textPayload(checked) as { status: string };
+    expect(checkedPayload.status).toBe("completed");
+
+    // `approvals list` is now empty — the resumed execution is no longer paused.
+    const listAfter = await runApprovals(["list", "--json"]);
+    const rowsAfter = JSON.parse(listAfter.stdout) as Array<{ executionId: string }>;
+    expect(rowsAfter.some((r) => r.executionId === executionId)).toBe(false);
+  });
+});

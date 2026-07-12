@@ -1,0 +1,202 @@
+import { createApprovalRuntime, openStoreFromEnv, type ResolvedEnv } from "@conduithq/mcp";
+import type { ConduitStore, Execution, ExecutionOutcome } from "@conduithq/sdk";
+
+/**
+ * `conduit approvals list|approve|deny` — the human approval queue (design
+ * §2.3). `list` reads `store.executions.listPaused()` and computes the
+ * expiry label at DISPLAY time from the stored `pausedOn.expiresAt` — it
+ * NEVER writes. `approve`/`deny` build a FRESH `ApprovalRuntime` per call
+ * (M6 fresh-catalog rule — see runtime.ts's doc comment) and drive
+ * `manager.resume`, printing the resulting outcome status.
+ *
+ * Injectable deps mirror add-mcp.ts's DI convention: production defaults to
+ * the real store/runtime, tests can substitute a runtime factory for
+ * outcome edges (e.g. `conflict`) that are hard to produce against a real
+ * manager.
+ */
+
+export interface ApprovalsDeps {
+  /** Defaults to `openStoreFromEnv`; injectable so tests can pre-open a store. */
+  openStore: (env?: NodeJS.ProcessEnv) => Promise<{ env: ResolvedEnv; store: ConduitStore }>;
+  /** Defaults to `createApprovalRuntime`; injectable for outcome edges hard
+   * to produce against a real manager (e.g. `conflict`). Deliberately NOT
+   * given a `log` option here — the seam's own default (console.error) is
+   * what production wiring exercises. */
+  createRuntime: (opts: { store: ConduitStore; allowPrivateEgress: boolean }) => Promise<{
+    manager: {
+      resume: (id: string, decision: { kind: "approve" | "deny" }) => Promise<ExecutionOutcome>;
+    };
+  }>;
+  env: NodeJS.ProcessEnv;
+  now: () => number;
+  stdout: (line: string) => void;
+  stderr: (line: string) => void;
+}
+
+export interface ApprovalsResult {
+  exitCode: number;
+}
+
+const PROD_DEPS: ApprovalsDeps = {
+  openStore: openStoreFromEnv,
+  createRuntime: createApprovalRuntime,
+  env: process.env,
+  now: () => Date.now(),
+  stdout: (line) => process.stdout.write(line),
+  stderr: (line) => process.stderr.write(line),
+};
+
+interface PausedRow {
+  executionId: string;
+  tool: string;
+  waitingSince: number;
+  expiresAt: number;
+  expired: boolean;
+}
+
+function toPausedRow(execution: Execution, now: number): PausedRow {
+  const pausedOn = execution.pausedOn;
+  if (pausedOn === undefined) {
+    // Defensive — listPaused only returns status:"paused" rows, which always
+    // carry pausedOn (manager.ts invariant). A row without it is corrupt
+    // state; surface it rather than silently drop the row.
+    throw new Error(
+      `[conduit approvals] listPaused returned a paused row with no pausedOn. Context: { executionId: ${execution.id} }`,
+    );
+  }
+  return {
+    executionId: execution.id,
+    tool: pausedOn.toolName,
+    waitingSince: execution.startedAt,
+    expiresAt: pausedOn.expiresAt,
+    expired: pausedOn.expiresAt < now,
+  };
+}
+
+function formatDuration(ms: number): string {
+  const totalSeconds = Math.max(0, Math.floor(ms / 1000));
+  const hours = Math.floor(totalSeconds / 3600);
+  const minutes = Math.floor((totalSeconds % 3600) / 60);
+  const seconds = totalSeconds % 60;
+  if (hours > 0) {
+    return `${hours}h${minutes}m`;
+  }
+  if (minutes > 0) {
+    return `${minutes}m${seconds}s`;
+  }
+  return `${seconds}s`;
+}
+
+function expiryLabel(row: PausedRow, now: number): string {
+  return row.expired
+    ? "EXPIRED (finalizes on next resume)"
+    : `${formatDuration(row.expiresAt - now)} remaining`;
+}
+
+function pad(value: string, width: number): string {
+  return value.length >= width ? value : value + " ".repeat(width - value.length);
+}
+
+function renderTable(rows: PausedRow[], now: number): string {
+  if (rows.length === 0) {
+    return "No paused executions awaiting approval.\n";
+  }
+  const idWidth = Math.max(7, ...rows.map((r) => r.executionId.length));
+  const toolWidth = Math.max(4, ...rows.map((r) => r.tool.length));
+  const lines = rows.map((row) => {
+    const waiting = new Date(row.waitingSince).toISOString();
+    return `${pad(row.executionId, idWidth)}  ${pad(row.tool, toolWidth)}  ${pad(waiting, 24)}  ${expiryLabel(row, now)}`;
+  });
+  const header = `${pad("EXEC ID", idWidth)}  ${pad("TOOL", toolWidth)}  ${pad("WAITING SINCE", 24)}  EXPIRY`;
+  return `${[header, ...lines].join("\n")}\n`;
+}
+
+export async function runList(
+  args: { json: boolean },
+  deps: ApprovalsDeps,
+): Promise<ApprovalsResult> {
+  const { store } = await deps.openStore(deps.env);
+  const paused = await store.executions.listPaused();
+  const now = deps.now();
+  const rows = paused.map((execution) => toPausedRow(execution, now));
+
+  if (args.json) {
+    deps.stdout(
+      `${JSON.stringify(
+        rows.map((row) => ({
+          executionId: row.executionId,
+          tool: row.tool,
+          waitingSince: row.waitingSince,
+          expiresAt: row.expiresAt,
+          expired: row.expired,
+        })),
+      )}\n`,
+    );
+  } else {
+    deps.stdout(renderTable(rows, now));
+  }
+  return { exitCode: 0 };
+}
+
+const EXPIRED_LINE =
+  "[conduit approvals] The approval expired before the decision applied: " +
+  "the execution was finalized as expired, and no tool call was made.";
+
+export async function runDecide(
+  kind: "approve" | "deny",
+  executionId: string | undefined,
+  deps: ApprovalsDeps,
+): Promise<ApprovalsResult> {
+  if (executionId === undefined || executionId.trim() === "") {
+    deps.stderr(`[conduit approvals] ${kind}: missing required <execution-id>.\n`);
+    return { exitCode: 1 };
+  }
+
+  const { env, store } = await deps.openStore(deps.env);
+  // M6: fresh runtime per invocation — never cached across calls.
+  const runtime = await deps.createRuntime({ store, allowPrivateEgress: env.allowPrivateEgress });
+  const outcome = await runtime.manager.resume(executionId, { kind });
+
+  deps.stdout(`${outcome.status}\n`);
+
+  if (outcome.status === "expired") {
+    deps.stderr(`${EXPIRED_LINE}\n`);
+    return { exitCode: 0 };
+  }
+  if (outcome.status === "conflict" || outcome.status === "failed") {
+    if (outcome.status === "failed") {
+      deps.stderr(
+        `[conduit approvals] ${kind} failed: ${outcome.error.name}: ${outcome.error.message}\n`,
+      );
+    } else {
+      deps.stderr(
+        `[conduit approvals] ${kind}: execution ${executionId} was not in a resumable (paused) state.\n`,
+      );
+    }
+    return { exitCode: 1 };
+  }
+  return { exitCode: 0 };
+}
+
+/** Production entrypoint wired into the CLI dispatch (bin.ts). */
+export async function approvals(argv: string[]): Promise<number> {
+  const [sub, ...rest] = argv;
+  switch (sub) {
+    case "list": {
+      const json = rest.includes("--json");
+      const result = await runList({ json }, PROD_DEPS);
+      return result.exitCode;
+    }
+    case "approve":
+    case "deny": {
+      const result = await runDecide(sub, rest[0], PROD_DEPS);
+      return result.exitCode;
+    }
+    default: {
+      PROD_DEPS.stderr(
+        `[conduit approvals] Unknown subcommand: ${sub ?? "(none)"}. Usage: conduit approvals list|approve|deny [<execution-id>]\n`,
+      );
+      return 1;
+    }
+  }
+}

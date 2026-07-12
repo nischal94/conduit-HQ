@@ -38,6 +38,8 @@ promise the product makes but does not yet enforce.
 | /cli add-mcp — an unreachable/dead upstream fails loud and writes 0 rows | `packages/cli/src/add-mcp.test.ts` ("INVARIANT /cli add-mcp: unreachable --url fails loud and writes nothing") + `packages/cli/src/integration.test.ts` ("INVARIANT /cli add-mcp: a dead url exits non-zero and writes 0 rows") | ✅ pinned |
 | /cli add-mcp — the credential is never echoed to stdout/stderr on any path (success, warn) | `packages/cli/src/add-mcp.test.ts` ("INVARIANT /cli add-mcp: secret is never echoed to stdout or stderr on a successful add" + the `--replace` warning-path variant) | ✅ pinned |
 | /cli add-mcp — re-sync with no `CONDUIT_ADD_SECRET` preserves an existing `credentialRef` (read-then-rewrite, never NULLed) | `packages/cli/src/add-mcp.test.ts` ("re-sync with no CONDUIT_ADD_SECRET but an existing credentialRef preserves it") | ✅ pinned |
+| §9.3 — `createApprovalRuntime`'s egress wiring, pinned DIRECTLY at the seam both callers (mcp server + cli approvals) share, not just transitively | `packages/mcp/src/runtime.test.ts` ("INVARIANT §9.3: allowPrivateEgress:false BLOCKS a loopback upstream call without naming the env var" + the `true` opt-in counterpart) | ✅ pinned |
+| /cli approvals — `approvals list` is read-only: expiry is presentation, computed at display time from `pausedOn.expiresAt`, never a write | `packages/cli/src/approvals.test.ts` ("INVARIANT /cli approvals: list renders paused rows oldest-first, with EXPIRED and time-remaining labels, and performs no write") | ✅ pinned |
 
 ---
 
