@@ -1,4 +1,4 @@
-import { mkdtempSync } from "node:fs";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -105,7 +105,10 @@ describe("conduit approvals list", () => {
   let scratch: string;
 
   afterEach(() => {
-    scratch = "";
+    if (scratch !== "") {
+      rmSync(scratch, { recursive: true, force: true });
+      scratch = "";
+    }
   });
 
   async function seedPaused(): Promise<ConduitStore> {
@@ -216,6 +219,10 @@ describe("conduit approvals approve|deny — real runtime", () => {
 
   afterEach(async () => {
     await new Promise<void>((resolve) => upstream.server.close(() => resolve()));
+    if (scratch !== "") {
+      rmSync(scratch, { recursive: true, force: true });
+      scratch = "";
+    }
   });
 
   async function setup(): Promise<void> {

@@ -268,6 +268,37 @@ describe("runAddMcp", () => {
     expect(await store.secrets.reveal(existingRef)).toBeUndefined();
   });
 
+  it("--clear-credential: a provisionSource failure leaves the old secret and old credentialRef fully intact", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer tok123" } }));
+    const connectionsBefore = await store.connections.list();
+    const existingRef = connectionsBefore.find((c) => c.integrationId === "int_github")
+      ?.credentialRef as string;
+
+    // Wrap the real store so provisionSource rejects — the removal must not
+    // have already fired before this point.
+    const failingStore: ConduitStore = {
+      ...store,
+      provisionSource: async () => {
+        throw new Error("simulated provisionSource failure");
+      },
+    };
+
+    await expect(
+      runAddMcp(
+        { ...BASE_ARGS, clearCredential: true },
+        makeDeps({ store: failingStore, env: {} }),
+      ),
+    ).rejects.toThrow("simulated provisionSource failure");
+
+    // Old connection still carries the old ref, and the old secret still
+    // reveals — nothing was removed by the failed attempt.
+    const connectionsAfter = await store.connections.list();
+    const conn = connectionsAfter.find((c) => c.integrationId === "int_github");
+    expect(conn?.credentialRef).toBe(existingRef);
+    expect(await store.secrets.reveal(existingRef)).toBe("Bearer tok123");
+  });
+
   it("INVARIANT /cli add-mcp: secret is never echoed to stdout or stderr on a successful add", async () => {
     const store = await openTestStore();
     const SECRET = "Bearer super_secret_value_do_not_leak";

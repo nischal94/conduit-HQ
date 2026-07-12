@@ -195,11 +195,17 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
   const suppliedSecret = deps.env.CONDUIT_ADD_SECRET;
   let credentialRef: string | undefined;
   let secretToStore: { ref: string; value: string } | undefined;
+  // The only deliberate deauth path: the removal is deferred until AFTER
+  // provisionSource succeeds (below), not performed here. If provisionSource
+  // throws, the old secret + old connection are left fully intact instead of
+  // being an orphaned dangling ref; a remove failure after success at worst
+  // leaves an orphaned sealed secret, which is the fail-safe direction.
+  let secretToRemove: string | undefined;
 
   if (args.clearCredential) {
     credentialRef = undefined;
     if (existingConnection?.credentialRef !== undefined) {
-      await store.secrets.remove(existingConnection.credentialRef);
+      secretToRemove = existingConnection.credentialRef;
     }
   } else if (suppliedSecret !== undefined && suppliedSecret.trim() !== "") {
     credentialRef = derivedCredentialRef;
@@ -228,6 +234,10 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     ...(secretToStore !== undefined ? { secret: secretToStore } : {}),
     tools,
   });
+
+  if (secretToRemove !== undefined) {
+    await store.secrets.remove(secretToRemove);
+  }
 
   // Step 7: success output — counts only, never per-tool names, never the secret.
   const counts = countsByRiskClass(tools);
