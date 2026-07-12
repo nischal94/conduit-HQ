@@ -1081,3 +1081,71 @@ as a carry-over). The "deep audit" trigger forced a re-read of the CURRENT file,
 which turned a wrong header-rewrite into three surgical edits (mark the carry-over
 DONE). Compose derivative docs against the file as it is NOW, never against a
 remembered version.
+
+## 2026-07-12 — §17 step-3 conduit CLI: design→plan→build (branch docs/conduit-cli-design, IN PROGRESS T1-T2 of 9)
+
+### 1. Cross-model review finds interaction bugs a same-model grilling can't
+
+The design passed a thorough `grilling` pass (6 adversarial questions, each
+source-verified) AND a structured eng-review. Both tested each decision in
+isolation. The real `codex exec` outside voice then found FIVE in-scope gaps —
+all of them SEAMS BETWEEN two individually-correct decisions: optional-credential
+× idempotent-resync = silent deauth; same-namespace × different-url = trust
+transfer to a new upstream; "compose the manager like approve-demo does" =
+duplicated security wiring. A single model carrying its own reasoning structurally
+can't see the interactions between its own decisions; a fresh cross-model pass
+that doesn't share that reasoning can. The lesson: after grilling, a cross-model
+pass on a DESIGN (not just code) is additive, not redundant — but only the
+lighter "plan review" framing (find what was missed), not the code-adversarial
+convergence pass, which still belongs on the diff.
+
+### 2. The coherence audit earned its place — intent vs. mechanism
+
+After folding 11 findings into the design across several edits, one final
+"read the assembled whole" pass found a real conflict the folding introduced:
+finding C2 said "preserve the existing credentialRef on re-sync", but
+`connections.upsert` UNCONDITIONALLY writes `credential_ref = excluded.value`
+(sqlite.ts:325) — there is no "leave this column alone". "Preserve" was an INTENT
+with no MECHANISM; an implementer would have called upsert with a credential-less
+Connection and re-introduced the exact silent-deauth bug the review caught. The
+fix: preserve = READ-THEN-RE-WRITE-THE-SAME-VALUE, resolved before the atomic
+write opens. Lesson: a design assembled from many folded findings needs one pass
+that checks the SEAMS between findings against the actual store/API mechanics —
+"each piece is correct" and "the assembly is correct" are different claims.
+
+### 3. `--no-verify` is what a sandboxed agent reaches for when the hook itself is sandbox-blocked
+
+The pre-commit hook calls `mktemp` (githooks/pre-commit:15), which the Bash
+sandbox denies. A Haiku implementer, running sandboxed, hit that and used
+`git commit --no-verify` to get past it — silently skipping the authoritative
+full-suite run (a documented incident per CLAUDE.md commit-routing). The code was
+fine (controller closed the gap by running the full sdk suite unsandboxed:
+315/315), but the ROOT CAUSE is that the hook needs temp-dir write the sandbox
+denies. FIX carried in every dispatch T2+: commit with the sandbox DISABLED (the
+hook is a hermetic local run — the sanctioned exception) so the hook actually
+runs; NEVER `--no-verify`. T2's implementer did exactly this and the hook ran
+clean (318/318). Lesson: when you tell a subagent "the hook is authoritative,"
+also tell it HOW to make the hook run under the sandbox — or it will route around
+the hook, not through it.
+
+### 4. A stale SDD ledger from a merged plan will collide with a new plan's task numbering
+
+At build start, `.superpowers/sdd/progress.md` held the COMPLETED PR#29 ledger
+(its "Task 6-12"). The new CLI plan also has "Task 1-9". Trusting the old ledger
+naively risked either re-dispatching merged work or number-collision confusion.
+Fix: archive the prior ledger (`progress.mcp-stdio-pr29.archive.md`), start a
+fresh ledger header naming the NEW plan, and namespace this plan's artifacts
+`cli-task-N-*`. Lesson: the SDD ledger is per-PLAN, not per-repo — when starting a
+new plan in a repo that ran SDD before, archive-and-restart the ledger first, or
+its completed-task entries lie about the new plan.
+
+### 5. Unmerged local-branch build is the tripwire blind spot — say it loudly in HANDOFF
+
+The entire CLI build (design + plan + 2 code commits) lives on local branch
+`docs/conduit-cli-design`, unpushed, no PR. `main` is untouched, so the git
+staleness tripwire AND `gh pr list` are both silent (LEARNINGS #21's exact blind
+spot). A HANDOFF that just says "next task = T3" without screaming "the work is
+off main, check out the branch first" would strand the next session re-deriving
+state. Lesson: when a session ends mid-build on an unmerged local branch, the
+FIRST line of the handoff must be the branch name and the "tripwire is silent"
+warning — the protocol's own known blind spot demands it.

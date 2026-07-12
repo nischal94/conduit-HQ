@@ -5,4 +5,7 @@ export {
   extendExecuteDefinition,
   outcomeToPayload,
 } from "./payloads.js";
+export { type ApprovalRuntime, createApprovalRuntime } from "./runtime.js";
+export { runStdioServer } from "./runtime-stdio.js";
 export { type ConduitMcpServerOptions, createConduitMcpServer } from "./server.js";
+export { openStoreFromEnv } from "./store-open.js";
