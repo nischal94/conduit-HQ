@@ -10,16 +10,16 @@ import type { ConduitStore, Execution, ExecutionOutcome } from "@conduithq/sdk";
  * `manager.resume`, printing the resulting outcome status.
  *
  * Injectable deps mirror add-mcp.ts's DI convention: production defaults to
- * the real store/runtime, tests can substitute a runtime factory for
- * outcome edges (e.g. `conflict`) that are hard to produce against a real
- * manager.
+ * the real store/runtime; tests substitute a runtime factory to pin
+ * individual outcome branches in isolation (real-path coverage also drives
+ * an actual manager, including a genuine double-approve `conflict`).
  */
 
 export interface ApprovalsDeps {
   /** Defaults to `openStoreFromEnv`; injectable so tests can pre-open a store. */
   openStore: (env?: NodeJS.ProcessEnv) => Promise<{ env: ResolvedEnv; store: ConduitStore }>;
-  /** Defaults to `createApprovalRuntime`; injectable for outcome edges hard
-   * to produce against a real manager (e.g. `conflict`). Deliberately NOT
+  /** Defaults to `createApprovalRuntime`; injectable so tests can pin
+   * individual outcome branches in isolation. Deliberately NOT
    * given a `log` option here — the seam's own default (console.error) is
    * what production wiring exercises. */
   createRuntime: (opts: { store: ConduitStore; allowPrivateEgress: boolean }) => Promise<{

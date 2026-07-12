@@ -16,9 +16,9 @@ import { runDecide, runList } from "./commands/approvals.js";
  * (mirrors sqlite.test.ts's listPaused fixture) with a fake clock so the
  * expiry label is deterministic. `approve`/`deny` are driven against a REAL
  * `createApprovalRuntime` manager over a real loopback MCP stub — mirrors
- * runtime.test.ts's fixture — for the happy paths; `conflict` (hard to
- * produce for real without a race) is driven via an injected runtime double,
- * mirroring add-mcp.test.ts's DI style.
+ * runtime.test.ts's fixture — including a genuine double-approve `conflict`
+ * and the chained re-pause; outcome branches are ALSO pinned in isolation
+ * via an injected runtime double, mirroring add-mcp.test.ts's DI style.
  */
 
 const PREFIX = "github.acme.prod";
