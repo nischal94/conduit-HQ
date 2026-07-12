@@ -1082,7 +1082,7 @@ which turned a wrong header-rewrite into three surgical edits (mark the carry-ov
 DONE). Compose derivative docs against the file as it is NOW, never against a
 remembered version.
 
-## 2026-07-12 — §17 step-3 conduit CLI: design→plan→build (Lane A T1-T5 MERGED as PR #31 → main `49f9c4b`; Lane B T6-T9 next on `feat/conduit-cli-lane-b`)
+## 2026-07-12 — §17 step-3 conduit CLI: design→plan→build (Lane A T1-T5 MERGED as PR #31 → main `0e333b6`; Lane B T6-T9 next on `feat/conduit-cli-lane-b`)
 
 ### 1. Cross-model review finds interaction bugs a same-model grilling can't
 
@@ -1180,3 +1180,27 @@ one sample — a mismatched filter fails SILENT (empty stream = indistinguishabl
 from "no events yet"), which is the worst failure mode for a watch. For CI, the
 plain tab-delimited `gh pr checks` output is simpler and less error-prone than
 `--json state`.
+
+### 8. A squash-merge concatenates ALL branch commit messages — an AI co-author trailer in ANY of them lands on main
+
+The merged squash commit (`49f9c4b`) showed "nischal94 and claude authored" on
+GitHub. Root cause: GitHub's squash-merge concatenates every branch commit's
+message into the squash body, and TWO earlier-session commits (`838109b` T1,
+`87d32ac` a handoff) carried `Co-Authored-By: Claude Opus 4.8
+<noreply@anthropic.com>` — GitHub parses that trailer and attributes co-authorship.
+This VIOLATES the standing "never attribute commit co-authorship to an AI" rule;
+this session's own commits correctly omitted it, but the old ones poisoned the
+squash. Fix (user-approved): `git commit --amend` main's tip to strip both trailer
+lines (message-only, identical tree), `git push --force-with-lease origin main`
+(main's tip, private repo, nothing else depended on it), then `git rebase --onto`
+the Lane B branch onto the corrected commit and fix the now-stale `49f9c4b`
+references in HANDOFF/LEARNINGS content. PREVENTION: added `githooks/commit-msg`
+that rejects any `Co-authored-by:` trailer naming claude/anthropic/noreply@anthropic
+(tested: rejects the AI trailer, allows human co-authors and claude.ai URLs).
+Lessons: (1) a squash's provenance is the UNION of the branch's commit messages —
+one bad trailer anywhere taints it; the guard must run at commit-msg time, on
+every commit, because the author who wrote the trailer is often a past session.
+(2) When you rewrite a merged commit, the fix isn't done until the CHILDREN are
+re-parented AND every durable-doc reference to the old SHA is corrected — a stale
+SHA in HANDOFF/LEARNINGS content is live misinformation the next session's
+tripwire reads, not just cosmetic history.

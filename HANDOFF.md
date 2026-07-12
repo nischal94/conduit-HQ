@@ -23,11 +23,15 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-12 (§17 step 3 `conduit` CLI — LANE A MERGED (PR #31 → main `49f9c4b`); NEXT = build Lane B, the CLI package, on `feat/conduit-cli-lane-b`)
+## Current handoff — written 2026-07-12 (§17 step 3 `conduit` CLI — LANE A MERGED (PR #31 → main `0e333b6`); NEXT = build Lane B, the CLI package, on `feat/conduit-cli-lane-b`)
 
 ### Where things stand
 
-- **Lane A MERGED (squash) → main is `49f9c4b`.** All 5 shared seams shipped:
+- **Lane A MERGED (squash) → main is `0e333b6`.** All 5 shared seams shipped:
+  (Note: the squash commit was force-corrected from `49f9c4b` → `0e333b6` post-merge
+  to strip an AI co-authorship trailer that GitHub scooped from two earlier-session
+  commit messages; message-only change, identical tree. A `githooks/commit-msg`
+  guard now blocks that trailer. See LEARNINGS 2026-07-12 #8.)
   T1 `listPaused` (deterministic approvals queue) + T2 `provisionSource` (atomic
   §5.3 chain, no policy rows) on the SDK store; T3 `runStdioServer` (+ M8 redirect
   folded in) + T4 `openStoreFromEnv` + T5 `createApprovalRuntime` (§9.3 egress +
@@ -48,9 +52,10 @@ at session start.
 ### NEXT TASK — build Lane B (the CLI), Tasks 6-9, on `feat/conduit-cli-lane-b`
 
 **The Lane B branch already exists** — `feat/conduit-cli-lane-b`, cut fresh off
-merged main (`49f9c4b`), with ONE commit (`b407582`) that folds the two PR #31
-Greptile carry-overs into the plan. **Check it out first** (`git checkout
-feat/conduit-cli-lane-b`). Do NOT reuse the deleted `docs/conduit-cli-design`.
+merged main (`0e333b6`), carrying a few doc commits: the two Greptile P2
+carry-overs folded into the plan (Tasks 7 & 9), this HANDOFF, the session
+closeout, and the `githooks/commit-msg` guard. **Check it out first** (`git
+checkout feat/conduit-cli-lane-b`). Do NOT reuse the deleted `docs/conduit-cli-design`.
 
 Resume **superpowers:subagent-driven-development** at plan
 `docs/superpowers/plans/2026-07-12-conduit-cli.md` **Task 6**. Lane B is purely
