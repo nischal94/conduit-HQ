@@ -1204,3 +1204,69 @@ every commit, because the author who wrote the trailer is often a past session.
 re-parented AND every durable-doc reference to the old SHA is corrected — a stale
 SHA in HANDOFF/LEARNINGS content is live misinformation the next session's
 tripwire reads, not just cosmetic history.
+
+## 2026-07-12/13 — Lane B: the conduit CLI (T6-T9 → PR #32, merged)
+
+Shipped: `packages/cli` — `serve`, `add-mcp`, `approvals list|approve|deny` as
+thin callers of Lane A's seams. Per-task SDD (2 fix loops), whole-branch opus
+review, /security-review clean, 3-pass codex arc (2 real findings fixed →
+CONVERGED — SHIP), 9 CI checks, quiz passed, human-named squash merge →
+main `79c3ae9`. sdk 321 + mcp 42 + cli 50; 6 new INVARIANTS rows; one
+user-approved frozen-interface amendment (T-I2 `removeSecretRef`).
+
+### 1. A post-buffer size check is not a bound
+
+The first hostile-catalog fix checked `text.length` AFTER `response.text()`
+buffered the whole body — an upstream omitting Content-Length could exhaust
+memory before the check ever ran, and the "oversized body → rejected" test
+PASSED throughout, because eventual rejection was all it asserted. Codex's
+re-pass caught it. Two lessons: enforce ingestion caps DURING the stream
+(count chunk bytes, cancel the reader at the cap, decode only after a
+complete under-cap read), and make the test prove the bound, not the verdict
+— the replacement test streams 50MB chunked with no Content-Length and
+asserts the server's OWN bytesWritten stopped near the cap. Same shape as
+adversarial-convergence's canonicalize-then-check: move the guard to where
+the resource is actually consumed.
+
+### 2. A new workspace package is an install gate — plan it at scaffold time
+
+The agent never installs, so `packages/cli` was born unlinked: Task 6's tests
+only ran by borrowing the sibling package's vitest through the pnpm store,
+and Task 7's new devDependency (test-only, version-identical to mcp's pin)
+needed a SECOND user-terminal `pnpm install` for the lockfile importer entry.
+Neither blocked local progress, but CI's `--frozen-lockfile` made the second
+one a hard pre-push gate. Next time a plan scaffolds a new workspace package:
+name the `pnpm install` handoff as an explicit task-level step (files first,
+install gate, then verification), and expect one more when a later task adds
+any dep the manifest didn't carry at link time.
+
+### 3. Scrutinize every write ADJACENT to an atomic batch
+
+Four reviewers (implementer, task reviewer twice, whole-branch opus) accepted
+`secrets.remove` running beside the atomic `provisionSource` batch; Greptile's
+P1 and codex's P2 both flagged it independently — a provisioning failure after
+the remove left a dangling credentialRef that a later "preserve" re-run would
+faithfully rewrite. The atomicity of the batch was tested and true; the bug
+lived in the write NEXT to it. Review heuristic: when a transaction has
+flanking writes (before OR after), the failure windows between them are the
+finding — either fold the flanker into the batch (done here, via the
+user-approved T-I3-style signature amendment) or prove each window fail-safe.
+
+### 4. Map every status the engine can return, not the ones you expect
+
+`approvals approve` handled completed/expired/conflict/failed — and printed a
+bare "paused" for the one outcome nobody expected: resume re-enters the drive
+loop, so an approved script that hits a SECOND require_approval legitimately
+re-pauses with a fresh pausedOn. Operationally that bare status was a dead
+end (no pending tool named, no pointer back to the queue). When a function
+consumes a discriminated union it doesn't own, enumerate the FULL status set
+from the type — the compiler only helps if you switch exhaustively, and the
+"can't happen" arm is where the operator gets stranded.
+
+### 5. Codex ops: confirming passes can silently time out
+
+The third codex pass hit the 560s timeout with exit 124 and ZERO output — the
+narrow-scope re-run (explicit file list, "do not re-review the rest") under a
+1500s cap completed with a clean verdict. Confirming passes are not cheaper
+by default; they re-walk the whole diff unless the prompt pins the scope.
+Give re-passes an explicit file scope and a bigger cap than the first pass.

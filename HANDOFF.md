@@ -23,7 +23,99 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-12 (§17 step 3 `conduit` CLI — LANE A MERGED (PR #31 → main `0e333b6`); NEXT = build Lane B, the CLI package, on `feat/conduit-cli-lane-b`)
+## Current handoff — written 2026-07-13 (§17 step 3 COMPLETE: Lane B `conduit` CLI MERGED — PR #32 → main `79c3ae9`; NEXT = §17 step 4, the §4.2 token demo + gate-one manual acceptance)
+
+### Where things stand
+
+- **Lane B MERGED (squash) → main is `79c3ae9`.** Spec §17 step 3 is DONE — the
+  `conduit` CLI shipped as `packages/cli`: `serve` (thin adapter over
+  `runStdioServer`), `add-mcp` (fetch-before-store with STREAMING byte cap +
+  tool-count cap, read-first C3 `--replace` gate, C2 credential
+  preserve-not-remove via `CONDUIT_ADD_SECRET` env only, ONE atomic
+  `provisionSource`, risk-class count summary), `approvals list|approve|deny`
+  (presentation-only expiry, fresh runtime per decision, full outcome mapping
+  incl. the chained re-pause). Suites at merge: **sdk 321 + mcp 42 + cli 50**,
+  6 new INVARIANTS rows, biome + tsc clean.
+- **T-I2 was AMENDED mid-gauntlet (user-approved):** `provisionSource` gained
+  optional `removeSecretRef` — the `--clear-credential` secret DELETE now runs
+  INSIDE the atomic batch (guard throws if both `secret` and `removeSecretRef`
+  supplied; rollback preserves the old secret). Codex found it, the human
+  approved the frozen-interface change explicitly.
+- **Full load-bearing gauntlet passed:** per-task SDD reviews (2 fix loops:
+  add-mcp schema-invalid fail-loud; approvals re-pause + real double-approve
+  conflict), whole-branch opus review (0 Critical/Important), /security-review
+  (0 findings), Greptile 1 P1 + 2 P2 all adjudicated in-thread (P1 fixed then
+  superseded by the batched delete; initialize-handshake = documented C4),
+  REAL codex exec 3-pass arc (unbounded-ingestion + clear-credential findings
+  fixed → "CONVERGED — SHIP"), 9 CI checks green ×2 pushes, /explain-diff quiz
+  passed (https://claude.ai/code/artifact/dd3e46aa-78b3-4a88-bc7e-6f7f70dd4408),
+  HUMAN-NAMED merge. Squash message verified trailer-free.
+- **Branch hygiene done:** `feat/conduit-cli-lane-b` deleted local + remote.
+  Local branches: exactly `main`. SDD ledger `.superpowers/sdd/progress.md`
+  carries the complete Lane B build + gauntlet record (git-ignored).
+
+### NEXT TASK — spec §17 step 4: the §4.2 before/after token demo
+
+The last build item in the §17 order: a demo proving the token-cost claim —
+an agent facing N raw upstream tool schemas vs. the same agent facing
+Conduit's two-tool surface (`execute` + `check_execution`), with the §4.2
+before/after numbers made visible. `conduit add-mcp --json` (the
+`{safe,review,destructive}` shape) exists partly for this. Scope it with a
+brainstorm first — it's a demo, not a product surface, so the routing
+question (script? doc? artifact?) is genuinely open. Do NOT build the web
+console, FTS5, Trace viewer, or Phases 2-5.
+
+**MVP is done only when BOTH §17 gates pass:**
+- **Gate one (human, still NOT done):** real Claude Desktop/Cursor manual
+  acceptance against the merged server — now via `conduit serve` (or the
+  `conduit-mcp` bin; same shared startup). `packages/cli/README.md` +
+  `packages/mcp/README.md` carry the onboarding; `conduit add-mcp` replaces
+  seed-demo for real onboarding.
+- **Gate two:** converged edge-case pass on the running skeleton.
+
+### Carry-overs (tracked, none blocking step 4)
+
+- **Retire `scripts/approve-demo.mjs`** — superseded by `conduit approvals`,
+  but `packages/mcp/src/integration.test.ts` still uses it for the
+  cross-process approval test; migrate that test to spawn the CLI, then
+  delete the script (small housekeeping PR).
+- **Tracked SDK design items:** C4 MCP transport maturity (stateless POST, no
+  initialize/session — now ALSO the reason add-mcp's fetch skips the
+  handshake, adjudicated on PR #32); C5 non-round-trippable tool names;
+  `getByIntegrationId` on ConnectionRepository (retires add-mcp's
+  list().find() scan); `pausedAt` on PendingApproval (per-pause
+  waiting-since in `approvals list`); `--json` shape on failure paths
+  (decide once); tools INSERT SQL dup (revisit at a 3rd site).
+- Aikido SAST MCP still not connected (`/aikido:setup` in the user's
+  terminal). gstack update available — user-run, low priority.
+
+### Session debrief (this session, full narrative)
+
+https://claude.ai/code/artifact/07f65c40-25f3-4d82-8faf-e31163859c60
+
+### Kickoff prompt for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: spec §17 step 3 is COMPLETE — the conduit CLI (Lane B) is MERGED
+> (PR #32, squash) → main `79c3ae9`; sdk 321 + mcp 42 + cli 50 green. Lane A
+> (PR #31) + Lane B both shipped. Do NOT re-implement them.**
+>
+> **NEXT: spec §17 step 4 — the §4.2 before/after token demo.** It's a demo,
+> not a product surface: START WITH `superpowers:brainstorming` to pick the
+> shape (script vs doc vs artifact), then keep it small. Do NOT build the web
+> console, FTS5, Trace viewer, or Phases 2-5.
+>
+> **Also pending: §17 gate-one manual acceptance** (human drives real Claude
+> Desktop against `conduit serve` end-to-end — README onboarding is current).
+> MVP is done only when both §17 gates pass. Housekeeping candidate if time
+> permits: migrate the mcp cross-process approval test off approve-demo.mjs
+> and retire the script. Routing: prose/docs direct-push via scripts/push-docs;
+> anything on the protected floor → branch → PR → gauntlet → human-named merge.
+
+---
+
+## Superseded handoff — written 2026-07-12 (§17 step 3 `conduit` CLI — LANE A MERGED (PR #31 → main `0e333b6`); Lane B was built + merged by the 2026-07-13 session above)
 
 ### Where things stand
 
