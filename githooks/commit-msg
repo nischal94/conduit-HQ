@@ -8,7 +8,13 @@
 # (it reached main via a squash-merge); this makes that structurally impossible.
 #
 # Scope: matches a `Co-authored-by:` trailer naming Claude/Anthropic or the
-# anthropic noreply address. A human co-author trailer (a real teammate) passes.
+# anthropic noreply address. A human co-author trailer passes UNLESS it happens
+# to contain "claude"/"anthropic" (e.g. a teammate literally named Claude) — a
+# deliberate false positive: this is a safety guard, so it fails conservative
+# (over-block a vanishingly-rare human "Claude" rather than under-block a future
+# AI-trailer format variant). The over-block is loud and recoverable; a missed
+# AI trailer silently reaching main is the incident this exists to prevent.
+# Do NOT loosen this to key only on the @anthropic email — trailer formats drift.
 set -e
 
 msg_file="$1"
