@@ -35,6 +35,9 @@ promise the product makes but does not yet enforce.
 | /mcp CLI — approvals queue lists paused executions oldest-first (deterministic (started_at, id)) | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
 | /mcp CLI — add-mcp provisioning is atomic + seeds NO policy rows | `packages/sdk/src/store/sqlite.test.ts` | ✅ pinned |
 | /mcp M8 — stdout purity holds through `conduit serve` (shared runStdioServer) | `packages/cli/src/integration.test.ts` | ✅ pinned |
+| /cli add-mcp — an unreachable/dead upstream fails loud and writes 0 rows | `packages/cli/src/add-mcp.test.ts` ("INVARIANT /cli add-mcp: unreachable --url fails loud and writes nothing") + `packages/cli/src/integration.test.ts` ("INVARIANT /cli add-mcp: a dead url exits non-zero and writes 0 rows") | ✅ pinned |
+| /cli add-mcp — the credential is never echoed to stdout/stderr on any path (success, warn) | `packages/cli/src/add-mcp.test.ts` ("INVARIANT /cli add-mcp: secret is never echoed to stdout or stderr on a successful add" + the `--replace` warning-path variant) | ✅ pinned |
+| /cli add-mcp — re-sync with no `CONDUIT_ADD_SECRET` preserves an existing `credentialRef` (read-then-rewrite, never NULLed) | `packages/cli/src/add-mcp.test.ts` ("re-sync with no CONDUIT_ADD_SECRET but an existing credentialRef preserves it") | ✅ pinned |
 
 ---
 

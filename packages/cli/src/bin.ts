@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { addMcp } from "./commands/add-mcp.js";
 import { serve } from "./commands/serve.js";
 import { type Command, dispatch } from "./dispatch.js";
 
@@ -6,14 +7,13 @@ import { type Command, dispatch } from "./dispatch.js";
 // redirects stdout (via runStdioServer, so MCP framing isn't corrupted) —
 // see design §6. Every other command prints normally.
 
-async function runCommand(command: Command, _args: string[]): Promise<number> {
+async function runCommand(command: Command, args: string[]): Promise<number> {
   switch (command) {
     case "serve":
       await serve();
       return 0;
     case "add-mcp":
-      console.error("conduit add-mcp: not yet implemented");
-      return 1;
+      return addMcp(args);
     case "approvals":
       console.error("conduit approvals: not yet implemented");
       return 1;

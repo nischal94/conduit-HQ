@@ -1,13 +1,17 @@
+import { execFile } from "node:child_process";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { promisify } from "node:util";
 import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+
+const execFileAsync = promisify(execFile);
 
 /**
  * Ring-2 integration suite (Lane B Task 7): drives the REAL COMPILED conduit
@@ -66,11 +70,24 @@ function startMcpServer(): Promise<{
     req.on("end", () => {
       const payload = JSON.parse(body) as {
         id: string;
-        params: { name: string; arguments: unknown };
+        method: string;
+        params?: { name: string; arguments: unknown };
       };
+      // add-mcp's precondition fetch (mcp-fetch.ts) POSTs a bare `tools/list`
+      // request with no `params` — answered here so the same stub upstream
+      // serves both `serve`'s tools/call traffic and add-mcp's tools/list
+      // fetch, no second fixture server.
+      if (payload.method === "tools/list") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: { tools: mcpToolsList } }),
+        );
+        return;
+      }
+      const params = payload.params as { name: string; arguments: unknown };
       upstreamCalls.push({
-        name: payload.params.name,
-        arguments: payload.params.arguments,
+        name: params.name,
+        arguments: params.arguments,
         sawAuthHeader: req.headers.authorization === SECRET,
       });
       res.writeHead(200, { "content-type": "application/json" });
@@ -267,5 +284,94 @@ describe("ring-2: conduit serve (spawned CLI bin)", () => {
     // would have thrown or hung instead.
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
+  });
+});
+
+describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
+  const addMcpDbPath = join(scratch, "add-mcp-it.db"); // cleaned with scratch in afterAll
+
+  async function runAddMcp(
+    args: string[],
+    env: Record<string, string> = {},
+  ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
+    try {
+      const { stdout, stderr } = await execFileAsync("node", [cliBinPath, "add-mcp", ...args], {
+        env: { ...process.env, ...baseEnv(), CONDUIT_DB: addMcpDbPath, ...env },
+      });
+      return { stdout, stderr, exitCode: 0 };
+    } catch (error) {
+      const err = error as { stdout?: string; stderr?: string; code?: number };
+      return { stdout: err.stdout ?? "", stderr: err.stderr ?? "", exitCode: err.code ?? 1 };
+    }
+  }
+
+  async function openAddMcpDb() {
+    const client = createClient({ url: `file:${addMcpDbPath}` });
+    const store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(masterKey),
+    });
+    return { store, close: () => client.close() };
+  }
+
+  it("writes rows against a stub upstream, and re-syncs on a second run against the same url", async () => {
+    const upstreamUrl = `http://127.0.0.1:${upstream.port}/mcp`;
+
+    const first = await runAddMcp([
+      "--url",
+      upstreamUrl,
+      "--namespace",
+      "ghadd",
+      "--prefix",
+      "github.acme.add",
+    ]);
+    expect(first.exitCode).toBe(0);
+    expect(first.stdout).toMatch(/seeded \d+ tools under github\.acme\.add:/);
+
+    {
+      const { store, close } = await openAddMcpDb();
+      const source = await store.sources.get("src_ghadd");
+      expect(source?.location).toBe(upstreamUrl);
+      const tools = await store.tools.list("ghadd");
+      expect(tools.length).toBeGreaterThan(0);
+      close();
+    }
+
+    // Second run against the SAME url: idempotent re-sync, still 0-exit.
+    const second = await runAddMcp([
+      "--url",
+      upstreamUrl,
+      "--namespace",
+      "ghadd",
+      "--prefix",
+      "github.acme.add",
+    ]);
+    expect(second.exitCode).toBe(0);
+
+    {
+      const { store, close } = await openAddMcpDb();
+      const tools = await store.tools.list("ghadd");
+      expect(tools.length).toBeGreaterThan(0);
+      close();
+    }
+  });
+
+  it("INVARIANT /cli add-mcp: a dead url exits non-zero and writes 0 rows", async () => {
+    const result = await runAddMcp([
+      "--url",
+      "http://127.0.0.1:1/mcp-dead",
+      "--namespace",
+      "ghdead",
+      "--prefix",
+      "github.acme.dead",
+    ]);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderr).toMatch(/upstream unreachable/);
+
+    const { store, close } = await openAddMcpDb();
+    const source = await store.sources.get("src_ghdead");
+    expect(source).toBeUndefined();
+    close();
   });
 });
