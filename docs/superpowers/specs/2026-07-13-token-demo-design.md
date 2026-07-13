@@ -79,7 +79,7 @@ Steps, all against throwaway state (temp dir database, generated master key):
 1. Spawn the upstream; wait for `PORT=`.
 2. `POST tools/list` to the upstream directly; **before** = Σ
    `estimateDefinitionTokens(tool)` over the 800 raw definitions.
-3. Spawn the real CLI bin: `conduit add-mcp <url> --name demo --json` with a
+3. Spawn the real CLI bin: `conduit add-mcp --url <url> --namespace demo --prefix demo --json` with a
    temp `CONDUIT_DB` + generated `CONDUIT_MASTER_KEY`. Parse the `--json`
    `{safe,review,destructive}` counts. Assert ingested total = 800.
 4. Spawn `conduit serve` on the same env; connect a real MCP client

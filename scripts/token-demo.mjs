@@ -17,16 +17,17 @@
 
 import { spawn } from "node:child_process";
 import { randomBytes } from "node:crypto";
+import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath, pathToFileURL } from "node:url";
-import { estimateDefinitionTokens } from "../packages/mcp/dist/index.js";
 import { renderTokenDemoHtml } from "./token-demo-html.mjs";
 import { CATALOG_SIZE } from "./token-demo-upstream.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
+const MCP_DIST = join(ROOT, "packages", "mcp", "dist", "index.js");
 const CLI_BIN = join(ROOT, "packages", "cli", "dist", "bin.js");
 const UPSTREAM_SCRIPT = join(ROOT, "scripts", "token-demo-upstream.mjs");
 const DEMO_DIR = join(ROOT, "demo");
@@ -39,6 +40,17 @@ const log = (line) => process.stderr.write(`[token-demo] ${line}\n`);
 function fail(reason) {
   throw new Error(`[token-demo] ${reason}`);
 }
+
+for (const distPath of [MCP_DIST, CLI_BIN]) {
+  if (!existsSync(distPath)) {
+    process.stderr.write(
+      `[token-demo] missing built dist ${distPath} — build first: (cd packages/mcp && node_modules/.bin/tsup) and (cd packages/cli && node_modules/.bin/tsup)\n`,
+    );
+    process.exit(1);
+  }
+}
+
+const { estimateDefinitionTokens } = await import(pathToFileURL(MCP_DIST));
 
 /** Spawns the upstream and resolves its OS-assigned port from stderr. */
 function startUpstream() {
@@ -115,7 +127,7 @@ async function fetchServedTools(env) {
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: [CLI_BIN, "serve"],
-    env: { ...process.env, ...env },
+    env: curatedEnv(env),
     stderr: "ignore",
   });
   await client.connect(transport);
@@ -129,6 +141,15 @@ async function fetchServedTools(env) {
 
 const sumTokens = (tools) =>
   tools.reduce((total, tool) => total + estimateDefinitionTokens(tool), 0);
+
+/** Minimal env for spawned bins — never leak ambient vars like CONDUIT_ADD_SECRET. */
+function curatedEnv(env) {
+  return {
+    CONDUIT_DB: env.CONDUIT_DB,
+    CONDUIT_MASTER_KEY: env.CONDUIT_MASTER_KEY,
+    PATH: process.env.PATH ?? "",
+  };
+}
 
 export async function runTokenDemo() {
   const stateDir = await mkdtemp(join(tmpdir(), "conduit-token-demo-"));
@@ -162,7 +183,7 @@ export async function runTokenDemo() {
         "demo",
         "--json",
       ],
-      { ...process.env, ...env },
+      curatedEnv(env),
     );
     if (addMcp.code !== 0) {
       fail(`conduit add-mcp exited ${addMcp.code}: ${addMcp.stderr.trim()}`);

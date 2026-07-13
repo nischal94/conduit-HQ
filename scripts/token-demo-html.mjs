@@ -4,6 +4,13 @@
 // scripts/token-demo.mjs EXCEPT the spec-scale point, which is visually and
 // textually labeled as an extrapolation (design §4).
 
+// Trusted-input boundary: `results` is first-party deterministic data produced
+// by scripts/token-demo.mjs in this same process, never user- or network-
+// controlled — that's why raw string interpolation into <script> and .innerHTML
+// below is safe. If that ever changes (e.g. results starts carrying upstream-
+// supplied strings), escape the less-than character in the injected JSON
+// (e.g. replace it with its < escape) and switch the innerHTML table
+// construction to DOM building.
 export function renderTokenDemoHtml(results) {
   const data = JSON.stringify(results);
   return `<!doctype html>
@@ -128,7 +135,8 @@ upstream and of <code>conduit serve</code> standing in front of it, counted with
   client received from <code>conduit serve</code>. Counter: <span id="estimator"></span> — all figures are
   estimates, not tokenizer output. Points beyond the measured catalog are linear extrapolations at the
   measured per-tool average and carry the <span class="badge">extrapolated</span> badge.
-  Reproduce: <code id="reproduce"></code></p>
+  Reproduce: <code id="reproduce"></code> Regenerate when the served tool surface changes — a diff in
+  these files means the surface moved.</p>
 </footer>
 
 <script>
