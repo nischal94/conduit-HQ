@@ -6,6 +6,7 @@
 # ten-second direct push, reviewed in chat like all agent work.
 HANDOFF.md
 LEARNINGS.md
+docs/demo-story.html
 CLAUDE.md
 .gitignore
 .editorconfig

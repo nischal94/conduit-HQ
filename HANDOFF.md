@@ -98,6 +98,14 @@ console, FTS5, Trace viewer, Phases 2–5 all stay out).
 - Aikido SAST MCP still not connected (`/aikido:setup` in the user's
   terminal). gstack update available — user-run, low priority.
 
+### Demo-story doc (deck base, added post-closeout this session)
+
+`docs/demo-story.html` — the demo pitch narrative, the gate-one flow
+diagram, the config-safety notes, and the product thesis, captured
+verbatim from the 2026-07-13 session at the user's request as base
+material for product/investor decks. Also published as an artifact:
+https://claude.ai/code/artifact/591d5af7-5d0f-4cd1-8034-8a55ea88fda7
+
 ### Session debrief (this session, full narrative)
 
 https://claude.ai/code/artifact/6ec370b0-0b60-43cb-900d-206655f219d0
