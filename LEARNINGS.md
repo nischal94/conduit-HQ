@@ -1270,3 +1270,52 @@ narrow-scope re-run (explicit file list, "do not re-review the rest") under a
 1500s cap completed with a clean verdict. Confirming passes are not cheaper
 by default; they re-walk the whole diff unless the prompt pins the scope.
 Give re-passes an explicit file scope and a bigger cap than the first pass.
+
+## 2026-07-13 — §17 step 4: the §4.2 token demo (PR #33 → main `08cb658`)
+
+### 1. Generated artifacts get excluded from linters, not conformed to them
+
+The pre-commit hook's whole-tree `biome check .` rejected the checked-in
+`demo/token-demo.json` — biome's formatter wanted a different shape than
+`JSON.stringify(..., null, 2)` emits, and "fixing" the file would have broken
+the script's byte-identical-re-run determinism. The correct move was one
+allowlist edit (`"!demo"` in biome.json includes): generated output is not
+lintable source, and chasing a formatter's opinion inside a generator is a
+treadmill. Watch for the symptom early — a Task-3 implementer first hit this
+as "untracked demo/ output blocks an unrelated commit" and worked around it
+by moving the directory aside, which was the tell that the linter's scope was
+wrong, not the artifact.
+
+### 2. A "deterministic" artifact is only as deterministic as its spawn env
+
+The orchestrator originally spawned the real `add-mcp`/`serve` bins with
+`{ ...process.env, ...env }`. The whole-branch review caught what four
+passing runs never would: an ambient `CONDUIT_ADD_SECRET` in the runner's
+shell would have silently flipped the checked-in artifact's `credential`
+field — an environment-dependent diff in a file whose diffs are DEFINED to
+mean "the tool surface changed." Measurement scripts that feed durable
+artifacts must spawn children with a curated env (here: exactly
+`CONDUIT_DB`, `CONDUIT_MASTER_KEY`, `PATH`), never a spread of the parent's.
+
+### 3. "Fail loud" is a per-boundary property — audit every await, not just the assertions
+
+The design contract said every failure exits 1 with a `[token-demo]` prefix;
+the assertions honored it, but the silent-failure pass found the boundaries
+didn't: `serve` was spawned with `stderr: "ignore"` (discarding the crash
+reason of the one child most worth hearing), `run()` had no timeout and no
+spawn-error handler (a bad spawn hung forever), native fetch/JSON errors
+escaped unprefixed, and the upstream's crash-after-PORT rejected an
+already-settled promise — a silent no-op. The pattern: a fail-loud contract
+is satisfied per BOUNDARY (spawn, connect, fetch, parse, child-exit), and
+each one needs its own wrapper, timeout, and diagnostics channel.
+
+### 4. This environment cannot render local HTML — verify structurally, defer visuals to the human
+
+Three straight walls: the Browser pane refuses `file://` navigation, the
+sandbox denies binding a localhost server for serving the page, and headless
+Chrome + screenshot needed both an unsandboxed run (denied) and an npm
+install (routed to the user by the sfw rule). The working fallback for
+generated pages: structural verification (the 17 declared element IDs
+exactly matched the 17 script-referenced IDs; injected DATA spot-checked) +
+an explicit "visual check rides with the human's PR review" note. Don't burn
+turns re-attempting the render path; name the handoff.

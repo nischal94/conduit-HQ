@@ -23,7 +23,109 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-13 (§17 step 3 COMPLETE: Lane B `conduit` CLI MERGED — PR #32 → main `79c3ae9`; NEXT = §17 step 4, the §4.2 token demo + gate-one manual acceptance)
+## Current handoff — written 2026-07-13 (§17 step 4 COMPLETE: the §4.2 token demo MERGED — PR #33 → main `08cb658`. ALL FOUR §17 BUILD ITEMS ARE BUILT; what remains for "MVP done" is the two §17 GATES)
+
+### Where things stand
+
+- **PR #33 MERGED (squash) → main is `08cb658`.** Spec §17 step 4 — the §4.2
+  before/after token demo — is DONE, and with it the §17 build order (steps
+  1–4) is fully built. What shipped:
+  - `scripts/token-demo-upstream.mjs` — bundled deterministic 800-tool MCP
+    upstream (pure function of in-file template tables; JSON-RPC POST
+    `tools/list`; `PORT=<n>` on stderr; stdout never).
+  - `scripts/token-demo.mjs` — the QA-gate orchestrator: spawns the upstream
+    → ingests via the REAL `conduit add-mcp` bin (through the live byte/tool
+    caps) → queries the REAL `conduit serve` bin with a real MCP client over
+    stdio → counts BOTH sides with `estimateDefinitionTokens` (now re-exported
+    from packages/mcp — the branch's only product-code line) → asserts
+    (exact two-tool surface; after ≤ 1,300; ingested = 800; ratio ≥ 20) →
+    writes artifacts ONLY after all assertions pass. Curated spawn env
+    (CONDUIT_DB/CONDUIT_MASTER_KEY/PATH only — see LEARNINGS #2).
+  - `demo/token-demo.json` + `demo/token-demo.html` — checked-in DETERMINISTIC
+    artifacts (no timestamps; re-run byte-identical; a diff MEANS the tool
+    surface moved — regenerate via `node scripts/token-demo.mjs` when it
+    does). The HTML is the self-contained interactive before/after page (the
+    §4.2 marketing-artifact seed).
+  - **Measured: before 133,450 tokens (800 raw schemas, ~166.8/tool) → after
+    505 tokens (execute + check_execution) = 264.3× reduction.** Spec-scale
+    1,600-tool point shown only as a labeled extrapolation (266,900).
+  - biome.json gained `"!demo"` (generated artifacts are not lintable source).
+- **Review trail (all clean or fixed):** SDD per-task reviews 4/4 approved →
+  whole-branch opus review (1 Important: ambient-env leak into spawned bins →
+  fixed `5948cee`, re-review approved) → Tier 2 (code-reviewer clean;
+  comment-analyzer clean; silent-failure-hunter's subprocess-diagnostics
+  cluster → fixed `d1760b0`, re-review approved) → /security-review 0
+  findings → CI 9/9 green verified per-commit on the final head, Greptile
+  5/5, CodeRabbit pass, ZERO inline bot comments. Tier classification
+  (below the codex-adversarial + quiz bar: demo tooling + one pure
+  re-export) was stated in the PR body, user-delegated, and the merge was
+  HUMAN-NAMED ("merge"). Squash message verified trailer-free.
+- **Branch hygiene done:** `feat/token-demo` deleted local + remote
+  (fetch --prune verified; the prune also cleared three older stale remote
+  refs). Local branches: exactly `main`. SDD ledger
+  `.superpowers/sdd/progress.md` carries the full build + gauntlet record.
+
+### NEXT TASK — the two §17 gates (MVP is done ONLY when both pass)
+
+Nothing is left to BUILD for the MVP; do not start Phase-1+ features (web
+console, FTS5, Trace viewer, Phases 2–5 all stay out).
+
+- **Gate one (human-driven, agent assists):** real Claude Desktop/Cursor
+  manual acceptance against the merged server via `conduit serve` (or the
+  `conduit-mcp` bin — same shared startup). Onboarding lives in
+  `packages/cli/README.md` + `packages/mcp/README.md`; `conduit add-mcp` is
+  the real onboarding path (seed-demo is superseded for this). The bundled
+  demo upstream (`node scripts/token-demo-upstream.mjs` — prints its port on
+  stderr, runs standalone) is a ready-made local source to add-mcp against,
+  with zero credentials needed.
+- **Gate two:** a converged edge-case/adversarial pass on the RUNNING
+  skeleton (spec §17: malformed schemas, hostile upstream echoes, credential
+  401s, timeouts, resume-after-pause, redaction paths, §14 startup-reload
+  caveat — each handled or documented out-of-scope). Convergence per
+  `~/.claude/rules/adversarial-convergence.md`.
+
+### Carry-overs (tracked, unchanged)
+
+- **Retire `scripts/approve-demo.mjs`** — superseded by `conduit approvals`;
+  `packages/mcp/src/integration.test.ts` still uses it for the cross-process
+  approval test; migrate that test to spawn the CLI, then delete the script
+  (small housekeeping PR).
+- **Tracked SDK design items:** C4 MCP transport maturity (stateless POST, no
+  initialize/session); C5 non-round-trippable tool names;
+  `getByIntegrationId` on ConnectionRepository; `pausedAt` on
+  PendingApproval; `--json` shape on failure paths; tools INSERT SQL dup
+  (revisit at a 3rd site).
+- Aikido SAST MCP still not connected (`/aikido:setup` in the user's
+  terminal). gstack update available — user-run, low priority.
+
+### Session debrief (this session, full narrative)
+
+https://claude.ai/code/artifact/6ec370b0-0b60-43cb-900d-206655f219d0
+(the SDD ledger `.superpowers/sdd/progress.md` carries the same record in
+git-ignored scratch).
+
+### Kickoff prompt for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: ALL FOUR §17 build items are MERGED — step 4's token demo landed
+> as PR #33 (squash) → main `08cb658`; demo measured 133,450 → 505 tokens
+> (264.3×). Do NOT re-implement anything; do NOT start Phase-1+ features.**
+>
+> **NEXT: the two §17 gates.** Gate one is HUMAN-driven manual acceptance —
+> help the user connect a real Claude Desktop/Cursor to `conduit serve`
+> end-to-end (READMEs carry onboarding; `conduit add-mcp` against the
+> bundled `scripts/token-demo-upstream.mjs` is a zero-credential local
+> source). Gate two is a converged edge-case pass on the RUNNING skeleton
+> (spec §17 list; convergence per adversarial-convergence.md). MVP is done
+> only when BOTH pass. Housekeeping candidate if time permits: migrate the
+> mcp cross-process approval test off approve-demo.mjs and retire it.
+> Routing: prose direct-push via scripts/push-docs; protected floor →
+> branch → PR → gauntlet → human-named merge.
+
+---
+
+## Superseded handoff — written 2026-07-13 earlier (§17 step 3 COMPLETE: Lane B `conduit` CLI MERGED — PR #32 → main `79c3ae9`; step 4 was built + merged by the section above)
 
 ### Where things stand
 
