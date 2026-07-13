@@ -49,7 +49,7 @@ export async function createApprovalRuntime(opts: {
   const manager = createExecutionManager({
     store,
     sandbox,
-    makeInvoker: ({ executionId, decisions }) =>
+    makeInvoker: ({ executionId, decisions, deadline }) =>
       createToolInvoker(
         {
           store,
@@ -58,7 +58,7 @@ export async function createApprovalRuntime(opts: {
           upstream,
           ...(decisions !== undefined ? { decisions } : {}),
         },
-        { executionId, log },
+        { executionId, log, ...(deadline !== undefined ? { deadline } : {}) },
       ),
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
   });

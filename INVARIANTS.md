@@ -24,7 +24,8 @@ promise the product makes but does not yet enforce.
 | §9.2 — a secret never enters sandbox heap / agent code / agent / model | `packages/sdk/src/credentials.test.ts` | ✅ pinned |
 | §9.3 — loopback/private egress off by default (authoritative check: per-connect IP pinning, `createPinnedLookup` — canonicalize-then-check, closes DNS-rebinding TOCTOU per spec §18) | `packages/sdk/src/pipeline/egress.test.ts` (redirect refusal covered in `pipeline/upstream.test.ts`) | ✅ pinned |
 | §11 — Trace stores no raw credentials; inputs redacted per policy (write-time; full `output` dropped from Trace — replay journal deliberately unredacted per §5.5 D7) | `packages/sdk/src/pipeline/invoker.test.ts` (+ D7 guard in `execution/manager.test.ts`) | ✅ pinned |
-| §16 — runaway executions interrupted (time / memory / output caps) | `packages/sdk/src/sandbox/quickjs.test.ts` | ✅ pinned |
+| §16 — runaway executions interrupted (time / memory / output caps); a pathologically deep guest value (parse OR return) fails cleanly without crashing the host (gate-two finding #1) | `packages/sdk/src/sandbox/quickjs.test.ts` | ✅ pinned |
+| §16 — the wall-clock budget is wired into the invoker: `makeInvoker` receives a `deadline` reflecting the remaining budget, so per-call timeouts clamp to `min(ceiling, remaining)` and the budget-exhausted refusal is live (gate-two finding F1) | `packages/sdk/src/execution/manager.test.ts` (+ the `min(ceiling, deadline())` clamp in `packages/sdk/src/pipeline/invoker.test.ts`) | ✅ pinned |
 | §5.5 — pause/resume via deterministic replay (journaled results, seeded non-determinism) | `packages/sdk/src/execution/manager.test.ts` | ✅ pinned |
 | §10.2 — policy defaults: safe→Allow, review/destructive→Require approval; block never seeded | `packages/sdk/src/policy.test.ts` | ✅ pinned |
 | /mcp M1 — the human-only approval seam: no resume/approve tool on the MCP surface | `packages/mcp/src/server.test.ts` | ✅ pinned |

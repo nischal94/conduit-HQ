@@ -203,8 +203,24 @@ function runOnce(
     }
     return capOutput(outcome.value, limits);
   } finally {
-    context.dispose();
-    runtime.dispose();
+    // Dispose defensively: a guest that overflowed the HOST stack (a
+    // pathologically deep value dumped back through the WASM boundary) can
+    // leave the runtime wedged, so `QTS_FreeRuntime` itself re-throws a fresh
+    // `RangeError` during teardown. That teardown fault must not mask the
+    // run's real outcome (a clean `failed`) nor escape as an infra fault —
+    // the OS reclaims the WASM instance when the module is GC'd regardless.
+    disposeQuietly(() => context.dispose());
+    disposeQuietly(() => runtime.dispose());
+  }
+}
+
+/** Run a disposer, swallowing any throw so a wedged-runtime teardown cannot
+ * mask the run's real outcome (gate-two finding #1, deep-value branch). */
+function disposeQuietly(dispose: () => void): void {
+  try {
+    dispose();
+  } catch {
+    // Intentionally ignored — see the call site.
   }
 }
 
@@ -215,6 +231,21 @@ type DriveOutcome =
 
 /** Evaluate the wrapped code and pump jobs until its promise settles. */
 function drive(context: QuickJSContext, runtime: QuickJSRuntime, code: string): DriveOutcome {
+  // A pathological guest — deeply nested object literal in the source, or a
+  // deeply nested value returned to `context.dump` — can overflow the HOST
+  // stack inside the WASM engine, throwing a synchronous JS error (e.g.
+  // `RangeError: Maximum call stack size exceeded`) out of `evalCode`/`dump`.
+  // That is a GUEST-caused failure, not an infra fault: convert it to a
+  // sandbox `failed` here so the agent receives a clean error envelope rather
+  // than the opaque internal error the manager raises for unexpected throws.
+  try {
+    return driveInner(context, runtime, code);
+  } catch (cause) {
+    return { kind: "error", error: toSandboxError(cause) };
+  }
+}
+
+function driveInner(context: QuickJSContext, runtime: QuickJSRuntime, code: string): DriveOutcome {
   const evalResult = context.evalCode(`(async () => {\n${code}\n})()`, "execution.js");
   if (evalResult.error) {
     const detail: unknown = context.dump(evalResult.error);

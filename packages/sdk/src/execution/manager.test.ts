@@ -1261,3 +1261,68 @@ describe("requestKey (mcp design M1)", () => {
     expect(h.calls).toHaveLength(1);
   });
 });
+
+describe("§16 wall-clock budget is wired into the invoker (finding F1, gate two)", () => {
+  afterEach(async () => {
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
+  });
+
+  /** A stub sandbox that settles `completed` without performing any tool call. */
+  const completingSandbox: Sandbox = {
+    execute: (request) =>
+      Promise.resolve({
+        status: "completed",
+        value: null,
+        seeds: request.seeds ?? { now: 0, random: 1 },
+        journal: [...(request.journal ?? [])],
+      }),
+  };
+
+  it("INVARIANT §16: the manager supplies makeInvoker a deadline reflecting the wall-clock budget", async () => {
+    const store = await makeBareStore();
+    let clock = 1_000;
+    const captured: Array<() => number> = [];
+    const deps: ExecutionManagerDeps = {
+      store,
+      sandbox: completingSandbox,
+      makeInvoker: ({ deadline }) => {
+        // The F1 fix: production wiring must SUPPLY a deadline (it previously
+        // passed only { executionId, log }, leaving remaining = Infinity so the
+        // §16 budget never clamped per-call timeouts).
+        if (deadline === undefined) {
+          throw new Error("makeInvoker received no deadline — F1 regression");
+        }
+        captured.push(deadline);
+        return () => Promise.resolve(null);
+      },
+      // The stub sandbox settles `completed` with zero tool calls, so the host
+      // is never invoked — a never-resolving stub keeps that explicit.
+      makeToolHost: () => ({
+        search: () => Promise.reject(new Error("host must not be called")),
+        describe: () => Promise.reject(new Error("host must not be called")),
+        call: () => Promise.reject(new Error("host must not be called")),
+      }),
+      makeDecisions: () => createInMemoryApprovalDecisions(),
+      now: () => clock,
+    };
+    const manager = createExecutionManager(deps);
+    await manager.start("return 1;", { limits: { wallClockMs: 60_000 } });
+
+    expect(captured).toHaveLength(1);
+    const deadline = captured[0];
+    if (deadline === undefined) {
+      throw new Error("no deadline captured");
+    }
+    // Captured at start-time `clock`; the full budget remains.
+    expect(deadline()).toBe(60_000);
+    // As the injected clock advances, the remaining budget shrinks — and goes
+    // non-positive past the window, which is exactly what makes the invoker's
+    // `remaining <= 0` refusal live in production.
+    clock += 45_000;
+    expect(deadline()).toBe(15_000);
+    clock += 20_000;
+    expect(deadline()).toBeLessThanOrEqual(0);
+  });
+});
