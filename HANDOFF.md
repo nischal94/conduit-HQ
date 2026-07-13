@@ -122,11 +122,14 @@ verbatim from the 2026-07-13 session at the user's request as base
 material for product/investor decks. Also published as an artifact:
 https://claude.ai/code/artifact/591d5af7-5d0f-4cd1-8034-8a55ea88fda7
 
-### Session debrief (this session, full narrative)
+### Session debriefs
 
-https://claude.ai/code/artifact/6ec370b0-0b60-43cb-900d-206655f219d0
-(the SDD ledger `.superpowers/sdd/progress.md` carries the same record in
-git-ignored scratch).
+- Gate-one session (2026-07-13→14, gate one PASSED):
+  https://claude.ai/code/artifact/5f00e756-4743-4062-8e36-65ab4f38892c
+- Token-demo session (2026-07-13):
+  https://claude.ai/code/artifact/6ec370b0-0b60-43cb-900d-206655f219d0
+  (the SDD ledger `.superpowers/sdd/progress.md` carries the same record in
+  git-ignored scratch).
 
 ### Kickoff prompt for the next session
 
