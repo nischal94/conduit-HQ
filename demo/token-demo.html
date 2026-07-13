@@ -1,12 +1,4 @@
-// HTML renderer for the §4.2 token demo (design 2026-07-13, §3.4). Produces
-// a fully self-contained page: inline CSS/JS, zero external requests, works
-// offline from file://. Every number on the page is live-measured by
-// scripts/token-demo.mjs EXCEPT the spec-scale point, which is visually and
-// textually labeled as an extrapolation (design §4).
-
-export function renderTokenDemoHtml(results) {
-  const data = JSON.stringify(results);
-  return `<!doctype html>
+<!doctype html>
 <html lang="en">
 <head>
 <meta charset="utf-8">
@@ -132,7 +124,7 @@ upstream and of <code>conduit serve</code> standing in front of it, counted with
 </footer>
 
 <script>
-  const DATA = ${data};
+  const DATA = {"catalog":{"tools":800,"families":["github","stripe","jira","sentry"],"source":"scripts/token-demo-upstream.mjs (bundled deterministic demo upstream)"},"before":{"tokens":133450,"perToolAvg":166.8,"surface":"800 raw tool schemas injected directly"},"after":{"tokens":505,"definitions":[{"name":"check_execution","tokens":156},{"name":"execute","tokens":349}],"surface":"conduit serve — execute + check_execution"},"ratio":264.3,"ingested":{"safe":0,"review":800,"destructive":0,"credential":"absent"},"estimator":"estimateDefinitionTokens (~4 chars/token heuristic, packages/mcp/src/payloads.ts)","reproduce":"node scripts/token-demo.mjs","extrapolation":{"label":"extrapolated (spec §4.2) — NOT measured","specTools":1600,"beforeTokens":266900,"afterTokens":505}};
   const fmt = (n) => n.toLocaleString("en-US");
   const byId = (id) => document.getElementById(id);
 
@@ -169,7 +161,7 @@ upstream and of <code>conduit serve</code> standing in front of it, counted with
     byId("proj-after").textContent = fmt(DATA.after.tokens);
     byId("extrapolation-note").innerHTML = measured
       ? "This point is the <strong>measured</strong> catalog (" + fmt(DATA.catalog.tools) + " tools)."
-      : 'Linear extrapolation at the measured average <span class="badge">extrapolated</span> — at the spec\\u2019s ' +
+      : 'Linear extrapolation at the measured average <span class="badge">extrapolated</span> — at the spec\u2019s ' +
         fmt(DATA.extrapolation.specTools) + "-tool catalog this projects to " +
         fmt(DATA.extrapolation.beforeTokens) + " tokens before vs " +
         fmt(DATA.extrapolation.afterTokens) + " after.";
@@ -179,5 +171,3 @@ upstream and of <code>conduit serve</code> standing in front of it, counted with
 </script>
 </body>
 </html>
-`;
-}
