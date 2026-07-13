@@ -28,6 +28,8 @@ const human = (resource) => resource.replace(/_/g, " ");
 
 // 4 families x 20 resources x 10 verbs = 800 tools, sized to land near the
 // ~174 tokens/tool density the spec's own 1,600 ≈ 278,800 figure implies.
+// (First measured run landed at ~166.8 tokens/tool — close enough to the
+// calibration target that the demo's honesty rules hold without retuning.)
 const FAMILIES = [
   {
     service: "github",
@@ -304,7 +306,10 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
         const parsed = JSON.parse(body);
         id = parsed?.id ?? null;
         method = parsed?.method;
-      } catch {
+      } catch (error) {
+        process.stderr.write(
+          `[token-demo-upstream] malformed request body: ${error instanceof Error ? error.message : String(error)}\n`,
+        );
         method = undefined;
       }
       res.writeHead(200, { "content-type": "application/json" });

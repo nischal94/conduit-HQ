@@ -31,9 +31,9 @@ const MCP_DIST = join(ROOT, "packages", "mcp", "dist", "index.js");
 const CLI_BIN = join(ROOT, "packages", "cli", "dist", "bin.js");
 const UPSTREAM_SCRIPT = join(ROOT, "scripts", "token-demo-upstream.mjs");
 const DEMO_DIR = join(ROOT, "demo");
-const SPEC_TOOL_COUNT = 1600; // spec §4.2's headline catalog size (extrapolation only)
+const SPEC_TOOL_COUNT = 1600; // spec §4.2's headline catalog size (extrapolation only; design doc D6)
 const MAX_AFTER_TOKENS = 1044 + 256; // the two INVARIANT §4.2 pins, summed
-const MIN_RATIO = 20; // conservative floor; expected ~100x
+const MIN_RATIO = 20; // conservative floor; measured 264.3x at the 800-tool catalog
 
 const log = (line) => process.stderr.write(`[token-demo] ${line}\n`);
 
@@ -57,14 +57,20 @@ function startUpstream() {
   const child = spawn(process.execPath, [UPSTREAM_SCRIPT], {
     stdio: ["ignore", "ignore", "pipe"],
   });
+  let buffer = "";
+  let crash = null;
+  child.stderr.on("data", (chunk) => {
+    buffer += chunk;
+  });
+  child.on("exit", (code, signal) => {
+    crash = { code, signal };
+  });
   const port = new Promise((resolvePort, rejectPort) => {
     const timer = setTimeout(
       () => rejectPort(new Error("[token-demo] upstream did not print PORT= within 5s")),
       5000,
     );
-    let buffer = "";
-    child.stderr.on("data", (chunk) => {
-      buffer += chunk;
+    child.stderr.on("data", () => {
       const match = buffer.match(/^PORT=(\d+)$/m);
       if (match) {
         clearTimeout(timer);
@@ -76,37 +82,69 @@ function startUpstream() {
       rejectPort(new Error(`[token-demo] upstream exited early with code ${code}`));
     });
   });
-  return { child, port };
+  const diagnostics = () => {
+    const crashPart = crash ? `crashed (code=${crash.code}, signal=${crash.signal})` : "running";
+    const tail = buffer.trim().slice(-500) || "(empty)";
+    return `${crashPart}; stderr tail: ${tail}`;
+  };
+  return { child, port, diagnostics };
 }
 
 /** Runs a child to completion, collecting stdout/stderr. */
 function run(command, args, env) {
-  return new Promise((resolveRun) => {
+  return new Promise((resolveRun, rejectRun) => {
     const child = spawn(command, args, { env, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
+    const timer = setTimeout(() => {
+      child.kill("SIGKILL");
+      rejectRun(new Error(`[token-demo] ${command} timed out after 60000ms`));
+    }, 60000);
     child.stdout.on("data", (c) => {
       stdout += c;
     });
     child.stderr.on("data", (c) => {
       stderr += c;
     });
-    child.on("close", (code) => resolveRun({ code, stdout, stderr }));
+    child.on("error", (error) => {
+      clearTimeout(timer);
+      rejectRun(new Error(`[token-demo] failed to spawn ${command}: ${error.message}`));
+    });
+    child.on("close", (code) => {
+      clearTimeout(timer);
+      resolveRun({ code, stdout, stderr });
+    });
   });
 }
 
 /** Fetches the raw tools/list from the upstream — the "before" surface. */
-async function fetchRawTools(port) {
-  const response = await fetch(`http://127.0.0.1:${port}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
-    signal: AbortSignal.timeout(5000),
-  });
+async function fetchRawTools(port, diagnostics) {
+  let response;
+  try {
+    response = await fetch(`http://127.0.0.1:${port}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      signal: AbortSignal.timeout(5000),
+    });
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    fail(
+      `upstream tools/list request failed (port ${port}): ${msg}\nupstream diagnostics: ${diagnostics()}`,
+    );
+  }
   if (!response.ok) {
     fail(`upstream tools/list responded ${response.status}`);
   }
-  const body = await response.json();
+  let body;
+  try {
+    body = await response.json();
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    fail(
+      `upstream tools/list body was not valid JSON: ${msg}\nupstream diagnostics: ${diagnostics()}`,
+    );
+  }
   const tools = body?.result?.tools;
   if (!Array.isArray(tools)) {
     fail("upstream tools/list response missing result.tools");
@@ -128,9 +166,21 @@ async function fetchServedTools(env) {
     command: process.execPath,
     args: [CLI_BIN, "serve"],
     env: curatedEnv(env),
-    stderr: "ignore",
+    stderr: "pipe",
   });
-  await client.connect(transport);
+  let capturedStderr = "";
+  transport.stderr?.on("data", (chunk) => {
+    capturedStderr += chunk;
+  });
+  try {
+    await client.connect(transport);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    await client.close().catch(() => {});
+    fail(
+      `conduit serve connect failed: ${msg}. serve stderr: ${capturedStderr.trim() || "(empty)"}`,
+    );
+  }
   try {
     const { tools } = await client.listTools();
     return tools;
@@ -153,13 +203,13 @@ function curatedEnv(env) {
 
 export async function runTokenDemo() {
   const stateDir = await mkdtemp(join(tmpdir(), "conduit-token-demo-"));
-  const { child: upstream, port: portPromise } = startUpstream();
+  const { child: upstream, port: portPromise, diagnostics } = startUpstream();
   try {
     const port = await portPromise;
     log(`upstream listening on 127.0.0.1:${port}`);
 
     // BEFORE: what an agent faces with every raw schema injected directly.
-    const rawTools = await fetchRawTools(port);
+    const rawTools = await fetchRawTools(port, diagnostics);
     if (rawTools.length !== CATALOG_SIZE) {
       fail(`upstream served ${rawTools.length} tools, expected ${CATALOG_SIZE}`);
     }
@@ -188,7 +238,15 @@ export async function runTokenDemo() {
     if (addMcp.code !== 0) {
       fail(`conduit add-mcp exited ${addMcp.code}: ${addMcp.stderr.trim()}`);
     }
-    const ingested = JSON.parse(addMcp.stdout);
+    let ingested;
+    try {
+      ingested = JSON.parse(addMcp.stdout);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      fail(
+        `add-mcp --json output was not valid JSON: ${msg}. stdout: ${addMcp.stdout.slice(0, 500)}`,
+      );
+    }
     const ingestedTotal = ingested.safe + ingested.review + ingested.destructive;
     if (ingestedTotal !== CATALOG_SIZE) {
       fail(`add-mcp ingested ${ingestedTotal} tools, expected ${CATALOG_SIZE}`);
