@@ -1319,3 +1319,35 @@ generated pages: structural verification (the 17 declared element IDs
 exactly matched the 17 script-referenced IDs; injected DATA spot-checked) +
 an explicit "visual check rides with the human's PR review" note. Don't burn
 turns re-attempting the render path; name the handoff.
+
+## 2026-07-14 — §17 gate one PASSED (real Claude Desktop manual acceptance)
+
+### 1. The bundled token-demo upstream is list-only — gate-one calls need a call-capable upstream
+
+`scripts/token-demo-upstream.mjs` serves ONLY `tools/list` (by design — the
+token demo never calls a tool). Using it as the gate-one source made
+onboarding and the pause work, but the first `approvals approve` failed
+loudly at the real upstream call (`-32601 only POST tools/list is served
+here`). Correct fail-loud behavior — `approve` printed the upstream error
+and exited non-zero, nothing faked — but the acceptance round trip needed a
+throwaway scratchpad upstream that also serves `tools/call`. If a reusable
+call-capable demo upstream is ever wanted in-repo, that's a small
+protected-floor PR; the scratchpad one was single-use.
+
+### 2. `--prefix` does not appear in agent-facing tool names — namespace does
+
+`add-mcp --namespace gateone --prefix gateone.local.demo` seeds tools the
+agent sees as `gateone.github_create_issue`, NOT
+`gateone.local.demo.github_create_issue`. The prefix is the source/trust
+label, not the tool-name path. The human (and this agent) both guessed
+wrong from the CLI's "seeded N tools under <prefix>" phrasing; Claude
+Desktop's model recovered by searching the catalog. Candidate README/`--help`
+wording fix rides with the next CLI-touching PR (tracked in HANDOFF).
+
+### 3. Ephemeral-port upstreams go stale across session restarts
+
+The demo upstream's port is OS-assigned; a session restart killed the
+background task and the stored source URL silently pointed at a dead port.
+`add-mcp --replace` re-pointed it in one command (retarget warning printed,
+policy overrides carried). For any demo flow that outlives a session, either
+pin a port or expect a `--replace` re-sync at resume.

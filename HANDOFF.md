@@ -65,27 +65,43 @@ at session start.
   refs). Local branches: exactly `main`. SDD ledger
   `.superpowers/sdd/progress.md` carries the full build + gauntlet record.
 
-### NEXT TASK — the two §17 gates (MVP is done ONLY when both pass)
+### NEXT TASK — §17 gate two (gate one PASSED 2026-07-14; MVP is done when gate two converges)
 
 Nothing is left to BUILD for the MVP; do not start Phase-1+ features (web
 console, FTS5, Trace viewer, Phases 2–5 all stay out).
 
-- **Gate one (human-driven, agent assists):** real Claude Desktop/Cursor
-  manual acceptance against the merged server via `conduit serve` (or the
-  `conduit-mcp` bin — same shared startup). Onboarding lives in
-  `packages/cli/README.md` + `packages/mcp/README.md`; `conduit add-mcp` is
-  the real onboarding path (seed-demo is superseded for this). The bundled
-  demo upstream (`node scripts/token-demo-upstream.mjs` — prints its port on
-  stderr, runs standalone) is a ready-made local source to add-mcp against,
-  with zero credentials needed.
-- **Gate two:** a converged edge-case/adversarial pass on the RUNNING
-  skeleton (spec §17: malformed schemas, hostile upstream echoes, credential
-  401s, timeouts, resume-after-pause, redaction paths, §14 startup-reload
-  caveat — each handled or documented out-of-scope). Convergence per
-  `~/.claude/rules/adversarial-convergence.md`.
+- **Gate one — PASSED (2026-07-14, real Claude Desktop).** Full loop proven
+  end-to-end from the real client: `add-mcp` onboarding (800-tool demo
+  namespace + a 2-tool call-capable scratch namespace) → catalog search →
+  `execute` → review-class policy pause with `execId`/`requestKey` → human
+  `conduit approvals approve` from a separate terminal process (`completed`)
+  → real upstream `tools/call` → result recovered via `check_execution` in
+  the client. The fail-loud path was ALSO exercised for real: approving a
+  call against the list-only token-demo upstream failed non-zero with the
+  upstream error printed. Findings + quirks in LEARNINGS 2026-07-14 (bundled
+  upstream is list-only; `--prefix` is not the tool-name path — namespace
+  is; ephemeral ports go stale across sessions → `add-mcp --replace`).
+  Gate-one desktop setup persists on the machine: `~/.conduit/` (db, key
+  file `gate-one-key`, config snippet) + a `conduit` entry in Claude
+  Desktop's config (backup `claude_desktop_config.json.bak-gate-one`);
+  its upstream was a session-scratchpad script, so the stored `gateone`
+  source URL is dead until re-pointed.
+- **Gate two (the remaining gate):** a converged edge-case/adversarial pass
+  on the RUNNING skeleton (spec §17: malformed schemas, hostile upstream
+  echoes, credential 401s, timeouts, resume-after-pause, redaction paths,
+  §14 startup-reload caveat — each handled or documented out-of-scope).
+  Convergence per `~/.claude/rules/adversarial-convergence.md`.
 
-### Carry-overs (tracked, unchanged)
+### Carry-overs (tracked)
 
+- **CLI wording fix (from gate one):** `add-mcp`'s "seeded N tools under
+  <prefix>" phrasing + READMEs imply the prefix is the agent-facing tool
+  path; it is not — tool names are `<namespace>.<tool>`. Clarify in
+  `packages/cli/README.md` + the summary line with the next CLI-touching PR.
+- **Optional: a call-capable demo upstream in-repo** — the token-demo
+  upstream serves tools/list only; gate one needed a scratch upstream that
+  also serves tools/call. Only worth a small PR if the demo flow will be
+  repeated (investor demos suggest yes).
 - **Retire `scripts/approve-demo.mjs`** — superseded by `conduit approvals`;
   `packages/mcp/src/integration.test.ts` still uses it for the cross-process
   approval test; migrate that test to spawn the CLI, then delete the script
@@ -120,14 +136,15 @@ git-ignored scratch).
 > as PR #33 (squash) → main `08cb658`; demo measured 133,450 → 505 tokens
 > (264.3×). Do NOT re-implement anything; do NOT start Phase-1+ features.**
 >
-> **NEXT: the two §17 gates.** Gate one is HUMAN-driven manual acceptance —
-> help the user connect a real Claude Desktop/Cursor to `conduit serve`
-> end-to-end (READMEs carry onboarding; `conduit add-mcp` against the
-> bundled `scripts/token-demo-upstream.mjs` is a zero-credential local
-> source). Gate two is a converged edge-case pass on the RUNNING skeleton
-> (spec §17 list; convergence per adversarial-convergence.md). MVP is done
-> only when BOTH pass. Housekeeping candidate if time permits: migrate the
-> mcp cross-process approval test off approve-demo.mjs and retire it.
+> **Gate one PASSED (2026-07-14, real Claude Desktop — full
+> pause→approve→result loop; see HANDOFF gate-one entry + LEARNINGS
+> 2026-07-14). NEXT: §17 gate two** — a converged edge-case/adversarial pass
+> on the RUNNING skeleton (spec §17 list: malformed schemas, hostile
+> upstream echoes, credential 401s, timeouts, resume-after-pause, redaction
+> paths, §14 startup-reload; convergence per adversarial-convergence.md).
+> MVP is done when gate two converges. Housekeeping candidates if time
+> permits: migrate the mcp cross-process approval test off approve-demo.mjs
+> and retire it; the gate-one CLI wording fix (prefix vs namespace).
 > Routing: prose direct-push via scripts/push-docs; protected floor →
 > branch → PR → gauntlet → human-named merge.
 
