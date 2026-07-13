@@ -1,0 +1,46 @@
+{
+  "catalog": {
+    "tools": 800,
+    "families": [
+      "github",
+      "stripe",
+      "jira",
+      "sentry"
+    ],
+    "source": "scripts/token-demo-upstream.mjs (bundled deterministic demo upstream)"
+  },
+  "before": {
+    "tokens": 133450,
+    "perToolAvg": 166.8,
+    "surface": "800 raw tool schemas injected directly"
+  },
+  "after": {
+    "tokens": 505,
+    "definitions": [
+      {
+        "name": "check_execution",
+        "tokens": 156
+      },
+      {
+        "name": "execute",
+        "tokens": 349
+      }
+    ],
+    "surface": "conduit serve — execute + check_execution"
+  },
+  "ratio": 264.3,
+  "ingested": {
+    "safe": 0,
+    "review": 800,
+    "destructive": 0,
+    "credential": "absent"
+  },
+  "estimator": "estimateDefinitionTokens (~4 chars/token heuristic, packages/mcp/src/payloads.ts)",
+  "reproduce": "node scripts/token-demo.mjs",
+  "extrapolation": {
+    "label": "extrapolated (spec §4.2) — NOT measured",
+    "specTools": 1600,
+    "beforeTokens": 266900,
+    "afterTokens": 505
+  }
+}

@@ -1,0 +1,191 @@
+// HTML renderer for the §4.2 token demo (design 2026-07-13, §3.4). Produces
+// a fully self-contained page: inline CSS/JS, zero external requests, works
+// offline from file://. Every number on the page is live-measured by
+// scripts/token-demo.mjs EXCEPT the spec-scale point, which is visually and
+// textually labeled as an extrapolation (design §4).
+
+// Trusted-input boundary: `results` is first-party deterministic data produced
+// by scripts/token-demo.mjs in this same process, never user- or network-
+// controlled — that's why raw string interpolation into <script> and .innerHTML
+// below is safe. If that ever changes (e.g. results starts carrying upstream-
+// supplied strings), escape the less-than character in the injected JSON
+// (e.g. replace it with its < escape) and switch the innerHTML table
+// construction to DOM building.
+export function renderTokenDemoHtml(results) {
+  const data = JSON.stringify(results);
+  return `<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Conduit — §4.2 before/after token demo</title>
+<style>
+  :root {
+    --bg: #ffffff; --fg: #111418; --muted: #5b6470; --line: #e3e7ec;
+    --before: #c74440; --after: #2c7a4b; --accent: #2f5fd0; --card: #f6f8fa;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #0e1116; --fg: #e8ebef; --muted: #98a1ad; --line: #2a3038;
+      --before: #e0716d; --after: #57b380; --accent: #7da2f0; --card: #171b21;
+    }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body {
+    background: var(--bg); color: var(--fg);
+    font: 16px/1.55 ui-sans-serif, system-ui, -apple-system, sans-serif;
+    max-width: 880px; margin: 0 auto; padding: 48px 24px 64px;
+  }
+  h1 { font-size: 1.6rem; letter-spacing: -0.01em; }
+  .sub { color: var(--muted); margin: 6px 0 36px; }
+  .numbers { display: flex; gap: 16px; flex-wrap: wrap; margin-bottom: 8px; }
+  .stat {
+    flex: 1 1 240px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 10px; padding: 18px 20px;
+  }
+  .stat .label { color: var(--muted); font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.06em; }
+  .stat .value { font-size: 2rem; font-variant-numeric: tabular-nums; font-weight: 650; }
+  .stat .detail { color: var(--muted); font-size: 0.85rem; }
+  .stat.before .value { color: var(--before); }
+  .stat.after .value { color: var(--after); }
+  .stat.ratio .value { color: var(--accent); }
+  .bars { margin: 28px 0 40px; }
+  .bar-row { display: grid; grid-template-columns: 64px 1fr 110px; gap: 12px; align-items: center; margin: 10px 0; }
+  .bar-row .name { color: var(--muted); font-size: 0.85rem; text-align: right; }
+  .bar-track { background: var(--card); border: 1px solid var(--line); border-radius: 6px; height: 26px; overflow: hidden; }
+  .bar { height: 100%; min-width: 2px; }
+  .bar.before { background: var(--before); }
+  .bar.after { background: var(--after); }
+  .bar-row .val { font-variant-numeric: tabular-nums; font-size: 0.9rem; }
+  h2 { font-size: 1.05rem; margin: 36px 0 10px; }
+  .slider-box { background: var(--card); border: 1px solid var(--line); border-radius: 10px; padding: 20px; }
+  .slider-box input[type="range"] { width: 100%; accent-color: var(--accent); }
+  .slider-readout { display: flex; justify-content: space-between; flex-wrap: wrap; gap: 8px; margin-top: 10px; font-variant-numeric: tabular-nums; }
+  .slider-readout .b { color: var(--before); }
+  .slider-readout .a { color: var(--after); }
+  .extrapolated { color: var(--muted); font-size: 0.85rem; margin-top: 8px; }
+  .badge {
+    display: inline-block; border: 1px dashed var(--muted); color: var(--muted);
+    border-radius: 5px; padding: 0 6px; font-size: 0.75rem; vertical-align: middle;
+  }
+  table { border-collapse: collapse; width: 100%; font-size: 0.92rem; }
+  td, th { border-bottom: 1px solid var(--line); padding: 8px 10px; text-align: left; font-variant-numeric: tabular-nums; }
+  th { color: var(--muted); font-weight: 500; font-size: 0.82rem; text-transform: uppercase; letter-spacing: 0.05em; }
+  footer { margin-top: 44px; color: var(--muted); font-size: 0.85rem; border-top: 1px solid var(--line); padding-top: 16px; }
+  code { font: 0.88em ui-monospace, SFMono-Regular, Menlo, monospace; background: var(--card); border: 1px solid var(--line); border-radius: 4px; padding: 1px 5px; }
+</style>
+</head>
+<body>
+<h1>Thousands of tools, no bloat</h1>
+<p class="sub">Conduit §4.2 progressive disclosure — every number below was <strong>live-measured</strong> by
+<code>node scripts/token-demo.mjs</code>: the same <code>tools/list</code> question asked of a raw
+upstream and of <code>conduit serve</code> standing in front of it, counted with the same estimator.</p>
+
+<div class="numbers">
+  <div class="stat before">
+    <div class="label">Before — raw schemas</div>
+    <div class="value" id="stat-before"></div>
+    <div class="detail" id="detail-before"></div>
+  </div>
+  <div class="stat after">
+    <div class="label">After — Conduit</div>
+    <div class="value" id="stat-after"></div>
+    <div class="detail" id="detail-after"></div>
+  </div>
+  <div class="stat ratio">
+    <div class="label">Reduction</div>
+    <div class="value" id="stat-ratio"></div>
+    <div class="detail">measured, estimated tokens</div>
+  </div>
+</div>
+
+<div class="bars">
+  <div class="bar-row">
+    <span class="name">before</span>
+    <div class="bar-track"><div class="bar before" id="bar-before"></div></div>
+    <span class="val" id="bar-before-val"></span>
+  </div>
+  <div class="bar-row">
+    <span class="name">after</span>
+    <div class="bar-track"><div class="bar after" id="bar-after"></div></div>
+    <span class="val" id="bar-after-val"></span>
+  </div>
+</div>
+
+<h2>What the model actually sees</h2>
+<table>
+  <thead><tr><th>Surface</th><th>Tool definitions</th><th>Estimated tokens</th></tr></thead>
+  <tbody id="surface-rows"></tbody>
+</table>
+
+<h2>Scale it: how the two surfaces grow</h2>
+<div class="slider-box">
+  <input type="range" id="n-slider" min="10" max="2000" step="10">
+  <div class="slider-readout">
+    <span><strong id="n-tools"></strong> tools connected</span>
+    <span class="b">before: <strong id="proj-before"></strong> tokens</span>
+    <span class="a">after: <strong id="proj-after"></strong> tokens (flat)</span>
+  </div>
+  <p class="extrapolated" id="extrapolation-note"></p>
+</div>
+
+<footer>
+  <p><strong>Provenance.</strong> Before = sum over the raw <code>tools/list</code> definitions served by the
+  bundled demo upstream and ingested via <code>conduit add-mcp</code>. After = the definitions a real MCP
+  client received from <code>conduit serve</code>. Counter: <span id="estimator"></span> — all figures are
+  estimates, not tokenizer output. Points beyond the measured catalog are linear extrapolations at the
+  measured per-tool average and carry the <span class="badge">extrapolated</span> badge.
+  Reproduce: <code id="reproduce"></code> Regenerate when the served tool surface changes — a diff in
+  these files means the surface moved.</p>
+</footer>
+
+<script>
+  const DATA = ${data};
+  const fmt = (n) => n.toLocaleString("en-US");
+  const byId = (id) => document.getElementById(id);
+
+  byId("stat-before").textContent = fmt(DATA.before.tokens);
+  byId("detail-before").textContent =
+    DATA.catalog.tools + " tool schemas, ~" + DATA.before.perToolAvg + " tokens/tool";
+  byId("stat-after").textContent = fmt(DATA.after.tokens);
+  byId("detail-after").textContent = DATA.after.definitions.map((d) => d.name).join(" + ");
+  byId("stat-ratio").textContent = DATA.ratio + "×";
+
+  byId("bar-before").style.width = "100%";
+  byId("bar-before-val").textContent = fmt(DATA.before.tokens);
+  byId("bar-after").style.width = (100 * DATA.after.tokens / DATA.before.tokens).toFixed(2) + "%";
+  byId("bar-after-val").textContent = fmt(DATA.after.tokens);
+
+  const rows = [
+    ["Raw (" + DATA.catalog.families.join(", ") + ")", fmt(DATA.catalog.tools) + " definitions", fmt(DATA.before.tokens)],
+    ...DATA.after.definitions.map((d) => ["Conduit", d.name, fmt(d.tokens)]),
+  ];
+  byId("surface-rows").innerHTML = rows
+    .map((r) => "<tr><td>" + r[0] + "</td><td>" + r[1] + "</td><td>" + r[2] + "</td></tr>")
+    .join("");
+
+  byId("estimator").textContent = DATA.estimator;
+  byId("reproduce").textContent = DATA.reproduce;
+
+  const slider = byId("n-slider");
+  slider.value = DATA.catalog.tools;
+  function project() {
+    const n = Number(slider.value);
+    const measured = n === DATA.catalog.tools;
+    byId("n-tools").textContent = fmt(n);
+    byId("proj-before").textContent = fmt(Math.round(n * DATA.before.perToolAvg));
+    byId("proj-after").textContent = fmt(DATA.after.tokens);
+    byId("extrapolation-note").innerHTML = measured
+      ? "This point is the <strong>measured</strong> catalog (" + fmt(DATA.catalog.tools) + " tools)."
+      : 'Linear extrapolation at the measured average <span class="badge">extrapolated</span> — at the spec\\u2019s ' +
+        fmt(DATA.extrapolation.specTools) + "-tool catalog this projects to " +
+        fmt(DATA.extrapolation.beforeTokens) + " tokens before vs " +
+        fmt(DATA.extrapolation.afterTokens) + " after.";
+  }
+  slider.addEventListener("input", project);
+  project();
+</script>
+</body>
+</html>
+`;
+}
