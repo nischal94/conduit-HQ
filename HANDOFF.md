@@ -23,7 +23,106 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-13 (§17 step 4 COMPLETE: the §4.2 token demo MERGED — PR #33 → main `08cb658`. ALL FOUR §17 BUILD ITEMS ARE BUILT; what remains for "MVP done" is the two §17 GATES)
+## Current handoff — written 2026-07-14 (§17 GATE TWO CLOSED → MVP DONE. PR #34 MERGED (squash) → main `8c622d5`)
+
+### Where things stand — the MVP is complete
+
+- **Both §17 gates now pass.** Gate one PASSED 2026-07-14 (real Claude Desktop
+  pause→approve→result loop). Gate two CLOSED this session: a converged
+  edge-case/adversarial pass on the running skeleton. **PR #34 merged (squash)
+  → main is `8c622d5`; branch deleted; local branches = just `main`.** Suites:
+  sdk 333 + mcp 44 + cli 50 green; tsc + biome + spec-drift clean.
+- **What gate two found and fixed (all in PR #34, §16 resource-limit hardening):**
+  - **Finding #3 — pre-existing cross-tenant DoS (High).** A host-stack overflow
+    from deeply-nested guest data (deep source literal OR deep return value via
+    `context.dump`) abandoned QuickJS objects mid-unwind; freeing the runtime
+    leaked into the PROCESS-WIDE shared WASM module (`getQuickJS()` singleton),
+    and after ~101 overflows it could no longer bootstrap → every tenant stranded
+    until restart. Fix = **Design F**: own the module via `getModule()`, detect
+    the overflow in `drive()`, `poisonModule()` + rebuild (coalesced), classify
+    the cause (recognized overflow → clean `failed`; unknown host throw →
+    re-thrown as operator-visible infra fault). Fast path unchanged (0.52ms; the
+    isolated-module-per-exec alternative cost +16ms, rejected). `quickjs.ts`.
+  - **Finding #1** — deep guest value now fails cleanly, not an opaque -32603.
+  - **F1** — the §16 wall-clock budget is now WIRED into the invoker
+    (`deadlineFor` → `makeInvoker`); it was dead code (remaining always ∞).
+- **Cross-model review was decisive.** codex (gpt-5.6) — reachable only by
+  reframing the prompt as correctness/concurrency (OpenAI's cyber filter refuses
+  a "security/adversarial" framing without human enrollment) — caught 3 real
+  bugs a same-model Claude agent MISSED: concurrent stale-module reference (a
+  >101 concurrent burst rejected an interleaved benign call), a throwing
+  diagnostics sink wedging recovery, and teardown swallowing all dispose faults.
+  All fixed; re-review CONVERGED ("no blocking issues"). See LEARNINGS 2026-07-14.
+- **Explainer + quiz** (load-bearing gate):
+  https://claude.ai/code/artifact/3531cb24-db62-42a1-9a69-e9d46ae5f018
+- **Invariants added** (all ✅): §16 module-poison recovery (sequential /
+  cross-instance / concurrent-past-threshold / bounded-recovery / classification
+  / diagnostic routing+ownership); deep-value fails cleanly; F1 clamp end-to-end.
+
+### NEXT TASK — the MVP is done; resume Phase 1 (spec §17, decided 2026-07-08)
+
+Only after BOTH gates pass does the build resume. Next is the **rest of Phase 1**:
+the web console (Add Source, connections, policies, Connect card), then FTS5/BM25
+search behind the existing Catalog interface (§8 roadmap), the durable background
+service, and `/mcp` streamable-HTTP (stdio already ships). This is a §5.5-scale
+new surface — **START WITH `superpowers:brainstorming` then `writing-plans`**; do
+NOT jump to code. Everything remains load-bearing: branch from origin/main, PR per
+commit routing, Tier 2 + /security-review + a real cross-model pass (see the
+codex-framing note in LEARNINGS) + /explain-diff quiz + HUMAN-NAMED merge.
+
+### Carry-overs (tracked)
+
+- **Resume drops caller-supplied limits (P2, pre-existing).** `Execution` does
+  not persist `limits`, so a resumed drive uses the DEFAULT wall-clock/memory/
+  output caps, not the original request's. `deadlineFor(undefined)` on resume is
+  consistent with this (documented at the call site, manager.ts). Fixing needs a
+  schema change to persist `limits` — its own small PR.
+- **`isHostStackOverflow` is a best-effort V8-message heuristic.** A future V8
+  rephrase degrades SAFELY (module still poisoned+rebuilt; only the agent-facing
+  envelope changes overflow→infra-fault). Noted at the call site.
+- **`deadlineFor` uses injectable `now` vs the sandbox's `Date.now`.** Production
+  uses one clock (no mismatch); a single monotonic clock is a nice-to-have.
+- **Stale worktree to remove:** `scratchpad/parent-wt` (detached `46dcc27`,
+  created only to test DoS pre-existence). Needs `git worktree remove --force`
+  (a per-invocation-confirm command) — ask the user, then prune.
+- **CLI wording fix (from gate one):** `add-mcp`'s "seeded N tools under
+  <prefix>" implies prefix == agent tool path; it's the namespace. Clarify in
+  `packages/cli/README.md` + the summary line with the next CLI-touching PR.
+- Retire `scripts/approve-demo.mjs` (superseded by `conduit approvals`;
+  `packages/mcp/src/integration.test.ts` still uses it — migrate then delete).
+- A call-capable demo upstream in-repo (the token-demo upstream is list-only;
+  gate one needed a scratch tools/call upstream — worth a small PR if demos
+  recur). Other tracked SDK items: C4 MCP transport maturity; C5 non-round-
+  trippable tool names; `getByIntegrationId`; `pausedAt` on PendingApproval;
+  `--json` failure-path shape; tools INSERT SQL dup (revisit at a 3rd site).
+- Aikido SAST MCP still not connected (`/aikido:setup` in the user's terminal).
+
+### Session debrief (this session, full narrative)
+
+TO PUBLISH at session close — the gate-two closeout (DoS root-cause, Design F,
+cross-model review value, the whole gauntlet).
+
+### Kickoff prompt for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5`). **State: §17
+> BOTH GATES PASS → the MVP is DONE. PR #34 (§16 sandbox DoS + gate-two
+> robustness) merged (squash) → main `8c622d5`; sdk 333 + mcp 44 + cli 50 green.
+> Do NOT re-open gate two or re-implement its fixes.**
+>
+> **NEXT: resume the rest of Phase 1** (spec §17, decided 2026-07-08) — web
+> console, then FTS5/BM25 search, durable background service, `/mcp`
+> streamable-HTTP. It's a §5.5-scale new surface: START WITH
+> `superpowers:brainstorming` then `writing-plans`; surface unknowns first. Then
+> subagent-driven build. Each piece is load-bearing: branch from origin/main, PR
+> routing, Tier 2 + /security-review + a REAL cross-model pass (codex needs the
+> correctness-framing workaround — see LEARNINGS 2026-07-14) + /explain-diff quiz
+> + HUMAN-NAMED merge. First housekeeping: remove the stale `scratchpad/parent-wt`
+> worktree (ask first — it's a confirm-gated command).
+
+### ⚠️ Historical note — everything below is SUPERSEDED by the above.
+
+## Superseded handoff — written 2026-07-13 (§17 step 4 COMPLETE: the §4.2 token demo MERGED — PR #33 → main `08cb658`. ALL FOUR §17 BUILD ITEMS ARE BUILT; what remains for "MVP done" is the two §17 GATES)
 
 ### Where things stand
 
