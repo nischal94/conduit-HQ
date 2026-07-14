@@ -46,10 +46,6 @@ let diagnostic: SandboxDiagnostic | undefined;
 export function setSandboxDiagnostic(fn: SandboxDiagnostic | undefined): void {
   diagnostic = fn;
 }
-/** Test helper: whether a diagnostics sink is currently registered. */
-export function hasSandboxDiagnostic(): boolean {
-  return diagnostic !== undefined;
-}
 /** Convenience: route module-recovery events to a line-oriented operator log,
  * set once at process startup. Detail is JSON — safe, it holds no guest data. */
 export function logSandboxDiagnosticsTo(log: (line: string) => void): void {

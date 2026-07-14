@@ -65,7 +65,6 @@ export type {
 export { createStorePolicyEngine } from "./policy.js";
 export { deriveRiskClass } from "./risk.js";
 export {
-  hasSandboxDiagnostic,
   logSandboxDiagnosticsTo,
   moduleRecoveries,
   QuickJSSandbox,
