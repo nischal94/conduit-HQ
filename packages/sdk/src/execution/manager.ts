@@ -708,6 +708,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // next pause. drive() owns terminalization from here on.
         const running: Execution = { ...execution, status: "running" };
         delete running.pausedOn;
+        // `deadlineFor(undefined)` is DELIBERATE, not a missing argument: the
+        // original `start()` limits are not persisted on the Execution row, so
+        // a resumed drive gets the DEFAULT wall-clock window — matching the
+        // sandbox, which also receives `undefined` limits below (its own §16
+        // interrupt still fires). Honoring the original tighter budget on resume
+        // needs Execution to persist `limits` — tracked, its own change.
         const invoke = deps.makeInvoker({
           executionId,
           decisions,

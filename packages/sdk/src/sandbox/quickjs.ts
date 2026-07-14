@@ -368,9 +368,14 @@ function drive(context: QuickJSContext, runtime: QuickJSRuntime, code: string): 
 }
 
 /** A host V8 stack overflow surfacing through the WASM trampolines — the sole
- * poison-capable guest fault. Matched structurally (RangeError + message) so a
- * genuine engine defect of a different shape stays an infra fault. Exported for
- * the classification invariant test. */
+ * poison-capable guest fault. This is a BEST-EFFORT heuristic on V8's current
+ * "Maximum call stack size exceeded" message: if a future V8 rephrases it, an
+ * overflow falls through to the re-throw branch and becomes an operator-visible
+ * infra fault instead of a clean `failed`. That is the SAFE degradation — the
+ * module is still poisoned+rebuilt regardless (drive() poisons before it
+ * classifies), so the DoS stays fixed; only the agent-facing envelope changes.
+ * Matching structurally (RangeError + message) keeps a genuinely different
+ * engine defect an infra fault. Exported for the classification invariant test. */
 export function isHostStackOverflow(cause: unknown): boolean {
   return cause instanceof RangeError && /call stack/i.test(cause.message);
 }
