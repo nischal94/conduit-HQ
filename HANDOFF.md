@@ -99,8 +99,9 @@ codex-framing note in LEARNINGS) + /explain-diff quiz + HUMAN-NAMED merge.
 
 ### Session debrief (this session, full narrative)
 
-TO PUBLISH at session close — the gate-two closeout (DoS root-cause, Design F,
-cross-model review value, the whole gauntlet).
+https://claude.ai/code/artifact/8b1abb6b-856e-493a-8b9b-261577603e98
+(companion explainer + merge-gate quiz:
+https://claude.ai/code/artifact/3531cb24-db62-42a1-9a69-e9d46ae5f018)
 
 ### Kickoff prompt for the next session
 
