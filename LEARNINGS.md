@@ -1418,3 +1418,15 @@ publishing external state. Held the PR for an explicit go thereafter. **Treat
 push / PR-open as a separate publish step needing its own yes, even when
 implementation was authorized — routine-write git safety (verify branch, no
 force) is necessary but not the same as publish authority.**
+
+### 6. Audit the SHAPE of your own fix, not just that it passes — a resource-limit fix where depth≠size
+
+For finding #1 (deep-value overflow) I almost shipped a byte-size cap on the
+`execute` code arg. It would have passed a quick test, but it's the WRONG SHAPE:
+nesting DEPTH, not byte count, drives a stack overflow, so any cap large enough
+for real code still admits a deep-enough literal. This is the denylist-over-
+unbounded-input trap (`adversarial-convergence.md`) applied to MY OWN FIX, not
+to a check. The shape-correct fix was to catch the host throw at the boundary
+and rebuild, closing the whole class. **When fixing a resource/limits issue, ask
+what dimension actually drives the failure (depth vs size vs count vs time) and
+bound THAT — a fix that bounds the wrong dimension looks safe and isn't.**
