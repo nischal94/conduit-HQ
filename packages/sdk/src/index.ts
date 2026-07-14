@@ -64,7 +64,13 @@ export type {
 } from "./policy.js";
 export { createStorePolicyEngine } from "./policy.js";
 export { deriveRiskClass } from "./risk.js";
-export { QuickJSSandbox } from "./sandbox/quickjs.js";
+export {
+  logSandboxDiagnosticsTo,
+  moduleRecoveries,
+  QuickJSSandbox,
+  type SandboxDiagnostic,
+  setSandboxDiagnostic,
+} from "./sandbox/quickjs.js";
 export type {
   ExecutionRequest,
   ExecutionSeeds,

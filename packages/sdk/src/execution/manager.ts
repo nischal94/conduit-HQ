@@ -8,7 +8,7 @@ import type {
   SandboxResult,
   ToolHost,
 } from "../sandbox/sandbox.js";
-import { generateSeeds } from "../sandbox/sandbox.js";
+import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "../sandbox/sandbox.js";
 import type { ConduitStore } from "../store/store.js";
 import type { Execution, PendingApproval } from "../types.js";
 import type { ApprovalDecision, ApprovalDecisions } from "./decisions.js";
@@ -87,7 +87,17 @@ export interface ExecutionManagerDeps {
    * Absent `decisions` (the `start` path) the invoker behaves exactly as it
    * does today.
    */
-  makeInvoker: (args: { executionId: string; decisions?: ApprovalDecisions }) => ToolInvoker;
+  makeInvoker: (args: {
+    executionId: string;
+    decisions?: ApprovalDecisions;
+    /**
+     * Remaining §16 wall-clock budget, in ms, for THIS drive. The invoker
+     * clamps each upstream call to `min(ceiling, deadline())` and refuses once
+     * the budget is exhausted — so a call raised late in the window cannot
+     * overrun the wall-clock by a full upstream ceiling (finding F1, gate two).
+     */
+    deadline?: () => number;
+  }) => ToolInvoker;
   /** Wrap an invoker into the catalog-backed ToolHost (e.g. createCatalogToolHost(catalog, invoke)). */
   makeToolHost: (invoke: ToolInvoker) => ToolHost;
   /** Defaults to `createInMemoryApprovalDecisions`; injectable for tests. */
@@ -178,6 +188,21 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   // instance per resume is correct: a decision lives only for the one resume
   // it is staged for, and the invoker consumes it one-shot.
   const makeDecisions = deps.makeDecisions ?? createInMemoryApprovalDecisions;
+
+  /**
+   * The remaining §16 wall-clock budget for a drive that is about to run, as a
+   * closure the invoker polls before each upstream call (finding F1, gate two).
+   * It mirrors the sandbox's OWN fresh per-drive window: the sandbox reсomputes
+   * `Date.now() + wallClockMs` at the top of every `execute`, and a resume gets
+   * a fresh window just like a start. Captured at makeInvoker time, a hair
+   * before the sandbox's own read, so the invoker's clamp is conservatively no
+   * later than the wall-clock interrupt.
+   */
+  function deadlineFor(limits: Partial<SandboxLimits> | undefined): () => number {
+    const wallClockMs = limits?.wallClockMs ?? DEFAULT_SANDBOX_LIMITS.wallClockMs;
+    const budgetEnd = now() + wallClockMs;
+    return () => budgetEnd - now();
+  }
 
   /**
    * Build the journaling ToolHost wrapper (design D8, the barrier). For every
@@ -580,7 +605,10 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         }
         throw cause;
       }
-      const invoke = deps.makeInvoker({ executionId: execution.id });
+      const invoke = deps.makeInvoker({
+        executionId: execution.id,
+        deadline: deadlineFor(opts?.limits),
+      });
       return drive(execution, invoke, [], undefined, opts?.limits);
     },
 
@@ -680,7 +708,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // next pause. drive() owns terminalization from here on.
         const running: Execution = { ...execution, status: "running" };
         delete running.pausedOn;
-        const invoke = deps.makeInvoker({ executionId, decisions });
+        // `deadlineFor(undefined)` is DELIBERATE, not a missing argument: the
+        // original `start()` limits are not persisted on the Execution row, so
+        // a resumed drive gets the DEFAULT wall-clock window — matching the
+        // sandbox, which also receives `undefined` limits below (its own §16
+        // interrupt still fires). Honoring the original tighter budget on resume
+        // needs Execution to persist `limits` — tracked, its own change.
+        const invoke = deps.makeInvoker({
+          executionId,
+          decisions,
+          deadline: deadlineFor(undefined),
+        });
         return await drive(running, invoke, prefix, undefined, undefined);
       } catch (cause) {
         // A throw in the preparation window (NOT from inside drive — drive

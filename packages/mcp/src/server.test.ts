@@ -1,4 +1,10 @@
-import { type ConduitStore, normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
+import {
+  type ConduitStore,
+  normalizeMcp,
+  openSqliteStore,
+  SecretBox,
+  setSandboxDiagnostic,
+} from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -87,6 +93,51 @@ describe("createConduitMcpServer", () => {
     store = await seedStore();
     server = createConduitMcpServer({ store, log: () => {} });
   });
+
+  it("routes sandbox module-recovery diagnostics to THIS server's log — and leaks no guest code", async () => {
+    // The recovery sink is process-global (the shared module is too), installed
+    // once at construction by createConduitMcpServer. Prove it actually ROUTES:
+    // drive a real overflow through the server, then a benign call that
+    // rebuilds, and assert the events land on this server's log in the
+    // "[sandbox]" format with NO guest code.
+    setSandboxDiagnostic(undefined);
+    const lines: string[] = [];
+    const own = createConduitMcpServer({ store, log: (line) => lines.push(line) });
+    const client = await connect(own);
+    const overflow = "let x = { secretMarker: 1 }; for (let i=0;i<20000;i++) x={n:x}; return x;";
+    await client.callTool({ name: "execute", arguments: { code: overflow } });
+    await client.callTool({ name: "execute", arguments: { code: "return 1;" } }); // rebuilds
+
+    const diag = lines.filter((l) => l.startsWith("[sandbox] "));
+    expect(diag.some((l) => l.includes("sandbox.module.poisoned"))).toBe(true);
+    expect(diag.some((l) => l.includes("sandbox.module.recovery.ok"))).toBe(true);
+    // No diagnostic line carries guest code or values.
+    for (const l of diag) {
+      expect(l).not.toContain("secretMarker");
+      expect(l).not.toContain('"n"');
+    }
+    setSandboxDiagnostic(undefined);
+  }, 30_000);
+
+  it("one owner per process: the last server constructed owns the global sink (documented model)", async () => {
+    // Two servers in one process is not our deployment model, but the semantics
+    // must be explicit and pinned, not silent: last-writer-wins.
+    setSandboxDiagnostic(undefined);
+    const first: string[] = [];
+    const second: string[] = [];
+    createConduitMcpServer({ store, log: (line) => first.push(line) });
+    const later = createConduitMcpServer({ store, log: (line) => second.push(line) });
+    const client = await connect(later);
+    await client.callTool({
+      name: "execute",
+      arguments: { code: "let x={v:0};for(let i=0;i<20000;i++)x={n:x};return x;" },
+    });
+    await client.callTool({ name: "execute", arguments: { code: "return 1;" } });
+
+    expect(second.some((l) => l.includes("sandbox.module.recovery.ok"))).toBe(true);
+    expect(first.some((l) => l.startsWith("[sandbox] "))).toBe(false);
+    setSandboxDiagnostic(undefined);
+  }, 30_000);
 
   it("tools/list exposes exactly execute + check_execution, with fresh connections", async () => {
     const client = await connect(server);

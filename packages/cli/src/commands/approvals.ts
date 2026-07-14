@@ -1,5 +1,10 @@
 import { createApprovalRuntime, openStoreFromEnv, type ResolvedEnv } from "@conduithq/mcp";
-import type { ConduitStore, Execution, ExecutionOutcome } from "@conduithq/sdk";
+import {
+  type ConduitStore,
+  type Execution,
+  type ExecutionOutcome,
+  logSandboxDiagnosticsTo,
+} from "@conduithq/sdk";
 
 /**
  * `conduit approvals list|approve|deny` — the human approval queue (design
@@ -191,6 +196,10 @@ export async function runDecide(
 
 /** Production entrypoint wired into the CLI dispatch (bin.ts). */
 export async function approvals(argv: string[]): Promise<number> {
+  // Route sandbox module-recovery diagnostics to this command's stderr, ONCE
+  // (the sink is process-global; this is the CLI process's entry point). A
+  // resumed execution can itself overflow, so the operator sees the recovery.
+  logSandboxDiagnosticsTo((line) => PROD_DEPS.stderr(line));
   const [sub, ...rest] = argv;
   switch (sub) {
     case "list": {

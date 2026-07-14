@@ -1,5 +1,5 @@
 import type { QuickJSContext, QuickJSRuntime, QuickJSWASMModule } from "quickjs-emscripten";
-import { getQuickJS } from "quickjs-emscripten";
+import { newQuickJSWASMModuleFromVariant, RELEASE_SYNC } from "quickjs-emscripten";
 import type {
   ExecutionRequest,
   ExecutionSeeds,
@@ -10,6 +10,104 @@ import type {
   SandboxResult,
 } from "./sandbox.js";
 import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "./sandbox.js";
+
+/**
+ * Shared QuickJS WASM module lifecycle (gate-two DoS fix).
+ *
+ * A host-stack overflow from pathological guest data — a deeply nested source
+ * literal, or a deeply nested value handed back through `context.dump` —
+ * abandons QuickJS objects mid-unwind. Freeing that runtime then leaks into the
+ * shared WASM module; after enough of them the module can no longer bootstrap a
+ * context, which would strand EVERY execution (all tenants) until the process
+ * restarts. Host-stack overflow is the SOLE poison-capable fault — memory,
+ * wall-clock, output-size, and ordinary guest exceptions all unwind cleanly
+ * (pinned by the §16 invariants) — and `drive()` detects exactly it. So we keep
+ * ONE shared module for the fast path and rebuild it ONLY after such a fault.
+ */
+let sharedModule: QuickJSWASMModule | undefined;
+let modulePoisoned = false;
+/** Coalesces a burst of concurrent rebuilds into a single replacement module. */
+let moduleBuildInFlight: Promise<QuickJSWASMModule> | undefined;
+let moduleRecoveryCount = 0;
+
+/**
+ * Operator-visible diagnostics sink for the module-recovery path. The payload
+ * is lifecycle events + counters ONLY — never guest code, guest values, or
+ * secrets.
+ *
+ * OWNERSHIP: this is a PROCESS-GLOBAL sink — the shared module it reports on is
+ * itself process-global — with LAST-WRITER-WINS registration. There is no
+ * single-instance enforcement; the contract is that the ONE process entry point
+ * (the mcp server construction, a CLI command) is the sole writer and sets it
+ * once at startup. Setting it repeatedly (e.g. per execution) or from a second
+ * owner in the same process silently reassigns the sink — so don't.
+ */
+export type SandboxDiagnostic = (event: string, detail?: Record<string, unknown>) => void;
+let diagnostic: SandboxDiagnostic | undefined;
+export function setSandboxDiagnostic(fn: SandboxDiagnostic | undefined): void {
+  diagnostic = fn;
+}
+/** Fire a diagnostic, ISOLATED from control flow: a throwing sink (a buggy
+ * operator logger) must never break module poison/recovery — that would let a
+ * bad logger wedge the sandbox permanently. Errors from the sink are swallowed. */
+function emit(event: string, detail?: Record<string, unknown>): void {
+  if (diagnostic === undefined) return;
+  try {
+    diagnostic(event, detail);
+  } catch {
+    // A diagnostics sink is observability, never a control-flow dependency.
+  }
+}
+/** Convenience: route module-recovery events to a line-oriented operator log,
+ * set once at process startup. Detail is JSON — safe, it holds no guest data. */
+export function logSandboxDiagnosticsTo(log: (line: string) => void): void {
+  setSandboxDiagnostic((event, detail) =>
+    log(`[sandbox] ${event}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ""}`),
+  );
+}
+/** Test/metric hook: how many times the shared module has been rebuilt. */
+export function moduleRecoveries(): number {
+  return moduleRecoveryCount;
+}
+
+async function getModule(): Promise<QuickJSWASMModule> {
+  if (sharedModule !== undefined && !modulePoisoned) {
+    return sharedModule;
+  }
+  if (moduleBuildInFlight === undefined) {
+    const isRecovery = sharedModule !== undefined;
+    if (isRecovery) {
+      emit("sandbox.module.recovery.start", { recovery: moduleRecoveryCount + 1 });
+    }
+    moduleBuildInFlight = newQuickJSWASMModuleFromVariant(RELEASE_SYNC).then(
+      (mod) => {
+        sharedModule = mod;
+        modulePoisoned = false;
+        moduleBuildInFlight = undefined;
+        if (isRecovery) {
+          moduleRecoveryCount += 1;
+          emit("sandbox.module.recovery.ok", { recovery: moduleRecoveryCount });
+        }
+        return mod;
+      },
+      (cause) => {
+        moduleBuildInFlight = undefined;
+        emit("sandbox.module.recovery.fail", { cause: String(cause) });
+        throw cause;
+      },
+    );
+  }
+  return moduleBuildInFlight;
+}
+
+/** Mark the shared module unusable after an abnormal host unwind, so the next
+ * `getModule()` rebuilds it. Idempotent within one poisoned generation. */
+function poisonModule(): void {
+  if (!modulePoisoned) {
+    modulePoisoned = true;
+    emit("sandbox.module.poisoned", {});
+  }
+}
 
 /**
  * QuickJS sandbox (spec §16, §20) on quickjs-emscripten's plain SYNC
@@ -58,11 +156,21 @@ export class QuickJSSandbox implements Sandbox {
       );
     }
 
-    const quickjs = await getQuickJS();
     const journal: JournalEntry[] = [...(request.journal ?? [])];
     const deadline = Date.now() + limits.wallClockMs;
 
     while (true) {
+      // Fetch the module for this drive, and re-fetch if a CONCURRENT execution
+      // poisoned it after `getModule()` resolved but before we run: several
+      // executions awaiting one coalesced build all receive the same module, so
+      // the first overflow among them would leave the rest holding a doomed
+      // reference. The re-check closes that window — and because `runOnce` is
+      // fully synchronous, once we hold a non-poisoned module no other execution
+      // can run (or poison it) before this drive completes.
+      let quickjs = await getModule();
+      while (modulePoisoned) {
+        quickjs = await getModule();
+      }
       const run = runOnce(quickjs, request.code, seeds, journal, limits, deadline);
       if (run.status !== "suspended") {
         return { ...run, seeds, journal };
@@ -203,8 +311,28 @@ function runOnce(
     }
     return capOutput(outcome.value, limits);
   } finally {
-    context.dispose();
-    runtime.dispose();
+    // Dispose defensively: a guest that overflowed the HOST stack (a
+    // pathologically deep value dumped back through the WASM boundary) can
+    // leave the runtime wedged, so `QTS_FreeRuntime` itself re-throws a fresh
+    // `RangeError` during teardown. That teardown fault must not mask the run's
+    // real outcome nor escape as an infra fault — BUT any dispose failure means
+    // the runtime could not be freed cleanly, so the shared module may be
+    // damaged: poison it so the next execution rebuilds rather than reuse a
+    // possibly-corrupt module. (Any thrown shape, not just a stack overflow.)
+    disposeQuietly(() => context.dispose());
+    disposeQuietly(() => runtime.dispose());
+  }
+}
+
+/** Run a disposer, swallowing any throw so a wedged-runtime teardown cannot
+ * mask the run's real outcome — but poisoning the shared module, since a failed
+ * dispose means the runtime was not freed cleanly and the module may be damaged
+ * (gate-two review: teardown must not silently reuse a possibly-corrupt module). */
+function disposeQuietly(dispose: () => void): void {
+  try {
+    dispose();
+  } catch {
+    poisonModule();
   }
 }
 
@@ -215,6 +343,44 @@ type DriveOutcome =
 
 /** Evaluate the wrapped code and pump jobs until its promise settles. */
 function drive(context: QuickJSContext, runtime: QuickJSRuntime, code: string): DriveOutcome {
+  // A synchronous HOST-level throw can escape guest eval/dump. Any such
+  // abnormal unwind may leave the shared WASM module damaged (a host-stack
+  // overflow abandons QuickJS objects), so we ALWAYS force a module rebuild
+  // before the next execution — then classify the cause:
+  try {
+    return driveInner(context, runtime, code);
+  } catch (cause) {
+    poisonModule();
+    if (isHostStackOverflow(cause)) {
+      // Guest-induced: a deeply nested source literal or return value
+      // overflowed the host stack. Surface a clean sandbox `failed` — the
+      // agent gets a normal error envelope, and the rebuild above contains the
+      // damage. (A byte cap is the wrong shape: nesting DEPTH, not size, drives
+      // the overflow, so any cap large enough for real code still admits it.)
+      return { kind: "error", error: toSandboxError(cause) };
+    }
+    // Unknown host/engine fault — NOT attributable to guest input. Do not mask
+    // a possible QuickJS regression as bad user code: re-throw so the manager
+    // surfaces it as an operator-visible infra fault (its unexpected-throw
+    // path finalizes `failed` and re-raises for diagnostics).
+    throw cause;
+  }
+}
+
+/** A host V8 stack overflow surfacing through the WASM trampolines — the sole
+ * poison-capable guest fault. This is a BEST-EFFORT heuristic on V8's current
+ * "Maximum call stack size exceeded" message: if a future V8 rephrases it, an
+ * overflow falls through to the re-throw branch and becomes an operator-visible
+ * infra fault instead of a clean `failed`. That is the SAFE degradation — the
+ * module is still poisoned+rebuilt regardless (drive() poisons before it
+ * classifies), so the DoS stays fixed; only the agent-facing envelope changes.
+ * Matching structurally (RangeError + message) keeps a genuinely different
+ * engine defect an infra fault. Exported for the classification invariant test. */
+export function isHostStackOverflow(cause: unknown): boolean {
+  return cause instanceof RangeError && /call stack/i.test(cause.message);
+}
+
+function driveInner(context: QuickJSContext, runtime: QuickJSRuntime, code: string): DriveOutcome {
   const evalResult = context.evalCode(`(async () => {\n${code}\n})()`, "execution.js");
   if (evalResult.error) {
     const detail: unknown = context.dump(evalResult.error);

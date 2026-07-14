@@ -3,6 +3,7 @@ import {
   type ConduitStore,
   type Execution,
   type ExecutionOutcome,
+  logSandboxDiagnosticsTo,
 } from "@conduithq/sdk";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
@@ -103,6 +104,12 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
   const { store } = options;
   const log = options.log ?? ((line: string) => console.error(line));
   const now = options.now ?? (() => Date.now());
+
+  // Route sandbox module-recovery diagnostics (gate-two DoS fix) to this
+  // server's operator log — ONCE, at construction. The sink is process-global
+  // (the shared QuickJS module is too); this is the process's single entry
+  // point, so it owns the registration rather than the per-call runtime.
+  logSandboxDiagnosticsTo(log);
 
   const server = new Server(
     { name: "conduit", version: "0.1.0" },

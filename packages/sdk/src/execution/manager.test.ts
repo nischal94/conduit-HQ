@@ -118,7 +118,11 @@ interface Harness {
  * deps wired to the real invoker/sandbox. The invoker upstream opts into
  * loopback egress (trusted-code path) exactly as the e2e smoke does.
  */
-async function makeHarness(options?: { location?: string }): Promise<Harness> {
+async function makeHarness(options?: {
+  location?: string;
+  /** Records the timeoutMs the invoker hands each upstream call (F1 clamp test). */
+  recordTimeout?: (timeoutMs: number) => void;
+}): Promise<Harness> {
   const scratch = mkdtempSync(join(tmpdir(), "conduit-mgr-"));
   const dbUrl = `file:${join(scratch, "mgr.db")}`;
   const keyBytes = SecretBox.generateKeyBytes();
@@ -151,16 +155,29 @@ async function makeHarness(options?: { location?: string }): Promise<Harness> {
 
   const policy = createStorePolicyEngine(store.policies);
   const credentials = createStoreCredentialResolver(store.secrets);
-  const upstream = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+  const realUpstream = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+  // Optionally record the per-call timeout the invoker computes, to prove the
+  // §16 wall-clock budget actually clamps it (F1) — not just that a deadline
+  // was supplied.
+  const upstream: typeof realUpstream = options?.recordTimeout
+    ? {
+        call: (args) => {
+          options.recordTimeout?.(args.timeoutMs);
+          return realUpstream.call(args);
+        },
+      }
+    : realUpstream;
   const sandbox = new QuickJSSandbox();
 
   const deps: ExecutionManagerDeps = {
     store,
     sandbox,
-    makeInvoker: ({ executionId, decisions }) =>
+    // Forward the manager-supplied deadline exactly as production runtime.ts
+    // does, so the wall-clock budget reaches the invoker's min(ceiling, remaining).
+    makeInvoker: ({ executionId, decisions, deadline }) =>
       createToolInvoker(
         { store, policy, credentials, upstream, ...(decisions !== undefined ? { decisions } : {}) },
-        { executionId },
+        { executionId, ...(deadline !== undefined ? { deadline } : {}) },
       ),
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
     makeDecisions: () => createInMemoryApprovalDecisions(),
@@ -1259,5 +1276,93 @@ describe("requestKey (mcp design M1)", () => {
     expect(second).toEqual({ status: "conflict", executionId: first.executionId });
     // The second start never drove a sandbox run: exactly one upstream call.
     expect(h.calls).toHaveLength(1);
+  });
+});
+
+describe("§16 wall-clock budget is wired into the invoker (finding F1, gate two)", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
+  });
+
+  /** A stub sandbox that settles `completed` without performing any tool call. */
+  const completingSandbox: Sandbox = {
+    execute: (request) =>
+      Promise.resolve({
+        status: "completed",
+        value: null,
+        seeds: request.seeds ?? { now: 0, random: 1 },
+        journal: [...(request.journal ?? [])],
+      }),
+  };
+
+  it("INVARIANT §16: the manager supplies makeInvoker a deadline reflecting the wall-clock budget", async () => {
+    const store = await makeBareStore();
+    let clock = 1_000;
+    const captured: Array<() => number> = [];
+    const deps: ExecutionManagerDeps = {
+      store,
+      sandbox: completingSandbox,
+      makeInvoker: ({ deadline }) => {
+        // The F1 fix: production wiring must SUPPLY a deadline (it previously
+        // passed only { executionId, log }, leaving remaining = Infinity so the
+        // §16 budget never clamped per-call timeouts).
+        if (deadline === undefined) {
+          throw new Error("makeInvoker received no deadline — F1 regression");
+        }
+        captured.push(deadline);
+        return () => Promise.resolve(null);
+      },
+      // The stub sandbox settles `completed` with zero tool calls, so the host
+      // is never invoked — a never-resolving stub keeps that explicit.
+      makeToolHost: () => ({
+        search: () => Promise.reject(new Error("host must not be called")),
+        describe: () => Promise.reject(new Error("host must not be called")),
+        call: () => Promise.reject(new Error("host must not be called")),
+      }),
+      makeDecisions: () => createInMemoryApprovalDecisions(),
+      now: () => clock,
+    };
+    const manager = createExecutionManager(deps);
+    await manager.start("return 1;", { limits: { wallClockMs: 60_000 } });
+
+    expect(captured).toHaveLength(1);
+    const deadline = captured[0];
+    if (deadline === undefined) {
+      throw new Error("no deadline captured");
+    }
+    // Captured at start-time `clock`; the full budget remains.
+    expect(deadline()).toBe(60_000);
+    // As the injected clock advances, the remaining budget shrinks — and goes
+    // non-positive past the window, which is exactly what makes the invoker's
+    // `remaining <= 0` refusal live in production.
+    clock += 45_000;
+    expect(deadline()).toBe(15_000);
+    clock += 20_000;
+    expect(deadline()).toBeLessThanOrEqual(0);
+  });
+
+  it("INVARIANT §16: a small wall-clock budget actually CLAMPS the upstream call timeout (end-to-end)", async () => {
+    // The real invoker + real upstream: a 2s wall-clock budget must shrink the
+    // per-call timeout well below the 30s default ceiling (proving the manager's
+    // deadline reaches min(ceiling, remaining) — not merely that a callback was
+    // supplied).
+    const timeouts: number[] = [];
+    const h = await makeHarness({ recordTimeout: (ms) => timeouts.push(ms) });
+    active = h;
+    const manager = createExecutionManager(h.deps);
+    const result = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+      { limits: { wallClockMs: 2_000 } },
+    );
+    expect(result.status).toBe("completed");
+    expect(timeouts).toHaveLength(1);
+    // Clamped to the remaining budget (≤ 2000ms), strictly below the 30s ceiling.
+    expect(timeouts[0]).toBeGreaterThan(0);
+    expect(timeouts[0]).toBeLessThanOrEqual(2_000);
   });
 });
