@@ -35,16 +35,28 @@ let moduleRecoveryCount = 0;
  * is lifecycle events + counters ONLY — never guest code, guest values, or
  * secrets.
  *
- * OWNERSHIP: this is a PROCESS-GLOBAL, set-once sink — the shared module it
- * reports on is itself process-global. A process's ENTRY POINT (the mcp server
- * construction, a CLI command) sets it exactly once at startup, not per unit of
- * work. Setting it repeatedly (e.g. per execution) is last-writer-wins and, if
- * two callers ever used different sinks, would misattribute events — so don't.
+ * OWNERSHIP: this is a PROCESS-GLOBAL sink — the shared module it reports on is
+ * itself process-global — with LAST-WRITER-WINS registration. There is no
+ * single-instance enforcement; the contract is that the ONE process entry point
+ * (the mcp server construction, a CLI command) is the sole writer and sets it
+ * once at startup. Setting it repeatedly (e.g. per execution) or from a second
+ * owner in the same process silently reassigns the sink — so don't.
  */
 export type SandboxDiagnostic = (event: string, detail?: Record<string, unknown>) => void;
 let diagnostic: SandboxDiagnostic | undefined;
 export function setSandboxDiagnostic(fn: SandboxDiagnostic | undefined): void {
   diagnostic = fn;
+}
+/** Fire a diagnostic, ISOLATED from control flow: a throwing sink (a buggy
+ * operator logger) must never break module poison/recovery — that would let a
+ * bad logger wedge the sandbox permanently. Errors from the sink are swallowed. */
+function emit(event: string, detail?: Record<string, unknown>): void {
+  if (diagnostic === undefined) return;
+  try {
+    diagnostic(event, detail);
+  } catch {
+    // A diagnostics sink is observability, never a control-flow dependency.
+  }
 }
 /** Convenience: route module-recovery events to a line-oriented operator log,
  * set once at process startup. Detail is JSON — safe, it holds no guest data. */
@@ -65,7 +77,7 @@ async function getModule(): Promise<QuickJSWASMModule> {
   if (moduleBuildInFlight === undefined) {
     const isRecovery = sharedModule !== undefined;
     if (isRecovery) {
-      diagnostic?.("sandbox.module.recovery.start", { recovery: moduleRecoveryCount + 1 });
+      emit("sandbox.module.recovery.start", { recovery: moduleRecoveryCount + 1 });
     }
     moduleBuildInFlight = newQuickJSWASMModuleFromVariant(RELEASE_SYNC).then(
       (mod) => {
@@ -74,13 +86,13 @@ async function getModule(): Promise<QuickJSWASMModule> {
         moduleBuildInFlight = undefined;
         if (isRecovery) {
           moduleRecoveryCount += 1;
-          diagnostic?.("sandbox.module.recovery.ok", { recovery: moduleRecoveryCount });
+          emit("sandbox.module.recovery.ok", { recovery: moduleRecoveryCount });
         }
         return mod;
       },
       (cause) => {
         moduleBuildInFlight = undefined;
-        diagnostic?.("sandbox.module.recovery.fail", { cause: String(cause) });
+        emit("sandbox.module.recovery.fail", { cause: String(cause) });
         throw cause;
       },
     );
@@ -93,7 +105,7 @@ async function getModule(): Promise<QuickJSWASMModule> {
 function poisonModule(): void {
   if (!modulePoisoned) {
     modulePoisoned = true;
-    diagnostic?.("sandbox.module.poisoned", {});
+    emit("sandbox.module.poisoned", {});
   }
 }
 
@@ -148,10 +160,17 @@ export class QuickJSSandbox implements Sandbox {
     const deadline = Date.now() + limits.wallClockMs;
 
     while (true) {
-      // Fetch the module per drive: if a prior overflow poisoned it, this
-      // hands back a freshly rebuilt one (a resuming execution gets a healthy
-      // module even if another execution poisoned it during the pause).
-      const quickjs = await getModule();
+      // Fetch the module for this drive, and re-fetch if a CONCURRENT execution
+      // poisoned it after `getModule()` resolved but before we run: several
+      // executions awaiting one coalesced build all receive the same module, so
+      // the first overflow among them would leave the rest holding a doomed
+      // reference. The re-check closes that window — and because `runOnce` is
+      // fully synchronous, once we hold a non-poisoned module no other execution
+      // can run (or poison it) before this drive completes.
+      let quickjs = await getModule();
+      while (modulePoisoned) {
+        quickjs = await getModule();
+      }
       const run = runOnce(quickjs, request.code, seeds, journal, limits, deadline);
       if (run.status !== "suspended") {
         return { ...run, seeds, journal };
@@ -295,21 +314,25 @@ function runOnce(
     // Dispose defensively: a guest that overflowed the HOST stack (a
     // pathologically deep value dumped back through the WASM boundary) can
     // leave the runtime wedged, so `QTS_FreeRuntime` itself re-throws a fresh
-    // `RangeError` during teardown. That teardown fault must not mask the
-    // run's real outcome (a clean `failed`) nor escape as an infra fault —
-    // the OS reclaims the WASM instance when the module is GC'd regardless.
+    // `RangeError` during teardown. That teardown fault must not mask the run's
+    // real outcome nor escape as an infra fault — BUT any dispose failure means
+    // the runtime could not be freed cleanly, so the shared module may be
+    // damaged: poison it so the next execution rebuilds rather than reuse a
+    // possibly-corrupt module. (Any thrown shape, not just a stack overflow.)
     disposeQuietly(() => context.dispose());
     disposeQuietly(() => runtime.dispose());
   }
 }
 
 /** Run a disposer, swallowing any throw so a wedged-runtime teardown cannot
- * mask the run's real outcome (gate-two finding #1, deep-value branch). */
+ * mask the run's real outcome — but poisoning the shared module, since a failed
+ * dispose means the runtime was not freed cleanly and the module may be damaged
+ * (gate-two review: teardown must not silently reuse a possibly-corrupt module). */
 function disposeQuietly(dispose: () => void): void {
   try {
     dispose();
   } catch {
-    // Intentionally ignored — see the call site.
+    poisonModule();
   }
 }
 

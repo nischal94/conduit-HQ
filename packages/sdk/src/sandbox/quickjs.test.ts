@@ -301,24 +301,51 @@ describe("QuickJSSandbox", () => {
       STRESS_TIMEOUT_MS,
     );
 
-    it("INVARIANT §16: concurrent overflow + benign executions all settle correctly", async () => {
-      const sandbox = new QuickJSSandbox();
-      const results = await Promise.allSettled([
-        ...Array.from({ length: 20 }, () => sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST })),
-        ...Array.from({ length: 20 }, () =>
-          sandbox.execute({ code: "return 7 * 6;", tools: NOOP_HOST }),
-        ),
-      ]);
-      // Every benign call returns the correct value; no call rejects.
-      for (const r of results.slice(20)) {
-        expect(r.status).toBe("fulfilled");
-        if (r.status === "fulfilled") {
-          expect(r.value).toMatchObject({ status: "completed", value: 42 });
+    it(
+      "INVARIANT §16: concurrent overflows PAST the poison threshold cannot fail an interleaved benign call",
+      async () => {
+        // Count is past the old ~101 accumulation threshold: several executions
+        // awaiting one coalesced build all receive the same module, so without a
+        // pre-run poison re-check the first overflow would doom the rest of the
+        // burst (they hold a reference that gets poisoned then broken). Every
+        // benign call in the burst must still complete correctly.
+        const sandbox = new QuickJSSandbox();
+        const results = await Promise.allSettled([
+          ...Array.from({ length: PAST_POISON_THRESHOLD }, () =>
+            sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST }),
+          ),
+          ...Array.from({ length: 20 }, () =>
+            sandbox.execute({ code: "return 7 * 6;", tools: NOOP_HOST }),
+          ),
+        ]);
+        for (const r of results.slice(PAST_POISON_THRESHOLD)) {
+          expect(r.status).toBe("fulfilled");
+          if (r.status === "fulfilled") {
+            expect(r.value).toMatchObject({ status: "completed", value: 42 });
+          }
         }
-      }
-      expect((await sandbox.execute({ code: "return 1;", tools: NOOP_HOST })).status).toBe(
-        "completed",
-      );
+        // No overflow rejected either — each settled as a clean `failed`.
+        for (const r of results.slice(0, PAST_POISON_THRESHOLD)) {
+          expect(r.status).toBe("fulfilled");
+          if (r.status === "fulfilled") expect(r.value.status).toBe("failed");
+        }
+      },
+      STRESS_TIMEOUT_MS,
+    );
+
+    it("INVARIANT §16: a throwing diagnostics sink cannot wedge module recovery", async () => {
+      // Diagnostics are observability, never control flow: a buggy operator
+      // logger that throws must not break poison/rebuild.
+      setSandboxDiagnostic(() => {
+        throw new Error("logger unavailable");
+      });
+      const sandbox = new QuickJSSandbox();
+      expect((await sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST })).status).toBe("failed");
+      // Recovery still happens despite every diagnostic call throwing.
+      expect(await sandbox.execute({ code: "return 1;", tools: NOOP_HOST })).toMatchObject({
+        status: "completed",
+        value: 1,
+      });
     });
 
     it(
