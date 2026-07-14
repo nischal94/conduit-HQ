@@ -210,13 +210,16 @@ describe("QuickJSSandbox", () => {
     });
 
     it("INVARIANT §16: a pathologically deep source literal fails cleanly, never crashes the host", async () => {
-      // A guest object literal nested deep enough to overflow the WASM
-      // engine's HOST stack at parse time (gate-two finding #1). The throw
-      // must be caught inside the sandbox and surfaced as a `failed` result —
-      // NOT propagate out of execute() as an opaque host RangeError (which the
-      // manager would raise to the agent as an internal error).
+      // A guest literal nested deep enough to overflow the host stack while
+      // the WASM engine parses it (gate-two finding #1). The throw must be
+      // caught inside the sandbox and surfaced as a `failed` result — NOT
+      // propagate out of execute() as an opaque host RangeError (which the
+      // manager would raise to the agent as an internal error). Depth is set
+      // far past the overflow threshold (~500 here) so the test is robust to
+      // host-stack size differences across environments; at this depth the
+      // fault is guaranteed at parse OR at the return-value dump.
       let deep = "0";
-      for (let i = 0; i < 4000; i++) deep = `[${deep}]`;
+      for (let i = 0; i < 100_000; i++) deep = `[${deep}]`;
       const result = await sandbox.execute({
         code: `return ${deep};`,
         tools: NOOP_HOST,
@@ -226,10 +229,11 @@ describe("QuickJSSandbox", () => {
 
     it("INVARIANT §16: a pathologically deep RETURN value fails cleanly, never crashes the host", async () => {
       // The overflow can also strike when dumping a deep value back to the
-      // host (context.dump), not only at parse. Same guarantee: `failed`, not
-      // a thrown host error.
+      // host (context.dump), not only at parse. The value is BUILT in the
+      // guest (a shallow source that loops), so this exercises the dump path
+      // specifically. Same guarantee: `failed`, not a thrown host error.
       const result = await sandbox.execute({
-        code: "let d = { v: 0 }; for (let i = 0; i < 4000; i++) d = { n: d }; return d;",
+        code: "let d = { v: 0 }; for (let i = 0; i < 100000; i++) d = { n: d }; return d;",
         tools: NOOP_HOST,
       });
       expect(result.status).toBe("failed");
