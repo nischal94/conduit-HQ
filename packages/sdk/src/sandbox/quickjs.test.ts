@@ -1,6 +1,11 @@
-import { describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it } from "vitest";
 import type { SearchHit, ToolDescription } from "../catalog.js";
-import { QuickJSSandbox } from "./quickjs.js";
+import {
+  isHostStackOverflow,
+  moduleRecoveries,
+  QuickJSSandbox,
+  setSandboxDiagnostic,
+} from "./quickjs.js";
 import type { ToolHost } from "./sandbox.js";
 
 const NOOP_HOST: ToolHost = {
@@ -237,6 +242,125 @@ describe("QuickJSSandbox", () => {
         tools: NOOP_HOST,
       });
       expect(result.status).toBe("failed");
+    });
+  });
+
+  // Gate-two DoS fix: a host-stack overflow abandons QuickJS objects, so the
+  // shared WASM module accumulates damage and would eventually fail to
+  // bootstrap for EVERY execution. These pin that a detected overflow rebuilds
+  // the module, so repeated pathological executions can never poison a later
+  // one — while ordinary faults neither poison nor trigger a rebuild.
+  describe("shared-module recovery after host-stack overflow (spec §16 DoS)", () => {
+    // Depth far past the overflow threshold (~500 in this vitest worker) so it
+    // reliably faults, but small enough that a 150-iteration stress loop —
+    // each iteration rebuilds the module — stays well under its timeout. The
+    // single-shot robustness tests above use 100k for stack-size independence;
+    // these repetition tests only need a reliable fault in-environment.
+    const OVERFLOW = "let x = { v: 0 }; for (let i = 0; i < 20000; i++) x = { n: x }; return x;";
+    // The old (unfixed) module poisoned at ~101 accumulated overflows, so a
+    // count comfortably past that is what proves the rebuild prevents it.
+    const PAST_POISON_THRESHOLD = 150;
+    const STRESS_TIMEOUT_MS = 30_000;
+    afterEach(() => setSandboxDiagnostic(undefined));
+
+    it(
+      "INVARIANT §16: sequential overflows past the old poison threshold cannot poison a later benign execution",
+      async () => {
+        const sandbox = new QuickJSSandbox();
+        for (let n = 0; n < PAST_POISON_THRESHOLD; n++) {
+          expect((await sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST })).status).toBe(
+            "failed",
+          );
+        }
+        const benign = await sandbox.execute({ code: "return 1 + 1;", tools: NOOP_HOST });
+        expect(benign).toMatchObject({ status: "completed", value: 2 });
+      },
+      STRESS_TIMEOUT_MS,
+    );
+
+    it("INVARIANT §16: a benign execution succeeds immediately after every overflow", async () => {
+      const sandbox = new QuickJSSandbox();
+      for (let n = 0; n < 25; n++) {
+        expect((await sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST })).status).toBe("failed");
+        const benign = await sandbox.execute({ code: "return 42;", tools: NOOP_HOST });
+        expect(benign).toMatchObject({ status: "completed", value: 42 });
+      }
+    });
+
+    it(
+      "INVARIANT §16: an overflow on one sandbox cannot poison a DIFFERENT instance (shared module)",
+      async () => {
+        const attacker = new QuickJSSandbox();
+        const victim = new QuickJSSandbox();
+        for (let n = 0; n < PAST_POISON_THRESHOLD; n++) {
+          await attacker.execute({ code: OVERFLOW, tools: NOOP_HOST });
+        }
+        const benign = await victim.execute({ code: "return 7 * 6;", tools: NOOP_HOST });
+        expect(benign).toMatchObject({ status: "completed", value: 42 });
+      },
+      STRESS_TIMEOUT_MS,
+    );
+
+    it("INVARIANT §16: concurrent overflow + benign executions all settle correctly", async () => {
+      const sandbox = new QuickJSSandbox();
+      const results = await Promise.allSettled([
+        ...Array.from({ length: 20 }, () => sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST })),
+        ...Array.from({ length: 20 }, () =>
+          sandbox.execute({ code: "return 7 * 6;", tools: NOOP_HOST }),
+        ),
+      ]);
+      // Every benign call returns the correct value; no call rejects.
+      for (const r of results.slice(20)) {
+        expect(r.status).toBe("fulfilled");
+        if (r.status === "fulfilled") {
+          expect(r.value).toMatchObject({ status: "completed", value: 42 });
+        }
+      }
+      expect((await sandbox.execute({ code: "return 1;", tools: NOOP_HOST })).status).toBe(
+        "completed",
+      );
+    });
+
+    it(
+      "INVARIANT §16: module recoveries are bounded — coalesced, not one per benign call",
+      async () => {
+        const sandbox = new QuickJSSandbox();
+        const before = moduleRecoveries();
+        for (let n = 0; n < 30; n++) {
+          await sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST });
+          await sandbox.execute({ code: "return 1;", tools: NOOP_HOST });
+        }
+        const recoveries = moduleRecoveries() - before;
+        // Each overflow triggers at most one rebuild; benign calls trigger none.
+        // So recoveries stay ≤ the overflow count (never grow with total calls).
+        expect(recoveries).toBeGreaterThan(0);
+        expect(recoveries).toBeLessThanOrEqual(30);
+      },
+      STRESS_TIMEOUT_MS,
+    );
+
+    it("INVARIANT §16: the recovery path emits operator-visible diagnostics (no guest code)", async () => {
+      const events: string[] = [];
+      setSandboxDiagnostic((event, detail) => {
+        events.push(event);
+        // Diagnostics must never carry guest code or values.
+        expect(JSON.stringify(detail ?? {})).not.toContain("n:");
+      });
+      const sandbox = new QuickJSSandbox();
+      await sandbox.execute({ code: OVERFLOW, tools: NOOP_HOST });
+      await sandbox.execute({ code: "return 1;", tools: NOOP_HOST }); // triggers the rebuild
+      expect(events).toContain("sandbox.module.poisoned");
+      expect(events).toContain("sandbox.module.recovery.ok");
+    });
+
+    it("INVARIANT §16: only a host-stack overflow is classified poison-capable", () => {
+      expect(isHostStackOverflow(new RangeError("Maximum call stack size exceeded"))).toBe(true);
+      // A genuine engine defect of another shape must NOT be masked as guest
+      // input — it stays an infra fault (re-thrown by drive()).
+      expect(isHostStackOverflow(new RangeError("Invalid array length"))).toBe(false);
+      expect(isHostStackOverflow(new TypeError("x is not a function"))).toBe(false);
+      expect(isHostStackOverflow(new Error("boom"))).toBe(false);
+      expect(isHostStackOverflow("not an error")).toBe(false);
     });
   });
 

@@ -118,7 +118,11 @@ interface Harness {
  * deps wired to the real invoker/sandbox. The invoker upstream opts into
  * loopback egress (trusted-code path) exactly as the e2e smoke does.
  */
-async function makeHarness(options?: { location?: string }): Promise<Harness> {
+async function makeHarness(options?: {
+  location?: string;
+  /** Records the timeoutMs the invoker hands each upstream call (F1 clamp test). */
+  recordTimeout?: (timeoutMs: number) => void;
+}): Promise<Harness> {
   const scratch = mkdtempSync(join(tmpdir(), "conduit-mgr-"));
   const dbUrl = `file:${join(scratch, "mgr.db")}`;
   const keyBytes = SecretBox.generateKeyBytes();
@@ -151,16 +155,29 @@ async function makeHarness(options?: { location?: string }): Promise<Harness> {
 
   const policy = createStorePolicyEngine(store.policies);
   const credentials = createStoreCredentialResolver(store.secrets);
-  const upstream = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+  const realUpstream = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+  // Optionally record the per-call timeout the invoker computes, to prove the
+  // §16 wall-clock budget actually clamps it (F1) — not just that a deadline
+  // was supplied.
+  const upstream: typeof realUpstream = options?.recordTimeout
+    ? {
+        call: (args) => {
+          options.recordTimeout?.(args.timeoutMs);
+          return realUpstream.call(args);
+        },
+      }
+    : realUpstream;
   const sandbox = new QuickJSSandbox();
 
   const deps: ExecutionManagerDeps = {
     store,
     sandbox,
-    makeInvoker: ({ executionId, decisions }) =>
+    // Forward the manager-supplied deadline exactly as production runtime.ts
+    // does, so the wall-clock budget reaches the invoker's min(ceiling, remaining).
+    makeInvoker: ({ executionId, decisions, deadline }) =>
       createToolInvoker(
         { store, policy, credentials, upstream, ...(decisions !== undefined ? { decisions } : {}) },
-        { executionId },
+        { executionId, ...(deadline !== undefined ? { deadline } : {}) },
       ),
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
     makeDecisions: () => createInMemoryApprovalDecisions(),
@@ -1263,7 +1280,10 @@ describe("requestKey (mcp design M1)", () => {
 });
 
 describe("§16 wall-clock budget is wired into the invoker (finding F1, gate two)", () => {
+  let active: Harness | undefined;
   afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
     for (const c of bareClients.splice(0)) {
       c.close();
     }
@@ -1324,5 +1344,25 @@ describe("§16 wall-clock budget is wired into the invoker (finding F1, gate two
     expect(deadline()).toBe(15_000);
     clock += 20_000;
     expect(deadline()).toBeLessThanOrEqual(0);
+  });
+
+  it("INVARIANT §16: a small wall-clock budget actually CLAMPS the upstream call timeout (end-to-end)", async () => {
+    // The real invoker + real upstream: a 2s wall-clock budget must shrink the
+    // per-call timeout well below the 30s default ceiling (proving the manager's
+    // deadline reaches min(ceiling, remaining) — not merely that a callback was
+    // supplied).
+    const timeouts: number[] = [];
+    const h = await makeHarness({ recordTimeout: (ms) => timeouts.push(ms) });
+    active = h;
+    const manager = createExecutionManager(h.deps);
+    const result = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+      { limits: { wallClockMs: 2_000 } },
+    );
+    expect(result.status).toBe("completed");
+    expect(timeouts).toHaveLength(1);
+    // Clamped to the remaining budget (≤ 2000ms), strictly below the 30s ceiling.
+    expect(timeouts[0]).toBeGreaterThan(0);
+    expect(timeouts[0]).toBeLessThanOrEqual(2_000);
   });
 });
