@@ -30,12 +30,32 @@ let modulePoisoned = false;
 let moduleBuildInFlight: Promise<QuickJSWASMModule> | undefined;
 let moduleRecoveryCount = 0;
 
-/** Operator-visible diagnostics sink for the module-recovery path. Never
- * carries guest code or secrets — only lifecycle events + counters. */
+/**
+ * Operator-visible diagnostics sink for the module-recovery path. The payload
+ * is lifecycle events + counters ONLY — never guest code, guest values, or
+ * secrets.
+ *
+ * OWNERSHIP: this is a PROCESS-GLOBAL, set-once sink — the shared module it
+ * reports on is itself process-global. A process's ENTRY POINT (the mcp server
+ * construction, a CLI command) sets it exactly once at startup, not per unit of
+ * work. Setting it repeatedly (e.g. per execution) is last-writer-wins and, if
+ * two callers ever used different sinks, would misattribute events — so don't.
+ */
 export type SandboxDiagnostic = (event: string, detail?: Record<string, unknown>) => void;
 let diagnostic: SandboxDiagnostic | undefined;
 export function setSandboxDiagnostic(fn: SandboxDiagnostic | undefined): void {
   diagnostic = fn;
+}
+/** Test helper: whether a diagnostics sink is currently registered. */
+export function hasSandboxDiagnostic(): boolean {
+  return diagnostic !== undefined;
+}
+/** Convenience: route module-recovery events to a line-oriented operator log,
+ * set once at process startup. Detail is JSON — safe, it holds no guest data. */
+export function logSandboxDiagnosticsTo(log: (line: string) => void): void {
+  setSandboxDiagnostic((event, detail) =>
+    log(`[sandbox] ${event}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ""}`),
+  );
 }
 /** Test/metric hook: how many times the shared module has been rebuilt. */
 export function moduleRecoveries(): number {

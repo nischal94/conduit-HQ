@@ -1,4 +1,11 @@
-import { type ConduitStore, normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
+import {
+  type ConduitStore,
+  hasSandboxDiagnostic,
+  normalizeMcp,
+  openSqliteStore,
+  SecretBox,
+  setSandboxDiagnostic,
+} from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -86,6 +93,17 @@ describe("createConduitMcpServer", () => {
   beforeEach(async () => {
     store = await seedStore();
     server = createConduitMcpServer({ store, log: () => {} });
+  });
+
+  it("wires the sandbox diagnostic ONCE at construction (ownership model, not per-execute)", () => {
+    // The recovery sink is process-global and MUST be installed by the process
+    // entry point — createConduitMcpServer — not on the per-execute hot path
+    // (the old placement in createApprovalRuntime re-registered every call).
+    setSandboxDiagnostic(undefined);
+    expect(hasSandboxDiagnostic()).toBe(false);
+    createConduitMcpServer({ store, log: () => {} });
+    expect(hasSandboxDiagnostic()).toBe(true);
+    setSandboxDiagnostic(undefined); // reset for other tests
   });
 
   it("tools/list exposes exactly execute + check_execution, with fresh connections", async () => {

@@ -9,7 +9,6 @@ import {
   type ExecutionManager,
   InMemoryCatalog,
   QuickJSSandbox,
-  setSandboxDiagnostic,
 } from "@conduithq/sdk";
 
 export interface ApprovalRuntime {
@@ -37,12 +36,6 @@ export async function createApprovalRuntime(opts: {
 }): Promise<ApprovalRuntime> {
   const { store } = opts;
   const log = opts.log ?? ((line: string) => console.error(line));
-  // Operator-visible sandbox module-recovery events (gate-two DoS fix). The
-  // detail carries only lifecycle events + counters — never guest code or
-  // secrets — so it is safe to route straight to the operator log.
-  setSandboxDiagnostic((event, detail) =>
-    log(`[sandbox] ${event}${detail !== undefined ? ` ${JSON.stringify(detail)}` : ""}`),
-  );
   const sandbox = new QuickJSSandbox();
   const policy = createStorePolicyEngine(store.policies);
   const credentials = createStoreCredentialResolver(store.secrets);
