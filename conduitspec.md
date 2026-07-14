@@ -765,6 +765,14 @@ shape is per-connection egress policy.
 poll design (`check_execution`) is skeleton-scoped: MCP-native completion signaling
 (progress notifications / task semantics) is the recorded Phase-1 successor — deferred, not
 forgotten.
+- **Whole-process sandbox availability is a defended §16 property (2026-07-14, gate two):** ✅
+§16's resource caps defend availability *per execution*; the gate-two DoS (a host-stack overflow
+poisoning the process-wide shared QuickJS module, stranding every subsequent execution) showed that was
+not enough. The fix (PR #34, "Design F": detect-and-rebuild the shared module) extends the guarantee:
+one execution's pathological input cannot deny service to a later one. Pinned by the §16 module-recovery
+invariants. Framing note: v1 is **single-operator** (see "Connection addressing (v1)" and the
+Phase-4 hosted-Cloud deferral) — so this is "an agent session cannot wedge the operator's own server,"
+NOT a multi-tenant isolation claim, which stays Phase 4.
 
 **Deferred (future phases — none block v0.1 / Phase 0):**
 
@@ -776,6 +784,13 @@ forgotten.
 6. **Settled execution-outcome retention/GC** (`/mcp` M4) — persisted
 `result`/`error` columns accumulate with no GC yet; same shape as the trace-retention
 deferral above — Phase 4.
+7. **Sandbox-escape testing depth** (2026-07-14) — the §9.2 guarantee is that the credential
+and the sandbox address space never coexist; a full QuickJS→host escape would break it. Whether to actively
+fuzz *for* escape (vs. rely on the boundary + the vetted-package allowlist) is a hardening-depth
+decision to make when the sandbox red-team work begins — not an MVP gate. Post-MVP hardening.
+8. **Upstream TLS / transport integrity** (2026-07-14) — v1 calls MCP-over-HTTP upstreams and
+trusts host TLS. Whether cert pinning / MITM resistance to upstreams is in scope is undecided; not in the
+§17 gate-two list, so post-MVP. Decide when the transport-hardening work begins.
 
 ---
 

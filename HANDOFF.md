@@ -59,56 +59,45 @@ at session start.
   cross-instance / concurrent-past-threshold / bounded-recovery / classification
   / diagnostic routing+ownership); deep-value fails cleanly; F1 clamp end-to-end.
 
-### NEXT TASK — HARDEN + DOGFOOD the core BEFORE resuming Phase 1 features (roadmap decided 2026-07-14)
+### NEXT TASK — dogfood the real skeleton (the §17 checkpoint's own next step); Phase 1 resumes when the user is ready
 
-The MVP is a walking skeleton that has been driven end-to-end exactly once (gate
-one) and whose one High-severity bug (the §16 DoS) was found by ACCIDENT, not by
-systematic testing. Phase-1 features (web console, HTTP transport) ADD attack
-surface. **A security product earns the right to add surface by hardening and
-dogfooding the surface it already has** — so the next phase is hardening +
-dogfooding, and Phase-1 feature build is deferred until after it. (This reorders
-the 2026-07-08 "resume Phase 1 next" plan; the phase CONTENTS of Phase 1 are
-unchanged, only their ordering.)
+The MVP is DONE — gate two converged on its §17-enumerated scope. The §17
+checkpoint itself says "STOP, test, find edge cases before building further," so
+the natural next step is **dogfooding the real thing**, which needs ZERO new
+scope decisions:
 
-**Do these, roughly in order (the earlier ones make the later ones systematic):**
+- **Dogfood `conduit serve` against a REAL MCP upstream** (GitHub, or another
+  real credentialed API) and run genuine agent workflows; keep a friction/surprise
+  log. Gate one found 3 real quirks from one manual run — more real use surfaces
+  more. Fixes are small PRs; the friction log feeds the backlog. This is cheap,
+  high-signal, and validates the product thesis.
 
-1. **Threat-model doc — `THREAT-MODEL.md` (the foundational artifact; DRAFT
-   started this session, needs the user's scope decisions).** Explicit
-   "defends against X / does NOT defend against Y", the adversary model, and the
-   trust boundaries — grounded in spec §16 security model, §9.2/§9.3, the §18
-   decisions, and INVARIANTS.md (references beat descriptions). Everything below
-   targets what this names. It has real KNOWN-UNKNOWNS the user must decide
-   (adversary scope, multi-tenant assumptions) → interview, don't assume.
-2. **Dogfood for real (cheapest high-signal, can run in parallel).** Point
-   `conduit serve` at 2-3 REAL MCP upstreams (GitHub, a real credentialed API)
-   and run genuine agent workflows daily; log friction + surprises. Gate one
-   found 3 real quirks from one manual run — more real use = more. Fixes here
-   are small PRs; the friction log feeds the backlog.
-3. **Systematic security hardening of the EXISTING boundary** (the DoS proves
-   this surface has undiscovered issues). No fuzzing infra exists yet — that gap
-   is the first build. Targets, richest first:
-   - **Sandbox fuzzing** (`packages/sdk/src/sandbox`) — property-test guest
-     code, tool inputs, upstream responses; the QuickJS boundary is where the
-     DoS lived.
-   - **§9.2 credential-boundary red-team** — the echo-scan is best-effort
-     (category-b); the REAL guarantee is structural (request-scoped, never
-     persisted). Prove THAT holds under a maximally-hostile upstream, not the
-     scan.
-   - **§9.3 egress fuzzing** — address encodings, redirects, DNS rebinding
-     against `createPinnedLookup` (canonicalize-then-check is the pattern).
-   - **Normalizer fuzzing** (`normalize/mcp.ts`) — it parses UNTRUSTED upstream
-     tool schemas; malformed/hostile schemas at scale.
-4. **THEN resume Phase 1 features** on the hardened, dogfooded core: web console
-   (Add Source, connections, policies, Connect card) → FTS5/BM25 search behind
-   the Catalog interface (§8) → durable background service → `/mcp`
-   streamable-HTTP (stdio already ships).
+After dogfooding (or whenever the user chooses), the spec's decided path resumes:
+**the rest of Phase 1** — web console (Add Source, connections, policies, Connect
+card) → FTS5/BM25 search behind the Catalog interface (§8) → durable background
+service → `/mcp` streamable-HTTP (stdio already ships).
+
+**Hardening / fuzzing — real, but post-MVP and NOT a blocking prerequisite.**
+The DoS was found by accident, which suggests deliberate adversarial testing of
+the existing boundary (sandbox, §9.2 credential structural guarantee, §9.3 egress
+encodings/rebinding, `normalize/mcp.ts` schemas) would find more; no fuzzing infra
+exists yet. Do this opportunistically — driven by what dogfooding surfaces, or as
+its own planned effort — NOT as a gate that must clear before Phase 1. The two
+genuinely-open scope questions it would raise are recorded as spec §18 Deferred
+items (sandbox-escape testing depth; upstream TLS/MITM) — decide them WHEN that
+work begins, don't pre-answer. (A prior draft of this section proposed a formal
+"harden-before-Phase-1" reorder and a full threat-model doc; that over-reached —
+it imported a Phase-4 multi-tenant lens into an MVP-stage plan. Corrected
+2026-07-14: v1 is single-operator per §18; the DoS is "an agent can't wedge the
+operator's own server," not cross-tenant. See §18 "Whole-process sandbox
+availability" + the two new Deferred items.)
 
 Each build piece is §5.5-scale — **START WITH `superpowers:brainstorming` then
 `writing-plans`**; do NOT jump to code. Everything stays load-bearing: branch
 from origin/main, PR per commit routing, Tier 2 + /security-review + a REAL
 cross-model pass (codex needs the correctness-framing workaround — LEARNINGS
-2026-07-14 #2) + /explain-diff quiz + HUMAN-NAMED merge. The security work
-ITSELF is the highest-stakes tier — cross-model is mandatory, not optional
+2026-07-14 #2) + /explain-diff quiz + HUMAN-NAMED merge. Any future security
+hardening is the highest-stakes tier — cross-model is mandatory there
 (LEARNINGS #1).
 
 ### Carry-overs (tracked)
@@ -123,9 +112,6 @@ ITSELF is the highest-stakes tier — cross-model is mandatory, not optional
   envelope changes overflow→infra-fault). Noted at the call site.
 - **`deadlineFor` uses injectable `now` vs the sandbox's `Date.now`.** Production
   uses one clock (no mismatch); a single monotonic clock is a nice-to-have.
-- **Stale worktree to remove:** `scratchpad/parent-wt` (detached `46dcc27`,
-  created only to test DoS pre-existence). Needs `git worktree remove --force`
-  (a per-invocation-confirm command) — ask the user, then prune.
 - **CLI wording fix (from gate one):** `add-mcp`'s "seeded N tools under
   <prefix>" implies prefix == agent tool path; it's the namespace. Clarify in
   `packages/cli/README.md` + the summary line with the next CLI-touching PR.
@@ -152,22 +138,22 @@ https://claude.ai/code/artifact/3531cb24-db62-42a1-9a69-e9d46ae5f018)
 > robustness) merged (squash) → main `8c622d5`; sdk 333 + mcp 44 + cli 50 green.
 > Do NOT re-open gate two or re-implement its fixes.**
 >
-> **NEXT: HARDEN + DOGFOOD the core BEFORE Phase-1 features** (roadmap decided
-> 2026-07-14 — a security product hardens the surface it has before widening it;
-> the DoS was found by accident, and features add attack surface). In order:
-> (1) `THREAT-MODEL.md` — a DRAFT exists (`docs/THREAT-MODEL.md`); resolve its
-> open scope decisions WITH THE USER (adversary model, multi-tenant assumptions)
-> — interview, don't assume. (2) Dogfood `conduit serve` against 2-3 REAL MCP
-> upstreams, log friction. (3) Build fuzzing infra (none exists) + red-team the
-> existing boundary: sandbox, §9.2 credential structural guarantee, §9.3 egress
-> encodings/rebinding, normalizer schemas. (4) THEN Phase-1 features (web console
-> → FTS5 → durable service → `/mcp` HTTP). Each build piece: START WITH
-> `superpowers:brainstorming` then `writing-plans`. Load-bearing route: branch
-> from origin/main, PR routing, Tier 2 + /security-review + a REAL cross-model
-> pass (codex needs the correctness-framing workaround, LEARNINGS 2026-07-14 #2)
-> + /explain-diff quiz + HUMAN-NAMED merge. Security work is the highest-stakes
-> tier — cross-model is MANDATORY (LEARNINGS #1). See the full roadmap in the
-> "NEXT TASK" section above.
+> **NEXT: dogfood the real skeleton** — the §17 checkpoint's own "STOP, test"
+> step; needs ZERO new scope decisions. Point `conduit serve` at a REAL MCP
+> upstream (GitHub / a real credentialed API), run genuine agent workflows, keep
+> a friction log (gate one found 3 real quirks from one manual run). Then the
+> spec's decided path resumes: the rest of Phase 1 (web console → FTS5 → durable
+> service → `/mcp` HTTP). Security hardening / fuzzing (sandbox, §9.2 structural
+> guarantee, §9.3 egress, normalizer) is real but POST-MVP and NOT a blocking
+> prerequisite — do it opportunistically, driven by dogfooding, cross-model
+> MANDATORY (LEARNINGS #1). The two genuinely-open scope questions are §18
+> Deferred items (sandbox-escape depth; upstream TLS) — decide WHEN that work
+> starts. Each build piece: START WITH `superpowers:brainstorming` then
+> `writing-plans`; load-bearing route (branch → PR → Tier 2 + /security-review +
+> real cross-model + /explain-diff quiz + HUMAN-NAMED merge). See the "NEXT TASK"
+> section above. (NOTE: an earlier draft over-reached with a "harden-before-Phase-1"
+> reorder + a full threat model — corrected 2026-07-14; the MVP is done and
+> dogfooding is the honest next step.)
 
 ### ⚠️ Historical note — everything below is SUPERSEDED by the above.
 
