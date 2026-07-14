@@ -579,8 +579,20 @@ four exclusion zones, reference-not-secret in the sandbox.
 output-size cap (defaults 60s / 128 MB / 1 MB; operator-tunable). A runaway
 `while(true)` is interrupted, not babysat.
 7. **Pluggable auth**: built-in session auth or delegated identity (Access/JWT).
-8. **Origin pinning**: `CONDUIT_WEB_BASE_URL` must match for browser logins.
-9. **Audit**: every call traced and exportable; secrets redacted in Trace.
+8. **Local browser control-plane integrity (request authenticity)**: the web console
+is a browser client of an unauthenticated loopback API that can fire real credentialed calls, so it
+needs a request-authenticity floor SEPARATE from login/identity auth (a malicious web page is a remote
+attacker that can reach `127.0.0.1` — CSRF-to-localhost / DNS-rebinding). On every
+STATE-CHANGING request: validate `Host` against the exact local listener (blocks rebinding);
+require the exact console `Origin` == `CONDUIT_WEB_BASE_URL` (reject `null`
+/ foreign); mutations only via non-simple JSON (never GET/form); no permissive CORS; a same-origin CSRF
+nonce / short-lived local capability; equivalent checks on any WS/SSE upgrade. This WIDENS the old
+"origin pinning for browser logins" rule to all mutating requests — it is NOT the login/identity auth
+library (that stays deferred, §18). Bind literally to loopback and FAIL CLOSED if bound beyond loopback
+while login-auth is unavailable.
+9. **Audit**: every call traced and exportable; secrets redacted in Trace. Any trace UI
+renders `trace_events` only (never the unredacted `replay_journal`, §18) and
+escapes content under a restrictive CSP — upstream/trace fields are attacker-controlled data.
 
 ---
 
@@ -621,6 +633,59 @@ line.
 
 Only after both gates pass does the build resume: the rest of Phase 1 (web console, FTS5), then
 Phases 2+. (Decided 2026-07-08.)
+
+**⭑ v1 Surface Product — the first thing a real end user can adopt (milestone, decided
+2026-07-14)**
+
+The MVP is a walking skeleton (done). Phase 1 as written groups capabilities, not the shortest path
+to a usable product; the v1 surface product is a NARROW cherry-pick from Phases 1–2 that turns the
+CLI-and-config developer preview into something a non-CLI user can adopt. Explicitly scoped
+**local, loopback, single-user, no login-auth** (§13.1) — every deferral below follows from
+that scope. Reviewed cross-model (2026-07-14): the naive "loopback + unauthenticated + web console" cut
+is CSRF-to-localhost / DNS-rebinding exploitable, so the request-authenticity floor (§16) is IN the
+milestone, not deferred with the auth library.
+
+**In v1 (build):**
+
+- **Durable background service** — owns the DB, execution manager, caches, and the
+control API. Decide the process-ownership model first: one daemon owns the store; the stdio
+`/mcp` surface is a thin local client of it (or an explicitly safe shared-store contract).
+A console over a throwaway foreground runtime that dies between agent sessions (and strands §5.5 paused
+approvals) is not a product.
+- **Typed control-plane API + hot-reload** — the console's own local HTTP API (distinct
+from the `/mcp` transport). It MUST invalidate/reload so a source saved in the console is
+visible to the running server without a restart (the §17 startup-reload caveat becomes a product bug
+otherwise). The API accepts an abstract actor/principal now (anonymous-local) so Cloud/self-host auth
+does not later require rewriting every handler.
+- **Request-authenticity floor (§16)** — ships IN THE SAME INCREMENT as the console, not
+after: Host/Origin validation, CSRF nonce, non-simple-JSON mutations, no permissive CORS, restrictive
+CSP + escaped trace/upstream content, loopback-only bind (fail closed beyond loopback). This is
+request integrity, NOT login/identity auth.
+- **Web console** — Add Source (**MCP-only** per the v1 upstream-scope
+decision, §18), connections, a policy editor over the EXISTING per-tool allow/approval/block model
+(no schema-aware/input-aware authoring), the **pending-approvals view** (§10.2 — mandatory:
+the first destructive call pauses, and the console is the human-usable resume path), and the Connect
+card.
+- **Read-only trace viewer** — projection of `trace_events` with cursor
+pagination and basic indexed filters (time/execution/tool/verdict; no FTS). NEVER joins or exposes the
+unredacted `replay_journal` (§18). Escaped rendering + CSP. NO export and NO
+retention/GC (both stay deferred, below); a durable local store SHOULD offer a confirmed manual purge
+that preserves pending executions + replay data.
+- **Prerequisite — verify credential key lifecycle.** Secrets-at-rest is built
+(SecretBox); before external users store real credentials, confirm the master-key generation, file
+permissions, and a defined recovery/rotation story (§16.3, Phase 0).
+
+**Deferred OUT of v1** (each follows from the local/loopback/single-user scope):
+`/mcp` streamable-HTTP transport (stdio already serves local Claude Desktop/Cursor; HTTP is a
+hosted/remote-agent need — keep its route stack independent so building the console never implements
+`/mcp`-over-HTTP); FTS5/BM25 (in-memory catalog suffices at v1 scale, §8); the login/identity
+**auth library** (§18 — moves to Phase 4/Cloud); input-aware policy rules (Phase 2, §10.3);
+trace export + retention/GC (Phase 2/4); desktop (Phase 3, cut); Cloud (4); self-host (5).
+
+**Build sequence:** (1) verify credential key lifecycle → (2) decide daemon ownership →
+(3) typed control API + hot-reload → (4) request-authenticity floor → (5) console onboarding /
+connections / policy / approvals / Connect → (6) read-only trace viewer → (7) service install / restart
+/ upgrade / recovery. Each piece is load-bearing.
 
 **Phase 1 — Local runtime + CLI + MCP**
 
@@ -768,7 +833,13 @@ forgotten.
 
 **Deferred (future phases — none block v0.1 / Phase 0):**
 
-1. **Auth library** for built-in mode (better-auth-equivalent) and the delegated-auth contract — Phase 1.
+1. **Auth library — SPLIT (revised 2026-07-14):** the login/identity system
+(better-auth-equivalent session auth + the delegated-auth contract) moves to **Phase 4/Cloud**
+— a local single-user product on loopback needs no login (§13.1). What must NOT be deferred is the
+**request-authenticity floor** (Host/Origin/CSRF/CSP/loopback-bind, §16) — that ships IN the
+v1 surface product because a browser console over an unauthenticated loopback API is otherwise
+CSRF-to-localhost / DNS-rebinding exploitable. "Defer auth" means defer login/identity, NOT request
+integrity. (Cross-model reviewed 2026-07-14.)
 2. **Trace storage scale** (SQLite fine locally; Cloud needs a real store + retention tiers) — Phase 4.
 3. **npm allowlist contents**: which packages ship vetted by default (AI SDK, validation, etc.) — Phase 0/1.
 4. **Pricing shape** for Cloud (out of scope per editorial standard, but flag for product) — Phase 4.
