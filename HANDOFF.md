@@ -119,8 +119,8 @@ lifecycle.
 
 ### Session debrief (this session)
 
-See the 2026-07-16 debrief artifact (link in the session's final message;
-friction log distilled into this handoff + LEARNINGS 2026-07-16).
+https://claude.ai/code/artifact/c9568154-1def-4460-bcbb-c0b870a46b7c
+(friction log distilled into this handoff + LEARNINGS 2026-07-16).
 
 ### Kickoff prompt for the next session
 
