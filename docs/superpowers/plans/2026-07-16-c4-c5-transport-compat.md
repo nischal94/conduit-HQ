@@ -762,7 +762,7 @@ it("INVARIANT §18-C5: records the raw upstream name so hyphenated names round-t
 - Budget mapping: `createMcpClient` gets `{ deadline: () => <remaining of request.timeoutMs measured from call start>, maxBytes: options.maxResponseBytes ?? 1 MiB }` — the WHOLE logical operation (handshake + call + one retry) shares `request.timeoutMs`, preserving F1 semantics.
 - Error mapping parity (read the current upstream.ts:140-300 first): `McpClientError` kinds map — `cap` → the existing response-cap upstreamError text; `timeout` → "timed out after {timeoutMs}ms"; `http_status` 3xx → the redirect-refused text; other `http_status`/`protocol` → upstreamError carrying status + sanitized detail via `sanitizeUpstreamText`; `network` + egress-blocked → exactly today's classification (`isEgressBlockedError` structural check preserved). §9.2: auth material still never appears in any error/trace (the client already never echoes headers; keep `credentialTokens` redaction on body-derived text).
 
-- [ ] **Step 1: Rewrite the wire-level tests.** Read `upstream.test.ts` fully first. Every existing test that spins a bare-JSON-RPC fixture server gets its fixture upgraded to the streamable-HTTP handshake (factor ONE local `createStreamableFixture(handlers)` helper inside the test file: handles initialize/initialized bookkeeping, then delegates tools/call to the test's handler; support a `sessionless: true` flag). Existing invariants that MUST survive with identical meaning: egress pre-flight refusal text; pinned-lookup DNS-rebinding block; redirect refusal; non-JSON/SSE content-type handling (now: SSE accepted, `text/plain` still refused); response byte cap; timeout classification; §9.2 no-token-in-error. NEW tests: `INVARIANT §18-C5: a hyphenated upstreamName from sourceSemantics is sent on the wire` (fixture asserts `params.name === "resolve-library-id"` for a Tool whose display name is `context7.resolve_library_id` and semantics carry the raw name); legacy-row fallback (no upstreamName → prefix-strip used); `handshake+call share request.timeoutMs` (fixture stalls initialize past the budget → timeout error, no call ever received).
+- [ ] **Step 1: Rewrite the wire-level tests.** Read `upstream.test.ts` fully first. Every existing test that spins a bare-JSON-RPC fixture server gets its fixture upgraded to the streamable-HTTP handshake (factor ONE local `createStreamableFixture(handlers)` helper inside the test file: handles initialize/initialized bookkeeping, then delegates tools/call to the test's handler; support a `sessionless: true` flag). Existing invariants that MUST survive with identical meaning: egress pre-flight refusal text; pinned-lookup DNS-rebinding block; redirect refusal; non-JSON/SSE content-type handling (now: SSE accepted, `text/plain` still refused); response byte cap; timeout classification; §9.2 no-token-in-error. NEW tests: `INVARIANT §18-C5: a hyphenated upstreamName from sourceSemantics is sent on the wire` — and this test goes THROUGH THE STORE, not an in-memory Tool: `normalizeMcp` the hyphenated fixture → `store.tools.replaceNamespace` into a real in-memory sqlite store → `store.tools.get` → hand the HYDRATED tool to the caller → fixture asserts `params.name === "resolve-library-id"` (pins that `upstreamName` survives the source_semantics JSON round-trip, spec Testing: "normalize → store → call"); legacy-row fallback (a tool whose stored source_semantics JSON lacks upstreamName → prefix-strip used — write the row with raw SQL or a semantics object without the field); `handshake+call share request.timeoutMs` (fixture stalls initialize past the budget → timeout error, no call ever received).
 
 - [ ] **Step 2: Run to verify the new/updated tests fail** — `cd packages/sdk && node_modules/.bin/vitest run src/pipeline/upstream.test.ts` → FAIL (old wire code).
 
@@ -926,6 +926,27 @@ Then `superpowers:finishing-a-development-branch` → Lane B PR → its own load
 **Lane-B verification step 0 (BEFORE any real PAT is used in dogfooding the merged result):** rotate the demo key — delete `~/.conduit/conduit.db*` + `gate-one-key`, mint a fresh key, update `~/.conduit/claude-desktop-snippet.json` + any Claude Code MCP config (HANDOFF housekeeping entry).
 
 ---
+
+## Real-upstream acceptance matrix (Lane B verification — the definition of "transport support complete")
+
+Fixtures prove determinism for CI; **transport support is complete only when
+this matrix passes against independent third-party servers** (LEARNINGS
+2026-07-16 #1). Run AFTER the key rotation (step 0) with a freshly minted
+`~/.conduit`; record results in the Lane B PR description.
+
+| # | Endpoint | Action (real CLI / real client, NO shim) | Expected outcome |
+|---|----------|------------------------------------------|------------------|
+| 1 | Context7 `https://mcp.context7.com/mcp` | `conduit add-mcp --url … --namespace context7 --prefix context7` (no credential) | Exit 0; 2 tools seeded, both safe |
+| 2 | Context7 | From a real MCP client via `conduit serve`: search → describe → `resolve-library-id` call with valid args | Completed execution; real library results; trace rows present |
+| 3 | Context7 | Chained workflow in ONE execution (resolve → parse → query-docs) | Completed; 2 trace rows under one execution_id; hyphenated names called correctly (C5 live) |
+| 4 | Context7 | Kill and restart `conduit serve` between onboarding and calling | Calls still work (fresh drive = fresh handshake; no stale-session dependence) |
+| 5 | GitHub `https://api.githubcopilot.com/mcp/` | `CONDUIT_ADD_SECRET="Bearer <PAT>" conduit add-mcp …` | Exit 0; ~44 tools seeded across safe/review/destructive |
+| 6 | GitHub | A safe read call (e.g. `get_me`) through the real client | Completed with real data (PAT sent serve-time, SSE parsed) |
+| 7 | GitHub | `add-mcp` WITHOUT the secret | Exit 1; error names authorization + CONDUIT_ADD_SECRET (NOT "unreachable") |
+| 8 | Vercel `https://mcp.vercel.com` | `add-mcp` (no static secret possible) | Exit 1; truthful auth error. DOCUMENTED expected failure — OAuth is out of scope (spec §18); this row pins that the failure is honest, not that it succeeds |
+| 9 | Any | Byte/tool-cap and timeout errors still name the cap/budget precisely (spot-check via fixture if no real trigger) | Specific error text, never generic "unreachable" |
+
+A matrix row failing = Lane B is NOT done, regardless of green suites.
 
 ## Deviations log
 
