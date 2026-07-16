@@ -1430,3 +1430,34 @@ to a check. The shape-correct fix was to catch the host throw at the boundary
 and rebuild, closing the whole class. **When fixing a resource/limits issue, ask
 what dimension actually drives the failure (depth vs size vs count vs time) and
 bound THAT — a fix that bounds the wrong dimension looks safe and isn't.**
+
+## 2026-07-16 — MVP dogfood against real public MCP upstreams (no PR; findings session)
+
+### 1. Compatibility proven only against self-authored upstreams is self-referential — count real third-party servers, not tests
+
+The MVP's transport was green against its own demo upstreams (bare JSON-RPC
+POST), and 0 of 3 real public MCP servers could be onboarded: GitHub → 401
+(onboarding fetch never sends auth; CONDUIT_ADD_SECRET is stored but unused
+at fetch time), Context7 → 400 "No valid session ID" (no initialize
+handshake), Vercel → 401 (OAuth). Serve-time additionally hard-refuses
+`text/event-stream` responses — the streamable-HTTP default. The standard
+handshake (initialize → Mcp-Session-Id → notifications/initialized, Accept
+with both content types, SSE frame parsing) was verified working against
+Context7 in a 30-line probe, so the fix (C4) is well-defined. **A transport
+is "done" when N real third-party endpoints onboard, not when the in-repo
+demo passes — put "works against ≥2 servers we didn't write" in the
+definition of done for any protocol surface.**
+
+### 2. Exit codes report the operator's operation, not the downstream object — `approvals deny` says "failed" when the deny succeeded
+
+`conduit approvals deny` on a paused execution prints "failed / deny failed:
+ConduitPolicyBlocked: operator denied this call on resume" and exits 1 —
+but the deny did exactly what the operator asked; it is the EXECUTION that
+(correctly) failed. Scripted denials will misread exit 1 as "retry the
+deny". **When a CLI verb's success necessarily produces a failure object
+(deny → failed execution), the exit code and headline word must track the
+VERB's outcome; put the object's fate in the detail line.** Same session:
+`add-mcp` flattens every fetch error (401, byte-cap, tool-cap) into
+"upstream unreachable — re-run when reachable", sending an auth problem to
+a network queue — the rich error existed and was discarded at the one
+catch site.

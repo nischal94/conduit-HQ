@@ -23,19 +23,129 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-14, amended 2026-07-16 (§17 GATE TWO CLOSED → MVP DONE. PR #34 MERGED (squash) → main `8c622d5`)
+## Current handoff — written 2026-07-16 (MVP DOGFOOD DONE: 0/3 real public MCP upstreams onboardable — C4 is an ADOPTION BLOCKER, not a tracked nicety)
 
-**Amendment 2026-07-16 (staleness-tripwire reconciliation):** one commit landed
-after this handoff was written — **PR #36 merged → main `840571a`** (spec-only,
-2026-07-14): §17 gained the **"v1 surface product" milestone**, §16.8 the
-request-authenticity floor, §18 the auth split (login/identity → Phase 4;
-request integrity stays in v1). This SUPERSEDES the loose "resume the rest of
-Phase 1" list below — after dogfooding, the decided path is §17's v1
-surface-product build sequence: (1) verify credential key lifecycle → (2)
-decide daemon ownership → (3) typed control API + hot-reload → (4)
-request-authenticity floor → (5) console → (6) read-only trace viewer → (7)
-service lifecycle. `/mcp`-over-HTTP and FTS5 are deferred OUT of v1. The
-"dogfood first" step is unchanged and remains the current task.
+### Where things stand
+
+- **Main is `4f1a4e7`** (docs). MVP unchanged since PR #34/`8c622d5`; PR #36
+  (`840571a`, spec-only) added the §17 **v1 surface-product milestone** +
+  §16.8 request-authenticity floor + §18 auth split. No open PRs.
+- **The dogfood step from the previous handoff is DONE (2026-07-16).** Two
+  halves:
+  - **Real-upstream onboarding: FAILED 3/3 — the headline finding.**
+    GitHub (`api.githubcopilot.com/mcp/`) → 401, `fetchToolsList` never sends
+    auth (CONDUIT_ADD_SECRET is stored but unused at onboarding); Context7
+    (`mcp.context7.com/mcp`) → 400 "No valid session ID" (no initialize
+    handshake); Vercel (`mcp.vercel.com`) → 401 OAuth. Serve-time
+    (`pipeline/upstream.ts`) DOES send auth but has the same session gap and
+    hard-refuses `text/event-stream` responses (the streamable-HTTP default).
+    **The MVP is only compatible with bare-JSON-RPC upstreams — i.e. its own
+    demo scripts.** The standard streamable-HTTP handshake was VERIFIED
+    working against Context7 (initialize → Mcp-Session-Id →
+    notifications/initialized → tools/list over SSE framing) — the C4 fix is
+    well-defined, not exploratory.
+  - **Live agent loop over the gate-one db: PASSED, from this very session
+    as the real MCP client** (conduit serve wired into Claude Code). search
+    ranking, review-class pause (clear agent-facing message), `approvals
+    list` table, approve → resume → fail-loud on the dead upstream,
+    double-approve conflict (exit 1), deny → agent sees ConduitPolicyBlocked
+    — all correct.
+- **CLI frictions found (fold into the C4/CLI PR, same files):**
+  1. `add-mcp` flattens EVERY fetch error (401 / byte-cap / tool-cap) into
+     "upstream unreachable — re-run when reachable" (the one catch at
+     `commands/add-mcp.ts:127` discards mcp-fetch.ts's rich errors — they
+     are dead strings). An auth problem is reported as a network problem.
+  2. `approvals deny` reports operator success as failure: "deny failed:
+     ConduitPolicyBlocked" + exit 1 when the deny SUCCEEDED (the execution
+     failed, correctly). Exit code should track the verb.
+  3. No `add-mcp --help` (falls through to validation); flags are
+     discoverable only from source/README. Drip-feed validation (namespace,
+     then prefix, one error per run).
+  4. Open question: `retryable:false` on connection-refused — the canonical
+     transient failure; define what retryable means (same execId vs
+     re-issue).
+- LEARNINGS 2026-07-16 has the distilled lessons (self-referential compat;
+  exit codes track the verb).
+
+### NEXT TASK — fix C4 (real-upstream compatibility), THEN the v1 surface sequence
+
+**Pending user decision first:** C4 is not in the §17 v1 build sequence, but
+v1's console ships "Add Source (MCP-only)" — pointless if no real MCP source
+can be added. Recommendation: promote the C4 fix to the first post-dogfood
+PR (or step 0 of the v1 sequence) and record that in spec §18. The user
+decides; the spec edit follows their call.
+
+The C4 fix scope (verified against real servers this session): initialize
+handshake + Mcp-Session-Id + notifications/initialized; `Accept:
+application/json, text/event-stream` + SSE frame parsing on BOTH the
+onboarding fetch (`packages/cli/src/mcp-fetch.ts`) and serve-time
+(`packages/sdk/src/pipeline/upstream.ts`); send CONDUIT_ADD_SECRET during
+onboarding; fold in CLI frictions 1–3 above (same files). It is §5.5-scale
+and touches the §9.3 boundary file → **START WITH `superpowers:brainstorming`
+then `writing-plans`**; full load-bearing route (branch from origin/main, PR,
+Tier 2 + /security-review + REAL cross-model pass with the correctness
+framing — LEARNINGS 2026-07-14 #2 — + /explain-diff quiz + HUMAN-NAMED
+merge). Then proceed to §17's v1 surface-product sequence: (1) credential
+key lifecycle → (2) daemon ownership → (3) control API + hot-reload → (4)
+request-authenticity floor → (5) console → (6) trace viewer → (7) service
+lifecycle.
+
+### Carry-overs (tracked)
+
+- **Resume drops caller-supplied limits (P2, pre-existing).** `Execution`
+  doesn't persist `limits`; resumed drives use defaults. Needs a schema
+  change — its own small PR.
+- **`isHostStackOverflow` V8-message heuristic** — degrades safely; noted at
+  the call site.
+- **CLI wording fix (gate one):** "seeded N tools under <prefix>" implies
+  prefix == tool path; it's the namespace. Fold into the C4/CLI PR.
+- Retire `scripts/approve-demo.mjs` (migrate the mcp integration test to
+  spawn the CLI first).
+- Call-capable demo upstream in-repo (gate one used a scratch one; the C4
+  work will need a REAL streamable-HTTP test upstream anyway — consider
+  building it as the fixture).
+- Other tracked SDK items: C5 non-round-trippable tool names;
+  `getByIntegrationId`; `pausedAt` on PendingApproval; `--json` failure-path
+  shape; tools INSERT SQL dup (3rd site rule).
+- Aikido SAST MCP still not connected (`/aikido:setup` in the user's
+  terminal).
+- **Housekeeping note:** `~/.conduit/claude-desktop-snippet.json` holds the
+  gate-one demo CONDUIT_MASTER_KEY in plaintext (by design — it's a config
+  snippet), and it was echoed into the 2026-07-16 session transcript.
+  Demo-scale secret (protects the gate-one demo db only); rotate at leisure
+  by regenerating the key + re-adding sources. The gate-one db now also
+  carries two deliberately-failed dogfood executions (pause/deny exercises)
+  — harmless test data.
+
+### Session debrief (this session)
+
+See the 2026-07-16 debrief artifact (link in the session's final message;
+friction log distilled into this handoff + LEARNINGS 2026-07-16).
+
+### Kickoff prompt for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: MVP done AND dogfooded (2026-07-16). Headline: 0/3 real public
+> MCP upstreams (GitHub, Context7, Vercel) can be onboarded — C4 transport
+> compatibility is THE adoption blocker. The fix is verified-well-defined
+> (streamable-HTTP handshake + SSE framing + onboarding auth; see HANDOFF
+> "NEXT TASK" for exact scope and files).**
+>
+> **NEXT: the C4 real-upstream compatibility fix** — but FIRST confirm with
+> the user that C4 is promoted ahead of the §17 v1 surface sequence (and
+> record that in spec §18 once they decide). It's §5.5-scale touching the
+> §9.3 boundary: START WITH `superpowers:brainstorming` then
+> `writing-plans`; load-bearing route (branch → PR → Tier 2 +
+> /security-review + real cross-model with correctness framing +
+> /explain-diff quiz + HUMAN-NAMED merge). Fold in the CLI frictions
+> (error flattening, deny exit code, add-mcp --help) — same files. Then
+> resume the §17 v1 surface-product sequence from step 1 (credential key
+> lifecycle). Do NOT re-run the dogfood; its findings are recorded.
+
+---
+
+## Superseded handoff — written 2026-07-14 (§17 GATE TWO CLOSED → MVP DONE. PR #34 MERGED (squash) → main `8c622d5`; its "dogfood" NEXT TASK was completed 2026-07-16 by the section above)
 
 ### Where things stand — the MVP is complete
 
