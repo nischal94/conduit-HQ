@@ -23,7 +23,19 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-14 (§17 GATE TWO CLOSED → MVP DONE. PR #34 MERGED (squash) → main `8c622d5`)
+## Current handoff — written 2026-07-14, amended 2026-07-16 (§17 GATE TWO CLOSED → MVP DONE. PR #34 MERGED (squash) → main `8c622d5`)
+
+**Amendment 2026-07-16 (staleness-tripwire reconciliation):** one commit landed
+after this handoff was written — **PR #36 merged → main `840571a`** (spec-only,
+2026-07-14): §17 gained the **"v1 surface product" milestone**, §16.8 the
+request-authenticity floor, §18 the auth split (login/identity → Phase 4;
+request integrity stays in v1). This SUPERSEDES the loose "resume the rest of
+Phase 1" list below — after dogfooding, the decided path is §17's v1
+surface-product build sequence: (1) verify credential key lifecycle → (2)
+decide daemon ownership → (3) typed control API + hot-reload → (4)
+request-authenticity floor → (5) console → (6) read-only trace viewer → (7)
+service lifecycle. `/mcp`-over-HTTP and FTS5 are deferred OUT of v1. The
+"dogfood first" step is unchanged and remains the current task.
 
 ### Where things stand — the MVP is complete
 
