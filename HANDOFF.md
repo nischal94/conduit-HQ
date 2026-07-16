@@ -69,11 +69,12 @@ at session start.
 
 ### NEXT TASK — fix C4 (real-upstream compatibility), THEN the v1 surface sequence
 
-**Pending user decision first:** C4 is not in the §17 v1 build sequence, but
-v1's console ships "Add Source (MCP-only)" — pointless if no real MCP source
-can be added. Recommendation: promote the C4 fix to the first post-dogfood
-PR (or step 0 of the v1 sequence) and record that in spec §18. The user
-decides; the spec edit follows their call.
+**DECIDED + RECORDED (2026-07-16, same session):** the user reviewed the
+stress-tested evidence and named the merge — **PR #37 merged (squash) →
+main `e0e5cfe`** puts the decision in spec §18: the C4 fix is the FIRST
+post-MVP PR, ahead of the §17 v1 surface sequence (OAuth-class upstreams
+out of scope). Do NOT re-open the sequencing question; go straight to the
+brainstorm.
 
 The C4 fix scope (verified against real servers this session; REFINED by the
 2026-07-16 stress-test pass): (1) initialize handshake + Mcp-Session-Id +
@@ -146,9 +147,11 @@ https://claude.ai/code/artifact/c9568154-1def-4460-bcbb-c0b870a46b7c
 > (streamable-HTTP handshake + SSE framing + onboarding auth; see HANDOFF
 > "NEXT TASK" for exact scope and files).**
 >
-> **NEXT: the C4 real-upstream compatibility fix** — but FIRST confirm with
-> the user that C4 is promoted ahead of the §17 v1 surface sequence (and
-> record that in spec §18 once they decide). It's §5.5-scale touching the
+> **NEXT: the C4 real-upstream compatibility fix** — sequencing is DECIDED
+> and in spec §18 (PR #37 merged → main `e0e5cfe`): C4 goes FIRST, ahead of
+> the §17 v1 surface sequence; do not re-ask. Step 0 before any real PAT is
+> stored: rotate the gate-one demo key (delete demo db + key, mint fresh —
+> see carry-overs). It's §5.5-scale touching the
 > §9.3 boundary: START WITH `superpowers:brainstorming` then
 > `writing-plans`; load-bearing route (branch → PR → Tier 2 +
 > /security-review + real cross-model with correctness framing +
