@@ -217,6 +217,35 @@ describe("INVARIANT §18-C4: initialize handshake", () => {
     await expect(tiny.initialize()).rejects.toMatchObject({ kind: "cap" });
   });
 
+  it("surfaces a JSON-RPC error rejection of initialize with the server's code and message", async () => {
+    const url = await serve((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const parsed = JSON.parse(raw);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            error: { code: -32600, message: "Invalid Request" },
+          }),
+        );
+      });
+    });
+    await expect(
+      createMcpClient({ target: url, headers: {} }, budget()).initialize(),
+    ).rejects.toMatchObject({
+      kind: "protocol",
+      message: expect.stringContaining("Invalid Request"),
+    });
+    await expect(
+      createMcpClient({ target: url, headers: {} }, budget()).initialize(),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("-32600"),
+    });
+  });
+
   it("an exhausted deadline fails as timeout before any request", async () => {
     const url = await serve((_req, res) => res.end());
     const spent = createMcpClient(

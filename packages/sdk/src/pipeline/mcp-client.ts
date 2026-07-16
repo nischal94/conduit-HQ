@@ -294,7 +294,7 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       throw new McpClientError("timeout", "MCP operation budget already exhausted");
     }
     const id = randomUUID();
-    const { result, headers } = await requestAndAwait(
+    const { result, error, headers } = await requestAndAwait(
       {
         jsonrpc: "2.0",
         id,
@@ -309,6 +309,17 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       id,
       false,
     );
+    if (error !== undefined) {
+      // The server's own JSON-RPC rejection: surface its code and message
+      // rather than a generic shape-validation failure. The message text is
+      // upstream-controlled but stays within the client; serve-time
+      // sanitization happens in upstream.ts's mapping. Nothing from
+      // endpoint.headers is interpolated (§9.2).
+      throw new McpClientError(
+        "protocol",
+        `MCP server rejected initialize: ${error.message} (code ${error.code})`,
+      );
+    }
     const parsed = initializeResultSchema.safeParse(result);
     if (!parsed.success) {
       throw new McpClientError(
