@@ -177,29 +177,32 @@ scope for v1.
 
 ### D4 — C5: store the upstream tool name; never derive it
 
-`tools` gains an `upstream_name` column. `normalizeMcp` records the
-original upstream name alongside the transformed display name. Serve-time
-sends `upstream_name` — the prefix-strip derivation is deleted. A one-time
-migration backfills existing rows using that same prefix-strip derivation
-(migration precedent: the §11 trace migration).
+**(Amended pre-plan, 2026-07-16, after re-reading the store: strictly less
+machinery than the column design the review converged on, with identical
+observable behavior.)** The `{ kind: "mcp" }` variant of `SourceSemantics`
+(types.ts:47-51) gains `upstreamName?: string`. `SourceSemantics` is
+ALREADY persisted whole as the `source_semantics` JSON TEXT column on
+`tools` — this is also the home the spec §18 C5 clause itself named
+("until the original name is stored in `sourceSemantics`"). Therefore:
+**no schema migration, no INSERT changes, no backfill step.**
+`normalizeMcp` always sets `upstreamName` to the original wire name.
+Serve-time uses `sourceSemantics.upstreamName` when present; a legacy row
+(field absent) falls back to today's prefix-strip derivation — which IS
+the documented-lossy backfill semantics of the reviewed design, expressed
+as a read-time fallback instead of a write-time migration.
 
-**The backfill is knowingly lossy, and that is documented, not hidden:** a
-stored `resolve_library_id` cannot reveal whether the upstream name was
-`resolve-library-id` or `resolve_library_id`, so a backfilled row whose
-name the normalizer transformed carries a possibly-wrong `upstream_name`.
-This is accepted deliberately because (a) those rows are EXACTLY the rows
-that are already uncallable today (the C5 bug) — the backfill regresses
-nothing and fixes the untransformed majority; (b) there are no production
-deployments (pre-launch; the only known db is the demo db slated for
-deletion at key rotation); (c) `add-mcp` re-sync fully repairs a catalog.
-The migration note and CLI README say: pre-C5 catalogs with transformed
-names need one `add-mcp --replace` re-sync. The fail-closed alternative
-(NULL upstream_name + serve-time refusal until re-sync) was considered and
-rejected as machinery for a user base of zero.
+**The fallback is knowingly lossy for legacy rows, documented, not
+hidden:** a legacy `resolve_library_id` cannot reveal whether the upstream
+name was hyphenated. Accepted deliberately because (a) such rows are
+EXACTLY the rows already uncallable today — nothing regresses; (b) there
+are no production deployments (pre-launch; the only known db is the demo
+db slated for deletion at key rotation); (c) one `add-mcp --replace`
+re-sync fully repairs a catalog (CLI README says so). The fail-closed
+alternative (refuse legacy rows until re-sync) was considered and rejected
+as machinery for a user base of zero.
 
-Both `INSERT INTO tools` sites (sqlite.ts:362 `replaceNamespace`, :683
-`provisionSource`) change — that is the tracked "3rd-site" trigger for the
-SQL duplication: extract the shared tools-INSERT helper in the same change.
+Since the tools INSERT statements do not change, the tracked "3rd-site"
+SQL-duplication trigger does NOT fire — that carry-over stays parked.
 
 ### D5 — CLI frictions (same files, same PRs)
 
@@ -304,4 +307,5 @@ agent remains ref-free and passes the existing §9.2 sanitization.
   organization.
 - STOP-and-ask: any change to `UpstreamCaller`'s public interface beyond
   adding the session scope; any new dependency; any change to cap values;
-  any schema change beyond `tools.upstream_name`.
+  ANY SQL schema change (D4 as amended needs none — a needed one is a
+  design deviation).
