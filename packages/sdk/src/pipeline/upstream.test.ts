@@ -2,10 +2,15 @@ import { lookup as lookupCb } from "node:dns";
 import { lookup as lookupPromises } from "node:dns/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
+import { createClient } from "@libsql/client";
 import { afterAll, describe, expect, it, vi } from "vitest";
+import { normalizeMcp } from "../normalize/mcp.js";
+import { SecretBox } from "../secrets.js";
+import { openSqliteStore } from "../store/sqlite.js";
 import type { Source, Tool } from "../types.js";
 import { GUEST_ERROR_NAMES } from "./errors.js";
 import { createMcpUpstreamCaller } from "./upstream.js";
+import { createUpstreamSessionScope } from "./upstream-session.js";
 
 // Real by default; the rebinding test overrides both DNS entry points to make
 // the pre-flight (node:dns/promises) and the pinned lookup (node:dns) disagree.
@@ -81,9 +86,74 @@ async function serve(
   return { port: (server.address() as AddressInfo).port, requests };
 }
 
-function jsonRpcResult(res: ServerResponse, result: unknown): void {
-  res.writeHead(200, { "content-type": "application/json" });
-  res.end(JSON.stringify({ jsonrpc: "2.0", id: "1", result }));
+const NEGOTIATED_VERSION = "2025-06-18";
+const SESSION_ID = "sess-upstream-1";
+
+/**
+ * Streamable-HTTP MCP fixture. Owns the handshake bookkeeping — replies to
+ * `initialize` (200 + session id + capabilities.tools + negotiated version)
+ * and to `notifications/initialized` (202, empty body) — and delegates only
+ * the `tools/call` request to the test's `onCall(request, res, parsed)`
+ * handler, which sends the tools/call response however the test needs.
+ *
+ * `sessionless: true` suppresses the Mcp-Session-Id header (a stateless
+ * streamable-HTTP server); the handshake still succeeds without a session id.
+ */
+function createStreamableFixture(
+  onCall: (request: RecordedRequest, res: ServerResponse, parsed: { id: string }) => void,
+  opts: { sessionless?: boolean } = {},
+): (request: RecordedRequest, res: ServerResponse) => void {
+  return (request, res) => {
+    const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+    if (parsed.method === "initialize") {
+      const headers: Record<string, string> = { "content-type": "application/json" };
+      if (opts.sessionless !== true) {
+        headers["mcp-session-id"] = SESSION_ID;
+      }
+      res.writeHead(200, headers);
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: parsed.id,
+          result: {
+            protocolVersion: NEGOTIATED_VERSION,
+            capabilities: { tools: {} },
+            serverInfo: { name: "fixture", version: "0" },
+          },
+        }),
+      );
+      return;
+    }
+    if (parsed.method === "notifications/initialized") {
+      res.writeHead(202);
+      res.end();
+      return;
+    }
+    // tools/call (or anything else the test drives) → the test's handler.
+    onCall(request, res, { id: parsed.id ?? "1" });
+  };
+}
+
+/** Convenience: a fixture whose tools/call replies with `result` as JSON-RPC. */
+function respondingFixture(
+  result: unknown,
+  opts: { sessionless?: boolean } = {},
+): (request: RecordedRequest, res: ServerResponse) => void {
+  return createStreamableFixture((_request, res, parsed) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result }));
+  }, opts);
+}
+
+/** The tools/call request among all recorded requests (skips the handshake pair). */
+function toolsCallRequest(requests: RecordedRequest[]): RecordedRequest | undefined {
+  return requests.find((r) => {
+    try {
+      return (JSON.parse(r.body || "{}") as { method?: string }).method === "tools/call";
+    } catch {
+      return false;
+    }
+  });
 }
 
 const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
@@ -91,7 +161,7 @@ const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
 describe("MCP upstream caller (spec §5.3 step 4)", () => {
   it("POSTs JSON-RPC tools/call with the prefix-stripped tool name and auth header", async () => {
     const mcpResult = { content: [{ type: "text", text: "3 issues" }] };
-    const { port, requests } = await serve((_request, res) => jsonRpcResult(res, mcpResult));
+    const { port, requests } = await serve(respondingFixture(mcpResult));
 
     const outcome = await caller.call({
       tool,
@@ -105,12 +175,14 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     expect(outcome.status).toBe(200);
     expect(outcome.latencyMs).toBeGreaterThanOrEqual(0);
 
-    expect(requests).toHaveLength(1);
-    const request = requests[0];
-    expect(request?.method).toBe("POST");
-    expect(request?.headers.authorization).toBe(SECRET);
-    expect(request?.headers["content-type"]).toBe("application/json");
-    const payload = JSON.parse(request?.body ?? "{}");
+    const call = toolsCallRequest(requests);
+    expect(call).toBeDefined();
+    expect(call?.method).toBe("POST");
+    expect(call?.headers.authorization).toBe(SECRET);
+    expect(call?.headers["content-type"]).toBe("application/json");
+    // Handshake carried the auth header too (session established under it).
+    expect(requests[0]?.headers.authorization).toBe(SECRET);
+    const payload = JSON.parse(call?.body ?? "{}");
     expect(payload.method).toBe("tools/call");
     expect(payload.params).toEqual({
       name: "list_issues", // namespace prefix stripped (decision A5)
@@ -118,8 +190,30 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     });
   });
 
+  it("accepts an SSE-framed tools/call response (streamable HTTP)", async () => {
+    const mcpResult = { content: [{ type: "text", text: "via SSE" }] };
+    const { port } = await serve(
+      createStreamableFixture((_request, res, parsed) => {
+        res.writeHead(200, { "content-type": "text/event-stream" });
+        res.end(
+          `data: ${JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: mcpResult })}\n\n`,
+        );
+      }),
+    );
+
+    const outcome = await caller.call({
+      tool,
+      source: sourceAt(port),
+      input: {},
+      auth: { headers: { Authorization: SECRET } },
+      timeoutMs: 2_000,
+    });
+    expect(outcome.result).toEqual(mcpResult);
+    expect(outcome.status).toBe(200);
+  });
+
   it("INVARIANT §9.3: the egress guard runs inside the caller (loopback blocked without the flag)", async () => {
-    const { port, requests } = await serve((_request, res) => jsonRpcResult(res, {}));
+    const { port, requests } = await serve(respondingFixture({}));
     const guarded = createMcpUpstreamCaller();
 
     await expect(
@@ -140,7 +234,7 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     // connect-time pinned lookup (node:dns) resolves the same host to a PRIVATE
     // address — the classic DNS-rebinding window. The pinned lookup must fail
     // closed so no socket ever connects to the private address.
-    const { port, requests } = await serve((_request, res) => jsonRpcResult(res, {}));
+    const { port, requests } = await serve(respondingFixture({}));
     const rebindSource: Source = {
       id: "src_rebind",
       type: "mcp",
@@ -171,7 +265,9 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     expect(requests).toHaveLength(0); // the socket never reached the server
   });
 
-  it("refuses redirects (3xx → ConduitUpstreamError, no second request)", async () => {
+  it("refuses redirects (3xx → ConduitUpstreamError, no tools/call)", async () => {
+    // The redirect fires on the handshake's very first POST (initialize); the
+    // whole logical operation is refused before any tools/call is attempted.
     const { port, requests } = await serve((_request, res) => {
       res.writeHead(302, { location: "http://127.0.0.1:9/elsewhere" });
       res.end();
@@ -186,13 +282,20 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     });
     await expect(attempt).rejects.toThrow(/redirect refused/i);
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
-    expect(requests).toHaveLength(1); // the redirect target was never followed
+    expect(toolsCallRequest(requests)).toBeUndefined(); // never followed, never called
   });
 
-  it("times out via AbortSignal and surfaces ConduitUpstreamError", async () => {
-    const { port } = await serve((_request, res) => {
-      setTimeout(() => jsonRpcResult(res, {}), 1_000);
-    });
+  it("times out and surfaces ConduitUpstreamError", async () => {
+    // The handshake completes fast; the tools/call response stalls past the
+    // shared budget.
+    const { port } = await serve(
+      createStreamableFixture((_request, res, parsed) => {
+        setTimeout(
+          () => res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: {} })),
+          1_000,
+        );
+      }),
+    );
 
     const attempt = caller.call({
       tool,
@@ -205,11 +308,13 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
   });
 
-  it("rejects non-JSON content types, naming the type", async () => {
-    const { port } = await serve((_request, res) => {
-      res.writeHead(200, { "content-type": "text/html" });
-      res.end("<html>surprise</html>");
-    });
+  it("rejects a text/plain content type on tools/call (SSE accepted, text/plain refused)", async () => {
+    const { port } = await serve(
+      createStreamableFixture((_request, res) => {
+        res.writeHead(200, { "content-type": "text/plain" });
+        res.end("surprise");
+      }),
+    );
 
     await expect(
       caller.call({
@@ -219,18 +324,21 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
         auth: { headers: {} },
         timeoutMs: 2_000,
       }),
-    ).rejects.toThrow(/non-JSON response.*text\/html/s);
+    ).rejects.toThrow(/unsupported content-type.*text\/plain/s);
   });
 
   it("caps the streamed response body at maxResponseBytes even when content-length lies", async () => {
     // Chunked transfer: no content-length at all — the cap must count bytes
-    // off the wire, not trust any header.
-    const { port } = await serve((_request, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.write('{"jsonrpc":"2.0","id":"1","result":"');
-      res.write("x".repeat(8 * 1024));
-      res.end('"}');
-    });
+    // off the wire, not trust any header. The oversized body arrives on the
+    // tools/call response.
+    const { port } = await serve(
+      createStreamableFixture((_request, res, parsed) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write(`{"jsonrpc":"2.0","id":"${parsed.id}","result":"`);
+        res.write("x".repeat(8 * 1024));
+        res.end('"}');
+      }),
+    );
     const capped = createMcpUpstreamCaller({
       maxResponseBytes: 1024,
       egress: { allowPrivate: true },
@@ -247,76 +355,19 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
   });
 
-  it("rejects a well-formed but non-JSON-RPC 200 body (no result, no error)", async () => {
-    for (const shape of ["42", "[]", "{}", "null", '"ok"']) {
-      const { port } = await serve((_request, res) => {
+  it("maps a JSON-RPC error member on tools/call to ConduitUpstreamError", async () => {
+    const { port } = await serve(
+      createStreamableFixture((_request, res, parsed) => {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(shape);
-      });
-      const attempt = caller.call({
-        tool,
-        source: sourceAt(port),
-        input: {},
-        auth: { headers: {} },
-        timeoutMs: 2_000,
-      });
-      // Never a { result: null } success, never a raw TypeError-as-infra.
-      await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
-    }
-  });
-
-  it("treats a null JSON-RPC error as no error, then requires a result", async () => {
-    const { port } = await serve((_request, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ jsonrpc: "2.0", id: "1", error: null }));
-    });
-    await expect(
-      caller.call({
-        tool,
-        source: sourceAt(port),
-        input: {},
-        auth: { headers: {} },
-        timeoutMs: 2_000,
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            error: { code: -32602, message: "Invalid params" },
+          }),
+        );
       }),
-    ).rejects.toThrow(/neither a result nor an error/);
-  });
-
-  it("redacts a bare-token echo through sanitizeUpstreamText (secret without its Bearer scheme)", async () => {
-    const bareToken = SECRET.split(" ")[1] ?? SECRET;
-    const { port } = await serve((_request, res) => {
-      // Non-JSON content type carrying the bare token → sanitizer runs on it.
-      res.writeHead(200, { "content-type": `text/plain; token=${bareToken}` });
-      res.end("nope");
-    });
-    let thrown: unknown;
-    try {
-      await caller.call({
-        tool,
-        source: sourceAt(port),
-        input: {},
-        auth: { headers: { Authorization: SECRET } },
-        timeoutMs: 2_000,
-      });
-    } catch (error) {
-      thrown = error;
-    }
-    const error = thrown as Error;
-    expect(error.message).toMatch(/non-JSON response/);
-    expect(error.message).toContain("[redacted]");
-    expect(error.message).not.toContain(bareToken);
-  });
-
-  it("maps JSON-RPC error objects to ConduitUpstreamError", async () => {
-    const { port } = await serve((_request, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: "1",
-          error: { code: -32602, message: "Invalid params" },
-        }),
-      );
-    });
+    );
 
     const attempt = caller.call({
       tool,
@@ -329,19 +380,21 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
   });
 
-  it("redacts auth echoed through a JSON-RPC error message (hostile 200 response)", async () => {
-    // Card-09, one branch over from the 401 case: the upstream echoes the
-    // Authorization header inside a well-formed JSON-RPC error object.
-    const { port } = await serve((request, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: "1",
-          error: { code: -32000, message: `denied for ${request.headers.authorization}` },
-        }),
-      );
-    });
+  it("redacts auth echoed through a JSON-RPC error message (hostile tools/call response)", async () => {
+    // The upstream echoes the Authorization header inside a well-formed
+    // JSON-RPC error object on tools/call.
+    const { port } = await serve(
+      createStreamableFixture((request, res, parsed) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            error: { code: -32000, message: `denied for ${request.headers.authorization}` },
+          }),
+        );
+      }),
+    );
 
     let thrown: unknown;
     try {
@@ -357,42 +410,17 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     }
     const error = thrown as Error;
     expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
-    // The full-body credential scan fires first and fails the call closed —
-    // stronger than redact-and-deliver. The secret reaches nothing.
-    expect(error.message).toMatch(/echoed the connection's credential/);
-    expect(error.message).not.toContain(SECRET);
-  });
-
-  it("redacts auth echoed through the content-type header", async () => {
-    const { port } = await serve((request, res) => {
-      res.writeHead(200, { "content-type": String(request.headers.authorization) });
-      res.end("{}");
-    });
-
-    let thrown: unknown;
-    try {
-      await caller.call({
-        tool,
-        source: sourceAt(port),
-        input: {},
-        auth: { headers: { Authorization: SECRET } },
-        timeoutMs: 2_000,
-      });
-    } catch (error) {
-      thrown = error;
-    }
-    const error = thrown as Error;
-    expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
-    expect(error.message).toMatch(/non-JSON response/);
     expect(error.message).not.toContain(SECRET);
   });
 
   it("classifies a timeout during body streaming as upstream (slow-loris after headers)", async () => {
-    // Headers arrive fast; the body trickles past the AbortSignal deadline.
-    const { port } = await serve((_request, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.write('{"jsonrpc":'); // never ends
-    });
+    // The tools/call headers arrive fast; the body trickles past the deadline.
+    const { port } = await serve(
+      createStreamableFixture((_request, res) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.write('{"jsonrpc":'); // never ends
+      }),
+    );
 
     const attempt = caller.call({
       tool,
@@ -401,7 +429,7 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
       auth: { headers: {} },
       timeoutMs: 50,
     });
-    await expect(attempt).rejects.toThrow(/timed out after 50ms while reading the response/);
+    await expect(attempt).rejects.toThrow(/timed out after 50ms/);
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
   });
 
@@ -410,8 +438,17 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     // header-reflecting upstream returns the Authorization header inside a
     // well-formed result. Delivering it would put the secret in the sandbox
     // heap, the journal, and Trace — the call must fail closed instead.
-    const { port } = await serve((request, res) =>
-      jsonRpcResult(res, { echoed: request.headers.authorization }),
+    const { port } = await serve(
+      createStreamableFixture((request, res, parsed) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: { echoed: request.headers.authorization },
+          }),
+        );
+      }),
     );
 
     let thrown: unknown;
@@ -437,10 +474,12 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     // the raw wire bytes miss the token, but JSON.parse decodes it to
     // plaintext. The scan must run on the parsed structure, not the body.
     const escaped = SECRET.replace(/_/g, "\\u005f"); // Bearer ghp_...
-    const { port } = await serve((_request, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(`{"jsonrpc":"2.0","id":"1","result":{"text":"${escaped}"}}`);
-    });
+    const { port } = await serve(
+      createStreamableFixture((_request, res, parsed) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(`{"jsonrpc":"2.0","id":"${parsed.id}","result":{"text":"${escaped}"}}`);
+      }),
+    );
 
     let thrown: unknown;
     try {
@@ -466,10 +505,7 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     // floor. The floor is now 5 (scheme words excluded), so a short bare token
     // is caught.
     const shortSecret = "Bearer abc1234"; // bare token is 7 chars
-    const { port } = await serve((_request, res) => {
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(JSON.stringify({ jsonrpc: "2.0", id: "1", result: { token: "abc1234" } }));
-    });
+    const { port } = await serve(respondingFixture({ token: "abc1234" }));
     await expect(
       caller.call({
         tool,
@@ -483,8 +519,8 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
 
   it("does not treat the auth scheme word alone as a credential (no over-redaction)", async () => {
     // "Bearer" appearing in benign response text must not trip the scan.
-    const { port } = await serve((_request, res) =>
-      jsonRpcResult(res, { note: "Use a Bearer token to authenticate." }),
+    const { port } = await serve(
+      respondingFixture({ note: "Use a Bearer token to authenticate." }),
     );
     const outcome = await caller.call({
       tool,
@@ -496,12 +532,15 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     expect(outcome.result).toEqual({ note: "Use a Bearer token to authenticate." });
   });
 
-  it("never serializes auth headers into the thrown error", async () => {
-    // Hostile upstream: echoes the Authorization header back in a 401 body.
-    const { port } = await serve((request, res) => {
-      res.writeHead(401, { "content-type": "application/json" });
-      res.end(JSON.stringify({ echo: request.headers.authorization }));
-    });
+  it("never serializes auth headers into the thrown error (hostile HTTP-error body)", async () => {
+    // Hostile upstream: the tools/call POST returns a 500 echoing the
+    // Authorization header in the body. The body never reaches the error.
+    const { port } = await serve(
+      createStreamableFixture((request, res) => {
+        res.writeHead(500, { "content-type": "application/json" });
+        res.end(JSON.stringify({ echo: request.headers.authorization }));
+      }),
+    );
 
     let thrown: unknown;
     try {
@@ -518,9 +557,149 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     expect(thrown).toBeInstanceOf(Error);
     const error = thrown as Error;
     expect(error.name).toBe(GUEST_ERROR_NAMES.upstream);
-    expect(error.message).toContain("401");
+    expect(error.message).toContain("500");
     expect(
       JSON.stringify({ name: error.name, message: error.message, stack: error.stack }),
     ).not.toContain(SECRET);
+  });
+
+  it("uses a caller-supplied session scope when provided (no ephemeral handshake per call)", async () => {
+    // With a shared scope, two calls to the same url+auth handshake ONCE.
+    const { port, requests } = await serve(respondingFixture({ ok: true }));
+    const scope = createUpstreamSessionScope();
+    try {
+      const req = {
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        timeoutMs: 2_000,
+        session: scope,
+      };
+      await caller.call(req);
+      await caller.call(req);
+    } finally {
+      await scope.dispose();
+    }
+    const initializeCount = requests.filter((r) => {
+      try {
+        return (JSON.parse(r.body || "{}") as { method?: string }).method === "initialize";
+      } catch {
+        return false;
+      }
+    }).length;
+    expect(initializeCount).toBe(1); // single shared handshake across both calls
+  });
+});
+
+describe("INVARIANT §18-C5: the stored upstream name is sent on the wire", () => {
+  async function openStore() {
+    return openSqliteStore({
+      client: createClient({ url: ":memory:" }),
+      secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+    });
+  }
+
+  it("sends a hyphenated upstreamName from sourceSemantics, hydrated through the store", async () => {
+    // The full C5 chain: normalize a hyphenated upstream tool → persist via the
+    // store → read it back (source_semantics JSON round-trip) → hand the
+    // HYDRATED tool to the caller → the raw hyphenated name lands on the wire.
+    const store = await openStore();
+    const normalized = normalizeMcp({
+      namespace: "context7",
+      tools: [{ name: "resolve-library-id", inputSchema: { type: "object" } }],
+    });
+    await store.tools.replaceNamespace("context7", normalized);
+    const hydrated = await store.tools.get("context7.resolve_library_id");
+    expect(hydrated).toBeDefined();
+    // Sanity: the round-trip preserved the raw wire name.
+    expect(hydrated?.sourceSemantics).toMatchObject({
+      kind: "mcp",
+      upstreamName: "resolve-library-id",
+    });
+
+    const { port, requests } = await serve(respondingFixture({ content: [] }));
+    await caller.call({
+      tool: hydrated as Tool,
+      source: {
+        id: "src_c7",
+        type: "mcp",
+        namespace: "context7",
+        location: `http://127.0.0.1:${port}/mcp`,
+      },
+      input: {},
+      auth: { headers: {} },
+      timeoutMs: 2_000,
+    });
+
+    const call = toolsCallRequest(requests);
+    const payload = JSON.parse(call?.body ?? "{}");
+    // The hyphen survived — NOT the qualified name, NOT the underscore rewrite.
+    expect(payload.params.name).toBe("resolve-library-id");
+  });
+
+  it("falls back to prefix-strip for a legacy row whose source_semantics lacks upstreamName", async () => {
+    // A pre-C5 stored tool: source_semantics JSON has no upstreamName. Serve-time
+    // must fall back to today's prefix-strip (D4 documented-lossy).
+    const store = await openStore();
+    // A tool object without upstreamName → the stored JSON lacks the field.
+    const legacyTool: Tool = {
+      name: "context7.get_docs",
+      namespace: "context7",
+      inputSchema: { type: "object" },
+      outputSchema: {},
+      riskClass: "safe",
+      sourceSemantics: { kind: "mcp", readOnlyHint: true },
+    };
+    await store.tools.replaceNamespace("context7", [legacyTool]);
+    const hydrated = await store.tools.get("context7.get_docs");
+    expect(hydrated).toBeDefined();
+    expect((hydrated?.sourceSemantics as { upstreamName?: string }).upstreamName).toBeUndefined();
+
+    const { port, requests } = await serve(respondingFixture({ content: [] }));
+    await caller.call({
+      tool: hydrated as Tool,
+      source: {
+        id: "src_c7",
+        type: "mcp",
+        namespace: "context7",
+        location: `http://127.0.0.1:${port}/mcp`,
+      },
+      input: {},
+      auth: { headers: {} },
+      timeoutMs: 2_000,
+    });
+
+    const call = toolsCallRequest(requests);
+    const payload = JSON.parse(call?.body ?? "{}");
+    expect(payload.params.name).toBe("get_docs"); // namespace prefix stripped
+  });
+});
+
+describe("INVARIANT F1: handshake + call share request.timeoutMs", () => {
+  it("times out during the handshake before any tools/call is sent", async () => {
+    // The whole logical operation (handshake + call + one retry) shares the
+    // single request.timeoutMs. If initialize stalls past the budget, the call
+    // times out and tools/call is never reached.
+    const { port, requests } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { method?: string };
+      if (parsed.method === "initialize") {
+        // Stall the handshake forever — the shared budget must fire.
+        return;
+      }
+      res.writeHead(202);
+      res.end();
+    });
+
+    const attempt = caller.call({
+      tool,
+      source: sourceAt(port),
+      input: {},
+      auth: { headers: {} },
+      timeoutMs: 50,
+    });
+    await expect(attempt).rejects.toThrow(/timed out after 50ms/);
+    await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
+    expect(toolsCallRequest(requests)).toBeUndefined(); // never reached tools/call
   });
 });

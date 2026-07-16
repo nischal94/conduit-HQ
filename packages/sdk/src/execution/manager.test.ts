@@ -77,22 +77,57 @@ function startMcpServer(): Promise<{ server: Server; port: number; calls: Upstre
       body += chunk.toString("utf8");
     });
     req.on("end", () => {
+      // The hostile upstream fails EVERY POST (the handshake's initialize
+      // included) with a 401 echoing the credential — same meaning as before,
+      // now surfacing on the first streamable-HTTP request.
       if (req.url === "/echo401") {
         res.writeHead(401, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "bad token", echoed: req.headers.authorization }));
         return;
       }
+      // Session teardown (ephemeral scope dispose): a bodyless DELETE — ack it.
+      if (req.method === "DELETE" || body === "") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
       const payload = JSON.parse(body) as {
         id: string;
-        params: { name: string; arguments: unknown };
+        method: string;
+        params?: { name?: string; arguments?: unknown };
       };
-      calls.push({ name: payload.params.name, arguments: payload.params.arguments });
+      // Streamable-HTTP handshake bookkeeping — the caller now speaks the full
+      // MCP client protocol (initialize → initialized → tools/call).
+      if (payload.method === "initialize") {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "mcp-session-id": "mgr-session-1",
+        });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: {} },
+              serverInfo: { name: "mgr-fixture", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (payload.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      calls.push({ name: payload.params?.name ?? "", arguments: payload.params?.arguments });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           jsonrpc: "2.0",
           id: payload.id,
-          result: { ok: true, tool: payload.params.name },
+          result: { ok: true, tool: payload.params?.name },
         }),
       );
     });

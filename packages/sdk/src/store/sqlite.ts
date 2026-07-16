@@ -827,7 +827,15 @@ function parseSourceSemantics(raw: string, name: string): SourceSemantics {
     }
     case "mcp": {
       const semantics: McpSemantics = { kind };
-      const { readOnlyHint, destructiveHint } = record;
+      const { upstreamName, readOnlyHint, destructiveHint } = record;
+      // C5 (design D4): the raw upstream wire name recorded at normalize time.
+      // Absent on legacy rows — serve-time falls back to prefix-strip.
+      if (upstreamName !== undefined) {
+        if (typeof upstreamName !== "string") {
+          throw toolReadError(name, `malformed mcp source_semantics: ${JSON.stringify(value)}`);
+        }
+        semantics.upstreamName = upstreamName;
+      }
       if (readOnlyHint !== undefined) {
         if (typeof readOnlyHint !== "boolean") {
           throw toolReadError(name, `malformed mcp source_semantics: ${JSON.stringify(value)}`);

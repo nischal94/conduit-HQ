@@ -1,5 +1,3 @@
-import { request as httpRequest, type IncomingMessage } from "node:http";
-import { request as httpsRequest } from "node:https";
 import type { UpstreamAuth } from "../credentials.js";
 import type { Source, Tool } from "../types.js";
 import {
@@ -9,13 +7,22 @@ import {
   isEgressBlockedError,
 } from "./egress.js";
 import { ConduitCallError, upstreamError } from "./errors.js";
+import { createMcpClient, McpClientError } from "./mcp-client.js";
+import { createUpstreamSessionScope, type UpstreamSessionScope } from "./upstream-session.js";
 
 /**
  * Upstream caller seam (spec §5.3 step 4): the pipeline hands over a fully
  * resolved request — tool, source, input, auth, time budget — and gets back
- * an outcome or a thrown ConduitCallError. Only this module knows about
- * fetch, JSON-RPC, or wire formats; per-source-type callers (decision A5:
+ * an outcome or a thrown ConduitCallError. Only this module knows about the
+ * MCP client, JSON-RPC, or wire formats; per-source-type callers (decision A5:
  * MCP-only in v1) mount behind this interface.
+ *
+ * The wire transport itself lives in `mcp-client.ts` (streamable HTTP,
+ * design D2/§18-C4): this module OWNS the §9.3 egress boundary (pre-flight +
+ * pinned lookup), the §9.2 credential redaction of guest-visible text, and
+ * the mapping of the client's typed error kinds back onto the guest-facing
+ * upstream-error taxonomy. The transport mechanics that used to live here
+ * (the bare JSON-RPC POST + capped body read) now belong to the client.
  */
 export interface UpstreamRequest {
   tool: Tool;
@@ -23,6 +30,13 @@ export interface UpstreamRequest {
   input: unknown;
   auth: UpstreamAuth;
   timeoutMs: number;
+  /**
+   * Per-drive session scope (§18-C4): reuses one initialized MCP session
+   * across calls to the same (url, auth). Optional — when absent (legacy
+   * callers, tests) an EPHEMERAL scope is used for this one call, so the
+   * handshake still happens but nothing is cached.
+   */
+  session?: UpstreamSessionScope;
 }
 
 export interface UpstreamOutcome {
@@ -64,158 +78,183 @@ export function createMcpUpstreamCaller(
           cause instanceof Error ? cause.message : "Upstream URL failed the egress check.",
         );
       }
-      // Decision A5: upstream MCP name = tool name minus the namespace
-      // prefix the normalizer added. Known limitation (documented in §18):
-      // wrong for MCP names the normalizer had to transform.
-      const upstreamName = request.tool.name.startsWith(`${request.tool.namespace}.`)
-        ? request.tool.name.slice(request.tool.namespace.length + 1)
-        : request.tool.name;
+      // Decision A5 (amended by C5 design D4): the upstream MCP name is the
+      // raw wire name recorded at normalize time (`sourceSemantics.upstreamName`)
+      // so hyphenated names round-trip exactly. On a LEGACY row that predates
+      // C5 (no `upstreamName` in the stored source_semantics), fall back to
+      // today's prefix-strip — documented-lossy: wrong for MCP names the
+      // normalizer had to transform (e.g. `resolve-library-id`).
+      const upstreamName =
+        request.tool.sourceSemantics.kind === "mcp" &&
+        request.tool.sourceSemantics.upstreamName !== undefined
+          ? request.tool.sourceSemantics.upstreamName
+          : stripNamespacePrefix(request.tool);
       const startedAt = Date.now();
-      const payload = JSON.stringify({
-        jsonrpc: "2.0",
-        id: crypto.randomUUID(),
-        method: "tools/call",
-        params: { name: upstreamName, arguments: request.input ?? {} },
-      });
-      let res: IncomingMessage;
+      // The WHOLE logical operation — handshake + call + one 404-retry — shares
+      // this single deadline (preserving F1's per-call budget semantics). The
+      // client decrements against `deadline()` at every phase; the byte cap is
+      // cumulative across every response in the operation.
+      const budget = {
+        deadline: () => Math.max(0, request.timeoutMs - (Date.now() - startedAt)),
+        maxBytes,
+      };
+      // The merged header object lives only in this call frame (spec §9.2):
+      // auth material is never persisted beyond the call, nor interpolated
+      // into an error/trace/host-log (the client never echoes headers, and
+      // guest-visible text is redacted below). The pinned lookup forces the
+      // socket to a §9.3-vetted IP.
+      const scope = request.session ?? createUpstreamSessionScope();
       try {
-        // The merged header object lives only in this request (spec §9.2):
-        // auth material is never persisted beyond the call frame nor
-        // interpolated into an error, trace row, or host log (it reaches
-        // sanitizeUpstreamText only as the redaction key, never as output).
-        // The pinned lookup forces the socket to a §9.3-vetted IP.
-        res = await sendPinnedRequest({
-          target,
-          payload,
-          headers: {
-            "content-type": "application/json",
-            accept: "application/json",
-            ...request.auth.headers,
+        const { client, session } = await scope.acquire({
+          url: request.source.location,
+          authHeaders: request.auth.headers,
+          make: async () => {
+            const client = createMcpClient(
+              { target, headers: { ...request.auth.headers }, lookup: pinnedLookup },
+              budget,
+            );
+            const session = await client.initialize();
+            return { client, session };
           },
-          timeoutMs: request.timeoutMs,
-          lookup: pinnedLookup,
         });
+        const { result, status } = await client.callTool(
+          session,
+          upstreamName,
+          request.input ?? {},
+        );
+        assertNoCredentialEcho(result, request);
+        return { result: result ?? null, status, latencyMs: Date.now() - startedAt };
       } catch (cause) {
-        if (cause instanceof ConduitCallError) {
-          throw cause;
+        throw mapUpstreamError(cause, request, maxBytes);
+      } finally {
+        // An ephemeral scope is torn down after the call (best-effort, never
+        // throws); a caller-supplied scope is owned by the caller and left
+        // alone for reuse across calls.
+        if (request.session === undefined) {
+          await scope.dispose();
         }
-        // A §9.3 refusal from the pinned lookup (every resolved address private
-        // at connect time — the DNS-rebinding case) is detected structurally,
-        // not by string-matching: the tagged error's message is ref-free and
-        // crosses to the agent verbatim.
-        if (isEgressBlockedError(cause)) {
-          throw upstreamError((cause as Error).message);
+      }
+    },
+  };
+}
+
+/**
+ * Decision A5 prefix-strip: the upstream MCP name is the qualified tool name
+ * minus the namespace prefix the normalizer added. The C5 fallback path only.
+ */
+function stripNamespacePrefix(tool: Tool): string {
+  return tool.name.startsWith(`${tool.namespace}.`)
+    ? tool.name.slice(tool.namespace.length + 1)
+    : tool.name;
+}
+
+/**
+ * §9.2 BEST-EFFORT tripwire (NOT a boundary — see containsCredential): if the
+ * result obviously contains the connection's own credential, fail closed
+ * rather than deliver it. Runs on the re-serialized parsed structure so a
+ * JSON-escaped echo is caught after decode. This scan cannot be complete (an
+ * adversary can encode the secret in unbounded ways), so it is not the
+ * guarantee — it is a cheap catch for the common case. The real guarantee is
+ * structural: the credential lives only in this request scope and is never
+ * persisted (§9.2); at-rest redaction is §11. Per
+ * ~/.claude/rules/adversarial-convergence.md, a finding against this scan is
+ * category (b), not a boundary break.
+ */
+function assertNoCredentialEcho(result: unknown, request: UpstreamRequest): void {
+  if (containsCredential(JSON.stringify(result) ?? "", request.auth)) {
+    throw upstreamError(
+      `Upstream response echoed the connection's credential; refusing to deliver it. Context: { tool: ${request.tool.name} }`,
+    );
+  }
+}
+
+/**
+ * Maps a thrown error from the MCP client back onto the guest-visible upstream
+ * taxonomy, preserving today's classification and message MEANING exactly:
+ *
+ * - a ConduitCallError (an egress pre-flight refusal, or the §9.2 echo refusal)
+ *   passes through unchanged — it is already classified;
+ * - a §9.3 pinned-lookup refusal (all resolved addresses private at connect
+ *   time — DNS rebinding) is detected structurally via `isEgressBlockedError`
+ *   and crosses as its ref-free message verbatim;
+ * - `McpClientError` kinds map:
+ *   - `timeout` → "timed out after {timeoutMs}ms" (the existing text);
+ *   - `cap` → the existing response-size-cap refusal text;
+ *   - `http_status` 3xx → the existing redirect-refused text;
+ *   - other `http_status` → the existing HTTP-status text (401/403 credential
+ *     variant preserved);
+ *   - `protocol` → an upstream error carrying the sanitized detail
+ *     (`sanitizeUpstreamText` redacts any echoed credential + strips/caps);
+ *   - `network` → the existing connection-failure text.
+ *
+ * §9.2: no auth material ever reaches the message — the client never echoes
+ * headers, and any upstream-controlled `protocol` detail is sanitized.
+ */
+function mapUpstreamError(
+  cause: unknown,
+  request: UpstreamRequest,
+  maxBytes: number,
+): ConduitCallError {
+  if (cause instanceof ConduitCallError) {
+    return cause;
+  }
+  // A §9.3 pinned-lookup refusal (every resolved address private at connect
+  // time — the DNS-rebinding case) is detected STRUCTURALLY, not by string
+  // match: its tagged error travels as the `cause` of the client's `network`
+  // McpClientError (postOnce wraps the socket error), so unwrap one level.
+  // The tagged message is ref-free and crosses to the agent verbatim.
+  const egressBlocked = isEgressBlockedError(cause)
+    ? (cause as Error)
+    : cause instanceof McpClientError && isEgressBlockedError(cause.cause)
+      ? (cause.cause as Error)
+      : undefined;
+  if (egressBlocked !== undefined) {
+    return upstreamError(egressBlocked.message);
+  }
+  if (cause instanceof McpClientError) {
+    switch (cause.kind) {
+      case "timeout":
+        return upstreamError(
+          `Upstream call failed: timed out after ${request.timeoutMs}ms. Context: { tool: ${request.tool.name} }`,
+        );
+      case "cap":
+        return upstreamError(
+          `Upstream response exceeded the size cap. Context: { maxBytes: ${maxBytes} }`,
+        );
+      case "http_status": {
+        const status = cause.status ?? 0;
+        if (status >= 300 && status < 400) {
+          return upstreamError(
+            `Upstream redirect refused (spec §9.3): redirects are not followed. Context: { status: ${status} }`,
+          );
         }
-        const reason =
-          cause instanceof Error && cause.name === "TimeoutError"
-            ? `timed out after ${request.timeoutMs}ms`
-            : "request failed before a response arrived";
-        throw upstreamError(
-          `Upstream call failed: ${reason}. Context: { tool: ${request.tool.name} }`,
-        );
-      }
-      const latencyMs = Date.now() - startedAt;
-      const status = res.statusCode ?? 0;
-      if (status === 0) {
-        // No parsed status line (malformed response). Refuse with a clear
-        // reason rather than the confusing "HTTP 0".
-        res.destroy();
-        throw upstreamError(
-          `Upstream response had no valid status line. Context: { tool: ${request.tool.name} }`,
-        );
-      }
-      if (status >= 300 && status < 400) {
-        res.destroy(); // release the socket; the redirect is refused, never followed
-        throw upstreamError(
-          `Upstream redirect refused (spec §9.3): redirects are not followed. Context: { status: ${status} }`,
-        );
-      }
-      const contentType = res.headers["content-type"] ?? "";
-      if (!contentType.includes("application/json")) {
-        res.destroy();
-        throw upstreamError(
-          `Upstream returned a non-JSON response. Context: { status: ${status}, contentType: ${sanitizeUpstreamText(contentType, request.auth) || "none"} }`,
-        );
-      }
-      // A 4xx/5xx body is still read (capped) to drain the socket, but its
-      // content never reaches the error — hostile upstreams echo secrets.
-      // Read-phase failures (slow-loris body, mid-stream reset) classify as
-      // upstream, same as their pre-response siblings above.
-      let body: string;
-      try {
-        body = await readCapped(res, maxBytes, request.timeoutMs, startedAt);
-      } catch (cause) {
-        if (cause instanceof ConduitCallError) {
-          throw cause; // the size cap, already classified
-        }
-        const reason =
-          cause instanceof Error && cause.name === "TimeoutError"
-            ? `timed out after ${request.timeoutMs}ms while reading the response`
-            : "connection failed while reading the response";
-        throw upstreamError(
-          `Upstream call failed: ${reason}. Context: { tool: ${request.tool.name} }`,
-        );
-      }
-      if (status < 200 || status >= 300) {
         if (status === 401 || status === 403) {
-          throw upstreamError(
+          return upstreamError(
             `Upstream rejected the connection's credentials (HTTP ${status}) — check the connection. Context: { tool: ${request.tool.name} }`,
           );
         }
-        throw upstreamError(
+        return upstreamError(
           `Upstream returned HTTP ${status}. Context: { tool: ${request.tool.name} }`,
         );
       }
-      let parsed: unknown;
-      try {
-        parsed = JSON.parse(body);
-      } catch {
-        throw upstreamError(
-          `Upstream response is not valid JSON. Context: { tool: ${request.tool.name} }`,
+      case "protocol":
+        // Upstream-controlled protocol text headed for a guest-visible error:
+        // redact + sanitize before interpolating.
+        return upstreamError(
+          `Upstream protocol error: ${sanitizeUpstreamText(cause.message, request.auth)}. Context: { tool: ${request.tool.name} }`,
         );
-      }
-      // §9.2 BEST-EFFORT tripwire (NOT a boundary — see containsCredential):
-      // if the response obviously contains the connection's own credential,
-      // fail closed rather than deliver it. Runs on the re-serialized parsed
-      // structure so a JSON-escaped echo is caught after decode. This scan
-      // cannot be complete (an adversary can encode the secret in unbounded
-      // ways), so it is not the guarantee — it is a cheap catch for the common
-      // case. The real guarantee is structural: the credential lives only in
-      // this request scope and is never persisted (§9.2); at-rest redaction is
-      // §11. Per ~/.claude/rules/adversarial-convergence.md, a finding against
-      // this scan is category (b), not a boundary break.
-      if (containsCredential(JSON.stringify(parsed) ?? "", request.auth)) {
-        throw upstreamError(
-          `Upstream response echoed the connection's credential; refusing to deliver it. Context: { tool: ${request.tool.name} }`,
+      case "network":
+        return upstreamError(
+          `Upstream call failed: request failed before a response arrived. Context: { tool: ${request.tool.name} }`,
         );
-      }
-      // Validate the JSON-RPC envelope shape rather than trusting a cast: a
-      // non-object body, or one bearing neither `result` nor `error`, is a
-      // protocol violation — never a `{ result: null }` success (which would
-      // memoize garbage for §5.5 replay) and never a raw property-access
-      // TypeError laundered into an opaque infra error.
-      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-        throw upstreamError(
-          `Upstream response is not a JSON-RPC object. Context: { tool: ${request.tool.name} }`,
-        );
-      }
-      const envelope = parsed as { result?: unknown; error?: unknown };
-      if (envelope.error !== undefined && envelope.error !== null) {
-        // Upstream-controlled text headed for a guest-visible error: redact
-        // + sanitize before interpolating.
-        const rpcError = envelope.error as { code?: unknown; message?: unknown };
-        throw upstreamError(
-          `Upstream tool call failed: ${sanitizeUpstreamText(String(rpcError.message ?? "unknown error"), request.auth)}. Context: { code: ${typeof rpcError.code === "number" ? rpcError.code : "none"} }`,
-        );
-      }
-      if (!("result" in envelope)) {
-        throw upstreamError(
-          `Upstream response carried neither a result nor an error (not JSON-RPC). Context: { tool: ${request.tool.name} }`,
-        );
-      }
-      return { result: envelope.result ?? null, status, latencyMs };
-    },
-  };
+    }
+  }
+  // Any other thrown value (should not happen — the client throws only
+  // McpClientError / ConduitCallError) crosses as a generic upstream failure
+  // rather than an opaque infra error, and never carries its raw text.
+  return upstreamError(
+    `Upstream call failed: request failed before a response arrived. Context: { tool: ${request.tool.name} }`,
+  );
 }
 
 /**
@@ -320,102 +359,4 @@ function sanitizeUpstreamText(raw: string, auth: UpstreamAuth): string {
   const text = redactTokens(raw, credentialTokens(auth));
   const printable = [...text].filter((ch) => ch >= " " && ch !== "\u007f").join("");
   return printable.length > 200 ? `${printable.slice(0, 200)}…` : printable;
-}
-
-/**
- * Sends the POST over node:http(s) with the pinned lookup and resolves with
- * the response stream (headers arrived; body not yet read). The Agent's
- * `lookup` forces the socket to a §9.3-vetted IP; the whole-request deadline
- * fires here for the pre-body phase, and again in readCapped for the body.
- *
- * A `lookup` rejection (all addresses private / NXDOMAIN) surfaces as the
- * socket's `error` — mapped by the caller. A pre-response deadline rejects
- * with a TimeoutError-named error so the caller's classifier matches fetch's.
- */
-function sendPinnedRequest(args: {
-  target: URL;
-  payload: string;
-  headers: Record<string, string>;
-  timeoutMs: number;
-  lookup: ReturnType<typeof createPinnedLookup>;
-}): Promise<IncomingMessage> {
-  const { target, payload, headers, timeoutMs, lookup } = args;
-  const send = target.protocol === "https:" ? httpsRequest : httpRequest;
-  return new Promise<IncomingMessage>((resolve, reject) => {
-    const req = send(
-      target,
-      {
-        method: "POST",
-        headers: { ...headers, "content-length": String(Buffer.byteLength(payload)) },
-        lookup,
-      },
-      (res) => {
-        // Headers arrived: the PRE-RESPONSE deadline is done. Disarm it so it
-        // cannot fire during the body-read phase — readCapped owns that
-        // deadline exclusively. Leaving it armed would race readCapped's timer
-        // and, if it won, destroy the socket with a plain "aborted" error that
-        // the caller mis-classifies as a connection failure, not a timeout.
-        req.setTimeout(0);
-        resolve(res);
-      },
-    );
-    // The pre-response deadline: fires only until headers arrive. Destroy with
-    // a TimeoutError so the caller's name check (mirrored from
-    // AbortSignal.timeout) classifies it as a timeout.
-    req.setTimeout(timeoutMs, () => {
-      req.destroy(Object.assign(new Error("Upstream request timed out"), { name: "TimeoutError" }));
-    });
-    req.on("error", (err) => reject(err));
-    req.end(payload);
-  });
-}
-
-/**
- * Reads the response stream into a UTF-8 string, capping at maxBytes off the
- * wire (never trusting content-length) and aborting if the body trickles past
- * the whole-request deadline. A cap breach throws a pre-classified upstream
- * error (a policy refusal, not a network flake); a deadline breach throws a
- * TimeoutError-named error the caller maps to "timed out while reading".
- */
-function readCapped(
-  res: IncomingMessage,
-  maxBytes: number,
-  timeoutMs: number,
-  startedAt: number,
-): Promise<string> {
-  return new Promise<string>((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    let total = 0;
-    const remaining = Math.max(0, timeoutMs - (Date.now() - startedAt));
-    const timer = setTimeout(() => {
-      res.destroy(
-        Object.assign(new Error("Upstream body read timed out"), { name: "TimeoutError" }),
-      );
-    }, remaining);
-    const settleReject = (err: unknown): void => {
-      clearTimeout(timer);
-      reject(err);
-    };
-    res.on("data", (chunk: Buffer) => {
-      total += chunk.byteLength;
-      if (total > maxBytes) {
-        // The cap wins over any subsequent 'error' from destroy(): a cap
-        // breach is a policy refusal, pre-classified so the caller passes it
-        // through rather than re-labeling it a network failure.
-        res.destroy();
-        settleReject(
-          upstreamError(
-            `Upstream response exceeded the size cap. Context: { maxBytes: ${maxBytes} }`,
-          ),
-        );
-        return;
-      }
-      chunks.push(chunk);
-    });
-    res.on("end", () => {
-      clearTimeout(timer);
-      resolve(Buffer.concat(chunks).toString("utf8"));
-    });
-    res.on("error", (err) => settleReject(err));
-  });
 }
