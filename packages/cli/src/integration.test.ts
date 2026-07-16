@@ -55,7 +55,19 @@ interface UpstreamCall {
   sawAuthHeader: boolean;
 }
 
-/** Loopback MCP upstream (same shape as packages/mcp's integration test). */
+const NEGOTIATED_VERSION = "2025-06-18";
+const SESSION_ID = "sess-cli-integration-1";
+
+/**
+ * Loopback MCP upstream (same shape as packages/mcp's integration test),
+ * upgraded to the streamable-HTTP pattern for `serve`'s traffic (mirrors
+ * Task 6's `createStreamableFixture` helper in sdk/pipeline/upstream.test.ts
+ * — copied local since test files don't share exports across packages).
+ * `add-mcp`'s precondition fetch (mcp-fetch.ts, Lane B/Task 10) still speaks
+ * the bare single-POST `tools/list` dialect — answered by its own branch
+ * below, unchanged — so the same stub upstream serves both traffic shapes,
+ * no second fixture server.
+ */
 function startMcpServer(): Promise<{
   server: Server;
   port: number;
@@ -68,7 +80,7 @@ function startMcpServer(): Promise<{
       body += chunk.toString("utf8");
     });
     req.on("end", () => {
-      const payload = JSON.parse(body) as {
+      const payload = JSON.parse(body || "{}") as {
         id: string;
         method: string;
         params?: { name: string; arguments: unknown };
@@ -82,6 +94,34 @@ function startMcpServer(): Promise<{
         res.end(
           JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: { tools: mcpToolsList } }),
         );
+        return;
+      }
+      if (payload.method === "initialize") {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "mcp-session-id": SESSION_ID,
+        });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "fixture", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (payload.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (req.method === "DELETE") {
+        res.writeHead(200);
+        res.end();
         return;
       }
       const params = payload.params as { name: string; arguments: unknown };

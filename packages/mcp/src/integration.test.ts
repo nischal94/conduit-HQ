@@ -56,12 +56,20 @@ interface UpstreamCall {
   sawAuthHeader: boolean;
 }
 
+const NEGOTIATED_VERSION = "2025-06-18";
+const SESSION_ID = "sess-integration-1";
+
 /**
  * Loopback MCP upstream (copied shape from sdk/e2e.smoke.test.ts's
- * startMcpServer — kept local per the brief). `/mcp` answers tools/call for
- * every tool except `delete_repo`, which it holds open for `delayMs` before
- * responding — the vehicle for the client-timeout case: the sandbox has no
- * real timers, so "slow" must come from the upstream response itself.
+ * startMcpServer — kept local per the brief), upgraded to the streamable-HTTP
+ * pattern (mirrors Task 6's `createStreamableFixture` helper in
+ * sdk/pipeline/upstream.test.ts — copied local since test files don't share
+ * exports across packages). Owns the handshake bookkeeping — replies to
+ * `initialize` and `notifications/initialized`, acks DELETE — and answers
+ * tools/call for every tool except `delete_repo`, which it holds open for
+ * `delayMs` before responding — the vehicle for the client-timeout case: the
+ * sandbox has no real timers, so "slow" must come from the upstream response
+ * itself.
  */
 function startMcpServer(delayMs = 0): Promise<{
   server: Server;
@@ -75,20 +83,50 @@ function startMcpServer(delayMs = 0): Promise<{
       body += chunk.toString("utf8");
     });
     req.on("end", () => {
-      const payload = JSON.parse(body) as {
-        id: string;
-        params: { name: string; arguments: unknown };
+      const parsed = JSON.parse(body || "{}") as {
+        id?: string;
+        method?: string;
+        params?: { name: string; arguments: unknown };
       };
+      if (parsed.method === "initialize") {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "mcp-session-id": SESSION_ID,
+        });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "fixture", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (req.method === "DELETE") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      const params = parsed.params as { name: string; arguments: unknown };
       upstreamCalls.push({
-        name: payload.params.name,
-        arguments: payload.params.arguments,
+        name: params.name,
+        arguments: params.arguments,
         sawAuthHeader: req.headers.authorization === SECRET,
       });
       const respond = () => {
         res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: ISSUES_RESULT }));
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: ISSUES_RESULT }));
       };
-      if (payload.params.name === "delete_repo" && delayMs > 0) {
+      if (params.name === "delete_repo" && delayMs > 0) {
         setTimeout(respond, delayMs);
       } else {
         respond();
