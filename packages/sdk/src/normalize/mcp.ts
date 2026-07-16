@@ -68,8 +68,16 @@ export function normalizeMcp(options: NormalizeMcpOptions): Tool[] {
     // defaulting to true, but review and destructive land on the same
     // require-approval policy default (§10.2), so ignoring the implicit
     // default loses no safety — only label precision.
-    const semantics: { kind: "mcp"; readOnlyHint?: boolean; destructiveHint?: boolean } = {
+    const semantics: {
+      kind: "mcp";
+      upstreamName?: string;
+      readOnlyHint?: boolean;
+      destructiveHint?: boolean;
+    } = {
       kind: "mcp",
+      // Raw upstream wire name recorded at normalize time (C5 design D4);
+      // absent on legacy rows → serve-time falls back to prefix-strip.
+      upstreamName: entry.name,
     };
     const readOnlyHint = entry.annotations?.readOnlyHint;
     if (readOnlyHint !== undefined) {

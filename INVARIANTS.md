@@ -54,6 +54,7 @@ promise the product makes but does not yet enforce.
 | §18-C4 — per-drive upstream session scope: auth material is never stored (only salted HMAC digest); cache key rotation on secret change; cache key canonical on mixed-case header names | `packages/sdk/src/pipeline/upstream-session.test.ts` ("INVARIANT §18-C4: same-url same-ref secret rotation forces a new session (auth digest key)" + "mixed-case header names produce the same cache key as lowercase") | ✅ pinned |
 | §18-C4 — single-flight semantics: concurrent first acquires share one `make()` call; a rejected make is not cached so the next acquire retries | `packages/sdk/src/pipeline/upstream-session.test.ts` ("caches by url+auth and single-flights concurrent first acquires" + "a failed make is not cached (next acquire retries)") | ✅ pinned |
 | §18-C4 — `UpstreamSessionScope.dispose()` NEVER throws; all cached sessions are deleted best-effort, with exceptions logged but never re-raised; a second dispose is a no-op | `packages/sdk/src/pipeline/upstream-session.test.ts` ("INVARIANT §18-C4: dispose deletes every cached session and never throws" + "dispose swallows a throwing deleteSession into the log") | ✅ pinned |
+| §18-C5 — `normalizeMcp` records the raw upstream wire name in `sourceSemantics.upstreamName` so hyphenated names (e.g. `resolve-library-id`) round-trip correctly at serve time | `packages/sdk/src/normalize/mcp.test.ts` ("INVARIANT §18-C5: records the raw upstream name so hyphenated names round-trip") | ✅ pinned |
 
 ---
 
