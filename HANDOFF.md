@@ -60,9 +60,20 @@ at session start.
   - Execution decision (user, 2026-07-16): **subagent-driven development in
     a FRESH session** — implementation starts fresh with the plan artifacts
     passed in (project rule).
-- **Key rotation is step 0 of Lane-B VERIFICATION** (before any real PAT):
-  delete `~/.conduit/conduit.db*` + `gate-one-key`, mint fresh, update
-  `~/.conduit/claude-desktop-snippet.json` + Claude Code MCP config.
+- **Key rotation: DONE 2026-07-16 evening** (moved up from Lane-B step 0 on
+  the codex strategic review's push; user delegated, agent executed). The
+  exposed gate-one key + demo db are DELETED; a fresh key lives at
+  `~/.conduit/master-key` (0600, never in any transcript);
+  `claude-desktop-snippet.json` + Claude Desktop's config both carry it; a
+  fresh empty `conduit.db` bootstrapped and verified via `approvals list`.
+  The Lane-B acceptance matrix's "after key rotation" precondition is
+  ALREADY satisfied. Any Claude Code session with a wired conduit MCP
+  server needs its config re-pointed at the new key (env
+  CONDUIT_MASTER_KEY from `~/.conduit/master-key`) on next reconnect.
+  **New finding for the §16.3 key-lifecycle work (v1 step 1):** the store
+  creates `conduit.db` with 0644 perms (fixed by hand to 0600 this time) —
+  the db that will hold sealed credentials should be created 0600; fold
+  into the Lane-B/console-prerequisite verification.
 - Earlier same day (sections below): dogfood rounds 1+2 (0/3 real upstreams
   → C4 promotion via PR #37; C5 verified live; first real e2e result +
   chained workflow through the boundary via a throwaway shim).
@@ -128,8 +139,9 @@ https://claude.ai/code/artifact/c9568154-1def-4460-bcbb-c0b870a46b7c
 > whole-branch review → Lane A PR (design+plan ride with it) → full
 > load-bearing gauntlet (Tier 2 + /security-review + REAL codex
 > correctness-framed pass + /explain-diff quiz) → HUMAN-NAMED merge. Lane B
-> (T9–T13) follows on merged main; its verification step 0 is the demo-key
-> rotation (HANDOFF housekeeping).
+> (T9–T13) follows on merged main; the demo-key rotation is ALREADY DONE
+> (2026-07-16 evening — fresh key at ~/.conduit/master-key; the plan's
+> acceptance-matrix precondition is satisfied).
 
 ### ⚠️ Superseded same-day section below (morning dogfood handoff) — findings remain valid; its NEXT TASK is done (design+plan exist).
 
