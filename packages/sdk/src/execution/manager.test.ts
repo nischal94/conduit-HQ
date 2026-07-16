@@ -11,6 +11,7 @@ import { createCatalogToolHost } from "../execute.js";
 import { normalizeMcp } from "../normalize/mcp.js";
 import { createToolInvoker } from "../pipeline/invoker.js";
 import { createMcpUpstreamCaller } from "../pipeline/upstream.js";
+import type { UpstreamSessionScope } from "../pipeline/upstream-session.js";
 import { createStorePolicyEngine } from "../policy.js";
 import { QuickJSSandbox } from "../sandbox/quickjs.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
@@ -1399,5 +1400,126 @@ describe("§16 wall-clock budget is wired into the invoker (finding F1, gate two
     // Clamped to the remaining budget (≤ 2000ms), strictly below the 30s ceiling.
     expect(timeouts[0]).toBeGreaterThan(0);
     expect(timeouts[0]).toBeLessThanOrEqual(2_000);
+  });
+});
+
+describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
+  });
+
+  /**
+   * A recording fake `UpstreamSessionScope`: never touches a real MCP
+   * session, just proves creation/disposal timing. `acquire` is never called
+   * by these tests (the real invoker/upstream caller path is bypassed via a
+   * stub `makeInvoker` below is NOT used here — the tests drive the REAL
+   * pipeline so the manager's own create/dispose wrapping around `drive` is
+   * what's under test, independent of whether `upstream.ts` ever calls
+   * `acquire`).
+   */
+  function makeRecordingUpstreamSession(
+    log: (event: "created" | "disposed") => void,
+    opts?: { throwOnDispose?: boolean },
+  ): () => UpstreamSessionScope {
+    return () => {
+      log("created");
+      let disposed = false;
+      return {
+        acquire: () => Promise.reject(new Error("acquire must not be called by these tests")),
+        async dispose() {
+          if (disposed) return;
+          disposed = true;
+          log("disposed");
+          if (opts?.throwOnDispose) {
+            throw new Error("[test] simulated dispose failure");
+          }
+        },
+      };
+    };
+  }
+
+  it("INVARIANT §18-C4: the manager disposes the upstream session scope on every drive exit — success, failure, AND pause", async () => {
+    const events: Array<"created" | "disposed"> = [];
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: makeRecordingUpstreamSession((e) => events.push(e)),
+    };
+    const manager = createExecutionManager(deps);
+
+    // 1. A completing execution (safe read only).
+    const completed = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+    );
+    expect(completed.status).toBe("completed");
+
+    // 2. A failing execution — an unknown tool fails closed (policy block →
+    //    guest-catchable ConduitPolicyBlocked is caught... use a genuinely
+    //    uncaught guest error instead, so the sandbox itself settles `failed`.
+    const failed = await manager.start(`throw new Error("boom");`);
+    expect(failed.status).toBe("failed");
+
+    // 3. An execution that pauses on a require_approval call.
+    const paused = await manager.start(
+      `return await tools.github.create_issue({ title: "from agent" });`,
+    );
+    expect(paused.status).toBe("paused");
+
+    expect(events.filter((e) => e === "created")).toHaveLength(3);
+    expect(events.filter((e) => e === "disposed")).toHaveLength(3);
+  });
+
+  it("INVARIANT §18-C4: a resumed drive gets a FRESH scope", async () => {
+    const events: Array<"created" | "disposed"> = [];
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: makeRecordingUpstreamSession((e) => events.push(e)),
+    };
+    const manager = createExecutionManager(deps);
+
+    const first = await manager.start(
+      `return await tools.github.create_issue({ title: "from agent" });`,
+    );
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") return;
+
+    expect(events).toEqual(["created", "disposed"]);
+
+    const resumed = await manager.resume(first.executionId, { kind: "approve" });
+    expect(resumed.status).toBe("completed");
+
+    // A SECOND scope was created for the resume — not a reuse of the first —
+    // and it too was disposed.
+    expect(events).toEqual(["created", "disposed", "created", "disposed"]);
+  });
+
+  it("a throwing dispose does not change the drive outcome", async () => {
+    const events: Array<"created" | "disposed"> = [];
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: makeRecordingUpstreamSession((e) => events.push(e), {
+        throwOnDispose: true,
+      }),
+    };
+    const manager = createExecutionManager(deps);
+
+    const result = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+    );
+    // The execution still reports its own (successful) outcome — the
+    // dispose failure is swallowed (routed to the diagnostics sink) rather
+    // than surfacing as a rejection or flipping the outcome to failed.
+    expect(result.status).toBe("completed");
+    expect(events).toEqual(["created", "disposed"]);
   });
 });

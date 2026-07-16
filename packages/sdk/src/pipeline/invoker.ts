@@ -14,6 +14,7 @@ import {
 } from "./errors.js";
 import { redactSensitiveFields } from "./redact.js";
 import type { UpstreamCaller, UpstreamOutcome } from "./upstream.js";
+import type { UpstreamSessionScope } from "./upstream-session.js";
 
 /**
  * The §5.3 per-call pipeline: resolve tool → enforce policy → resolve
@@ -57,6 +58,14 @@ export interface CreateToolInvokerOptions {
   deadline?: () => number;
   /** Host-side sink for infra-failure detail; NEVER guest-visible. */
   log?: (message: string) => void;
+  /**
+   * §18-C4: the per-drive upstream session scope, owned and disposed by the
+   * execution manager. Forwarded onto every `UpstreamRequest` this invoker
+   * builds so repeat calls within the same drive reuse one initialized MCP
+   * session. Optional — absent (legacy callers, tests) each call falls back
+   * to `upstream.ts`'s own ephemeral per-call scope.
+   */
+  upstreamSession?: UpstreamSessionScope;
 }
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
@@ -202,7 +211,14 @@ async function runCall(
   const timeoutMs = Math.max(1, Math.min(ceiling, remaining));
   let outcome: UpstreamOutcome;
   try {
-    outcome = await deps.upstream.call({ tool, source, input, auth, timeoutMs });
+    outcome = await deps.upstream.call({
+      tool,
+      source,
+      input,
+      auth,
+      timeoutMs,
+      ...(options.upstreamSession !== undefined ? { session: options.upstreamSession } : {}),
+    });
   } catch (cause) {
     const error = cause instanceof ConduitCallError ? cause : infraError(cause, log);
     if (error.kind === "upstream") {
