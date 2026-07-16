@@ -590,6 +590,65 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     }).length;
     expect(initializeCount).toBe(1); // single shared handshake across both calls
   });
+
+  it("INVARIANT §18-C4: chained calls in one drive each get a fresh per-call budget while reusing the session", async () => {
+    // Two sequential calls share ONE scope (session reused, initialize once),
+    // but each must run under its OWN F1 budget — a fresh deadline AND a fresh
+    // cumulative byte allowance. Before the fix, the cached handshake client
+    // (bound to call #1's budget) was used for every call, so call #2 inherited
+    // call #1's already-elapsed deadline (→ spurious timeout) and drained the
+    // same 1 MiB byte counter (→ spurious cap). Both sides are exercised here.
+
+    // (b) Byte side: shrink the cap so each response is well under one budget
+    // but two together exceed a SINGLE budget. With a fresh per-call byte
+    // allowance, neither call breaches; with the stale shared client, call #2's
+    // bytes push the shared counter negative → a cap error.
+    const bodyPadding = "x".repeat(4096);
+    const { port, requests } = await serve(respondingFixture({ pad: bodyPadding }));
+    // Cap just above one response (handshake + one tools/call body), far below
+    // two. 6 KiB comfortably fits one ~4 KiB response but not two.
+    const budgetCaller = createMcpUpstreamCaller({
+      egress: { allowPrivate: true },
+      maxResponseBytes: 6 * 1024,
+    });
+    const scope = createUpstreamSessionScope();
+    try {
+      const req = {
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        // (a) Deadline side: a small per-call budget. The gap between the two
+        // calls (below) exceeds it, so call #2 under the STALE cached budget
+        // sees deadline() <= 0 and fails immediately; under a FRESH per-call
+        // budget it has the full window again.
+        timeoutMs: 150,
+        session: scope,
+      };
+      const first = await budgetCaller.call(req);
+      expect(first.result).toEqual({ pad: bodyPadding });
+
+      // Elapse the whole of call #1's budget window before call #2 starts.
+      await new Promise((r) => setTimeout(r, 200));
+
+      // With the fix: fresh deadline + fresh byte allowance → success, and the
+      // session is still reused (no second handshake).
+      const second = await budgetCaller.call(req);
+      expect(second.result).toEqual({ pad: bodyPadding });
+      expect(second.status).toBe(200);
+    } finally {
+      await scope.dispose();
+    }
+
+    const initializeCount = requests.filter((r) => {
+      try {
+        return (JSON.parse(r.body || "{}") as { method?: string }).method === "initialize";
+      } catch {
+        return false;
+      }
+    }).length;
+    expect(initializeCount).toBe(1); // session reused across both calls
+  });
 });
 
 describe("INVARIANT §18-C5: the stored upstream name is sent on the wire", () => {

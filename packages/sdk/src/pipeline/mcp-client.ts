@@ -246,6 +246,10 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       res.on("data", (chunk: Buffer) => {
         bytesLeft -= chunk.byteLength;
         if (bytesLeft < 0) {
+          // After a cap breach this client is single-shot: `bytesLeft` stays
+          // negative so any further postOnce on the same client fails the cap
+          // immediately. Callers wanting a fresh byte budget build a fresh
+          // client (see upstream.ts's per-call client), which upstream.ts does.
           res.destroy();
           settle(() =>
             reject(new McpClientError("cap", "MCP response exceeded the cumulative byte budget")),

@@ -105,7 +105,15 @@ export function createMcpUpstreamCaller(
       // socket to a §9.3-vetted IP.
       const scope = request.session ?? createUpstreamSessionScope();
       try {
-        const { client, session } = await scope.acquire({
+        // The scope caches SESSION STATE per (url, auth-digest) for the whole
+        // drive (design D3: session id + negotiated version) — NOT per-call
+        // machinery. `acquire`'s `make` runs the handshake single-flighted;
+        // the client it builds is bound to THIS call's budget (correct — the
+        // handshake happens during this call) and is cached only so `dispose`
+        // can issue the teardown DELETE later. That cached client's budget can
+        // be stale by disposal time, which is fine: a failed teardown DELETE is
+        // best-effort by design (dispose never throws).
+        const { session } = await scope.acquire({
           url: request.source.location,
           authHeaders: request.auth.headers,
           make: async () => {
@@ -117,7 +125,18 @@ export function createMcpUpstreamCaller(
             return { client, session };
           },
         });
-        const { result, status } = await client.callTool(
+        // The CALL itself uses a FRESH client bound to THIS call's budget
+        // (deadline + a fresh cumulative byte allowance), not the cached
+        // handshake client — otherwise call #2+ to a reused session would run
+        // under call #1's stale deadline/byte budget (F1 per-call semantics).
+        // The 404-expiry retry inside `callTool` mutates the CACHED `session`
+        // object in place (same reference the scope holds; see
+        // `withSessionExpiryRetry`), so a renewal is visible to later calls.
+        const freshClient = createMcpClient(
+          { target, headers: { ...request.auth.headers }, lookup: pinnedLookup },
+          budget,
+        );
+        const { result, status } = await freshClient.callTool(
           session,
           upstreamName,
           request.input ?? {},
