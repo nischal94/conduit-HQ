@@ -67,7 +67,34 @@ at session start.
 - LEARNINGS 2026-07-16 has the distilled lessons (self-referential compat;
   exit codes track the verb).
 
-### NEXT TASK — fix C4 (real-upstream compatibility), THEN the v1 surface sequence
+### Dogfood ROUND 2 (2026-07-16, same session, user-directed) — real schemas + a real API through the full boundary
+
+- **C5 verified live → folded into the C4 PR scope (see NEXT TASK).**
+  Context7's real names are hyphenated (`resolve-library-id`); normalizeMcp
+  underscores them; serve-time derives the upstream name by stripping the
+  namespace → 2/2 tools failed live ("Tool resolve_library_id not found").
+  GitHub's 44 tools round-trip only by luck (already snake_case).
+- **Everything behind the transport WORKS against a live API** (via a
+  throwaway loopback shim translating bare JSON-RPC → streamable HTTP,
+  scratchpad-only, now stopped): real `add-mcp` ingest (2 safe tools), C3
+  `--replace` gate exercised (clean refusal → informative retarget), catalog
+  search ranked the real tools first, schema fidelity perfect through
+  normalize → store → describe, **first real end-to-end result ever**
+  (Context7 resolve), and a **chained two-call workflow in one sandboxed
+  execution** (resolve → parse → query_docs, 2 trace rows under one
+  execution_id — the §4 thesis proven).
+- **Findings/questions logged (LEARNINGS 2026-07-16 round 2):** upstream
+  `isError:true` crosses as a COMPLETED execution (trace row faithful;
+  v1 trace viewer should offer a tool-level-failure filter); stored
+  inputSchema is NOT enforced pre-flight (upstream rejected my bad input;
+  Ajv already a dep — decide deliberately in the C4/C5 design); a source
+  added mid-session IS visible without restart (catalog is store-backed —
+  the §14 caveat didn't bite this path).
+- Housekeeping: the `context7` source row in the demo db points at a dead
+  ephemeral shim port — irrelevant; the whole demo db is deleted at C4
+  step 0 (key rotation).
+
+### NEXT TASK — fix C4 + C5 together (real-upstream compatibility), THEN the v1 surface sequence
 
 **DECIDED + RECORDED (2026-07-16, same session):** the user reviewed the
 stress-tested evidence and named the merge — **PR #37 merged (squash) →
@@ -83,8 +110,14 @@ application/json, text/event-stream` + SSE frame parsing on BOTH the
 onboarding fetch (`packages/cli/src/mcp-fetch.ts`) and serve-time
 (`packages/sdk/src/pipeline/upstream.ts`); (3) send CONDUIT_ADD_SECRET during
 onboarding; (4) tools/list pagination via nextCursor (named in C4's own
-design-doc text; real servers paginate); fold in CLI frictions 1–3 above
-(same files). Stress-test evidence (2026-07-16, live): GitHub accepts bare
+design-doc text; real servers paginate); (5) **C5 — store the upstream tool
+name and use IT at call time** (round-2 dogfood proved hyphenated names are
+MCP-mainstream and 2/2 of the first real upstream's tools were uncallable;
+likely a schema change on `tools` + `normalize/mcp.ts` + `upstream.ts`);
+fold in CLI frictions 1–3 above (same files). Design questions queued for
+the brainstorm: bare-JSON-RPC dialect fate (Q1, asked, unanswered),
+serve-time session strategy (per-call handshake vs cached), pre-flight
+input validation against the stored schema (Ajv already a dep). Stress-test evidence (2026-07-16, live): GitHub accepts bare
 tools/list WITH auth (its blockers are auth + SSE only) and the full
 handshake onboards its real 44-tool surface; Context7 genuinely requires the
 session handshake — the standard handshake covers both. **Vercel-class OAuth

@@ -1461,3 +1461,37 @@ VERB's outcome; put the object's fate in the detail line.** Same session:
 "upstream unreachable — re-run when reachable", sending an auth problem to
 a network queue — the rich error existed and was discarded at the one
 catch site.
+
+## 2026-07-16 — Dogfood round 2: real schemas + a real API through the full boundary (no PR; findings session)
+
+### 1. Real-world tool names broke round-trip on FIRST contact — C5 is a C4 co-requisite
+
+Context7's actual tool names are `resolve-library-id` and `query-docs`;
+`normalizeMcp` rewrites hyphens to underscores, and serve-time recovers the
+upstream name by string-stripping the namespace — so 2/2 of the first real
+upstream's tools failed live with "Tool resolve_library_id not found"
+(demonstrated end-to-end through a translation shim). GitHub's 44 tools
+happened to round-trip (already snake_case), which is exactly why the demo
+suite never caught it. **C5 (store the upstream name; stop deriving it from
+the display name) must ship in the same PR as C4** — a working transport to
+an uncallable catalog is still an adoption blocker. Corollary: hyphenated
+names are MCP-mainstream, not an edge case.
+
+### 2. A 60-line loopback shim un-blocked dogfooding the entire rest of the product
+
+With the transport blocked (C4), a throwaway shim (bare JSON-RPC →
+streamable HTTP, session cached, one 404-re-handshake retry) let the REAL
+`add-mcp`, C3 `--replace` gate, catalog, sandbox, policy, egress, trace, and
+the chained multi-call workflow all run against a LIVE remote API — first
+real end-to-end result ever, plus live confirmation that: a source added
+mid-session is visible to a running server without restart (catalog is
+store-backed; the §14 caveat didn't bite this path); an upstream
+`isError:true` result crosses as a COMPLETED execution whose trace row
+faithfully records the error text (agents must check `isError`; a trace-
+viewer filter for tool-level failures is a v1 console nicety); and invalid
+input is rejected by the UPSTREAM, not pre-flight — the stored inputSchema
+is not enforced before dispatch (Ajv is already an sdk dep; decide
+deliberately). **When a boundary component blocks dogfooding, build the
+smallest translation harness and dogfood everything behind it anyway —
+the findings (C5, isError, validation) were all invisible from the blocked
+side.**
