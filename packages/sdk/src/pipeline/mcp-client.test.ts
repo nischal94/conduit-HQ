@@ -564,6 +564,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
   it("INVARIANT §18-C4: 404 retry fires ONLY when the request carried a session id, at most once", async () => {
     let initializeCount = 0;
     let callCount = 0;
+    const callSessionHeaders: (string | string[] | undefined)[] = [];
     const url = await serve((req, res) => {
       readBody(req).then(({ parsed }) => {
         if (parsed.method === "initialize") {
@@ -584,6 +585,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
         }
         if (parsed.method === "tools/call") {
           callCount++;
+          callSessionHeaders.push(req.headers["mcp-session-id"]);
           if (callCount === 1) {
             res.writeHead(404);
             res.end();
@@ -604,6 +606,10 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
       status: 200,
     });
     expect(initializeCount).toBe(2);
+    // The retried request must carry the FRESH session's id on the wire —
+    // pinning that the retry uses the re-initialized local session, not the
+    // stale one that 404'd.
+    expect(callSessionHeaders).toEqual(["sess-1", "sess-2"]);
   });
 
   it("INVARIANT §18-C4: a second consecutive 404 rejects http_status 404", async () => {
@@ -743,6 +749,75 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     // page 1 was fetched twice: once before the 404, once after the restart.
     expect(page1FetchCount).toBe(2);
     expect(initializeCount).toBe(2);
+  });
+
+  it("INVARIANT §18-C4: the byte budget consumed BEFORE a mid-pagination 404 still counts against the retry — a from-zero retry would fit, the kept budget does not", async () => {
+    // Sizing (measured off the wire, JSON bodies): each initialize response
+    // is ~150 bytes; each page body with a 1000-byte pad is ~1080 bytes; the
+    // 404 and 202 responses are empty. Full sequence:
+    //   init(150) + page1(1080) + [404: 0] + re-init(150) + page1(1080) + page2(1080)
+    //   ≈ 3540 bytes cumulative > maxBytes 3000 → cap during the retry leg.
+    // A retry leg alone from a RESET budget would be ≈ 2310 < 3000 and would
+    // resolve — so this test fails if the retry ever resets `bytesLeft`,
+    // pinning the "budget NOT reset" half of the mid-pagination invariant.
+    let initializeCount = 0;
+    let page1FetchCount = 0;
+    const pad = "x".repeat(1000);
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": `sess-${initializeCount}`,
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/list") {
+          const params = parsed.params as { cursor?: string } | undefined;
+          if (params?.cursor === undefined) {
+            page1FetchCount++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(
+              jsonRpcResponse(parsed.id as string, {
+                result: { tools: [{ name: "p1", pad }], nextCursor: "p2" },
+              }),
+            );
+            return;
+          }
+          if (page1FetchCount === 1) {
+            res.writeHead(404);
+            res.end();
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: { tools: [{ name: "p2", pad }] } }),
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient(
+      { target: url, headers: {} },
+      { deadline: () => 5_000, maxBytes: 3000 },
+    );
+    const session = await client.initialize();
+    await expect(client.listTools(session, 1024)).rejects.toMatchObject({ kind: "cap" });
+    // The retry DID start (re-handshake + page-one restart happened) — the
+    // cap fired only because the pre-404 bytes were kept on the budget.
+    expect(initializeCount).toBe(2);
+    expect(page1FetchCount).toBe(2);
   });
 
   it("INVARIANT §18-C4: a delayed 404 from an old session cannot invalidate a newly established session", async () => {
