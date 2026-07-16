@@ -23,7 +23,117 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-16 (MVP DOGFOOD DONE: 0/3 real public MCP upstreams onboardable — C4 is an ADOPTION BLOCKER, not a tracked nicety)
+## Current handoff — written 2026-07-16 evening (C4+C5 DESIGN + PLAN READY on branch `docs/c4-c5-transport-compat-design` — next session BUILDS Lane A via SDD)
+
+### Where things stand
+
+- **Main is `f5c2e49`** (docs only all day; product code unchanged since
+  `8c622d5`). **PR #37 MERGED** (`e0e5cfe`): spec §18 locks the C4 fix as the
+  first post-MVP PR, ahead of the §17 v1 surface sequence. No open PRs.
+- **The C4+C5 design AND implementation plan are DONE, reviewed, and
+  committed on branch `docs/c4-c5-transport-compat-design`** (pushed to
+  origin as backup; NO PR — the branch becomes Lane A's base; the git
+  tripwire is silent about it by design, LEARNINGS #21):
+  - Design: `docs/superpowers/specs/2026-07-16-c4-c5-transport-compat-design.md`
+    (commit `ad6eacb`, D4 amended `9e80470`). **CONVERGED after a 4-pass
+    codex cross-model review** — pass 1: 12 findings/6 P1 (missing
+    MCP-Protocol-Version header, version allowlist, id-correlating SSE
+    dispatcher, ONE logical-op budget, resume-session honesty, migration
+    lossiness); pass 2: 2 P1 (retarget credential leak → refusal;
+    in-drive session invalidation → cache binding); pass 3: 1 P1
+    (credentialRef is deterministic → per-drive salted auth digest);
+    pass 4: CONVERGED, 3 P3 precision notes folded in.
+  - **D4 was amended post-review** (strictly less machinery): upstreamName
+    lives in the ALREADY-persisted `sourceSemantics` JSON — no schema
+    migration, no INSERT changes, legacy rows fall back to prefix-strip
+    (the documented-lossy semantics as a read-time fallback). ANY SQL
+    schema change is now a STOP-and-ask deviation.
+  - Plan: `docs/superpowers/plans/2026-07-16-c4-c5-transport-compat.md`
+    (commit `08638ad`) — 13 TDD tasks. **Lane A (T1–T8, sdk):** mcp-wire
+    parser → mcp-client handshake → pagination/call/404-retry →
+    upstream-session scope → C5 normalizer → upstream.ts rewire →
+    manager-owned dispose → fixture closure; own PR, full load-bearing
+    gauntlet. **Lane B (T9–T13, cli):** demo upstream upgrade → onboarding
+    via shared client + retarget refusal + error mapping → --help +
+    collected validation → deny exit code → seed-demo retirement + README
+    truth-ups + token-demo byte-identical check.
+  - Execution decision (user, 2026-07-16): **subagent-driven development in
+    a FRESH session** — implementation starts fresh with the plan artifacts
+    passed in (project rule).
+- **Key rotation is step 0 of Lane-B VERIFICATION** (before any real PAT):
+  delete `~/.conduit/conduit.db*` + `gate-one-key`, mint fresh, update
+  `~/.conduit/claude-desktop-snippet.json` + Claude Code MCP config.
+- Earlier same day (sections below): dogfood rounds 1+2 (0/3 real upstreams
+  → C4 promotion via PR #37; C5 verified live; first real e2e result +
+  chained workflow through the boundary via a throwaway shim).
+
+### NEXT TASK — build Lane A (plan Tasks 1–8) via superpowers:subagent-driven-development
+
+Check out `docs/c4-c5-transport-compat-design`, cut the working branch
+`feat/c4-c5-lane-a-sdk` from it (design + plan ride with Lane A's PR, the
+PR #31 precedent), then drive the plan task-by-task: fresh implementer per
+task → verify (unsandboxed vitest per package; hook covers sdk on commit)
+→ two-verdict review → ledger (`.superpowers/sdd/progress.md`). COMMIT WITH
+SANDBOX DISABLED (hook mktemp; never --no-verify); NO git stash in
+dispatches; rebuild `packages/sdk/dist` (tsup) before anything mcp/cli
+consumes it. After T8: whole-branch review → Lane A PR → Tier 2 +
+/security-review + REAL codex pass (correctness framing — LEARNINGS
+2026-07-14 #2) + /explain-diff quiz + HUMAN-NAMED merge. Then Lane B
+(T9–T13) on merged main.
+
+### Session quirks worth inheriting
+
+- codex-one-path: inline prompt, `</dev/null`, read STDOUT (stderr is
+  reasoning noise), `dangerouslyDisableSandbox` (auth file), re-pass prompts
+  list already-fixed findings and demand an explicit CONVERGED line. The
+  4-pass arc this session worked exactly this way.
+- `$?` after a pipe reads grep's exit, not the command's — use zsh
+  `${pipestatus[1]}`.
+- The conduit MCP server wired into Claude Code sessions reads the demo db;
+  a source added mid-session IS visible live (catalog is store-backed).
+
+### Carry-overs (tracked)
+
+- Resume drops caller-supplied limits (P2, pre-existing; schema change, own
+  PR). `isHostStackOverflow` heuristic (degrades safely). Retire
+  `scripts/approve-demo.mjs` (migrate the mcp integration test first).
+  Pre-flight Ajv input validation (D6 deferral — decide deliberately,
+  design question). `isError` tool-failure filter = v1 trace-viewer nicety.
+  tools INSERT SQL dup: parked again (D4-amended changes no INSERTs).
+  Aikido MCP still not connected (`/aikido:setup`, user terminal).
+- CLI wording fix (prefix vs namespace) — IN the plan now (T13), no longer
+  a floating carry-over.
+
+### Session debrief (2026-07-16, full day)
+
+https://claude.ai/code/artifact/c9568154-1def-4460-bcbb-c0b870a46b7c
+
+### Kickoff prompt for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: C4+C5 design (codex-converged, 4 passes) + 13-task plan are
+> COMMITTED on branch `docs/c4-c5-transport-compat-design` (pushed, no PR).
+> PR #37 already locked the sequencing in spec §18. Do NOT redesign or
+> re-review the spec; do NOT re-run the dogfood.**
+>
+> **NEXT: build Lane A (plan Tasks 1–8).** Check out the design branch, cut
+> `feat/c4-c5-lane-a-sdk` from it, and run
+> superpowers:subagent-driven-development over
+> docs/superpowers/plans/2026-07-16-c4-c5-transport-compat.md — fresh
+> implementer per task, verify with unsandboxed vitest, two-verdict review,
+> ledger in .superpowers/sdd/progress.md. Global constraints live in the
+> plan header (zero new deps; cap values and SQL schema are STOP-and-ask;
+> commit sandbox-disabled, never --no-verify; no git stash). After T8:
+> whole-branch review → Lane A PR (design+plan ride with it) → full
+> load-bearing gauntlet (Tier 2 + /security-review + REAL codex
+> correctness-framed pass + /explain-diff quiz) → HUMAN-NAMED merge. Lane B
+> (T9–T13) follows on merged main; its verification step 0 is the demo-key
+> rotation (HANDOFF housekeeping).
+
+### ⚠️ Superseded same-day section below (morning dogfood handoff) — findings remain valid; its NEXT TASK is done (design+plan exist).
+
+## Superseded handoff — written 2026-07-16 morning (MVP DOGFOOD DONE: 0/3 real public MCP upstreams onboardable — C4 is an ADOPTION BLOCKER, not a tracked nicety)
 
 ### Where things stand
 

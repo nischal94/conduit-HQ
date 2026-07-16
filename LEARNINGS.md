@@ -1495,3 +1495,35 @@ deliberately). **When a boundary component blocks dogfooding, build the
 smallest translation harness and dogfood everything behind it anyway —
 the findings (C5, isError, validation) were all invisible from the blocked
 side.**
+
+## 2026-07-16 — C4+C5 design session (no code PR; spec PR #37 merged; design+plan on branch)
+
+### 1. Cross-model review at DESIGN stage caught 9 P1s before they were code — cheapest point on the curve
+
+The C4+C5 design looked complete after my own evidence-based audit (which
+itself caught 3 real gaps). A 4-pass codex arc then found NINE more
+blocking defects — a mandatory header I omitted entirely
+(MCP-Protocol-Version), an unbounded version negotiation, a
+timeout-multiplication hole (per-response budgets instead of one
+logical-operation budget), a credential leak through `--replace` retarget
+persistence, a session-cache key that rotation wouldn't change
+(deterministic `cred_${namespace}` ref), and an overstated
+"correct by construction" resume claim. Every one would have shipped into
+the §9.3 boundary file and been 10× costlier to find in PR review.
+**For a protocol or security-boundary design, run the cross-model pass on
+the DESIGN, not only the diff — and adjudicate each finding (accept /
+scope-down / reword) rather than accepting wholesale; 4 of 12 pass-1
+findings were legitimately scoped down as documented non-goals.**
+
+### 2. Re-read the store before designing a migration — the "schema change" was already a JSON field
+
+The reviewed design (and three codex passes over it) carried a
+`tools.upstream_name` column + backfill migration. Reading the actual
+store before planning revealed `sourceSemantics` is ALREADY persisted
+whole as a JSON TEXT column — and the spec's own C5 clause had named it as
+the intended home. The amendment (optional `upstreamName` field, read-time
+fallback for legacy rows) deleted the migration, the INSERT changes, and
+the 3rd-site SQL-extraction trigger from scope with identical observable
+behavior. **A migration design is not validated until someone re-reads the
+current schema — reviewers converge on the design's internal consistency,
+not on whether its premise about the codebase is true.**
