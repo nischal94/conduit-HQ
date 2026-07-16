@@ -484,6 +484,100 @@ describe("INVARIANT §18-C4: callTool", () => {
     expect(pingAnswerSeen).toEqual({ jsonrpc: "2.0", id: "ping-1", result: {} });
   });
 
+  it("INVARIANT §18-C4: reading stops at the matching response — a held-open SSE stream does not time out a delivered result", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          // Deliver the matching response, then KEEP THE STREAM OPEN forever.
+          res.write(
+            `data: ${jsonRpcResponse(parsed.id as string, { result: { content: [{ type: "text", text: "ok" }] } })}\n\n`,
+          );
+          // Deliberately never res.end() — a server that holds the stream open.
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    const started = Date.now();
+    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
+      result: { content: [{ type: "text", text: "ok" }] },
+      status: 200,
+    });
+    // Resolved from the matched frame, well before the 5s budget.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
+  it("INVARIANT §18-C4: a mid-stream ping is answered while the stream is still open", async () => {
+    let pingAnswerSeen = false;
+    let responseSentAfterPing = false;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        // The ping answer arrives as its own POST while the tools/call SSE stream is open.
+        if (parsed.id === "ping-live" && parsed.result !== undefined) {
+          pingAnswerSeen = true;
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          // Emit ONLY the ping first; hold the response until the ping is answered.
+          res.write(
+            `data: ${JSON.stringify({ jsonrpc: "2.0", method: "ping", id: "ping-live" })}\n\n`,
+          );
+          const waitForAnswer = setInterval(() => {
+            if (pingAnswerSeen) {
+              clearInterval(waitForAnswer);
+              responseSentAfterPing = true;
+              res.end(
+                `data: ${jsonRpcResponse(parsed.id as string, { result: { content: [] } })}\n\n`,
+              );
+            }
+          }, 10);
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
+      result: { content: [] },
+      status: 200,
+    });
+    expect(pingAnswerSeen).toBe(true);
+    expect(responseSentAfterPing).toBe(true);
+  });
+
   it("a JSON-RPC error member throws a protocol error naming the code and message", async () => {
     const url = await serve((req, res) => {
       readBody(req).then(({ parsed }) => {
@@ -936,6 +1030,43 @@ describe("INVARIANT §18-C4: deleteSession", () => {
       kind: "http_status",
       status: 500,
     });
+  });
+
+  it("INVARIANT §18-C4: deleteSession is deadline-bounded — a never-ending DELETE body cannot outlive the budget", async () => {
+    const url = await serve((req, res) => {
+      if (req.method === "DELETE") {
+        // Headers arrive, body starts, but the stream never ends.
+        res.writeHead(200);
+        res.write("draining");
+        // Deliberately never res.end() — a broken/malicious upstream.
+        return;
+      }
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-del" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        res.writeHead(202);
+        res.end();
+      });
+    });
+    const startedAt = Date.now();
+    const client = createMcpClient(
+      { target: url, headers: {} },
+      { deadline: () => Math.max(0, 500 - (Date.now() - startedAt)), maxBytes: 1024 * 1024 },
+    );
+    const session = await client.initialize();
+    const del = client.deleteSession(session);
+    const sentinel = new Promise<"sentinel">((r) => setTimeout(() => r("sentinel"), 3_000));
+    const started = Date.now();
+    // The rejection must win the race against a 3s sentinel.
+    await expect(
+      Promise.race([del.then(() => "resolved" as const), sentinel]),
+    ).rejects.toMatchObject({ kind: "timeout" });
+    expect(Date.now() - started).toBeLessThan(2_000);
   });
 
   it("does nothing when the session has no sessionId (sessionless server)", async () => {
