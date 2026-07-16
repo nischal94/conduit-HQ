@@ -56,6 +56,16 @@ export interface McpEndpoint {
   lookup?: LookupFunction;
 }
 
+/**
+ * A caller-owned, mutable session handle. `listTools`/`callTool` may replace
+ * `sessionId` in place on a scoped 404-expiry retry (design D3) — but ONLY
+ * when, at the moment the retry is about to publish, this object's
+ * `sessionId` still strictly equals the id that 404'd. If some other
+ * operation already renewed the session (a newer generation), the retry's
+ * freshly-initialized session is used LOCALLY to complete this operation and
+ * the caller's object is left untouched, so a delayed 404 from an old
+ * generation can never clobber a newer session.
+ */
 export interface McpSession {
   protocolVersion: string;
   sessionId?: string;
@@ -84,6 +94,35 @@ const initializeResultSchema = z.object({
   capabilities: z.record(z.unknown()),
   serverInfo: z.record(z.unknown()),
 });
+
+const toolsListResultSchema = z.object({
+  tools: z.array(z.unknown()),
+  nextCursor: z.string().optional(),
+});
+
+/**
+ * Safely extracts `{code, message}` from a JSON-RPC `error` member that
+ * `classifyJsonRpc` casts unchecked (Task-1 review carry-over): a malformed
+ * member (a bare string, missing fields, wrong types) never produces
+ * "undefined" in the rendered message — it falls back to a safe generic
+ * code/message instead.
+ */
+function safeRpcError(error: unknown): { code: number | "unknown"; message: string } {
+  if (typeof error === "object" && error !== null) {
+    const e = error as Record<string, unknown>;
+    return {
+      code: typeof e.code === "number" ? e.code : "unknown",
+      message: typeof e.message === "string" ? e.message : "unknown error",
+    };
+  }
+  return { code: "unknown", message: "unknown error (malformed error member)" };
+}
+
+/** `"<message> (code <code>)"` rendering, used by initialize/tools-list rejections. */
+function describeRpcError(error: unknown): string {
+  const { code, message } = safeRpcError(error);
+  return `${message} (code ${code})`;
+}
 
 export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpClient {
   // Cumulative across every response in the operation — every postOnce call
@@ -372,20 +411,200 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
     return session;
   }
 
+  /**
+   * Runs `op` against `session`. If it fails with a 404 that carried a
+   * session id, re-initializes ONCE into a fresh LOCAL session and retries
+   * `op` against that fresh session — never a second retry (a counter in
+   * this call frame, not per page: `op` itself may issue many requests, e.g.
+   * pagination, but only the FIRST 404 anywhere in the operation triggers a
+   * retry). On success of the retried `op`, the caller's `session` object is
+   * updated in place ONLY if it still holds the exact sessionId that 404'd —
+   * see the `McpSession` doc comment for the generation-guard rationale.
+   */
+  async function withSessionExpiryRetry<T>(
+    session: McpSession,
+    op: (activeSession: McpSession) => Promise<T>,
+  ): Promise<T> {
+    const sessionIdAtEntry = session.sessionId;
+    try {
+      return await op(session);
+    } catch (err) {
+      const is404 =
+        err instanceof McpClientError && err.kind === "http_status" && err.status === 404;
+      if (!is404 || sessionIdAtEntry === undefined) {
+        // Only a session-carrying request's 404 is eligible for the retry;
+        // a sessionless 404 (or any non-404 failure) surfaces immediately.
+        throw err;
+      }
+      const freshSession = await initialize();
+      const result = await op(freshSession);
+      if (session.sessionId === sessionIdAtEntry) {
+        session.protocolVersion = freshSession.protocolVersion;
+        if (freshSession.sessionId === undefined) {
+          delete session.sessionId;
+        } else {
+          session.sessionId = freshSession.sessionId;
+        }
+      }
+      return result;
+    }
+  }
+
+  async function listToolsOnce(session: McpSession, maxTools: number): Promise<unknown[]> {
+    const tools: unknown[] = [];
+    let cursor: string | undefined;
+    for (;;) {
+      const id = randomUUID();
+      const { result, error } = await requestAndAwait(
+        {
+          jsonrpc: "2.0",
+          id,
+          method: "tools/list",
+          params: cursor === undefined ? {} : { cursor },
+        },
+        session,
+        id,
+        session.protocolVersion !== "2025-06-18",
+      );
+      if (error !== undefined) {
+        throw new McpClientError(
+          "protocol",
+          `MCP server rejected tools/list: ${describeRpcError(error)}`,
+        );
+      }
+      const parsed = toolsListResultSchema.safeParse(result);
+      if (!parsed.success) {
+        throw new McpClientError(
+          "protocol",
+          `MCP tools/list result did not match the expected shape: ${parsed.error.message}`,
+        );
+      }
+      tools.push(...parsed.data.tools);
+      if (tools.length > maxTools) {
+        throw new McpClientError("cap", `MCP tools/list exceeded the maxTools cap (${maxTools})`);
+      }
+      if (parsed.data.nextCursor === undefined) {
+        return tools;
+      }
+      cursor = parsed.data.nextCursor;
+    }
+  }
+
+  async function callToolOnce(
+    session: McpSession,
+    name: string,
+    args: unknown,
+  ): Promise<{ result: unknown; status: number }> {
+    const id = randomUUID();
+    const { result, error } = await requestAndAwait(
+      {
+        jsonrpc: "2.0",
+        id,
+        method: "tools/call",
+        params: { name, arguments: args ?? {} },
+      },
+      session,
+      id,
+      session.protocolVersion !== "2025-06-18",
+    );
+    if (error !== undefined) {
+      // Parity with upstream.ts's error-member mapping: a JSON-RPC `error`
+      // member is a protocol failure. MCP tool-level failures instead arrive
+      // as `result.content[].isError` and are NOT errors — passed through
+      // verbatim below.
+      const { code, message } = safeRpcError(error);
+      throw new McpClientError("protocol", `upstream returned JSON-RPC error ${code}: ${message}`);
+    }
+    return { result, status: 200 };
+  }
+
+  function deleteSession(session: McpSession): Promise<void> {
+    if (session.sessionId === undefined) {
+      return Promise.resolve();
+    }
+    const remaining = budget.deadline();
+    if (remaining <= 0) {
+      return Promise.reject(
+        new McpClientError("timeout", "MCP operation budget already exhausted"),
+      );
+    }
+    const headers: Record<string, string> = {
+      ...endpoint.headers,
+      "mcp-protocol-version": session.protocolVersion,
+      "mcp-session-id": session.sessionId,
+    };
+    const send = endpoint.target.protocol === "https:" ? httpsRequest : httpRequest;
+
+    return new Promise<void>((resolve, reject) => {
+      const req = send(
+        endpoint.target,
+        {
+          method: "DELETE",
+          headers,
+          ...(endpoint.lookup !== undefined ? { lookup: endpoint.lookup } : {}),
+        },
+        (res) => {
+          req.setTimeout(0);
+          const status = res.statusCode ?? 0;
+          res.resume(); // drain, no body needed
+          res.on("end", () => {
+            if (status >= 200 && status < 300) {
+              resolve();
+              return;
+            }
+            if (status === 404 || status === 405) {
+              resolve();
+              return;
+            }
+            reject(
+              new McpClientError("http_status", `MCP session DELETE returned HTTP ${status}`, {
+                status,
+              }),
+            );
+          });
+          res.on("error", (err) => {
+            reject(
+              new McpClientError("network", "MCP session DELETE response stream failed", {
+                cause: err,
+              }),
+            );
+          });
+        },
+      );
+      req.setTimeout(remaining, () => {
+        req.destroy(Object.assign(new Error("MCP request timed out"), { name: "TimeoutError" }));
+      });
+      req.on("error", (err) => {
+        if (err instanceof Error && err.name === "TimeoutError") {
+          reject(new McpClientError("timeout", "MCP request timed out before a response arrived"));
+          return;
+        }
+        reject(
+          new McpClientError("network", "MCP request failed before a response arrived", {
+            cause: err,
+          }),
+        );
+      });
+      req.end();
+    });
+  }
+
   return {
     initialize,
-    listTools(_session: McpSession, _maxTools: number): Promise<unknown[]> {
-      throw new McpClientError("protocol", "not implemented");
+    listTools(session: McpSession, maxTools: number): Promise<unknown[]> {
+      return withSessionExpiryRetry(session, (activeSession) =>
+        listToolsOnce(activeSession, maxTools),
+      );
     },
     callTool(
-      _session: McpSession,
-      _name: string,
-      _args: unknown,
+      session: McpSession,
+      name: string,
+      args: unknown,
     ): Promise<{ result: unknown; status: number }> {
-      throw new McpClientError("protocol", "not implemented");
+      return withSessionExpiryRetry(session, (activeSession) =>
+        callToolOnce(activeSession, name, args),
+      );
     },
-    deleteSession(_session: McpSession): Promise<void> {
-      throw new McpClientError("protocol", "not implemented");
-    },
+    deleteSession,
   };
 }

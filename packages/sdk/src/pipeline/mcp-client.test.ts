@@ -1,6 +1,6 @@
-import { createServer, type Server } from "node:http";
+import { createServer, type IncomingMessage, type Server } from "node:http";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMcpClient, SUPPORTED_PROTOCOL_VERSIONS } from "./mcp-client.js";
+import { createMcpClient, type McpSession, SUPPORTED_PROTOCOL_VERSIONS } from "./mcp-client.js";
 
 let server: Server | undefined;
 afterEach(() => new Promise<void>((r) => (server ? server.close(() => r()) : r())));
@@ -253,5 +253,716 @@ describe("INVARIANT §18-C4: initialize handshake", () => {
       { deadline: () => 0, maxBytes: 1024 },
     );
     await expect(spent.initialize()).rejects.toMatchObject({ kind: "timeout" });
+  });
+});
+
+/** A single JSON-RPC response frame, written as a plain JSON body. */
+function jsonRpcResponse(id: string, body: object) {
+  return JSON.stringify({ jsonrpc: "2.0", id, ...body });
+}
+
+function readBody(req: IncomingMessage): Promise<{
+  raw: string;
+  parsed: Record<string, unknown>;
+}> {
+  return new Promise((resolve) => {
+    let raw = "";
+    req.on("data", (c) => (raw += c));
+    req.on("end", () => resolve({ raw, parsed: raw ? JSON.parse(raw) : {} }));
+  });
+}
+
+describe("INVARIANT §18-C4: listTools pagination and caps", () => {
+  it("INVARIANT §18-C4: tools/list follows nextCursor to completion and the tool-count cap spans ALL pages", async () => {
+    const page1 = Array.from({ length: 2 }, (_, i) => ({ name: `t1-${i}` }));
+    const page2 = Array.from({ length: 2 }, (_, i) => ({ name: `t2-${i}` }));
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/list") {
+          const params = parsed.params as { cursor?: string } | undefined;
+          res.writeHead(200, { "content-type": "application/json" });
+          if (params?.cursor === "p2") {
+            res.end(jsonRpcResponse(parsed.id as string, { result: { tools: page2 } }));
+          } else {
+            res.end(
+              jsonRpcResponse(parsed.id as string, {
+                result: { tools: page1, nextCursor: "p2" },
+              }),
+            );
+          }
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.listTools(session, 1024)).resolves.toEqual([...page1, ...page2]);
+  });
+
+  it("INVARIANT §18-C4: tools/list rejects with a cap error when the running tool count exceeds maxTools, across pages", async () => {
+    const page1 = Array.from({ length: 2 }, (_, i) => ({ name: `t1-${i}` }));
+    const page2 = Array.from({ length: 2 }, (_, i) => ({ name: `t2-${i}` }));
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/list") {
+          const params = parsed.params as { cursor?: string } | undefined;
+          res.writeHead(200, { "content-type": "application/json" });
+          if (params?.cursor === "p2") {
+            res.end(jsonRpcResponse(parsed.id as string, { result: { tools: page2 } }));
+          } else {
+            res.end(
+              jsonRpcResponse(parsed.id as string, {
+                result: { tools: page1, nextCursor: "p2" },
+              }),
+            );
+          }
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.listTools(session, 3)).rejects.toMatchObject({ kind: "cap" });
+  });
+
+  it("INVARIANT §18-C4: the byte budget is cumulative across pages", async () => {
+    // Each page's tools array is padded to ~700 bytes; two pages exceed maxBytes:1000.
+    const pad = "x".repeat(650);
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/list") {
+          const params = parsed.params as { cursor?: string } | undefined;
+          res.writeHead(200, { "content-type": "application/json" });
+          if (params?.cursor === "p2") {
+            res.end(
+              jsonRpcResponse(parsed.id as string, {
+                result: { tools: [{ name: "b", pad }] },
+              }),
+            );
+          } else {
+            res.end(
+              jsonRpcResponse(parsed.id as string, {
+                result: { tools: [{ name: "a", pad }], nextCursor: "p2" },
+              }),
+            );
+          }
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient(
+      { target: url, headers: {} },
+      { deadline: () => 5_000, maxBytes: 1000 },
+    );
+    const session = await client.initialize();
+    await expect(client.listTools(session, 1024)).rejects.toMatchObject({ kind: "cap" });
+  });
+});
+
+describe("INVARIANT §18-C4: callTool", () => {
+  it("tools/call returns the JSON-RPC result verbatim with the HTTP status, ignoring an interleaved notification", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          // An interleaved notification (no matching id, no method:"ping") then the real response.
+          res.write(
+            `data: ${JSON.stringify({ jsonrpc: "2.0", method: "notifications/progress", params: {} })}\n\n`,
+          );
+          res.end(
+            `data: ${jsonRpcResponse(parsed.id as string, { result: { content: [{ type: "text", text: "ok" }] } })}\n\n`,
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
+      result: { content: [{ type: "text", text: "ok" }] },
+      status: 200,
+    });
+  });
+
+  it("INVARIANT §18-C4: a server ping mid-stream is answered and the response still arrives", async () => {
+    let pingAnswerSeen: unknown;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        // The client's answer to the ping arrives as its own POST.
+        if (parsed.id === "ping-1" && parsed.result !== undefined) {
+          pingAnswerSeen = parsed;
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          res.write(
+            `data: ${JSON.stringify({ jsonrpc: "2.0", method: "ping", id: "ping-1" })}\n\n`,
+          );
+          res.end(`data: ${jsonRpcResponse(parsed.id as string, { result: { content: [] } })}\n\n`);
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
+      result: { content: [] },
+      status: 200,
+    });
+    expect(pingAnswerSeen).toEqual({ jsonrpc: "2.0", id: "ping-1", result: {} });
+  });
+
+  it("a JSON-RPC error member throws a protocol error naming the code and message", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, {
+              error: { code: -32601, message: "Method not found" },
+            }),
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "protocol",
+      message: expect.stringContaining("-32601"),
+    });
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      message: expect.stringContaining("Method not found"),
+    });
+  });
+
+  it("a malformed JSON-RPC error member (missing/non-conforming fields) still throws a protocol error with a safe generic message", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "application/json" });
+          // error member is a bare string, not { code, message }.
+          res.end(jsonRpcResponse(parsed.id as string, { error: "totally broken" }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({ kind: "protocol" });
+    try {
+      await client.callTool(session, "demo", {});
+      throw new Error("expected rejection");
+    } catch (err) {
+      expect(String((err as Error).message)).not.toContain("undefined (code undefined)");
+    }
+  });
+});
+
+describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
+  it("INVARIANT §18-C4: 404 retry fires ONLY when the request carried a session id, at most once", async () => {
+    let initializeCount = 0;
+    let callCount = 0;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": `sess-${initializeCount}`,
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          callCount++;
+          if (callCount === 1) {
+            res.writeHead(404);
+            res.end();
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
+      result: { content: [] },
+      status: 200,
+    });
+    expect(initializeCount).toBe(2);
+  });
+
+  it("INVARIANT §18-C4: a second consecutive 404 rejects http_status 404", async () => {
+    let initializeCount = 0;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": `sess-${initializeCount}`,
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "http_status",
+      status: 404,
+    });
+    expect(initializeCount).toBe(2);
+  });
+
+  it("INVARIANT §18-C4: a sessionless call getting 404 rejects immediately without retrying", async () => {
+    let initializeCount = 0;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          // No mcp-session-id header — sessionless server.
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    expect(session.sessionId).toBeUndefined();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "http_status",
+      status: 404,
+    });
+    expect(initializeCount).toBe(1);
+  });
+
+  it("INVARIANT §18-C4: a 404 mid-pagination restarts from page one, discarding the stale cursor, keeping the cumulative budget", async () => {
+    let initializeCount = 0;
+    let page1FetchCount = 0;
+    const pad = "x".repeat(50);
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": `sess-${initializeCount}`,
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/list") {
+          const params = parsed.params as { cursor?: string } | undefined;
+          if (params?.cursor === undefined) {
+            page1FetchCount++;
+            res.writeHead(200, { "content-type": "application/json" });
+            res.end(
+              jsonRpcResponse(parsed.id as string, {
+                result: { tools: [{ name: "p1", pad }], nextCursor: "p2" },
+              }),
+            );
+            return;
+          }
+          // page 2 request: 404 on the FIRST attempt only, succeed on retry.
+          if (page1FetchCount === 1) {
+            res.writeHead(404);
+            res.end();
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: { tools: [{ name: "p2", pad }] } }),
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient(
+      { target: url, headers: {} },
+      { deadline: () => 5_000, maxBytes: 100_000 },
+    );
+    const session = await client.initialize();
+    await expect(client.listTools(session, 1024)).resolves.toEqual([
+      { name: "p1", pad },
+      { name: "p2", pad },
+    ]);
+    // page 1 was fetched twice: once before the 404, once after the restart.
+    expect(page1FetchCount).toBe(2);
+    expect(initializeCount).toBe(2);
+  });
+
+  it("INVARIANT §18-C4: a delayed 404 from an old session cannot invalidate a newly established session", async () => {
+    let initializeCount = 0;
+    let callCount = 0;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": `sess-${initializeCount}`,
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          callCount++;
+          if (callCount === 1) {
+            res.writeHead(404);
+            res.end();
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session: McpSession = await client.initialize();
+    const originalSessionId = session.sessionId;
+    // Simulate a concurrent renewal: someone else already moved the shared
+    // session object to a new id before this operation's retry would publish.
+    const inFlight = client.callTool(session, "demo", {});
+    session.sessionId = "sess-renewed-by-someone-else";
+    await expect(inFlight).resolves.toEqual({ result: { content: [] }, status: 200 });
+    // The retry's local re-initialize must NOT have clobbered the caller's
+    // session, because by the time it would publish, session.sessionId no
+    // longer equals the id that 404'd.
+    expect(session.sessionId).toBe("sess-renewed-by-someone-else");
+    expect(session.sessionId).not.toBe(originalSessionId);
+  });
+});
+
+describe("INVARIANT §18-C4: deleteSession", () => {
+  it("sends DELETE with session + version headers; 404/405 resolve (non-fatal)", async () => {
+    for (const status of [200, 404, 405] as const) {
+      const seenDeletes: { headers: Record<string, string | string[] | undefined> }[] = [];
+      const url = await serve((req, res) => {
+        if (req.method === "DELETE") {
+          seenDeletes.push({ headers: req.headers });
+          res.writeHead(status);
+          res.end();
+          return;
+        }
+        readBody(req).then(({ parsed }) => {
+          if (parsed.method === "initialize") {
+            res.writeHead(200, {
+              "content-type": "application/json",
+              "mcp-session-id": "sess-del",
+            });
+            res.end(
+              jsonRpcResponse(parsed.id as string, {
+                result: initializeResult("2025-06-18").result,
+              }),
+            );
+            return;
+          }
+          res.writeHead(202);
+          res.end();
+        });
+      });
+      const client = createMcpClient({ target: url, headers: {} }, budget());
+      const session = await client.initialize();
+      await expect(client.deleteSession(session)).resolves.toBeUndefined();
+      expect(seenDeletes).toHaveLength(1);
+      expect(seenDeletes[0]?.headers["mcp-session-id"]).toBe("sess-del");
+      expect(seenDeletes[0]?.headers["mcp-protocol-version"]).toBe("2025-06-18");
+      await new Promise<void>((r) => server?.close(() => r()));
+      server = undefined;
+    }
+  });
+
+  it("a non-2xx/404/405 DELETE status throws http_status", async () => {
+    const url = await serve((req, res) => {
+      if (req.method === "DELETE") {
+        res.writeHead(500);
+        res.end();
+        return;
+      }
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-del" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        res.writeHead(202);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.deleteSession(session)).rejects.toMatchObject({
+      kind: "http_status",
+      status: 500,
+    });
+  });
+
+  it("does nothing when the session has no sessionId (sessionless server)", async () => {
+    let deleteCalls = 0;
+    const url = await serve((req, res) => {
+      if (req.method === "DELETE") {
+        deleteCalls++;
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        res.writeHead(202);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.deleteSession(session)).resolves.toBeUndefined();
+    expect(deleteCalls).toBe(0);
+  });
+});
+
+describe("INVARIANT §18-C4: batched array responses gated by negotiated protocol version", () => {
+  it("accepted under 2025-03-26", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": "sess-batch",
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-03-26").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(
+            JSON.stringify([
+              { jsonrpc: "2.0", method: "notifications/other", params: {} },
+              { jsonrpc: "2.0", id: parsed.id, result: { content: [] } },
+            ]),
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    expect(session.protocolVersion).toBe("2025-03-26");
+    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
+      result: { content: [] },
+      status: 200,
+    });
+  });
+
+  it("rejected under 2025-06-18", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": "sess-batch2",
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify([{ jsonrpc: "2.0", id: parsed.id, result: { content: [] } }]));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    expect(session.protocolVersion).toBe("2025-06-18");
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({ kind: "protocol" });
   });
 });
