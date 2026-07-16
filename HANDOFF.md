@@ -75,12 +75,21 @@ can be added. Recommendation: promote the C4 fix to the first post-dogfood
 PR (or step 0 of the v1 sequence) and record that in spec §18. The user
 decides; the spec edit follows their call.
 
-The C4 fix scope (verified against real servers this session): initialize
-handshake + Mcp-Session-Id + notifications/initialized; `Accept:
+The C4 fix scope (verified against real servers this session; REFINED by the
+2026-07-16 stress-test pass): (1) initialize handshake + Mcp-Session-Id +
+notifications/initialized + protocolVersion negotiation; (2) `Accept:
 application/json, text/event-stream` + SSE frame parsing on BOTH the
 onboarding fetch (`packages/cli/src/mcp-fetch.ts`) and serve-time
-(`packages/sdk/src/pipeline/upstream.ts`); send CONDUIT_ADD_SECRET during
-onboarding; fold in CLI frictions 1–3 above (same files). It is §5.5-scale
+(`packages/sdk/src/pipeline/upstream.ts`); (3) send CONDUIT_ADD_SECRET during
+onboarding; (4) tools/list pagination via nextCursor (named in C4's own
+design-doc text; real servers paginate); fold in CLI frictions 1–3 above
+(same files). Stress-test evidence (2026-07-16, live): GitHub accepts bare
+tools/list WITH auth (its blockers are auth + SSE only) and the full
+handshake onboards its real 44-tool surface; Context7 genuinely requires the
+session handshake — the standard handshake covers both. **Vercel-class OAuth
+upstreams stay OUT of scope** (static CONDUIT_ADD_SECRET is the v1 credential
+model; OAuth onboarding is its own later decision) — post-fix reality is 2/3
+verified onboardable, third blocked on OAuth by design. It is §5.5-scale
 and touches the §9.3 boundary file → **START WITH `superpowers:brainstorming`
 then `writing-plans`**; full load-bearing route (branch from origin/main, PR,
 Tier 2 + /security-review + REAL cross-model pass with the correctness
@@ -109,13 +118,18 @@ lifecycle.
   shape; tools INSERT SQL dup (3rd site rule).
 - Aikido SAST MCP still not connected (`/aikido:setup` in the user's
   terminal).
-- **Housekeeping note:** `~/.conduit/claude-desktop-snippet.json` holds the
-  gate-one demo CONDUIT_MASTER_KEY in plaintext (by design — it's a config
-  snippet), and it was echoed into the 2026-07-16 session transcript.
-  Demo-scale secret (protects the gate-one demo db only); rotate at leisure
-  by regenerating the key + re-adding sources. The gate-one db now also
-  carries two deliberately-failed dogfood executions (pause/deny exercises)
-  — harmless test data.
+- **Key rotation is a HARD step 0 of C4 dogfooding (upgraded from "at
+  leisure" 2026-07-16 after verification).** The gate-one demo
+  CONDUIT_MASTER_KEY (echoed into the 2026-07-16 transcript from
+  `claude-desktop-snippet.json`) currently protects NOTHING — verified:
+  the gate-one db's `secrets` table has 0 rows and all ~/.conduit files
+  are 0600 — so no action is needed today. BUT the C4 work will store the
+  FIRST real credential (a GitHub PAT); the exposed key must not be the
+  key sealing it. Cheapest rotation: at C4-dogfood setup, delete the demo
+  db + key and mint fresh (nothing in the db is worth keeping — both
+  sources point at dead ports; executions are dogfood test data), then
+  update the desktop snippet + any Claude Code MCP config. This dovetails
+  with §17 v1 step 1 ("verify credential key lifecycle").
 
 ### Session debrief (this session)
 
