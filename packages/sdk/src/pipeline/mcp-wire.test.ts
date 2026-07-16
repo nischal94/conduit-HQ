@@ -1,0 +1,50 @@
+import { describe, expect, it } from "vitest";
+import { classifyJsonRpc, createSseParser } from "./mcp-wire.js";
+
+describe("createSseParser", () => {
+  it("emits a data payload terminated by a blank line", () => {
+    const p = createSseParser();
+    expect(p.push('event: message\ndata: {"a":1}\n\n')).toEqual(['{"a":1}']);
+  });
+  it("joins multi-data lines and handles chunk splits mid-line", () => {
+    const p = createSseParser();
+    expect(p.push("data: hel")).toEqual([]);
+    expect(p.push("lo\ndata: world\n\n")).toEqual(["hello\nworld"]);
+  });
+  it("ignores comments, event names, id and retry fields", () => {
+    const p = createSseParser();
+    expect(p.push(": comment\nid: 7\nretry: 100\ndata: x\n\n")).toEqual(["x"]);
+  });
+  it("flush returns an unterminated trailing payload", () => {
+    const p = createSseParser();
+    p.push("data: tail");
+    expect(p.flush()).toEqual(["tail"]);
+  });
+});
+
+describe("classifyJsonRpc", () => {
+  it("matches the response by id", () => {
+    const [m] = classifyJsonRpc('{"jsonrpc":"2.0","id":"r1","result":{"ok":true}}', "r1", false);
+    expect(m).toEqual({ kind: "response", message: { id: "r1", result: { ok: true } } });
+  });
+  it("classifies a server ping request", () => {
+    const [m] = classifyJsonRpc('{"jsonrpc":"2.0","id":9,"method":"ping"}', "r1", false);
+    expect(m).toEqual({ kind: "ping", id: 9 });
+  });
+  it("classifies notifications and unrelated responses as other", () => {
+    expect(
+      classifyJsonRpc('{"jsonrpc":"2.0","method":"notifications/progress"}', "r1", false)[0],
+    ).toEqual({ kind: "other" });
+    expect(classifyJsonRpc('{"jsonrpc":"2.0","id":"zzz","result":1}', "r1", false)[0]).toEqual({
+      kind: "other",
+    });
+  });
+  it("accepts batches only when allowed (2025-03-26)", () => {
+    const batch = '[{"jsonrpc":"2.0","id":"r1","result":1},{"jsonrpc":"2.0","method":"x"}]';
+    expect(classifyJsonRpc(batch, "r1", true).some((m) => m.kind === "response")).toBe(true);
+    expect(() => classifyJsonRpc(batch, "r1", false)).toThrow(/malformed JSON-RPC payload/);
+  });
+  it("throws on unparseable JSON", () => {
+    expect(() => classifyJsonRpc("{nope", "r1", false)).toThrow(/malformed JSON-RPC payload/);
+  });
+});
