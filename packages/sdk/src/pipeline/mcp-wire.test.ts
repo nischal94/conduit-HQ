@@ -51,6 +51,14 @@ describe("createSseParser", () => {
     // The trailing \n resolves the final CR so nothing stays deferred.
     expect(p.push("\rdata: b\r\r\n")).toEqual(["a", "b"]);
   });
+  it("flush resets the buffer so a reused parser never prepends stale content", () => {
+    const p = createSseParser();
+    // A partial line left in the buffer, then flushed.
+    expect(p.push("data: stale")).toEqual([]);
+    p.flush();
+    // Reusing the SAME parser must NOT prepend the flushed partial.
+    expect(p.push("data: x\n\n")).toEqual(["x"]);
+  });
   it("flush terminates a trailing lone CR without leaking it into the payload", () => {
     const p = createSseParser();
     expect(p.push("data: x\r")).toEqual([]);

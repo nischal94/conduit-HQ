@@ -149,4 +149,20 @@ describe("INVARIANT §18-C4: per-drive session scope", () => {
     // make should only be called once (cache hit on second)
     expect(made).toEqual(["a"]);
   });
+
+  it("INVARIANT §18-C4: acquire after dispose rejects without running make (no leaked session)", async () => {
+    const made: string[] = [];
+    const scope = createUpstreamSessionScope();
+    await scope.dispose();
+    await expect(
+      scope.acquire({
+        url: "http://u/mcp",
+        authHeaders: { authorization: "Bearer a" },
+        make: fakeMake("late", made, []),
+      }),
+    ).rejects.toThrow(/after dispose/);
+    // make must NEVER run post-dispose — otherwise the fresh session it builds
+    // is inserted into a map that dispose has already drained, leaking it.
+    expect(made).toEqual([]);
+  });
 });

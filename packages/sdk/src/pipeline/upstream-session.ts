@@ -48,6 +48,13 @@ export function createUpstreamSessionScope(log?: (line: string) => void): Upstre
 
   return {
     async acquire(args) {
+      // Guard against acquire-after-dispose (G1): dispose() drains and clears
+      // the map, so a stray acquire would run make() (a fresh handshake), cache
+      // the live session in the emptied map, and leak it server-side (dispose
+      // never runs again). Reject BEFORE make() rather than orphan a session.
+      if (disposed) {
+        throw new Error("[UpstreamSessionScope] acquire after dispose");
+      }
       const digest = createHmac("sha256", salt)
         .update(canonicalAuth(args.authHeaders))
         .digest("hex");

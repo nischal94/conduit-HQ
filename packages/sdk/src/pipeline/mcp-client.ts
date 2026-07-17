@@ -745,10 +745,13 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
           `MCP tools/list result did not match the expected shape: ${parsed.error.message}`,
         );
       }
-      tools.push(...parsed.data.tools);
-      if (tools.length > maxTools) {
+      // Cap BEFORE spreading the page into the accumulator (G2): the maxBytes
+      // reader already bounds the wire, but checking the running count first
+      // avoids materializing an over-cap page. Same cap error, same message.
+      if (tools.length + parsed.data.tools.length > maxTools) {
         throw new McpClientError("cap", `MCP tools/list exceeded the maxTools cap (${maxTools})`);
       }
+      tools.push(...parsed.data.tools);
       if (parsed.data.nextCursor === undefined) {
         return tools;
       }

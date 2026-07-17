@@ -461,6 +461,38 @@ describe("INVARIANT §18-C4: listTools pagination and caps", () => {
     await expect(client.listTools(session, 3)).rejects.toMatchObject({ kind: "cap" });
   });
 
+  it("INVARIANT §18-C4: a SINGLE page exceeding maxTools caps BEFORE spreading it into the accumulator (G2)", async () => {
+    const page = Array.from({ length: 5 }, (_, i) => ({ name: `t-${i}` }));
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/list") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(jsonRpcResponse(parsed.id as string, { result: { tools: page } }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    // 5 tools > cap of 2 on the first (and only) page — the check must fire
+    // before the whole page is spread into the accumulator.
+    await expect(client.listTools(session, 2)).rejects.toMatchObject({ kind: "cap" });
+  });
+
   it("INVARIANT §18-C4: the byte budget is cumulative across pages", async () => {
     // Each page's tools array is padded to ~700 bytes; two pages exceed maxBytes:1000.
     const pad = "x".repeat(650);
