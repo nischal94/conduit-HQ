@@ -118,4 +118,37 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
       expect(result.stdout).toContain("--namespace");
     }
   });
+
+  it("add-mcp --namespace --help → routed (--help is the namespace VALUE, not a help request)", () => {
+    const result = dispatch(["add-mcp", "--namespace", "--help"]);
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.command).toBe("add-mcp");
+      expect(result.args).toEqual(["--namespace", "--help"]);
+    }
+  });
+
+  it("add-mcp --url -h → routed (-h is the url VALUE, not a help request)", () => {
+    const result = dispatch(["add-mcp", "--url", "-h"]);
+    expect(result.kind).toBe("route");
+    if (result.kind === "route") {
+      expect(result.args).toEqual(["--url", "-h"]);
+    }
+  });
+
+  it("add-mcp --replace --help → help (--replace is boolean; help legitimately follows)", () => {
+    const result = dispatch(["add-mcp", "--replace", "--help"]);
+    expect(result.kind).toBe("help");
+    if (result.kind === "help") {
+      expect(result.stdout).toContain("--namespace");
+    }
+  });
+
+  it("add-mcp --namespace foo --help → help (help is in a flag position, not a value)", () => {
+    const result = dispatch(["add-mcp", "--namespace", "foo", "--help"]);
+    expect(result.kind).toBe("help");
+    if (result.kind === "help") {
+      expect(result.stdout).toContain("--prefix");
+    }
+  });
 });

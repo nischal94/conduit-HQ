@@ -151,20 +151,22 @@ function mapFetchError(cause: unknown, url: string): string {
   if (!(cause instanceof McpClientError)) {
     return unreachable;
   }
+  // The shared fallthrough: surface the client's own message verbatim. Used by
+  // non-auth http_status (e.g. 404/500), cap (byte/tool-count breach), and
+  // protocol — each carries a self-describing McpClientError.message.
+  const clientMessage = `[conduit add-mcp] ${cause.message}; nothing was written.`;
   switch (cause.kind) {
     case "http_status":
       if (cause.status === 401 || cause.status === 403) {
         return `[conduit add-mcp] upstream requires authorization (HTTP ${cause.status}): set CONDUIT_ADD_SECRET; nothing was written.`;
       }
       // Other non-2xx (e.g. 404/500) — surface the client's own message.
-      return `[conduit add-mcp] ${cause.message}; nothing was written.`;
+      return clientMessage;
     case "cap":
-      // The client's cap message verbatim (byte or tool-count breach).
-      return `[conduit add-mcp] ${cause.message}; nothing was written.`;
+    case "protocol":
+      return clientMessage;
     case "timeout":
       return `[conduit add-mcp] upstream did not complete within the onboarding budget; nothing was written.`;
-    case "protocol":
-      return `[conduit add-mcp] ${cause.message}; nothing was written.`;
     case "network":
       return unreachable;
     default: {

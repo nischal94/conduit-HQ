@@ -38,6 +38,32 @@ function isCommand(value: string): value is Command {
 }
 
 /**
+ * add-mcp's value-taking flags (mirrors parseAddMcpArgs). A `--help`/`-h` token
+ * sitting in the VALUE position of one of these (e.g. `--namespace --help`) is
+ * the flag's argument, not a help request — so it must fall through to
+ * validation (exit 1), not print help (exit 0). Boolean flags (--replace,
+ * --clear-credential, --json) take no value, so a `--help` after them is a
+ * genuine help request.
+ */
+const ADD_MCP_VALUE_FLAGS = new Set(["--url", "--namespace", "--prefix"]);
+
+/**
+ * True iff a `--help`/`-h` token appears in a FLAG position anywhere in `rest`
+ * — i.e. at least one such token is NOT the value of a preceding value-taking
+ * flag. `add-mcp --namespace --help` → false (help is the namespace value);
+ * `add-mcp --help`, `add-mcp -h`, `add-mcp --replace --help` → true.
+ */
+function requestsAddMcpHelp(rest: string[]): boolean {
+  for (let i = 0; i < rest.length; i++) {
+    const token = rest[i];
+    if ((token === "--help" || token === "-h") && !ADD_MCP_VALUE_FLAGS.has(rest[i - 1] ?? "")) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/**
  * Pure arg→route function (design §6). Takes argv (without the node/script
  * entries) and returns a route decision. Never touches process.stdout,
  * process.stderr, or process.exit — the caller (bin.ts) is responsible for
@@ -60,8 +86,10 @@ export function dispatch(argv: string[]): DispatchResult {
 
   if (isCommand(first)) {
     // D5: add-mcp --help/-h is intercepted here — printed directly, never
-    // routed into runAddMcp (no store open, no network, exit 0).
-    if (first === "add-mcp" && (rest.includes("--help") || rest.includes("-h"))) {
+    // routed into runAddMcp (no store open, no network, exit 0). Only honored
+    // when help sits in a FLAG position: `--namespace --help` is a namespace
+    // VALUE (falls through to validation), not a help request.
+    if (first === "add-mcp" && requestsAddMcpHelp(rest)) {
       return { kind: "help", stdout: `${ADD_MCP_USAGE}\n` };
     }
     return { kind: "route", command: first, args: rest };
