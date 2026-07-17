@@ -363,9 +363,12 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       return Promise.reject(new McpClientError("http_status", "MCP redirect refused", { status }));
     }
     const contentType = res.headers["content-type"] ?? "";
-    if (!contentType.includes("text/event-stream")) {
-      // Non-SSE: read fully, then hand the single JSON body (or empty) to the
-      // caller. A single JSON body cannot early-stop, so nothing is lost.
+    if (status < 200 || status >= 300 || !contentType.includes("text/event-stream")) {
+      // Non-2xx (whatever its content-type — a 404 dressed as SSE must still
+      // classify http_status so the session-expiry retry and credential-error
+      // mapping fire) or non-SSE: read fully via the buffered path, which
+      // drains capped and throws http_status on a non-2xx. A single JSON body
+      // cannot early-stop, so nothing is lost on the 2xx non-SSE path either.
       return handleBufferedResponse(res).then((r) => ({
         payloads: r.payloads,
         headers: r.headers,

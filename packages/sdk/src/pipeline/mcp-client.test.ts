@@ -914,6 +914,86 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     expect(page1FetchCount).toBe(2);
   });
 
+  it("INVARIANT §18-C4: a non-2xx response with an SSE content-type still classifies as http_status — a 404 dressed as SSE triggers the session-expiry retry", async () => {
+    let initializeCount = 0;
+    let callCount = 0;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": `sess-${initializeCount}`,
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          callCount++;
+          if (callCount === 1) {
+            // A session-expiry 404 DRESSED IN an SSE content-type: must still
+            // classify as http_status 404 and fire the retry, not stream to
+            // no-match and reject protocol.
+            res.writeHead(404, { "content-type": "text/event-stream" });
+            res.end("data: gone\n\n");
+            return;
+          }
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
+      result: { content: [] },
+      status: 200,
+    });
+    expect(initializeCount).toBe(2);
+  });
+
+  it("a 401 with an SSE content-type rejects http_status 401 (credential mapping preserved)", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(401, { "content-type": "text/event-stream" });
+          res.end("data: denied\n\n");
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "http_status",
+      status: 401,
+    });
+  });
+
   it("INVARIANT §18-C4: a delayed 404 from an old session cannot invalidate a newly established session", async () => {
     let initializeCount = 0;
     let callCount = 0;
