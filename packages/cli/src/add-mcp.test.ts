@@ -1,7 +1,7 @@
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { type ConduitStore, openSqliteStore, SecretBox } from "@conduithq/sdk";
+import { type ConduitStore, McpClientError, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { type AddMcpArgs, type AddMcpDeps, runAddMcp } from "./commands/add-mcp.js";
@@ -406,5 +406,211 @@ describe("runAddMcp", () => {
     expect(result.exitCode).toBe(0);
     const parsed = JSON.parse(deps.stdoutLines.join("").trim());
     expect(parsed.credential).toBe("absent");
+  });
+
+  // --- Retarget credential-leak guard (design §18-C4 D2) ------------------
+  //
+  // A `--replace` to a NEW url while a stored credential exists, with no fresh
+  // CONDUIT_ADD_SECRET and no --clear-credential, is REFUSED OUTRIGHT — the
+  // stored secret is bound to the old upstream and must never be sent to a
+  // different host. The matrix pins refuse / proceed-with-env / proceed-with-
+  // clear.
+
+  it("INVARIANT /cli add-mcp: refuses --replace retarget to a new url while a stored credential exists (no env, no clear) — 0 writes, old cred intact", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer tok123" } }));
+    const before = await store.connections.list();
+    const existingRef = before.find((c) => c.integrationId === "int_github")
+      ?.credentialRef as string;
+    const beforeTools = await store.tools.list();
+
+    const deps = makeDeps({ store, env: {} });
+    const result = await runAddMcp(
+      { ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-new", replace: true },
+      deps,
+    );
+
+    expect(result.exitCode).toBe(1);
+    expect(deps.stderrLines.join("")).toContain(
+      `[conduit add-mcp] refusing to retarget "github" to a new url while a stored credential exists: pass CONDUIT_ADD_SECRET for the new upstream or --clear-credential to drop it. Nothing was written.`,
+    );
+    // Zero writes: url unchanged, tools unchanged, secret still resolves.
+    const source = await store.sources.get("src_github");
+    expect(source?.location).toBe(BASE_ARGS.url);
+    expect(await store.tools.list()).toEqual(beforeTools);
+    expect(await store.secrets.reveal(existingRef)).toBe("Bearer tok123");
+  });
+
+  it("retarget to a new url PROCEEDS when a fresh CONDUIT_ADD_SECRET is supplied (new secret sealed)", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer old" } }));
+
+    const result = await runAddMcp(
+      { ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-new", replace: true },
+      makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer new" } }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    const source = await store.sources.get("src_github");
+    expect(source?.location).toBe("http://127.0.0.1:9/mcp-new");
+    const conn = (await store.connections.list()).find((c) => c.integrationId === "int_github");
+    expect(conn?.credentialRef).toBeDefined();
+    expect(await store.secrets.reveal(conn?.credentialRef as string)).toBe("Bearer new");
+  });
+
+  it("retarget to a new url PROCEEDS with --clear-credential (cred dropped in-batch)", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer old" } }));
+    const before = await store.connections.list();
+    const oldRef = before.find((c) => c.integrationId === "int_github")?.credentialRef as string;
+
+    const result = await runAddMcp(
+      { ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-new", replace: true, clearCredential: true },
+      makeDeps({ store, env: {} }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    const source = await store.sources.get("src_github");
+    expect(source?.location).toBe("http://127.0.0.1:9/mcp-new");
+    const conn = (await store.connections.list()).find((c) => c.integrationId === "int_github");
+    expect(conn?.credentialRef).toBeUndefined();
+    expect(await store.secrets.reveal(oldRef)).toBeUndefined();
+  });
+
+  // --- Stored-credential reuse only on an UNCHANGED url -------------------
+
+  it("reuses the stored credential for the fetch ONLY when the url is unchanged", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer tok123" } }));
+
+    // Same url, no env secret: the stored credential is resolved and passed
+    // to the fetch as the Authorization header.
+    const sameUrlFetch = vi.fn(async (_url: string, opts?: { authorization?: string }) => {
+      void opts;
+      return TOOLS_LIST;
+    });
+    const result = await runAddMcp(
+      BASE_ARGS,
+      makeDeps({ store, env: {}, fetchTools: sameUrlFetch }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(sameUrlFetch).toHaveBeenCalledTimes(1);
+    expect(sameUrlFetch.mock.calls[0]?.[0]).toBe(BASE_ARGS.url);
+    expect(sameUrlFetch.mock.calls[0]?.[1]).toEqual({ authorization: "Bearer tok123" });
+  });
+
+  it("does NOT pass the stored credential when no auth is available (fresh add, no env)", async () => {
+    const store = await openTestStore();
+    const noAuthFetch = vi.fn(async (_url: string, opts?: { authorization?: string }) => {
+      void opts;
+      return TOOLS_LIST;
+    });
+
+    const result = await runAddMcp(
+      BASE_ARGS,
+      makeDeps({ store, env: {}, fetchTools: noAuthFetch }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    // Either called with no opts or opts without an authorization key.
+    expect(noAuthFetch.mock.calls[0]?.[1]?.authorization).toBeUndefined();
+  });
+
+  it("passes the fresh CONDUIT_ADD_SECRET (not the stored ref) to the fetch when both exist", async () => {
+    const store = await openTestStore();
+    await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer stored" } }));
+
+    const envFetch = vi.fn(async (_url: string, opts?: { authorization?: string }) => {
+      void opts;
+      return TOOLS_LIST;
+    });
+    const result = await runAddMcp(
+      BASE_ARGS,
+      makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer fresh" }, fetchTools: envFetch }),
+    );
+
+    expect(result.exitCode).toBe(0);
+    expect(envFetch.mock.calls[0]?.[1]).toEqual({ authorization: "Bearer fresh" });
+  });
+
+  // --- Error mapping per McpClientError kind (replaces the discard-all catch)
+
+  const errorCases: {
+    label: string;
+    error: McpClientError;
+    expected: string;
+  }[] = [
+    {
+      label: "http_status 401 → authorization guidance",
+      error: new McpClientError("http_status", "MCP endpoint returned HTTP 401", { status: 401 }),
+      expected:
+        "[conduit add-mcp] upstream requires authorization (HTTP 401): set CONDUIT_ADD_SECRET; nothing was written.",
+    },
+    {
+      label: "http_status 403 → authorization guidance",
+      error: new McpClientError("http_status", "MCP endpoint returned HTTP 403", { status: 403 }),
+      expected:
+        "[conduit add-mcp] upstream requires authorization (HTTP 403): set CONDUIT_ADD_SECRET; nothing was written.",
+    },
+    {
+      label: "cap → the client cap message verbatim",
+      error: new McpClientError("cap", "MCP response exceeded the cumulative byte budget"),
+      expected:
+        "[conduit add-mcp] MCP response exceeded the cumulative byte budget; nothing was written.",
+    },
+    {
+      label: "timeout → onboarding-budget line",
+      error: new McpClientError("timeout", "MCP response body read timed out"),
+      expected:
+        "[conduit add-mcp] upstream did not complete within the onboarding budget; nothing was written.",
+    },
+    {
+      label: "protocol → the client message",
+      error: new McpClientError("protocol", "MCP response never carried the expected id"),
+      expected:
+        "[conduit add-mcp] MCP response never carried the expected id; nothing was written.",
+    },
+    {
+      label: "network → today's unreachable line",
+      error: new McpClientError("network", "MCP request failed before a response arrived"),
+      expected: `[conduit add-mcp] upstream unreachable at ${BASE_ARGS.url}; nothing was written. Re-run when reachable.`,
+    },
+  ];
+
+  for (const { label, error, expected } of errorCases) {
+    it(`error mapping: ${label} — exit 1, exact stderr, 0 writes`, async () => {
+      const store = await openTestStore();
+      const deps = makeDeps({
+        store,
+        fetchTools: vi.fn(async () => {
+          throw error;
+        }),
+      });
+
+      const result = await runAddMcp(BASE_ARGS, deps);
+
+      expect(result.exitCode).toBe(1);
+      expect(deps.stderrLines.join("")).toContain(expected);
+      expect(await store.sources.list()).toEqual([]);
+    });
+  }
+
+  it("a non-McpClientError rejection still fails loud via the network fallback line", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({
+      store,
+      fetchTools: vi.fn(async () => {
+        throw new Error("some other error");
+      }),
+    });
+
+    const result = await runAddMcp(BASE_ARGS, deps);
+
+    expect(result.exitCode).toBe(1);
+    expect(deps.stderrLines.join("")).toContain(
+      `[conduit add-mcp] upstream unreachable at ${BASE_ARGS.url}; nothing was written. Re-run when reachable.`,
+    );
+    expect(await store.sources.list()).toEqual([]);
   });
 });
