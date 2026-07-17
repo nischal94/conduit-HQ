@@ -32,7 +32,7 @@ in this package). `--help` and `--version` are available at the top level.
    `add-mcp` fetches the upstream's `tools/list` first (5s timeout) and writes
    NOTHING unless the fetch succeeds — a dead upstream leaves zero rows. On
    success it prints a risk-class count summary (e.g.
-   `seeded 12 tools under github.acme.prod: 8 safe (auto-allow), 3 review (approval), 1 destructive (approval)`),
+   `seeded 12 tools for connection github.acme.prod (namespace github): 8 safe (auto-allow), 3 review (approval), 1 destructive (approval)`),
    stating the fail-closed §10.2 policy defaults. No policy rows are written.
 
    - **Credential (optional):** supply it via the `CONDUIT_ADD_SECRET` env
