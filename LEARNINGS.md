@@ -1527,3 +1527,47 @@ the 3rd-site SQL-extraction trigger from scope with identical observable
 behavior. **A migration design is not validated until someone re-reads the
 current schema — reviewers converge on the design's internal consistency,
 not on whether its premise about the codebase is true.**
+
+## 2026-07-17 — C4+C5 Lane A: build + full load-bearing gauntlet (PR #38 squash-merged → main `91fadef`)
+
+### 1. Fixes create new surface — convergence is judged by the SHAPE of findings, not their count
+
+The cross-model (codex) correctness pass ran FOUR times, and each fix round
+introduced a new bug the next round caught: the fresh-per-call-client fix (for
+deadline staleness) split the cumulative byte counter into two; adding rare
+CR-only SSE support broke the COMMON CRLF-split-across-chunks case; the
+single-flight acquire wasn't bounded by the waiting call's deadline. Each was a
+DISTINCT root cause in genuinely intricate new concurrency code, narrowing pass
+over pass — not one class re-spelled (which would be a denylist that never
+converges). The loop terminated correctly when the only remaining finding was a
+documented, already-accepted minor. **On a review loop that keeps finding bugs:
+check whether the findings are distinct, narrowing root causes (iterate and
+reconverge) or the same class respelled (fix the SHAPE and stop). "Still finding
+bugs" is not proof of systemic breakage — but the shape of the sequence is the
+signal to watch, per adversarial-convergence.md.**
+
+### 2. Both Tier-2 review mechanics earn their place — the pre-PR pass caught what four later layers missed
+
+`review-pr` (5 parallel specialists — the PRE-PR Tier-2 mechanic) was run LAST,
+after the post-PR 5-lens `code-review`, `/security-review`, a converged codex
+arc, AND Greptile — and still found a real self-consistency gap: `makeInvoker`
+could strand a `running` execution row, violating the §6 invariant the code's
+own comment two lines above asserts. Separately, the post-PR mechanic's
+git-history lens caught a dropped envelope-validation that ONLY the pre-branch
+history knew was a deliberate prior hardening. **The two Tier-2 mechanics are
+not redundant on the highest-stakes PRs; each carries framings the other lacks
+(specialist type/test/silent-failure lenses vs. git-history + prior-PR-comment
+lenses). Run both.**
+
+### 3. A high-severity finding is a prompt to verify, not a verdict to act on
+
+A specialist flagged a Sev-8 "concurrent acquire-vs-dispose session leak" — it
+looked severe and shippable-as-a-fix. Tracing the event-loop semantics showed
+the guard → `make()` → `entries.set()` run in one synchronous tick with no
+`await` between them, so `dispose()` can only interleave before the guard
+(acquire throws) or after the set (dispose tears the entry down): the leak
+window does not exist. False positive. A GREEN regression test was added anyway
+to lock the property. **The discipline that rejects a false Sev-8 is the same
+one that fixes a real P2 — severity from any reviewer (human, bot, or model)
+demands independent tracing before adoption. This is audit-recommendations-
+adversarially applied to a review finding, not an audit recommendation.**

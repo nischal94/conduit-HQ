@@ -23,7 +23,82 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-16 evening (C4+C5 DESIGN + PLAN READY on branch `docs/c4-c5-transport-compat-design` — next session BUILDS Lane A via SDD)
+## Current handoff — written 2026-07-17 (C4+C5 LANE A MERGED — PR #38 squash → main `91fadef`; next session BUILDS Lane B via SDD)
+
+### Where things stand
+
+- **Main is `91fadef`** — C4+C5 **Lane A MERGED** (PR #38, squash, trailer-free
+  verified). The serve-time upstream caller now speaks MCP streamable HTTP
+  (initialize handshake + version allowlist, session-id validation, incremental
+  SSE with early-stop + live ping answering, tools/list pagination, tools/call,
+  deadline-bounded DELETE, ONE logical-op budget = single deadline + single
+  cumulative off-the-wire byte counter). Adds a per-drive session scope
+  (url+salted-auth-digest key, single-flight, dispose-never-throws) and C5 (the
+  raw upstream tool name stored in `sourceSemantics`, hydrated + sent on the
+  wire; legacy rows prefix-strip). No open PRs; local branches = only `main`
+  (the stale `docs/c4-c5-transport-compat-design` design branch was verified
+  merged-into-main-via-squash and deleted).
+- **Lane A passed the FULL load-bearing gauntlet** — 15 real defects found &
+  fixed (all RED-first INVARIANT-pinned) across per-task ×8 + whole-branch +
+  staff audit + BOTH Tier-2 mechanics (post-PR 5-lens `code-review` AND pre-PR
+  5-specialist `review-pr`) + `/security-review` (0 findings) + a 4-pass codex
+  CONVERGENCE + Greptile. The convergence loop's recurring lesson: each fix
+  round created new surface the next pass caught (byte-budget-doubling →
+  SSE-CRLF → acquire-wait → …) — legitimate distinct root causes, not a
+  denylist loop; it converged when the only remaining item was a documented
+  accepted minor.
+- Explainer + 6-question merge-gate quiz (human passed):
+  `https://claude.ai/code/artifact/f599cbfb-6de4-4664-93db-27199bebbe0c`.
+  Full session narrative: `.superpowers/sdd/progress-c4-c5.md` (git-ignored SDD
+  ledger) + this session's debrief artifact.
+
+### NEXT TASK — C4+C5 Lane B (plan Tasks 9–13, cli)
+
+Read the plan `docs/superpowers/plans/2026-07-16-c4-c5-transport-compat.md`
+(Lane B = T9–T13) and the design `docs/superpowers/specs/2026-07-16-c4-c5-transport-compat-design.md`.
+Lane B upgrades the CLI / onboarding path onto the now-merged Lane A client:
+T9 demo-upstream upgrade to streamable HTTP · T10 onboarding (`add-mcp`) fetch
+via the shared client + retarget-refusal + error mapping · T11 `--help` +
+collected validation · T12 dead-url deny exit code · T13 seed-demo retirement +
+README truth-ups + token-demo byte-identical check. Execution: subagent-driven
+development in a FRESH session (project rule); own PR, full load-bearing gauntlet
+(Lane B touches onboarding + a fetch path). LEARNINGS #21: Lane B has NO design
+branch — it bases off merged main; pair the git tripwire with `gh pr list`.
+
+### DEFERRED FOLLOW-UPS from Lane A (fold into the right pass; NOT blocking Lane B)
+
+1. **[egress / §16 hardening]** Bound the DNS pre-flight
+   (`assertEgressAllowed` / `createPinnedLookup`) with a timeout — it runs
+   before `startedAt`, so a slow resolver hangs the call unbounded by
+   `timeoutMs`. Pre-existing (identical in the old upstream.ts); a real gap vs
+   the "timeouts on every external call" rule. **Trigger:** next egress /
+   §16-resource-limit hardening pass.
+2. **[trace accuracy, tiny]** Thread `res.statusCode` through
+   `requestAndAwait` → `callToolOnce` instead of hardcoding `status: 200`, so a
+   2xx-non-200 upstream success traces its real status. Trace-cosmetic (nothing
+   branches on it). **Trigger:** next time that return path is touched.
+3. **[type-design durability]** Make `McpBudget`'s shared byte counter the sole
+   required representation (drop `maxBytes` + optional-`bytes`) so a future
+   caller can't silently construct two counters and break the F-1 cumulative
+   cap. **Trigger:** next mcp-client refactor.
+4. **[type-design durability]** Co-locate `McpSession`'s generation-guarded
+   `sessionId` mutation behind a method/class (or return-new-session) so the D3
+   invariant lives in the type, not a 25-line comment. Higher cost. **Trigger:**
+   next mcp-client refactor.
+
+### KICKOFF PROMPT for the Lane B session
+
+> Read HANDOFF.md, then the C4+C5 plan (Lane B = Tasks 9–13) and the design
+> doc. Lane A is merged (main `91fadef`). Build Lane B via subagent-driven
+> development: per-task brief → implement (TDD) → per-task review → fix loop →
+> whole-branch review → PR → load-bearing gauntlet (Tier 2 both mechanics +
+> `/security-review` + codex convergence + `/explain-diff` quiz) → human-named
+> merge. Carry the 4 deferred Lane-A follow-ups and act on each where its
+> trigger fires. The agent never merges — surface the PR for the human.
+
+---
+
+## Superseded handoff — written 2026-07-16 evening (C4+C5 DESIGN + PLAN READY on branch `docs/c4-c5-transport-compat-design` — next session BUILDS Lane A via SDD)
 
 ### Where things stand
 
