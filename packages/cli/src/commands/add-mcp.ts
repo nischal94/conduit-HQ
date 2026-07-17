@@ -170,11 +170,14 @@ function mapFetchError(cause: unknown, url: string): string {
     case "network":
       return unreachable;
     default: {
-      // Exhaustiveness: every McpClientError kind is handled above. A future
-      // sixth kind is a compile error here (mirrors bin.ts's _exhaustive), not
-      // a silent fall-through to the unreachable line.
+      // Exhaustiveness: every McpClientError kind is handled above, so a future
+      // sixth kind is a COMPILE error here (mirrors bin.ts's _exhaustive). The
+      // runtime return is the prefixed fallback, not the bare kind string, so a
+      // stale-compiled CLI against a newer SDK still emits a self-describing line
+      // rather than a raw `"new_kind"` with no `[conduit add-mcp]` prefix.
       const _exhaustive: never = cause.kind;
-      return _exhaustive;
+      void _exhaustive;
+      return unreachable;
     }
   }
 }
