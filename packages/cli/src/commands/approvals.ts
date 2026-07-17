@@ -162,6 +162,13 @@ export async function runDecide(
   const runtime = await deps.createRuntime({ store, allowPrivateEgress: env.allowPrivateEgress });
   const outcome = await runtime.manager.resume(executionId, { kind });
 
+  // Special case: a deny with ConduitPolicyBlocked means the policy successfully
+  // blocked the execution — the deny itself succeeded in achieving its goal.
+  if (outcome.status === "failed" && kind === "deny" && outcome.error.name === "ConduitPolicyBlocked") {
+    deps.stdout("denied\n");
+    return { exitCode: 0 };
+  }
+
   deps.stdout(`${outcome.status}\n`);
 
   if (outcome.status === "expired") {

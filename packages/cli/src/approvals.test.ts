@@ -474,4 +474,45 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
     expect(deps.stdoutLines.join("")).toBe("failed\n");
     expect(deps.stderrLines.join("")).toMatch(/SomeError: boom/);
   });
+
+  it("deny with ConduitPolicyBlocked exits 0 and prints 'denied'", async () => {
+    const store = await bareStore();
+    const outcome: ExecutionOutcome = {
+      status: "failed",
+      executionId: "exec_denied",
+      error: { name: "ConduitPolicyBlocked", message: "policy denied the execution" },
+    };
+    const deps = depsWithOutcome(outcome, store);
+    const result = await runDecide("deny", "exec_denied", deps);
+    expect(result.exitCode).toBe(0);
+    expect(deps.stdoutLines.join("")).toBe("denied\n");
+  });
+
+  it("deny with other error names still exits non-zero", async () => {
+    const store = await bareStore();
+    const outcome: ExecutionOutcome = {
+      status: "failed",
+      executionId: "exec_other",
+      error: { name: "NetworkError", message: "connection failed" },
+    };
+    const deps = depsWithOutcome(outcome, store);
+    const result = await runDecide("deny", "exec_other", deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("failed\n");
+    expect(deps.stderrLines.join("")).toMatch(/NetworkError: connection failed/);
+  });
+
+  it("approve with ConduitPolicyBlocked still exits non-zero (unchanged)", async () => {
+    const store = await bareStore();
+    const outcome: ExecutionOutcome = {
+      status: "failed",
+      executionId: "exec_approve_blocked",
+      error: { name: "ConduitPolicyBlocked", message: "policy denied the execution" },
+    };
+    const deps = depsWithOutcome(outcome, store);
+    const result = await runDecide("approve", "exec_approve_blocked", deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("failed\n");
+    expect(deps.stderrLines.join("")).toMatch(/ConduitPolicyBlocked: policy denied the execution/);
+  });
 });
