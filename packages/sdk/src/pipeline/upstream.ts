@@ -120,18 +120,27 @@ export function createMcpUpstreamCaller(
         // can issue the teardown DELETE later. That cached client's budget can
         // be stale by disposal time, which is fine: a failed teardown DELETE is
         // best-effort by design (dispose never throws).
-        const { session } = await scope.acquire({
-          url: request.source.location,
-          authHeaders: request.auth.headers,
-          make: async () => {
-            const client = createMcpClient(
-              { target, headers: { ...request.auth.headers }, lookup: pinnedLookup },
-              budget,
-            );
-            const session = await client.initialize();
-            return { client, session };
-          },
-        });
+        // Bound the acquire wait by THIS call's own deadline (F1). A second
+        // call single-flighting onto another call's in-flight handshake must
+        // not block past its own budget — otherwise a caller with 50ms left
+        // could wait seconds for a peer's (or a hostile upstream's stalled)
+        // handshake before its own deadline is ever checked. On a cache hit
+        // the acquire promise is already resolved and wins immediately.
+        const { session } = await withinDeadline(
+          scope.acquire({
+            url: request.source.location,
+            authHeaders: request.auth.headers,
+            make: async () => {
+              const client = createMcpClient(
+                { target, headers: { ...request.auth.headers }, lookup: pinnedLookup },
+                budget,
+              );
+              const session = await client.initialize();
+              return { client, session };
+            },
+          }),
+          budget.deadline,
+        );
         // The CALL itself uses a FRESH client bound to THIS call's budget
         // (deadline + a fresh cumulative byte allowance), not the cached
         // handshake client — otherwise call #2+ to a reused session would run
@@ -162,6 +171,41 @@ export function createMcpUpstreamCaller(
       }
     },
   };
+}
+
+/**
+ * Resolves `p`, but rejects with a `timeout` McpClientError if the caller's
+ * operation deadline elapses first. Used to bound the wait on a single-flighted
+ * session acquire by the waiting call's own budget (F1): only a genuine wait on
+ * a peer's in-flight handshake can hit this — a cache hit resolves immediately.
+ * The underlying acquire is not cancelled; the peer that owns it still settles
+ * it for other waiters.
+ */
+function withinDeadline<T>(p: Promise<T>, deadline: () => number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => {
+      if (settled) return;
+      settled = true;
+      reject(
+        new McpClientError("timeout", "MCP session acquisition exceeded the operation deadline"),
+      );
+    }, deadline());
+    p.then(
+      (value) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (err: unknown) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 /**

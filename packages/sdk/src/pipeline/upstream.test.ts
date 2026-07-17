@@ -591,6 +591,74 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
     expect(initializeCount).toBe(1); // single shared handshake across both calls
   });
 
+  it("INVARIANT §18-C4: waiting on a peer's in-flight handshake is bounded by the waiter's own deadline", async () => {
+    // Call A drives the shared handshake with a long budget; its initialize
+    // RESPONSE is delayed. Call B single-flights onto A's pending acquire with
+    // a tiny budget — it must NOT block for A's whole handshake. Before the
+    // fix, B awaited A's acquire unbounded and only checked its long-expired
+    // budget after the handshake resolved, so B blew past its timeoutMs.
+    const HANDSHAKE_DELAY = 600;
+    const { port, requests } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+      if (parsed.method === "initialize") {
+        setTimeout(() => {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": SESSION_ID });
+          res.end(
+            JSON.stringify({
+              jsonrpc: "2.0",
+              id: parsed.id,
+              result: {
+                protocolVersion: NEGOTIATED_VERSION,
+                capabilities: { tools: {} },
+                serverInfo: { name: "fixture", version: "0" },
+              },
+            }),
+          );
+        }, HANDSHAKE_DELAY);
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id ?? "1", result: { ok: true } }));
+    });
+    const isInitialize = (r: RecordedRequest): boolean => {
+      try {
+        return (JSON.parse(r.body || "{}") as { method?: string }).method === "initialize";
+      } catch {
+        return false;
+      }
+    };
+    const scope = createUpstreamSessionScope();
+    try {
+      const shared = {
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: { Authorization: SECRET } },
+        session: scope,
+      };
+      // A begins the shared handshake (long budget).
+      const a = caller.call({ ...shared, timeoutMs: 5_000 });
+      // Wait until A's initialize is on the wire, so B single-flights onto A's
+      // pending acquire rather than racing to start its own handshake.
+      while (!requests.some(isInitialize)) {
+        await new Promise((r) => setTimeout(r, 5));
+      }
+      const startB = Date.now();
+      const b = caller.call({ ...shared, timeoutMs: 50 });
+      await expect(b).rejects.toThrow(/timed out after 50ms/);
+      // Bounded by B's own 50ms budget, NOT by A's ~600ms handshake.
+      expect(Date.now() - startB).toBeLessThan(HANDSHAKE_DELAY - 100);
+      await expect(a).resolves.toMatchObject({ result: { ok: true } });
+    } finally {
+      await scope.dispose();
+    }
+  });
+
   it("INVARIANT §18-C4: chained calls in one drive each get a fresh per-call budget while reusing the session", async () => {
     // Two sequential calls share ONE scope (session reused, initialize once),
     // but each must run under its OWN F1 budget — a fresh deadline AND a fresh
