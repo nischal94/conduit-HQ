@@ -349,7 +349,13 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
     });
     req.on("end", () => {
       if (req.method !== "POST") {
-        sendJson(res, 400, rpcError(null, -32600, "only POST is served here"));
+        // Protocol-correct 405 (not a generic 400): a real client's best-effort
+        // teardown DELETE lands here and must see method-not-allowed — so a
+        // regression in the client's teardown headers/verb surfaces distinctly
+        // instead of blending into the malformed-request bucket. No session
+        // termination support — the client treats 405 as non-fatal and moves on.
+        res.setHeader("Allow", "POST");
+        sendJson(res, 405, rpcError(null, -32600, "method not allowed: only POST is served here"));
         return;
       }
 
@@ -370,6 +376,29 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
       }
 
       if (method === "initialize") {
+        // Validate the full initialize shape like a conforming MCP server
+        // (deliberate strictness, Task 9): a handshake missing protocolVersion,
+        // capabilities, or clientInfo is a 400, so a client regression that
+        // stops sending them is caught here instead of silently accepted.
+        const offeredVersion = params?.protocolVersion;
+        if (
+          typeof offeredVersion !== "string" ||
+          typeof params?.capabilities !== "object" ||
+          params?.capabilities === null ||
+          typeof params?.clientInfo !== "object" ||
+          params?.clientInfo === null
+        ) {
+          sendJson(
+            res,
+            400,
+            rpcError(
+              id,
+              -32602,
+              "initialize requires protocolVersion, capabilities, and clientInfo",
+            ),
+          );
+          return;
+        }
         sessionId = randomUUID();
         res.setHeader("Mcp-Session-Id", sessionId);
         sendJson(res, 200, {

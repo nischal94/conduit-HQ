@@ -164,6 +164,14 @@ async function fetchRawTools(port, diagnostics) {
     jsonrpc: "2.0",
     id: 0,
     method: "initialize",
+    // The fixture validates the full initialize shape (protocolVersion +
+    // capabilities + clientInfo) like a conforming MCP server — a bare
+    // `initialize` with no params is a 400 there, as it should be.
+    params: {
+      protocolVersion: UPSTREAM_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "token-demo", version: "0.0.0" },
+    },
   });
   const sessionId = initResponse.headers.get("mcp-session-id");
   if (!sessionId) {
