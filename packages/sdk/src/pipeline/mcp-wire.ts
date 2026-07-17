@@ -29,12 +29,20 @@ export function createSseParser(): { push(chunk: string): string[]; flush(): str
     // comments (:), event:, id:, retry: — ignored (resumption is a D6 non-goal)
   }
   // WHATWG SSE line endings: CR, LF, or CRLF. Scan for the next boundary and
-  // report both its index and whether it was the two-char CRLF.
+  // report both its index and its length. A LONE CR that is the LAST char of
+  // the buffer is DEFERRED (return undefined): it could be the first half of a
+  // CRLF split across chunks, and consuming it early would frame a multi-line
+  // event as two. It stays buffered until the next push reveals the following
+  // char (or flush treats it as a terminator).
   function nextBreak(s: string): { idx: number; len: number } | undefined {
     for (let i = 0; i < s.length; i++) {
       const ch = s[i];
       if (ch === "\n") return { idx: i, len: 1 };
-      if (ch === "\r") return s[i + 1] === "\n" ? { idx: i, len: 2 } : { idx: i, len: 1 };
+      if (ch === "\r") {
+        if (s[i + 1] === "\n") return { idx: i, len: 2 }; // CRLF
+        if (i + 1 < s.length) return { idx: i, len: 1 }; // confirmed CR-only
+        return undefined; // trailing lone CR — defer until the next char is known
+      }
     }
     return undefined;
   }
@@ -55,13 +63,14 @@ export function createSseParser(): { push(chunk: string): string[]; flush(): str
         consumeLine(buffer.slice(0, brk.idx));
         buffer = buffer.slice(brk.idx + brk.len);
       }
-      // Note: a CRLF split across two chunks terminates the line at the CR in
-      // this chunk; the leading LF of the next chunk becomes a harmless empty
-      // line (no buffered data → no-op), so frame boundaries stay correct.
+      // A trailing lone CR (if any) stays in `buffer`, held pending to
+      // disambiguate a CRLF split across chunks.
       return complete.splice(0);
     },
     flush(): string[] {
-      if (buffer !== "") consumeLine(buffer);
+      // At stream end a trailing lone CR IS a line terminator — strip it so it
+      // never leaks into the data payload.
+      if (buffer !== "") consumeLine(buffer.replace(/\r$/, ""));
       buffer = "";
       if (dataLines.length > 0) {
         complete.push(dataLines.join("\n"));

@@ -22,7 +22,10 @@ describe("createSseParser", () => {
   });
   it("INVARIANT §18-C4: splits on CR-only line endings (WHATWG SSE)", () => {
     const p = createSseParser();
-    expect(p.push("data: a\rdata: b\r\r")).toEqual(["a\nb"]);
+    // CR-only terminators: two data lines with a blank line (\r\r) between the
+    // events → two separate events. The trailing \n resolves the final CR so
+    // nothing is left deferred.
+    expect(p.push("data: a\r\rdata: b\r\r\n")).toEqual(["a", "b"]);
   });
   it("INVARIANT §18-C4: strips a single leading BOM at stream start", () => {
     const p = createSseParser();
@@ -32,6 +35,26 @@ describe("createSseParser", () => {
     const p = createSseParser();
     expect(p.push("﻿")).toEqual([]);
     expect(p.push("data: x\n\n")).toEqual(["x"]);
+  });
+  it("INVARIANT §18-C4: a CRLF split across chunks frames as one event", () => {
+    const p = createSseParser();
+    // The trailing \r of chunk 1 must be DEFERRED — it is the first half of a
+    // CRLF, not a CR-only line terminator.
+    expect(p.push("data: one\r")).toEqual([]);
+    expect(p.push("\ndata: two\r\n\r\n")).toEqual(["one\ntwo"]);
+  });
+  it("a lone CR at a chunk boundary that turns out to be CR-only frames correctly", () => {
+    const p = createSseParser();
+    expect(p.push("data: a\r")).toEqual([]);
+    // The deferred \r is followed by another \r (not \n) → confirmed CR-only
+    // terminators; the blank line ends event "a", then "b" is its own event.
+    // The trailing \n resolves the final CR so nothing stays deferred.
+    expect(p.push("\rdata: b\r\r\n")).toEqual(["a", "b"]);
+  });
+  it("flush terminates a trailing lone CR without leaking it into the payload", () => {
+    const p = createSseParser();
+    expect(p.push("data: x\r")).toEqual([]);
+    expect(p.flush()).toEqual(["x"]);
   });
 });
 
