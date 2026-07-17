@@ -4,7 +4,7 @@ import { join } from "node:path";
 import { type ConduitStore, McpClientError, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { type AddMcpArgs, type AddMcpDeps, runAddMcp } from "./commands/add-mcp.js";
+import { type AddMcpArgs, type AddMcpDeps, runAddMcp, USAGE } from "./commands/add-mcp.js";
 
 const TOOLS_LIST = [
   {
@@ -75,6 +75,22 @@ const BASE_ARGS: AddMcpArgs = {
   json: false,
 };
 
+describe("USAGE (D5 — add-mcp --help)", () => {
+  it("lists every flag and mentions CONDUIT_ADD_SECRET", () => {
+    for (const flag of [
+      "--url",
+      "--namespace",
+      "--prefix",
+      "--replace",
+      "--clear-credential",
+      "--json",
+    ]) {
+      expect(USAGE).toContain(flag);
+    }
+    expect(USAGE).toContain("CONDUIT_ADD_SECRET");
+  });
+});
+
 describe("runAddMcp", () => {
   it("malformed --namespace is rejected before any write", async () => {
     const store = await openTestStore();
@@ -85,6 +101,22 @@ describe("runAddMcp", () => {
     expect(result.exitCode).not.toBe(0);
     expect(deps.fetchTools).not.toHaveBeenCalled();
     expect(await store.sources.list()).toEqual([]);
+  });
+
+  it("D5: no flags at all → ONE stderr line naming ALL missing required flags, exit 1", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({ store, fetchTools: vi.fn() });
+
+    const result = await runAddMcp({ replace: false, clearCredential: false, json: false }, deps);
+
+    expect(result.exitCode).toBe(1);
+    expect(deps.fetchTools).not.toHaveBeenCalled();
+    expect(await store.sources.list()).toEqual([]);
+    expect(deps.stderrLines).toHaveLength(1);
+    const stderr = deps.stderrLines[0];
+    expect(stderr).toContain("--namespace");
+    expect(stderr).toContain("--url");
+    expect(stderr).toContain("--prefix");
   });
 
   it("INVARIANT /cli add-mcp: unreachable --url fails loud and writes nothing", async () => {

@@ -22,6 +22,26 @@ import { fetchToolsList } from "../mcp-fetch.js";
 
 const NAMESPACE_PATTERN = /^[a-z0-9_-]+$/;
 
+/** `conduit add-mcp --help` text (D5). dispatch.ts prints this directly
+ * without invoking runAddMcp — no store open, no network. */
+export const USAGE = `Usage: conduit add-mcp --namespace <ns> --url <url> --prefix <prefix> [options]
+
+Register an upstream MCP source with conduit-mcp (atomic onboarding/re-sync).
+
+Required flags:
+  --namespace <ns>   Namespace to register the source under (/^[a-z0-9_-]+$/)
+  --url <url>        Upstream MCP server URL to fetch tools/list from
+  --prefix <prefix>  Unique tool-name prefix for this source
+
+Options:
+  --replace           Allow retargeting an existing namespace to a new url/prefix
+  --clear-credential   Drop the stored credential instead of preserving it
+  --json               Emit machine-readable JSON output instead of a summary line
+  --help, -h            Show this help text
+
+Environment:
+  CONDUIT_ADD_SECRET  Authorization credential for the upstream fetch (never logged)`;
+
 export interface AddMcpArgs {
   url?: string;
   namespace?: string;
@@ -140,23 +160,26 @@ function mapFetchError(cause: unknown, url: string): string {
 }
 
 export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<AddMcpResult> {
-  const { namespace, url, prefix } = args;
-
-  // Step 1: validate --namespace BEFORE any fetch/store access.
-  if (namespace === undefined || !NAMESPACE_PATTERN.test(namespace)) {
-    deps.stderr(
-      `[conduit add-mcp] Invalid --namespace: must match /^[a-z0-9_-]+$/. Context: { namespace: ${JSON.stringify(namespace)} }\n`,
-    );
+  // Step 1: collect ALL missing/invalid required flags into ONE stderr line
+  // (D5 — single-pass validation) BEFORE any fetch/store access.
+  const missing: string[] = [];
+  if (args.namespace === undefined || !NAMESPACE_PATTERN.test(args.namespace)) {
+    missing.push("--namespace (must match /^[a-z0-9_-]+$/)");
+  }
+  if (args.url === undefined || args.url.trim() === "") {
+    missing.push("--url");
+  }
+  if (args.prefix === undefined || args.prefix.trim() === "") {
+    missing.push("--prefix");
+  }
+  if (missing.length > 0) {
+    deps.stderr(`[conduit add-mcp] Missing/invalid required flags: ${missing.join(", ")}.\n`);
     return { exitCode: 1 };
   }
-  if (url === undefined || url.trim() === "") {
-    deps.stderr(`[conduit add-mcp] Missing required --url.\n`);
-    return { exitCode: 1 };
-  }
-  if (prefix === undefined || prefix.trim() === "") {
-    deps.stderr(`[conduit add-mcp] Missing required --prefix.\n`);
-    return { exitCode: 1 };
-  }
+  // Narrowed: all three are now known-defined, valid strings.
+  const namespace: string = args.namespace as string;
+  const url: string = args.url as string;
+  const prefix: string = args.prefix as string;
 
   // Step 2: open the store and READ existing state FIRST (design §18-C4 D2).
   // The onboarding auth order requires read-before-fetch: the stored row and
