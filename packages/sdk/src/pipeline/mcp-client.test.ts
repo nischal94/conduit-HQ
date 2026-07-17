@@ -160,6 +160,30 @@ describe("INVARIANT §18-C4: initialize handshake", () => {
     }
   });
 
+  it("INVARIANT §18-C4: a repeated (array) Mcp-Session-Id header is malformed and rejected", async () => {
+    // Node array-ifies a duplicated response header. The client's
+    // `typeof rawSessionId !== "string"` branch treats an array as malformed.
+    const url = await serve((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const parsed = JSON.parse(raw);
+        if (parsed.method === "initialize") {
+          res.setHeader("content-type", "application/json");
+          res.setHeader("mcp-session-id", ["sid-1", "sid-2"]);
+          res.writeHead(200);
+          res.end(JSON.stringify({ ...initializeResult("2025-06-18"), id: parsed.id }));
+        } else {
+          res.writeHead(202);
+          res.end();
+        }
+      });
+    });
+    await expect(
+      createMcpClient({ target: url, headers: {} }, budget()).initialize(),
+    ).rejects.toMatchObject({ kind: "protocol" });
+  });
+
   it("accepts a sessionless server (no Mcp-Session-Id header)", async () => {
     const url = await serve((req, res) => {
       let raw = "";
@@ -718,6 +742,60 @@ describe("INVARIANT §18-C4: callTool", () => {
     expect(responseSentAfterPing).toBe(true);
   });
 
+  it("INVARIANT §18-C4: a failing ping-answer POST surfaces as the outer operation rejection", async () => {
+    // A mid-stream ping whose answer POST the server rejects (non-202) must NOT
+    // be swallowed: pingError + rejectOnce settle the outer callTool as a
+    // protocol failure, and the stream is torn down (no hang to budget).
+    let pingAnswerAttempted = false;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        // The ping-answer POST: reject it (500, not the required 202-empty).
+        if (parsed.id === "ping-bad" && parsed.result !== undefined) {
+          pingAnswerAttempted = true;
+          res.writeHead(500);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "text/event-stream" });
+          // Emit the ping and hold the stream open — the answer failure, not a
+          // later response, is what must settle the operation.
+          res.write(
+            `data: ${JSON.stringify({ jsonrpc: "2.0", method: "ping", id: "ping-bad" })}\n\n`,
+          );
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const started = Date.now();
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    // The ping-answer POST's 500 surfaces as the outer rejection (http_status),
+    // NOT swallowed — pingError + rejectOnce carry it out and tear down the
+    // held-open stream.
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "http_status",
+      status: 500,
+    });
+    expect(pingAnswerAttempted).toBe(true);
+    // Settled by the ping-answer failure, not by the 5s budget timeout.
+    expect(Date.now() - started).toBeLessThan(2_000);
+  });
+
   it("INVARIANT §18-C4: a response with neither result nor error is a protocol violation, never a null success", async () => {
     const url = await serve((req, res) => {
       readBody(req).then(({ parsed }) => {
@@ -1165,6 +1243,44 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
       kind: "http_status",
       status: 401,
+    });
+  });
+
+  it("INVARIANT §18-C4: a 3xx redirect dressed as SSE on tools/call is redirect-refused, not streamed to no-match", async () => {
+    // readClassified's redirect branch (status 3xx) runs BEFORE the content-type
+    // branch, so a 302 with an SSE content-type is refused as http_status, never
+    // parsed as an SSE stream that ends in a no-match protocol error.
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(302, {
+            "content-type": "text/event-stream",
+            location: "http://elsewhere/mcp",
+          });
+          res.end("data: go away\n\n");
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "http_status",
+      status: 302,
     });
   });
 

@@ -645,11 +645,29 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         throw cause;
       }
       try {
-        const invoke = deps.makeInvoker({
-          executionId: execution.id,
-          deadline: deadlineFor(opts?.limits),
-          upstreamSession,
-        });
+        // `deadlineFor()` and the injected `makeInvoker` are ALSO inside the
+        // terminalize-on-throw window: a synchronous throw from either (an
+        // injected invoker doing sync work, a bad limits value) must finalize
+        // the just-persisted `running` row, not strand it (§6). The default
+        // createToolInvoker does no sync-throwing work, so this is defensive —
+        // but the module's asserted invariant must hold for any injected dep.
+        let invoke: ToolInvoker;
+        try {
+          invoke = deps.makeInvoker({
+            executionId: execution.id,
+            deadline: deadlineFor(opts?.limits),
+            upstreamSession,
+          });
+        } catch (cause) {
+          await finish(execution, {
+            status: "failed",
+            error: {
+              name: "ConduitInternalError",
+              message: `[ExecutionManager] Invoker creation failed at start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+            },
+          });
+          throw cause;
+        }
         return await drive(execution, invoke, [], undefined, opts?.limits);
       } finally {
         try {

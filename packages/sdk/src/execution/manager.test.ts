@@ -1414,13 +1414,12 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
   });
 
   /**
-   * A recording fake `UpstreamSessionScope`: never touches a real MCP
-   * session, just proves creation/disposal timing. `acquire` is never called
-   * by these tests (the real invoker/upstream caller path is bypassed via a
-   * stub `makeInvoker` below is NOT used here — the tests drive the REAL
-   * pipeline so the manager's own create/dispose wrapping around `drive` is
-   * what's under test, independent of whether `upstream.ts` ever calls
-   * `acquire`).
+   * A recording fake `UpstreamSessionScope`: never touches a real MCP session,
+   * just proves creation/disposal timing. `acquire` is never called by these
+   * tests — they drive the REAL pipeline, so what's under test is the manager's
+   * own create/dispose wrapping around `drive()`, independent of whether
+   * `upstream.ts` ever calls `acquire`. (`acquire` here rejects to prove it is
+   * not exercised on these paths.)
    */
   function makeRecordingUpstreamSession(
     log: (event: "created" | "disposed") => void,
@@ -1459,9 +1458,9 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
     );
     expect(completed.status).toBe("completed");
 
-    // 2. A failing execution — an unknown tool fails closed (policy block →
-    //    guest-catchable ConduitPolicyBlocked is caught... use a genuinely
-    //    uncaught guest error instead, so the sandbox itself settles `failed`.
+    // 2. A failing execution — a plain uncaught guest error (a policy block
+    //    would be guest-catchable, so we use a genuinely uncaught throw here)
+    //    so the sandbox itself settles the drive `failed`.
     const failed = await manager.start(`throw new Error("boom");`);
     expect(failed.status).toBe("failed");
 
@@ -1523,6 +1522,64 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
     expect(row?.endedAt).toBeDefined();
     if (result.kind === "resolved") {
       expect(result.r.status).toBe("failed");
+    }
+  });
+
+  it("INVARIANT §6: a synchronously-throwing makeInvoker at start() terminalizes the row failed, never stranded running", async () => {
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeInvoker: () => {
+        throw new Error("[test] makeInvoker blew up synchronously");
+      },
+    };
+    const manager = createExecutionManager(deps);
+
+    const result = await manager
+      .start(`return 1;`, { requestKey: "rk-invoker-throw" })
+      .then((r) => ({ kind: "resolved" as const, r }))
+      .catch((e) => ({ kind: "threw" as const, e }));
+    // The window from the running-state persist until drive() takes over must
+    // terminalize on ANY throw (§6: running must reach a terminal). A stranded
+    // `running` row is un-resumable forever.
+    const row = await h.store.executions.getByRequestKey("rk-invoker-throw");
+    expect(row).toBeDefined();
+    expect(row?.status).toBe("failed");
+    expect(row?.endedAt).toBeDefined();
+    if (result.kind === "resolved") {
+      expect(result.r.status).toBe("failed");
+    }
+  });
+
+  it("INVARIANT §6: a throwing makeUpstreamSession on the RESUME path terminalizes, never stranded running (F-5 twin)", async () => {
+    const h = await makeHarness();
+    active = h;
+    // First: a normal start that pauses, using the default scope factory.
+    const manager0 = createExecutionManager(h.deps);
+    const first = await manager0.start(
+      `return await tools.github.create_issue({ title: "from agent" });`,
+    );
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") return;
+
+    // Now resume with a manager whose scope factory throws.
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: () => {
+        throw new Error("[test] resume-path scope factory blew up");
+      },
+    };
+    const manager = createExecutionManager(deps);
+    const resumed = await manager
+      .resume(first.executionId, { kind: "approve" })
+      .then((r) => ({ kind: "resolved" as const, r }))
+      .catch((e) => ({ kind: "threw" as const, e }));
+    const row = await h.store.executions.get(first.executionId);
+    expect(row?.status).toBe("failed");
+    expect(row?.endedAt).toBeDefined();
+    if (resumed.kind === "resolved") {
+      expect(resumed.r.status).toBe("failed");
     }
   });
 

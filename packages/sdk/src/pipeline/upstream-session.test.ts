@@ -150,6 +150,45 @@ describe("INVARIANT §18-C4: per-drive session scope", () => {
     expect(made).toEqual(["a"]);
   });
 
+  it("INVARIANT §18-C4: a dispose racing a pending acquire never leaks the just-made session", async () => {
+    // Regression pin (expected GREEN): the acquire guard runs synchronously and
+    // entries.set() caches the pending promise with NO await gap before dispose
+    // can interleave. So an acquire whose make() is still pending when dispose()
+    // is called — then resolves — must still have its session torn down (dispose
+    // drained the synchronously-cached entry). This locks the invariant against
+    // a future edit inserting an await between the guard and entries.set.
+    const deleted: string[] = [];
+    let resolveMake: ((v: { client: McpClient; session: McpSession }) => void) | undefined;
+    const madeSession: McpSession = { protocolVersion: "2025-06-18", sessionId: "sid-deferred" };
+    const madeClient: McpClient = {
+      initialize: async () => {
+        throw new Error("unused");
+      },
+      listTools: async () => [],
+      callTool: async () => ({ result: null, status: 200 }),
+      deleteSession: async (s) => {
+        deleted.push(s.sessionId ?? "none");
+      },
+    };
+    const scope = createUpstreamSessionScope();
+    const acquired = scope.acquire({
+      url: "http://u/mcp",
+      authHeaders: { authorization: "Bearer a" },
+      make: () =>
+        new Promise((resolve) => {
+          resolveMake = resolve;
+        }),
+    });
+    // dispose() while make() is still pending — it awaits the cached pending
+    // promise before tearing down.
+    const disposed = scope.dispose();
+    // Now resolve the handshake.
+    resolveMake?.({ client: madeClient, session: madeSession });
+    await Promise.all([acquired, disposed]);
+    // No leak: the just-made session was torn down by dispose.
+    expect(deleted).toEqual(["sid-deferred"]);
+  });
+
   it("INVARIANT §18-C4: acquire after dispose rejects without running make (no leaked session)", async () => {
     const made: string[] = [];
     const scope = createUpstreamSessionScope();
