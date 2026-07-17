@@ -60,6 +60,13 @@ function classifyOne(msg: unknown, expectedId: string): WireMessage {
     return { kind: "ping", id: m.id };
   }
   if (m.id === expectedId && m.method === undefined) {
+    // A matched id with NEITHER key is a malformed envelope, never a
+    // {result: undefined} success the caller could memoize as null (the
+    // hardening d534e26 added to the pre-rewrite upstream caller). JSON
+    // cannot encode undefined, so `in` is exactly the right presence test.
+    if (!("result" in m) && !("error" in m)) {
+      throw new Error("malformed JSON-RPC payload: response carried neither a result nor an error");
+    }
     const response: ClassifyOneResponse = {
       id: m.id as string,
     };

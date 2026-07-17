@@ -12,10 +12,10 @@ import { classifyJsonRpc, createSseParser, type WireMessage } from "./mcp-wire.j
  * incremental `postClassified`) and the handshake (`initialize`/`initialized`)
  * plus `listTools`/`callTool`/`deleteSession`. `postClassified` parses SSE
  * responses INCREMENTALLY and early-stops at the matching JSON-RPC id (design
- * D2), while `postOnce` reads short, single-body responses fully. Everything
- * here mirrors the transport mechanics in `upstream.ts`'s `sendPinnedRequest` +
- * `readCapped` — deliberately the same shape so upstream.ts can later delegate
- * to this client instead of maintaining a parallel path.
+ * D2), while `postOnce` reads short, single-body responses fully. This module
+ * OWNS the wire transport: `upstream.ts` delegates to this client for
+ * serve-time calls (pinned lookup, request-scoped auth headers, per-call
+ * budget) rather than maintaining a parallel HTTP path.
  */
 
 /** Newest-first: sent as the client's offer; also the counter-offer allowlist. */
@@ -152,6 +152,17 @@ function safeRpcError(error: unknown): { code: number | "unknown"; message: stri
   return { code: "unknown", message: "unknown error (malformed error member)" };
 }
 
+/**
+ * Renders a `classifyJsonRpc` throw into the protocol-error message, keeping
+ * the wire layer's specific reason (e.g. "carried neither a result nor an
+ * error", batch-forbidden) visible instead of a generic wrapper line.
+ */
+function describeWireError(cause: unknown): string {
+  return cause instanceof Error && cause.message !== ""
+    ? `MCP response was not valid JSON-RPC: ${cause.message}`
+    : "MCP response was not valid JSON-RPC";
+}
+
 /** `"<message> (code <code>)"` rendering, used by initialize/tools-list rejections. */
 function describeRpcError(error: unknown): string {
   const { code, message } = safeRpcError(error);
@@ -181,10 +192,11 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
 
   /**
    * Opens one JSON-RPC POST and hands the live response to `onResponse` once
-   * headers arrive. Owns the two-phase deadline handoff — the pre-response
-   * timer is disarmed the instant headers arrive, and the body reader that
-   * `onResponse` builds owns the remaining deadline (see upstream.ts
-   * sendPinnedRequest). Pre-response failures (timeout / socket error) reject.
+   * headers arrive. Owns the two-phase deadline handoff — one timer covers the
+   * connect/headers phase and is disarmed the instant headers arrive; the body
+   * reader that `onResponse` builds arms its own timer from the remaining
+   * budget, so the two phases can never race each other. Pre-response failures
+   * (timeout / socket error) reject.
    */
   function openPost<T>(
     body: object,
@@ -213,7 +225,8 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
         },
         (res) => {
           // Headers arrived: disarm the pre-response deadline so it cannot
-          // race the body-read phase (see upstream.ts sendPinnedRequest).
+          // race the body-read phase, which arms its own timer from the
+          // remaining budget.
           req.setTimeout(0);
           onResponse(res, req).then(resolve, reject);
         },
@@ -422,9 +435,7 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
         try {
           messages = classifyJsonRpc(payload, ctx.expectedId, ctx.allowBatch);
         } catch (cause) {
-          rejectOnce(
-            new McpClientError("protocol", "MCP response was not valid JSON-RPC", { cause }),
-          );
+          rejectOnce(new McpClientError("protocol", describeWireError(cause), { cause }));
           return true;
         }
         for (const msg of messages) {
@@ -534,7 +545,7 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       try {
         messages = classifyJsonRpc(payload, expectedId, allowBatch);
       } catch (cause) {
-        throw new McpClientError("protocol", "MCP response was not valid JSON-RPC", { cause });
+        throw new McpClientError("protocol", describeWireError(cause), { cause });
       }
       for (const msg of messages) {
         if (msg.kind === "response") {

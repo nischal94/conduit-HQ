@@ -578,6 +578,40 @@ describe("INVARIANT §18-C4: callTool", () => {
     expect(responseSentAfterPing).toBe(true);
   });
 
+  it("INVARIANT §18-C4: a response with neither result nor error is a protocol violation, never a null success", async () => {
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "application/json" });
+          // Malformed envelope: the matched id with NEITHER result NOR error —
+          // must never become a memoizable {result: null} success (d534e26).
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "protocol",
+      message: expect.stringContaining("neither a result nor an error"),
+    });
+  });
+
   it("a JSON-RPC error member throws a protocol error naming the code and message", async () => {
     const url = await serve((req, res) => {
       readBody(req).then(({ parsed }) => {

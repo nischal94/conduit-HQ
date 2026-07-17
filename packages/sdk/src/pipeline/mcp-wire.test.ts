@@ -47,4 +47,9 @@ describe("classifyJsonRpc", () => {
   it("throws on unparseable JSON", () => {
     expect(() => classifyJsonRpc("{nope", "r1", false)).toThrow(/malformed JSON-RPC payload/);
   });
+  it("INVARIANT §18-C4: a matched id with neither result nor error is a protocol violation, not a response", () => {
+    expect(() => classifyJsonRpc('{"jsonrpc":"2.0","id":"r1"}', "r1", false)).toThrow(
+      /neither a result nor an error/,
+    );
+  });
 });
