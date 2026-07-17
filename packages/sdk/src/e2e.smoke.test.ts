@@ -90,20 +90,57 @@ function startMcpServer(): Promise<{
       body += chunk.toString("utf8");
     });
     req.on("end", () => {
+      // The hostile-auth upstream fails EVERY POST (initialize included) with
+      // a 401 echoing the credential — same meaning, now on the first request.
       if (req.url === "/echo401") {
         res.writeHead(401, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "bad token", echoed: req.headers.authorization }));
         return;
       }
+      // Session teardown (ephemeral scope dispose): a bodyless DELETE — ack it.
+      if (req.method === "DELETE" || body === "") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      const payload = JSON.parse(body) as {
+        id: string;
+        method: string;
+        params?: { name?: string; arguments?: unknown };
+      };
+      // Streamable-HTTP handshake bookkeeping (every route handshakes normally;
+      // route-specific behavior lands on the tools/call below).
+      if (payload.method === "initialize") {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "mcp-session-id": "e2e-session-1",
+        });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: {} },
+              serverInfo: { name: "e2e-fixture", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (payload.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
       if (req.url === "/echoInBody") {
         // A hostile-but-200 upstream: instead of rejecting auth (like
-        // /echo401), it ACCEPTS the call and echoes the credential back
+        // /echo401), it ACCEPTS the tools/call and echoes the credential back
         // inside a successful JSON-RPC *result* body (Task 12 — the M4
-        // falsification probe). Any 200 response still passes through the
+        // falsification probe). Any 200 result still passes through the
         // §9.2 containsCredential tripwire (upstream.ts), so this exercises
         // the same defense-in-depth on the success path, one step earlier
         // than /echo401's error-body path.
-        const payload = JSON.parse(body) as { id: string };
         res.writeHead(200, { "content-type": "application/json" });
         res.end(
           JSON.stringify({
@@ -114,13 +151,9 @@ function startMcpServer(): Promise<{
         );
         return;
       }
-      const payload = JSON.parse(body) as {
-        id: string;
-        params: { name: string; arguments: unknown };
-      };
       upstreamCalls.push({
-        name: payload.params.name,
-        arguments: payload.params.arguments,
+        name: payload.params?.name ?? "",
+        arguments: payload.params?.arguments,
         sawAuthHeader: req.headers.authorization === SECRET,
       });
       res.writeHead(200, { "content-type": "application/json" });
@@ -230,9 +263,15 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
 
     const rehydrated = await store.tools.list("github");
     expect(rehydrated).toHaveLength(3);
-    // The read-side guard (PR #18) rebuilt sourceSemantics field-by-field.
+    // The read-side guard (PR #18) rebuilt sourceSemantics field-by-field,
+    // including the C5 upstreamName (the raw wire name recorded at normalize
+    // time) so hyphenated names round-trip to serve-time.
     const safeTool = rehydrated.find((t) => t.name === "github.list_issues");
-    expect(safeTool?.sourceSemantics).toEqual({ kind: "mcp", readOnlyHint: true });
+    expect(safeTool?.sourceSemantics).toEqual({
+      kind: "mcp",
+      upstreamName: "list_issues",
+      readOnlyHint: true,
+    });
 
     const catalog = new InMemoryCatalog();
     catalog.upsert(rehydrated);

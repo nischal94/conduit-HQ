@@ -47,7 +47,7 @@ export type RiskClass = "safe" | "review" | "destructive";
 export type SourceSemantics =
   | { kind: "openapi"; method: string; path: string }
   | { kind: "graphql"; operation: "query" | "mutation" }
-  | { kind: "mcp"; readOnlyHint?: boolean; destructiveHint?: boolean }
+  | { kind: "mcp"; upstreamName?: string; readOnlyHint?: boolean; destructiveHint?: boolean }
   | { kind: "custom_js"; declaredRisk: RiskClass };
 
 /** One callable operation, normalized to the one tool shape (spec §4.1, §7). */

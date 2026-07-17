@@ -11,6 +11,7 @@ import { createCatalogToolHost } from "../execute.js";
 import { normalizeMcp } from "../normalize/mcp.js";
 import { createToolInvoker } from "../pipeline/invoker.js";
 import { createMcpUpstreamCaller } from "../pipeline/upstream.js";
+import type { UpstreamSessionScope } from "../pipeline/upstream-session.js";
 import { createStorePolicyEngine } from "../policy.js";
 import { QuickJSSandbox } from "../sandbox/quickjs.js";
 import type { Sandbox } from "../sandbox/sandbox.js";
@@ -77,22 +78,57 @@ function startMcpServer(): Promise<{ server: Server; port: number; calls: Upstre
       body += chunk.toString("utf8");
     });
     req.on("end", () => {
+      // The hostile upstream fails EVERY POST (the handshake's initialize
+      // included) with a 401 echoing the credential — same meaning as before,
+      // now surfacing on the first streamable-HTTP request.
       if (req.url === "/echo401") {
         res.writeHead(401, { "content-type": "application/json" });
         res.end(JSON.stringify({ error: "bad token", echoed: req.headers.authorization }));
         return;
       }
+      // Session teardown (ephemeral scope dispose): a bodyless DELETE — ack it.
+      if (req.method === "DELETE" || body === "") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
       const payload = JSON.parse(body) as {
         id: string;
-        params: { name: string; arguments: unknown };
+        method: string;
+        params?: { name?: string; arguments?: unknown };
       };
-      calls.push({ name: payload.params.name, arguments: payload.params.arguments });
+      // Streamable-HTTP handshake bookkeeping — the caller now speaks the full
+      // MCP client protocol (initialize → initialized → tools/call).
+      if (payload.method === "initialize") {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "mcp-session-id": "mgr-session-1",
+        });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: {} },
+              serverInfo: { name: "mgr-fixture", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (payload.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      calls.push({ name: payload.params?.name ?? "", arguments: payload.params?.arguments });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           jsonrpc: "2.0",
           id: payload.id,
-          result: { ok: true, tool: payload.params.name },
+          result: { ok: true, tool: payload.params?.name },
         }),
       );
     });
@@ -1364,5 +1400,208 @@ describe("§16 wall-clock budget is wired into the invoker (finding F1, gate two
     // Clamped to the remaining budget (≤ 2000ms), strictly below the 30s ceiling.
     expect(timeouts[0]).toBeGreaterThan(0);
     expect(timeouts[0]).toBeLessThanOrEqual(2_000);
+  });
+});
+
+describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
+  });
+
+  /**
+   * A recording fake `UpstreamSessionScope`: never touches a real MCP session,
+   * just proves creation/disposal timing. `acquire` is never called by these
+   * tests — they drive the REAL pipeline, so what's under test is the manager's
+   * own create/dispose wrapping around `drive()`, independent of whether
+   * `upstream.ts` ever calls `acquire`. (`acquire` here rejects to prove it is
+   * not exercised on these paths.)
+   */
+  function makeRecordingUpstreamSession(
+    log: (event: "created" | "disposed") => void,
+    opts?: { throwOnDispose?: boolean },
+  ): () => UpstreamSessionScope {
+    return () => {
+      log("created");
+      let disposed = false;
+      return {
+        acquire: () => Promise.reject(new Error("acquire must not be called by these tests")),
+        async dispose() {
+          if (disposed) return;
+          disposed = true;
+          log("disposed");
+          if (opts?.throwOnDispose) {
+            throw new Error("[test] simulated dispose failure");
+          }
+        },
+      };
+    };
+  }
+
+  it("INVARIANT §18-C4: the manager disposes the upstream session scope on every drive exit — success, failure, AND pause", async () => {
+    const events: Array<"created" | "disposed"> = [];
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: makeRecordingUpstreamSession((e) => events.push(e)),
+    };
+    const manager = createExecutionManager(deps);
+
+    // 1. A completing execution (safe read only).
+    const completed = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+    );
+    expect(completed.status).toBe("completed");
+
+    // 2. A failing execution — a plain uncaught guest error (a policy block
+    //    would be guest-catchable, so we use a genuinely uncaught throw here)
+    //    so the sandbox itself settles the drive `failed`.
+    const failed = await manager.start(`throw new Error("boom");`);
+    expect(failed.status).toBe("failed");
+
+    // 3. An execution that pauses on a require_approval call.
+    const paused = await manager.start(
+      `return await tools.github.create_issue({ title: "from agent" });`,
+    );
+    expect(paused.status).toBe("paused");
+
+    expect(events.filter((e) => e === "created")).toHaveLength(3);
+    expect(events.filter((e) => e === "disposed")).toHaveLength(3);
+  });
+
+  it("INVARIANT §18-C4: a resumed drive gets a FRESH scope", async () => {
+    const events: Array<"created" | "disposed"> = [];
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: makeRecordingUpstreamSession((e) => events.push(e)),
+    };
+    const manager = createExecutionManager(deps);
+
+    const first = await manager.start(
+      `return await tools.github.create_issue({ title: "from agent" });`,
+    );
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") return;
+
+    expect(events).toEqual(["created", "disposed"]);
+
+    const resumed = await manager.resume(first.executionId, { kind: "approve" });
+    expect(resumed.status).toBe("completed");
+
+    // A SECOND scope was created for the resume — not a reuse of the first —
+    // and it too was disposed.
+    expect(events).toEqual(["created", "disposed", "created", "disposed"]);
+  });
+
+  it("INVARIANT §18-C4: a throwing makeUpstreamSession at start() terminalizes the row failed, never stranded running", async () => {
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: () => {
+        throw new Error("[test] scope factory blew up (e.g. randomBytes failure)");
+      },
+    };
+    const manager = createExecutionManager(deps);
+
+    const result = await manager
+      .start(`return 1;`, { requestKey: "rk-scope-throw" })
+      .then((r) => ({ kind: "resolved" as const, r }))
+      .catch((e) => ({ kind: "threw" as const, e }));
+    // Whether it rejects or resolves-failed, the persisted row MUST be terminal.
+    const row = await h.store.executions.getByRequestKey("rk-scope-throw");
+    expect(row).toBeDefined();
+    expect(row?.status).toBe("failed");
+    expect(row?.endedAt).toBeDefined();
+    if (result.kind === "resolved") {
+      expect(result.r.status).toBe("failed");
+    }
+  });
+
+  it("INVARIANT §6: a synchronously-throwing makeInvoker at start() terminalizes the row failed, never stranded running", async () => {
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeInvoker: () => {
+        throw new Error("[test] makeInvoker blew up synchronously");
+      },
+    };
+    const manager = createExecutionManager(deps);
+
+    const result = await manager
+      .start(`return 1;`, { requestKey: "rk-invoker-throw" })
+      .then((r) => ({ kind: "resolved" as const, r }))
+      .catch((e) => ({ kind: "threw" as const, e }));
+    // The window from the running-state persist until drive() takes over must
+    // terminalize on ANY throw (§6: running must reach a terminal). A stranded
+    // `running` row is un-resumable forever.
+    const row = await h.store.executions.getByRequestKey("rk-invoker-throw");
+    expect(row).toBeDefined();
+    expect(row?.status).toBe("failed");
+    expect(row?.endedAt).toBeDefined();
+    if (result.kind === "resolved") {
+      expect(result.r.status).toBe("failed");
+    }
+  });
+
+  it("INVARIANT §6: a throwing makeUpstreamSession on the RESUME path terminalizes, never stranded running (F-5 twin)", async () => {
+    const h = await makeHarness();
+    active = h;
+    // First: a normal start that pauses, using the default scope factory.
+    const manager0 = createExecutionManager(h.deps);
+    const first = await manager0.start(
+      `return await tools.github.create_issue({ title: "from agent" });`,
+    );
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") return;
+
+    // Now resume with a manager whose scope factory throws.
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: () => {
+        throw new Error("[test] resume-path scope factory blew up");
+      },
+    };
+    const manager = createExecutionManager(deps);
+    const resumed = await manager
+      .resume(first.executionId, { kind: "approve" })
+      .then((r) => ({ kind: "resolved" as const, r }))
+      .catch((e) => ({ kind: "threw" as const, e }));
+    const row = await h.store.executions.get(first.executionId);
+    expect(row?.status).toBe("failed");
+    expect(row?.endedAt).toBeDefined();
+    if (resumed.kind === "resolved") {
+      expect(resumed.r.status).toBe("failed");
+    }
+  });
+
+  it("a throwing dispose does not change the drive outcome", async () => {
+    const events: Array<"created" | "disposed"> = [];
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: makeRecordingUpstreamSession((e) => events.push(e), {
+        throwOnDispose: true,
+      }),
+    };
+    const manager = createExecutionManager(deps);
+
+    const result = await manager.start(
+      `return await tools.github.list_issues({ owner: "acme", repo: "site" });`,
+    );
+    // The execution still reports its own (successful) outcome — the
+    // dispose failure is swallowed (routed to the diagnostics sink) rather
+    // than surfacing as a rejection or flipping the outcome to failed.
+    expect(result.status).toBe("completed");
+    expect(events).toEqual(["created", "disposed"]);
   });
 });

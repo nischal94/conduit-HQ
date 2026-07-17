@@ -35,6 +35,16 @@ interface UpstreamCall {
   name: string;
 }
 
+const NEGOTIATED_VERSION = "2025-06-18";
+const SESSION_ID = "sess-cli-approvals-1";
+
+/**
+ * Streamable-HTTP MCP fixture (mirrors Task 6's `createStreamableFixture`
+ * helper in sdk/pipeline/upstream.test.ts — copied local since test files
+ * don't share exports across packages). Owns the handshake bookkeeping —
+ * replies to `initialize` and `notifications/initialized`, acks DELETE —
+ * and only records + answers the `tools/call` request.
+ */
 function startMcpServer(): Promise<{ server: Server; port: number; calls: UpstreamCall[] }> {
   const calls: UpstreamCall[] = [];
   const server = createServer((req, res) => {
@@ -43,14 +53,47 @@ function startMcpServer(): Promise<{ server: Server; port: number; calls: Upstre
       body += chunk.toString("utf8");
     });
     req.on("end", () => {
-      const payload = JSON.parse(body) as { id: string; params: { name: string } };
-      calls.push({ name: payload.params.name });
+      const payload = JSON.parse(body || "{}") as {
+        id?: string;
+        method?: string;
+        params?: { name: string };
+      };
+      if (payload.method === "initialize") {
+        res.writeHead(200, {
+          "content-type": "application/json",
+          "mcp-session-id": SESSION_ID,
+        });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "fixture", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (payload.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      if (req.method === "DELETE") {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+      const params = payload.params as { name: string };
+      calls.push({ name: params.name });
       res.writeHead(200, { "content-type": "application/json" });
       res.end(
         JSON.stringify({
           jsonrpc: "2.0",
           id: payload.id,
-          result: { ok: true, tool: payload.params.name },
+          result: { ok: true, tool: params.name },
         }),
       );
     });

@@ -73,9 +73,13 @@ describe("normalizeMcp", () => {
     it("records only explicitly declared hints in sourceSemantics", () => {
       expect(toolByName("linear.search_issues").sourceSemantics).toEqual({
         kind: "mcp",
+        upstreamName: "search_issues",
         readOnlyHint: true,
       });
-      expect(toolByName("linear.whoami").sourceSemantics).toEqual({ kind: "mcp" });
+      expect(toolByName("linear.whoami").sourceSemantics).toEqual({
+        kind: "mcp",
+        upstreamName: "whoami",
+      });
     });
   });
 
@@ -113,6 +117,21 @@ describe("normalizeMcp", () => {
       expect(() => normalizeMcp({ namespace: "x", tools: [{ name: "" }] })).toThrow(
         /not a structurally valid tools\/list result/,
       );
+    });
+  });
+
+  describe("upstream name recording", () => {
+    it("INVARIANT §18-C5: records the raw upstream name so hyphenated names round-trip", () => {
+      const tools = normalizeMcp({
+        namespace: "context7",
+        tools: [{ name: "resolve-library-id", inputSchema: { type: "object" } }],
+      });
+      expect(tools).toHaveLength(1);
+      expect(tools[0]?.name).toBe("context7.resolve_library_id");
+      expect(tools[0]?.sourceSemantics).toMatchObject({
+        kind: "mcp",
+        upstreamName: "resolve-library-id",
+      });
     });
   });
 });

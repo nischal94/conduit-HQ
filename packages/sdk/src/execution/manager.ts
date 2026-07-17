@@ -1,5 +1,9 @@
 import type { ToolInvoker } from "../execute.js";
 import { GUEST_ERROR_NAMES, REPLAY_DIVERGENCE_ERROR_NAME } from "../pipeline/errors.js";
+import {
+  createUpstreamSessionScope,
+  type UpstreamSessionScope,
+} from "../pipeline/upstream-session.js";
 import type {
   JournalEntry,
   Sandbox,
@@ -97,11 +101,25 @@ export interface ExecutionManagerDeps {
      * overrun the wall-clock by a full upstream ceiling (finding F1, gate two).
      */
     deadline?: () => number;
+    /**
+     * §18-C4: the per-drive upstream session scope, created by the manager
+     * BEFORE this invoker and disposed in a `finally` around the whole drive.
+     * Threading it through here (rather than each call minting an ephemeral
+     * scope) is what lets repeat calls to the same (url, auth) within one
+     * drive reuse a single initialized MCP session.
+     */
+    upstreamSession?: UpstreamSessionScope;
   }) => ToolInvoker;
   /** Wrap an invoker into the catalog-backed ToolHost (e.g. createCatalogToolHost(catalog, invoke)). */
   makeToolHost: (invoke: ToolInvoker) => ToolHost;
   /** Defaults to `createInMemoryApprovalDecisions`; injectable for tests. */
   makeDecisions?: () => ApprovalDecisions;
+  /**
+   * §18-C4: builds the per-drive upstream session scope. Defaults to
+   * `createUpstreamSessionScope`; injectable for tests (a recording fake
+   * proves creation/disposal timing without a real MCP session).
+   */
+  makeUpstreamSession?: () => UpstreamSessionScope;
   /** Injectable clock (ms); defaults to Date.now. */
   now?: () => number;
   /** Injectable id generator; defaults to crypto.randomUUID. */
@@ -188,6 +206,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   // instance per resume is correct: a decision lives only for the one resume
   // it is staged for, and the invoker consumes it one-shot.
   const makeDecisions = deps.makeDecisions ?? createInMemoryApprovalDecisions;
+  const makeUpstreamSession = deps.makeUpstreamSession ?? (() => createUpstreamSessionScope());
 
   /**
    * The remaining §16 wall-clock budget for a drive that is about to run, as a
@@ -605,11 +624,64 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         }
         throw cause;
       }
-      const invoke = deps.makeInvoker({
-        executionId: execution.id,
-        deadline: deadlineFor(opts?.limits),
-      });
-      return drive(execution, invoke, [], undefined, opts?.limits);
+      // The row is now `running` (persisted above). EVERYTHING from here until
+      // `drive` takes over must terminalize the row on a throw, or it strands
+      // `running` forever (§6 state machine: running must reach a terminal).
+      // `makeUpstreamSession()` — or the `randomBytes` inside the default scope
+      // factory — can throw; it must be INSIDE this guard, not before it (F-5).
+      let upstreamSession: UpstreamSessionScope;
+      try {
+        upstreamSession = makeUpstreamSession();
+      } catch (cause) {
+        // Sibling of drive()'s catch: finalize the just-persisted `running` row
+        // to terminal `failed` BEFORE re-throwing, so it is never stranded.
+        await finish(execution, {
+          status: "failed",
+          error: {
+            name: "ConduitInternalError",
+            message: `[ExecutionManager] Upstream session scope creation failed at start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+          },
+        });
+        throw cause;
+      }
+      try {
+        // `deadlineFor()` and the injected `makeInvoker` are ALSO inside the
+        // terminalize-on-throw window: a synchronous throw from either (an
+        // injected invoker doing sync work, a bad limits value) must finalize
+        // the just-persisted `running` row, not strand it (§6). The default
+        // createToolInvoker does no sync-throwing work, so this is defensive —
+        // but the module's asserted invariant must hold for any injected dep.
+        let invoke: ToolInvoker;
+        try {
+          invoke = deps.makeInvoker({
+            executionId: execution.id,
+            deadline: deadlineFor(opts?.limits),
+            upstreamSession,
+          });
+        } catch (cause) {
+          await finish(execution, {
+            status: "failed",
+            error: {
+              name: "ConduitInternalError",
+              message: `[ExecutionManager] Invoker creation failed at start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+            },
+          });
+          throw cause;
+        }
+        return await drive(execution, invoke, [], undefined, opts?.limits);
+      } finally {
+        try {
+          await upstreamSession.dispose();
+        } catch (cause) {
+          // Best-effort: a throwing dispose never changes the drive's own
+          // outcome (upstream-session.ts's own dispose never throws, but a
+          // custom injected scope might). Route to the same diagnostics sink
+          // the invoker uses (console.error) rather than rethrow.
+          console.error(
+            `[ExecutionManager] upstream session scope dispose failed after start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+          );
+        }
+      }
     },
 
     async resume(executionId, decision) {
@@ -714,12 +786,26 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // sandbox, which also receives `undefined` limits below (its own §16
         // interrupt still fires). Honoring the original tighter budget on resume
         // needs Execution to persist `limits` — tracked, its own change.
-        const invoke = deps.makeInvoker({
-          executionId,
-          decisions,
-          deadline: deadlineFor(undefined),
-        });
-        return await drive(running, invoke, prefix, undefined, undefined);
+        const upstreamSession = makeUpstreamSession();
+        try {
+          const invoke = deps.makeInvoker({
+            executionId,
+            decisions,
+            deadline: deadlineFor(undefined),
+            upstreamSession,
+          });
+          return await drive(running, invoke, prefix, undefined, undefined);
+        } finally {
+          try {
+            await upstreamSession.dispose();
+          } catch (cause) {
+            // Same best-effort discipline as start(): never let a throwing
+            // dispose change the resumed drive's own outcome.
+            console.error(
+              `[ExecutionManager] upstream session scope dispose failed after resume(). Context: { executionId: ${executionId}, cause: ${String(cause)} }`,
+            );
+          }
+        }
       } catch (cause) {
         // A throw in the preparation window (NOT from inside drive — drive
         // finalizes its own faults and re-throws already-terminalized). Best
