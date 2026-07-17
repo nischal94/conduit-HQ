@@ -31,7 +31,7 @@ Register an upstream MCP source with conduit-mcp (atomic onboarding/re-sync).
 Required flags:
   --namespace <ns>   Namespace to register the source under (/^[a-z0-9_-]+$/)
   --url <url>        Upstream MCP server URL to fetch tools/list from
-  --prefix <prefix>  Unique tool-name prefix for this source
+  --prefix <prefix>  Unique per-connection identifier for this source (not the tool-name path)
 
 Options:
   --replace           Allow retargeting an existing namespace to a new url/prefix

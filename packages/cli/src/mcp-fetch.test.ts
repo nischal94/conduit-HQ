@@ -143,7 +143,7 @@ describe("fetchToolsList — hostile-upstream caps", () => {
       writeMore();
     });
 
-    await expect(fetchToolsList(url)).rejects.toThrow();
+    await expect(fetchToolsList(url)).rejects.toMatchObject({ kind: "cap" });
 
     // The server must have sent FAR less than the 50MB total. 2× the cap
     // allows slack for socket buffers between "client cancelled" and "server
