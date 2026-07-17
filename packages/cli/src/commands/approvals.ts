@@ -164,7 +164,11 @@ export async function runDecide(
 
   // Special case: a deny with ConduitPolicyBlocked means the policy successfully
   // blocked the execution — the deny itself succeeded in achieving its goal.
-  if (outcome.status === "failed" && kind === "deny" && outcome.error.name === "ConduitPolicyBlocked") {
+  if (
+    outcome.status === "failed" &&
+    kind === "deny" &&
+    outcome.error.name === "ConduitPolicyBlocked"
+  ) {
     deps.stdout("denied\n");
     return { exitCode: 0 };
   }

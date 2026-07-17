@@ -16,17 +16,20 @@ package adds no core logic of its own; it is a thin transport shell over
    node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
    ```
 
-2. Seed a demo source/connection with allow-only policies so the walking
-   skeleton has something to call without stranding on an unapproved pause:
+2. Onboard an upstream MCP source with `conduit add-mcp` (from the
+   `@conduithq/cli` package — see `packages/cli/README.md` for the full flag
+   reference, `CONDUIT_ADD_SECRET` credential onboarding, and the retarget
+   refusal):
 
    ```bash
-   node scripts/seed-demo.mjs <upstream-mcp-url>
+   CONDUIT_MASTER_KEY=<your key> \
+   node <abs path>/packages/cli/dist/bin.js add-mcp \
+     --url https://mcp.example.com/mcp --namespace github --prefix github.acme.prod
    ```
 
-   This prints a ready-to-paste client config snippet to stderr. The command
-   it prints is honest about the package's current state — nothing is
-   published to npm yet, so the snippet points `command`/`args` at the built
-   file directly:
+   `add-mcp` fetches the upstream's `tools/list` first and writes NOTHING
+   unless the fetch succeeds. Nothing is published to npm yet, so the client
+   config snippet below points `command`/`args` at the built file directly:
 
    ```json
    {
@@ -60,11 +63,11 @@ package adds no core logic of its own; it is a thin transport shell over
    agent waits:
 
    ```bash
-   node scripts/approve-demo.mjs <execId>
+   conduit approvals list                 # oldest-first queue
+   conduit approvals approve <execId>     # or: deny <execId>
    ```
 
-   This is an interim script standing in for the step-3 `conduit approvals`
-   CLI, which is not built yet.
+   See `packages/cli/README.md` for the full `conduit` command reference.
 
 ## Env vars
 
