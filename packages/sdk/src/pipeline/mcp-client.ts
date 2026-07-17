@@ -49,6 +49,16 @@ export interface McpBudget {
   deadline: () => number;
   /** Cumulative byte allowance across EVERY response in the operation. */
   maxBytes: number;
+  /**
+   * Optional SHARED cumulative byte counter (F-1). When two clients run in one
+   * logical operation (serve-time builds a cached handshake client AND a fresh
+   * per-call client from the SAME budget), they must draw from ONE counter or
+   * the first call gets two full `maxBytes` allowances. When present, the
+   * client decrements `bytes.left` instead of a private copy of `maxBytes`; the
+   * owner seeds it to `maxBytes`. Absent → each client keeps its own counter
+   * (single-client callers and tests).
+   */
+  bytes?: { left: number };
 }
 
 export interface McpEndpoint {
@@ -170,9 +180,13 @@ function describeRpcError(error: unknown): string {
 }
 
 export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpClient {
-  // Cumulative across every response in the operation — every postOnce call
-  // decrements this shared counter; a breach anywhere throws a cap error.
-  let bytesLeft = budget.maxBytes;
+  // Cumulative across every response in the operation — every read decrements
+  // this counter; a breach anywhere throws a cap error and (staying negative)
+  // makes the client single-shot. When the budget carries a SHARED `bytes` ref
+  // (F-1), all clients built from that budget draw from the SAME counter so the
+  // handshake + call in one operation are genuinely cumulative; otherwise a
+  // private counter seeded from `maxBytes`.
+  const bytes = budget.bytes ?? { left: budget.maxBytes };
 
   /** Builds the fixed POST header set (§9.2: `endpoint.headers` verbatim, never interpolated). */
   function postHeaders(session?: McpSession): Record<string, string> {
@@ -224,17 +238,24 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
           ...(endpoint.lookup !== undefined ? { lookup: endpoint.lookup } : {}),
         },
         (res) => {
-          // Headers arrived: disarm the pre-response deadline so it cannot
-          // race the body-read phase, which arms its own timer from the
+          // Headers arrived: disarm the pre-response WALL-CLOCK timer so it
+          // cannot race the body-read phase, which arms its own timer from the
           // remaining budget.
-          req.setTimeout(0);
+          clearTimeout(preResponseTimer);
           onResponse(res, req).then(resolve, reject);
         },
       );
-      req.setTimeout(remaining, () => {
+      // F-2: an ABSOLUTE wall-clock bound on the whole pre-response phase.
+      // `req.setTimeout` is socket-INACTIVITY based, so a slowloris server that
+      // dribbles header bytes resets it forever and evades the deadline. A
+      // plain setTimeout fires at the absolute remaining budget regardless of
+      // activity; the body phase already uses a wall-clock timer — this mirrors
+      // it. Named TimeoutError so the `error` handler classifies it `timeout`.
+      const preResponseTimer = setTimeout(() => {
         req.destroy(Object.assign(new Error("MCP request timed out"), { name: "TimeoutError" }));
-      });
+      }, remaining);
       req.on("error", (err) => {
+        clearTimeout(preResponseTimer);
         if (err instanceof Error && err.name === "TimeoutError") {
           reject(new McpClientError("timeout", "MCP request timed out before a response arrived"));
           return;
@@ -255,8 +276,8 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
    * fully-buffered callers — `initialize`, `notifications/initialized`, and
    * ping-answer posts — which have no matching id to early-stop on (their
    * bodies are empty 202s or a single validated result). The byte cap here is
-   * CUMULATIVE across every call in the operation via the closure's
-   * `bytesLeft`, not per-response.
+   * CUMULATIVE across every call in the operation via the shared `bytes`
+   * counter, not per-response.
    */
   function postOnce(body: object, session?: McpSession): Promise<PostResult> {
     return openPost(body, session, (res) => handleBufferedResponse(res));
@@ -313,12 +334,12 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
         fn();
       };
       res.on("data", (chunk: Buffer) => {
-        bytesLeft -= chunk.byteLength;
-        if (bytesLeft < 0) {
-          // After a cap breach this client is single-shot: `bytesLeft` stays
-          // negative so any further postOnce on the same client fails the cap
-          // immediately. Callers wanting a fresh byte budget build a fresh
-          // client (see upstream.ts's per-call client), which upstream.ts does.
+        bytes.left -= chunk.byteLength;
+        if (bytes.left < 0) {
+          // After a cap breach the counter stays negative, so any further read
+          // (on this client, or a sibling sharing the same `bytes` ref) fails
+          // the cap immediately. A fresh byte budget requires a fresh budget
+          // object (upstream.ts mints one per call()).
           res.destroy();
           settle(() =>
             reject(new McpClientError("cap", "MCP response exceeded the cumulative byte budget")),
@@ -362,7 +383,7 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
    * open, and other payloads / notifications are ignored. A non-SSE
    * (`application/json`) body cannot early-stop, so it is read fully and
    * returned as a single payload for the caller to classify. Preserves the
-   * two-phase deadline, cumulative `bytesLeft`, redirect refusal, non-2xx
+   * two-phase deadline, cumulative `bytes` counter, redirect refusal, non-2xx
    * drain-then-throw, and unsupported-content-type contracts.
    */
   function postClassified(body: object, ctx: ClassifyContext): Promise<ClassifiedResult> {
@@ -476,8 +497,8 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
 
       res.on("data", (chunk: Buffer) => {
         if (done) return;
-        bytesLeft -= chunk.byteLength;
-        if (bytesLeft < 0) {
+        bytes.left -= chunk.byteLength;
+        if (bytes.left < 0) {
           rejectOnce(new McpClientError("cap", "MCP response exceeded the cumulative byte budget"));
           return;
         }
@@ -595,10 +616,13 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       // rather than a generic shape-validation failure. The message text is
       // upstream-controlled but stays within the client; serve-time
       // sanitization happens in upstream.ts's mapping. Nothing from
-      // endpoint.headers is interpolated (§9.2).
+      // endpoint.headers is interpolated (§9.2). `safeRpcError` (F-7 defense-
+      // in-depth, matching callTool) tolerates a malformed error member — the
+      // root fix is in classifyOne, which never classifies a null error as a
+      // response, but this keeps initialize from ever reading off a bad shape.
       throw new McpClientError(
         "protocol",
-        `MCP server rejected initialize: ${error.message} (code ${error.code})`,
+        `MCP server rejected initialize: ${describeRpcError(error)}`,
       );
     }
     const parsed = initializeResultSchema.safeParse(result);
@@ -786,13 +810,13 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
           ...(endpoint.lookup !== undefined ? { lookup: endpoint.lookup } : {}),
         },
         (res) => {
-          // Headers arrived: disarm the pre-response timer, then arm a
-          // SEPARATE drain deadline from the remaining budget. Without it, a
+          // Headers arrived: disarm the pre-response WALL-CLOCK timer, then arm
+          // a SEPARATE drain deadline from the remaining budget. Without it, a
           // server that sends headers but never ends the body would leave this
           // promise pending forever — and dispose() awaits it in a `finally`,
           // so one broken upstream would hang every execution that opened a
           // session to it (design D2: a capped, deadline-bounded DELETE).
-          req.setTimeout(0);
+          clearTimeout(preResponseTimer);
           const status = res.statusCode ?? 0;
           const drainTimer = setTimeout(
             () => {
@@ -805,6 +829,22 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
             clearTimeout(drainTimer);
             fn();
           };
+          // F-4: the drain is byte-aware for consistency with the read path.
+          // `res.resume()` alone is memory-safe (chunks are discarded), but a
+          // DELETE body that exceeds the remaining cumulative allowance is
+          // still an over-cap response — settle it the same way rather than
+          // silently draining unbounded bytes.
+          res.on("data", (chunk: Buffer) => {
+            bytes.left -= chunk.byteLength;
+            if (bytes.left < 0) {
+              res.destroy();
+              settle(() =>
+                reject(
+                  new McpClientError("cap", "MCP session DELETE response exceeded the byte budget"),
+                ),
+              );
+            }
+          });
           res.resume(); // drain, no body needed
           res.on("end", () => {
             settle(() => {
@@ -834,10 +874,13 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
           });
         },
       );
-      req.setTimeout(remaining, () => {
+      // F-2: wall-clock pre-response bound (see openPost) — inactivity-based
+      // req.setTimeout is evaded by a slowloris that dribbles header bytes.
+      const preResponseTimer = setTimeout(() => {
         req.destroy(Object.assign(new Error("MCP request timed out"), { name: "TimeoutError" }));
-      });
+      }, remaining);
       req.on("error", (err) => {
+        clearTimeout(preResponseTimer);
         if (err instanceof Error && err.name === "TimeoutError") {
           reject(new McpClientError("timeout", "MCP request timed out before a response arrived"));
           return;

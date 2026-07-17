@@ -1501,6 +1501,31 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
     expect(events).toEqual(["created", "disposed", "created", "disposed"]);
   });
 
+  it("INVARIANT §18-C4: a throwing makeUpstreamSession at start() terminalizes the row failed, never stranded running", async () => {
+    const h = await makeHarness();
+    active = h;
+    const deps: ExecutionManagerDeps = {
+      ...h.deps,
+      makeUpstreamSession: () => {
+        throw new Error("[test] scope factory blew up (e.g. randomBytes failure)");
+      },
+    };
+    const manager = createExecutionManager(deps);
+
+    const result = await manager
+      .start(`return 1;`, { requestKey: "rk-scope-throw" })
+      .then((r) => ({ kind: "resolved" as const, r }))
+      .catch((e) => ({ kind: "threw" as const, e }));
+    // Whether it rejects or resolves-failed, the persisted row MUST be terminal.
+    const row = await h.store.executions.getByRequestKey("rk-scope-throw");
+    expect(row).toBeDefined();
+    expect(row?.status).toBe("failed");
+    expect(row?.endedAt).toBeDefined();
+    if (result.kind === "resolved") {
+      expect(result.r.status).toBe("failed");
+    }
+  });
+
   it("a throwing dispose does not change the drive outcome", async () => {
     const events: Array<"created" | "disposed"> = [];
     const h = await makeHarness();

@@ -20,6 +20,19 @@ describe("createSseParser", () => {
     p.push("data: tail");
     expect(p.flush()).toEqual(["tail"]);
   });
+  it("INVARIANT §18-C4: splits on CR-only line endings (WHATWG SSE)", () => {
+    const p = createSseParser();
+    expect(p.push("data: a\rdata: b\r\r")).toEqual(["a\nb"]);
+  });
+  it("INVARIANT §18-C4: strips a single leading BOM at stream start", () => {
+    const p = createSseParser();
+    expect(p.push('﻿data: {"a":1}\n\n')).toEqual(['{"a":1}']);
+  });
+  it("strips the BOM even when it arrives split from the rest", () => {
+    const p = createSseParser();
+    expect(p.push("﻿")).toEqual([]);
+    expect(p.push("data: x\n\n")).toEqual(["x"]);
+  });
 });
 
 describe("classifyJsonRpc", () => {
@@ -51,5 +64,23 @@ describe("classifyJsonRpc", () => {
     expect(() => classifyJsonRpc('{"jsonrpc":"2.0","id":"r1"}', "r1", false)).toThrow(
       /neither a result nor an error/,
     );
+  });
+  it("INVARIANT §18-C4: a null error member with no result is a malformed envelope, not a response", () => {
+    // {error: null} is not a valid error member — it must NOT classify as a
+    // response (which would let initialize read error.message off null → TypeError).
+    expect(() => classifyJsonRpc('{"jsonrpc":"2.0","id":"r1","error":null}', "r1", false)).toThrow(
+      /neither a result nor an error/,
+    );
+  });
+  it("a well-formed error member still classifies as an error response", () => {
+    const [m] = classifyJsonRpc(
+      '{"jsonrpc":"2.0","id":"r1","error":{"code":-32601,"message":"nope"}}',
+      "r1",
+      false,
+    );
+    expect(m).toEqual({
+      kind: "response",
+      message: { id: "r1", error: { code: -32601, message: "nope" } },
+    });
   });
 });

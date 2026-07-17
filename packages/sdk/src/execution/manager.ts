@@ -624,7 +624,26 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         }
         throw cause;
       }
-      const upstreamSession = makeUpstreamSession();
+      // The row is now `running` (persisted above). EVERYTHING from here until
+      // `drive` takes over must terminalize the row on a throw, or it strands
+      // `running` forever (§6 state machine: running must reach a terminal).
+      // `makeUpstreamSession()` — or the `randomBytes` inside the default scope
+      // factory — can throw; it must be INSIDE this guard, not before it (F-5).
+      let upstreamSession: UpstreamSessionScope;
+      try {
+        upstreamSession = makeUpstreamSession();
+      } catch (cause) {
+        // Sibling of drive()'s catch: finalize the just-persisted `running` row
+        // to terminal `failed` BEFORE re-throwing, so it is never stranded.
+        await finish(execution, {
+          status: "failed",
+          error: {
+            name: "ConduitInternalError",
+            message: `[ExecutionManager] Upstream session scope creation failed at start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+          },
+        });
+        throw cause;
+      }
       try {
         const invoke = deps.makeInvoker({
           executionId: execution.id,

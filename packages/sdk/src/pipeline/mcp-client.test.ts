@@ -1,9 +1,28 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
+import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
 import { createMcpClient, type McpSession, SUPPORTED_PROTOCOL_VERSIONS } from "./mcp-client.js";
 
 let server: Server | undefined;
 afterEach(() => new Promise<void>((r) => (server ? server.close(() => r()) : r())));
+
+/** A raw TCP server for byte-level fixtures (e.g. slowloris trickling). */
+function createRawServer(onConn: (socket: Socket) => void): Promise<{
+  url: URL;
+  close: () => Promise<void>;
+}> {
+  return new Promise((resolve) => {
+    const s: NetServer = createNetServer(onConn);
+    s.listen(0, "127.0.0.1", () => {
+      const addr = s.address();
+      if (addr === null || typeof addr === "string") throw new Error("no port");
+      resolve({
+        url: new URL(`http://127.0.0.1:${addr.port}/mcp`),
+        close: () => new Promise<void>((r) => s.close(() => r())),
+      });
+    });
+  });
+}
 
 function serve(handler: Parameters<typeof createServer>[1]): Promise<URL> {
   return new Promise((resolve) => {
@@ -217,6 +236,48 @@ describe("INVARIANT §18-C4: initialize handshake", () => {
     await expect(tiny.initialize()).rejects.toMatchObject({ kind: "cap" });
   });
 
+  it("INVARIANT §18-C4: the byte budget is cumulative across the handshake and the call in one operation (shared across clients)", async () => {
+    // Mirrors upstream.ts: ONE budget per call() is passed to TWO clients — the
+    // handshake client and the fresh per-call client. A ~700KiB init body plus
+    // a ~700KiB tools/call body under a 1MiB cap must fail cap. Before F-1 each
+    // client had its own counter, so the first call got two full budgets.
+    const pad = "x".repeat(700 * 1024);
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, {
+              result: { ...initializeResult("2025-06-18").result, pad },
+            }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(jsonRpcResponse(parsed.id as string, { result: { content: [{ pad }] } }));
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const sharedBudget = {
+      deadline: () => 5_000,
+      maxBytes: 1024 * 1024,
+      bytes: { left: 1024 * 1024 },
+    };
+    const handshakeClient = createMcpClient({ target: url, headers: {} }, sharedBudget);
+    const session = await handshakeClient.initialize();
+    const callClient = createMcpClient({ target: url, headers: {} }, sharedBudget);
+    await expect(callClient.callTool(session, "demo", {})).rejects.toMatchObject({ kind: "cap" });
+  });
+
   it("surfaces a JSON-RPC error rejection of initialize with the server's code and message", async () => {
     const url = await serve((req, res) => {
       let raw = "";
@@ -246,6 +307,27 @@ describe("INVARIANT §18-C4: initialize handshake", () => {
     });
   });
 
+  it("INVARIANT §18-C4: a hostile null error member on initialize is a protocol error, not a TypeError", async () => {
+    // {id, error: null} with no result: classifyOne must treat null as no valid
+    // error member and route to the malformed-envelope throw, not read
+    // error.message off null (which would TypeError → mapped to a network error).
+    const url = await serve((req, res) => {
+      let raw = "";
+      req.on("data", (c) => (raw += c));
+      req.on("end", () => {
+        const parsed = JSON.parse(raw);
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, error: null }));
+      });
+    });
+    await expect(
+      createMcpClient({ target: url, headers: {} }, budget()).initialize(),
+    ).rejects.toMatchObject({
+      kind: "protocol",
+      message: expect.stringContaining("neither a result nor an error"),
+    });
+  });
+
   it("an exhausted deadline fails as timeout before any request", async () => {
     const url = await serve((_req, res) => res.end());
     const spent = createMcpClient(
@@ -253,6 +335,32 @@ describe("INVARIANT §18-C4: initialize handshake", () => {
       { deadline: () => 0, maxBytes: 1024 },
     );
     await expect(spent.initialize()).rejects.toMatchObject({ kind: "timeout" });
+  });
+
+  it("INVARIANT §18-C4: the pre-response phase is bounded by the ABSOLUTE deadline, not socket inactivity (slowloris)", async () => {
+    // A raw TCP server that dribbles partial HTTP-header bytes forever: each
+    // trickle resets socket-inactivity, so a `req.setTimeout(remaining)` (which
+    // is inactivity-based) never fires. Only a wall-clock timer bounds this.
+    const raw = await createRawServer((socket) => {
+      let sent = 0;
+      const trickle = setInterval(() => {
+        // One header byte every 150ms — well under any inactivity window, but
+        // the full response head never arrives.
+        socket.write(sent === 0 ? "HTTP/1.1 200 OK\r\n" : "x-pad: y\r\n");
+        sent++;
+      }, 150);
+      socket.on("close", () => clearInterval(trickle));
+      socket.on("error", () => clearInterval(trickle));
+    });
+    const client = createMcpClient(
+      { target: raw.url, headers: {} },
+      { deadline: () => 600, maxBytes: 1024 * 1024 },
+    );
+    const started = Date.now();
+    await expect(client.initialize()).rejects.toMatchObject({ kind: "timeout" });
+    // Bounded near the 600ms budget, NOT indefinitely.
+    expect(Date.now() - started).toBeLessThan(2_500);
+    await raw.close();
   });
 });
 

@@ -94,9 +94,16 @@ export function createMcpUpstreamCaller(
       // this single deadline (preserving F1's per-call budget semantics). The
       // client decrements against `deadline()` at every phase; the byte cap is
       // cumulative across every response in the operation.
+      // ONE budget per call() — and ONE shared cumulative byte counter (F-1)
+      // so the cached handshake client and the fresh per-call client below draw
+      // from the SAME allowance. Without the shared `bytes` ref, the first call
+      // would grant a full `maxBytes` to the handshake response AND another full
+      // `maxBytes` to the tools/call response, violating the cumulative-cap
+      // invariant. Call #2 (cache hit) mints a new budget → a fresh allowance.
       const budget = {
         deadline: () => Math.max(0, request.timeoutMs - (Date.now() - startedAt)),
         maxBytes,
+        bytes: { left: maxBytes },
       };
       // The merged header object lives only in this call frame (spec §9.2):
       // auth material is never persisted beyond the call, nor interpolated
