@@ -119,6 +119,36 @@ describe("runAddMcp", () => {
     expect(stderr).toContain("--prefix");
   });
 
+  it("D5: an unparseable --url fails Step-1 validation (ONE stderr line, exit 1, fetch never called)", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({ store, fetchTools: vi.fn() });
+
+    const result = await runAddMcp({ ...BASE_ARGS, url: "not-a-url" }, deps);
+
+    expect(result.exitCode).toBe(1);
+    expect(deps.fetchTools).not.toHaveBeenCalled();
+    expect(await store.sources.list()).toEqual([]);
+    expect(deps.stderrLines).toHaveLength(1);
+    const stderr = deps.stderrLines[0];
+    expect(stderr).toContain("Missing/invalid required flags");
+    expect(stderr).toContain("--url (must be a valid http(s) URL)");
+    // NOT the "upstream unreachable" line — a bad url is a validation error.
+    expect(stderr).not.toContain("upstream unreachable");
+  });
+
+  it("D5: a non-http(s) --url scheme fails Step-1 validation (ONE stderr line, exit 1, fetch never called)", async () => {
+    const store = await openTestStore();
+    const deps = makeDeps({ store, fetchTools: vi.fn() });
+
+    const result = await runAddMcp({ ...BASE_ARGS, url: "ftp://host/mcp" }, deps);
+
+    expect(result.exitCode).toBe(1);
+    expect(deps.fetchTools).not.toHaveBeenCalled();
+    expect(await store.sources.list()).toEqual([]);
+    expect(deps.stderrLines).toHaveLength(1);
+    expect(deps.stderrLines[0]).toContain("--url (must be a valid http(s) URL)");
+  });
+
   it("INVARIANT /cli add-mcp: unreachable --url fails loud and writes nothing", async () => {
     const store = await openTestStore();
     const deps = makeDeps({
@@ -155,13 +185,15 @@ describe("runAddMcp", () => {
     expect(await store.sources.list()).toEqual([]);
   });
 
-  it("INVARIANT /cli add-mcp: an oversized upstream tools/list body fails loud with 0 writes", async () => {
+  it("a plain-Error rejection carrying a cap message fails loud with 0 writes (fallback path, not the McpClientError cap mapping)", async () => {
     const store = await openTestStore();
     const deps = makeDeps({
       store,
-      // mcp-fetch.ts enforces the byte cap itself; this pins runAddMcp's
-      // handling of that failure through the SAME fail-loud/0-writes path
-      // as every other fetchTools rejection.
+      // NOTE: this throws a PLAIN Error, so it exercises runAddMcp's
+      // non-McpClientError fallback — NOT the real byte-cap enforcement, which
+      // lives in the shared client and is pinned by mcp-fetch.test.ts /
+      // mcp-client.test.ts (the INVARIANTS.md cap rows). Kept as fallback-path
+      // coverage; the INVARIANT prefix was dropped as an overclaim.
       fetchTools: vi.fn(async () => {
         throw new Error(
           "[conduit add-mcp] upstream tools/list response exceeds the 5242880-byte cap; nothing was written.",
@@ -175,10 +207,12 @@ describe("runAddMcp", () => {
     expect(await store.sources.list()).toEqual([]);
   });
 
-  it("INVARIANT /cli add-mcp: an over-count upstream tools/list body fails loud with 0 writes", async () => {
+  it("a plain-Error rejection carrying an over-count message fails loud with 0 writes (fallback path, not the McpClientError cap mapping)", async () => {
     const store = await openTestStore();
     const deps = makeDeps({
       store,
+      // Plain Error → non-McpClientError fallback path (see the byte-cap test
+      // above); real over-count enforcement is pinned in mcp-client.test.ts.
       fetchTools: vi.fn(async () => {
         throw new Error(
           "[conduit add-mcp] upstream tools/list response exceeds the 1024-tool cap (got 2000); nothing was written.",
@@ -219,12 +253,12 @@ describe("runAddMcp", () => {
     const beforeTools = await store.tools.list();
 
     // Second run: same namespace, different url, no --replace.
-    const result = await runAddMcp(
-      { ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-different" },
-      makeDeps({ store }),
-    );
+    const deps = makeDeps({ store });
+    const result = await runAddMcp({ ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-different" }, deps);
 
     expect(result.exitCode).not.toBe(0);
+    // The C3 gate refuses BEFORE any fetch to the new url.
+    expect(deps.fetchTools).not.toHaveBeenCalled();
     const source = await store.sources.get("src_github");
     expect(source?.location).toBe(BASE_ARGS.url); // unchanged
     expect(await store.tools.list()).toEqual(beforeTools); // unchanged
@@ -261,6 +295,8 @@ describe("runAddMcp", () => {
     expect(stderr).toMatch(/^\[conduit add-mcp\]/);
     expect(stderr).toMatch(/prefix github\.acme\.prod is already used by another source/);
     expect(stderr).toMatch(/nothing was written/);
+    // The collision is caught read-first, BEFORE any fetch to the new url.
+    expect(deps.fetchTools).not.toHaveBeenCalled();
 
     // Namespace B got 0 rows.
     expect(await store.sources.get("src_gitlab")).toBeUndefined();
@@ -412,7 +448,7 @@ describe("runAddMcp", () => {
 
     expect(result.exitCode).toBe(0);
     const line = deps.stdoutLines.join("");
-    expect(line).toMatch(/seeded 3 tools under github\.acme\.prod:/);
+    expect(line).toMatch(/seeded 3 tools for connection github\.acme\.prod \(namespace github\):/);
     expect(line).toMatch(/1 safe \(auto-allow\)/);
     expect(line).toMatch(/1 review \(approval\)/);
     expect(line).toMatch(/1 destructive \(approval\)/);
@@ -456,7 +492,7 @@ describe("runAddMcp", () => {
       ?.credentialRef as string;
     const beforeTools = await store.tools.list();
 
-    const deps = makeDeps({ store, env: {} });
+    const deps = makeDeps({ store, env: {}, fetchTools: vi.fn(async () => TOOLS_LIST) });
     const result = await runAddMcp(
       { ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-new", replace: true },
       deps,
@@ -466,6 +502,8 @@ describe("runAddMcp", () => {
     expect(deps.stderrLines.join("")).toContain(
       `[conduit add-mcp] refusing to retarget "github" to a new url while a stored credential exists: pass CONDUIT_ADD_SECRET for the new upstream or --clear-credential to drop it. Nothing was written.`,
     );
+    // The refusal happened BEFORE any network request to the new host.
+    expect(deps.fetchTools).not.toHaveBeenCalled();
     // Zero writes: url unchanged, tools unchanged, secret still resolves.
     const source = await store.sources.get("src_github");
     expect(source?.location).toBe(BASE_ARGS.url);
@@ -473,16 +511,23 @@ describe("runAddMcp", () => {
     expect(await store.secrets.reveal(existingRef)).toBe("Bearer tok123");
   });
 
-  it("retarget to a new url PROCEEDS when a fresh CONDUIT_ADD_SECRET is supplied (new secret sealed)", async () => {
+  it("retarget to a new url PROCEEDS when a fresh CONDUIT_ADD_SECRET is supplied (fetch carried the FRESH secret, new secret sealed)", async () => {
     const store = await openTestStore();
     await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer old" } }));
 
+    // Spy the fetch: the retarget fetch to the NEW host must carry the FRESH
+    // secret ("Bearer new"), never the old stored one bound to the old host.
+    const freshFetch = vi.fn(async (_url: string, opts?: { authorization?: string }) => {
+      void opts;
+      return TOOLS_LIST;
+    });
     const result = await runAddMcp(
       { ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-new", replace: true },
-      makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer new" } }),
+      makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer new" }, fetchTools: freshFetch }),
     );
 
     expect(result.exitCode).toBe(0);
+    expect(freshFetch.mock.calls[0]?.[1]).toEqual({ authorization: "Bearer new" });
     const source = await store.sources.get("src_github");
     expect(source?.location).toBe("http://127.0.0.1:9/mcp-new");
     const conn = (await store.connections.list()).find((c) => c.integrationId === "int_github");
@@ -490,18 +535,27 @@ describe("runAddMcp", () => {
     expect(await store.secrets.reveal(conn?.credentialRef as string)).toBe("Bearer new");
   });
 
-  it("retarget to a new url PROCEEDS with --clear-credential (cred dropped in-batch)", async () => {
+  it("retarget to a new url PROCEEDS with --clear-credential (cred dropped in-batch, fetch sent NO auth)", async () => {
     const store = await openTestStore();
     await runAddMcp(BASE_ARGS, makeDeps({ store, env: { CONDUIT_ADD_SECRET: "Bearer old" } }));
     const before = await store.connections.list();
     const oldRef = before.find((c) => c.integrationId === "int_github")?.credentialRef as string;
 
+    // Spy the fetch: --clear-credential drops the old secret AND must send NO
+    // Authorization to the new host — the stored secret is bound to the old
+    // upstream and must never reach a different one.
+    const clearFetch = vi.fn(async (_url: string, opts?: { authorization?: string }) => {
+      void opts;
+      return TOOLS_LIST;
+    });
     const result = await runAddMcp(
       { ...BASE_ARGS, url: "http://127.0.0.1:9/mcp-new", replace: true, clearCredential: true },
-      makeDeps({ store, env: {} }),
+      makeDeps({ store, env: {}, fetchTools: clearFetch }),
     );
 
     expect(result.exitCode).toBe(0);
+    // The fetch to the NEW host carried no auth (undefined, not the old secret).
+    expect(clearFetch.mock.calls[0]?.[1]?.authorization).toBeUndefined();
     const source = await store.sources.get("src_github");
     expect(source?.location).toBe("http://127.0.0.1:9/mcp-new");
     const conn = (await store.connections.list()).find((c) => c.integrationId === "int_github");

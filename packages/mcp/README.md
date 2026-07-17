@@ -63,8 +63,10 @@ package adds no core logic of its own; it is a thin transport shell over
    agent waits:
 
    ```bash
-   conduit approvals list                 # oldest-first queue
-   conduit approvals approve <execId>     # or: deny <execId>
+   # Pre-publish, invoke the built CLI directly (same form as step 2); once
+   # published, `conduit approvals …` is the installed alias.
+   node <abs path>/packages/cli/dist/bin.js approvals list             # oldest-first queue
+   node <abs path>/packages/cli/dist/bin.js approvals approve <execId> # or: deny <execId>
    ```
 
    See `packages/cli/README.md` for the full `conduit` command reference.

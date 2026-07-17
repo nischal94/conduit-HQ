@@ -162,8 +162,11 @@ export async function runDecide(
   const runtime = await deps.createRuntime({ store, allowPrivateEgress: env.allowPrivateEgress });
   const outcome = await runtime.manager.resume(executionId, { kind });
 
-  // Special case: a deny with ConduitPolicyBlocked means the policy successfully
-  // blocked the execution — the deny itself succeeded in achieving its goal.
+  // A deny resolves the paused call as a failure named ConduitPolicyBlocked —
+  // deny deliberately REUSES that error name (design D1/M3) rather than minting
+  // a deny-specific one. When the operator asked for the deny, that
+  // policy-blocked failure IS the intended outcome, so report it as success
+  // ("denied", exit 0), not as a failure line.
   if (
     outcome.status === "failed" &&
     kind === "deny" &&

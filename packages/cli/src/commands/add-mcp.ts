@@ -113,6 +113,19 @@ export function parseAddMcpArgs(argv: string[]): AddMcpArgs {
   return args;
 }
 
+/** True iff `value` parses as a URL with an http: or https: protocol. Used by
+ * Step-1 validation (D5) so a bad url/scheme fails as a validation error rather
+ * than throwing later out of `new URL()` (TypeError / ERR_INVALID_PROTOCOL). */
+function isValidHttpUrl(value: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return parsed.protocol === "http:" || parsed.protocol === "https:";
+}
+
 function countsByRiskClass(tools: readonly { riskClass: RiskClass }[]): {
   safe: number;
   review: number;
@@ -154,8 +167,13 @@ function mapFetchError(cause: unknown, url: string): string {
       return `[conduit add-mcp] ${cause.message}; nothing was written.`;
     case "network":
       return unreachable;
-    default:
-      return unreachable;
+    default: {
+      // Exhaustiveness: every McpClientError kind is handled above. A future
+      // sixth kind is a compile error here (mirrors bin.ts's _exhaustive), not
+      // a silent fall-through to the unreachable line.
+      const _exhaustive: never = cause.kind;
+      return _exhaustive;
+    }
   }
 }
 
@@ -168,6 +186,12 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
   }
   if (args.url === undefined || args.url.trim() === "") {
     missing.push("--url");
+  } else if (!isValidHttpUrl(args.url)) {
+    // Validate parseability + http(s) scheme HERE (D5 single-pass), so a
+    // malformed url or a non-http scheme fails as a validation error with the
+    // rest of the flags — never later as `new URL()` TypeError /
+    // ERR_INVALID_PROTOCOL masquerading as "upstream unreachable".
+    missing.push("--url (must be a valid http(s) URL)");
   }
   if (args.prefix === undefined || args.prefix.trim() === "") {
     missing.push("--prefix");
@@ -359,8 +383,9 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     deps.stdout(`${JSON.stringify({ ...counts, credential: credentialState })}\n`);
   } else {
     deps.stdout(
-      `seeded ${tools.length} tools under ${prefix}: ${counts.safe} safe (auto-allow), ` +
-        `${counts.review} review (approval), ${counts.destructive} destructive (approval)\n`,
+      `seeded ${tools.length} tools for connection ${prefix} (namespace ${namespace}): ` +
+        `${counts.safe} safe (auto-allow), ${counts.review} review (approval), ` +
+        `${counts.destructive} destructive (approval)\n`,
     );
   }
 

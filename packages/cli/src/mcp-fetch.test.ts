@@ -194,6 +194,55 @@ describe("fetchToolsList — hostile-upstream caps", () => {
 
     expect(result).toEqual(tools);
   });
+
+  it("still resolves the tools when the session-teardown DELETE fails (500)", async () => {
+    // The tools are already in hand once tools/list returns; the best-effort
+    // DELETE teardown (mcp-fetch.ts's `.catch(() => {})`) must not turn an
+    // otherwise-good onboarding fetch into a failure. This pins that swallow:
+    // the fixture answers the DELETE with a 500, and fetchToolsList still
+    // resolves the tools list.
+    const tools = [{ name: "ok_tool", inputSchema: { type: "object" } }];
+    const sessionId = "sess-mcp-fetch-delete-500";
+    const url = await startServer((req, res) => {
+      if (req.method === "DELETE") {
+        sendJson(res, 500, { error: "teardown boom" });
+        return;
+      }
+      void readBody(req).then(({ id, method }) => {
+        if (method === "initialize") {
+          sendJson(
+            res,
+            200,
+            {
+              jsonrpc: "2.0",
+              id,
+              result: {
+                protocolVersion: PROTOCOL_VERSION,
+                capabilities: { tools: {} },
+                serverInfo: { name: "fixture", version: "0.1.0" },
+              },
+            },
+            sessionId,
+          );
+          return;
+        }
+        if (method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (method === "tools/list") {
+          sendJson(res, 200, { jsonrpc: "2.0", id, result: { tools } });
+          return;
+        }
+        sendJson(res, 200, { jsonrpc: "2.0", id, error: { code: -32601, message: "unsupported" } });
+      });
+    });
+
+    const result = await fetchToolsList(url);
+
+    expect(result).toEqual(tools);
+  });
 });
 
 describe("fetchToolsList — onboarding auth", () => {

@@ -20,8 +20,11 @@
 //
 // Protocol strictness is deliberate (Task 9 brief): after initialize, every
 // request MUST carry both a matching Mcp-Session-Id and an MCP-Protocol-
-// Version header, or the fixture answers 400 — this exercises conduit's
-// client honestly instead of tolerating a loose upstream.
+// Version header — this exercises conduit's client honestly instead of
+// tolerating a loose upstream. A MISSING header is a 400; a WRONG/expired
+// Mcp-Session-Id is a 404 (protocol-correct — what the real client's
+// session-expiry retry keys on). There is no DELETE support (deliberate): the
+// client's best-effort teardown DELETE gets a 400/404 here and swallows it.
 
 import { randomUUID } from "node:crypto";
 import { createServer } from "node:http";
@@ -321,14 +324,28 @@ function rpcError(id, code, message) {
 // Serve only when run directly (buildCatalog stays importable for checks).
 if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.argv[1]).href) {
   const catalog = buildCatalog();
-  // Single active session for this fixture's lifetime, minted at the first
-  // successful initialize. Not persisted, not reused across process runs.
+  // The currently-valid session id. Each `initialize` RE-MINTS it, invalidating
+  // any prior session (a later request bearing the old id gets a 404). Not
+  // persisted, not reused across process runs.
   let sessionId;
 
   const server = createServer((req, res) => {
     let body = "";
     req.on("data", (chunk) => {
       body += chunk;
+    });
+    // A request-stream error (aborted/reset connection) must not debug as a
+    // client timeout: report it and answer with no body (or a 400 if headers
+    // are still writable) rather than leaving the socket hanging.
+    req.on("error", (error) => {
+      process.stderr.write(
+        `[token-demo-upstream] request stream error: ${error instanceof Error ? error.message : String(error)}\n`,
+      );
+      if (!res.headersSent) {
+        sendJson(res, 400, rpcError(null, -32600, "request stream error"));
+      } else {
+        res.end();
+      }
     });
     req.on("end", () => {
       if (req.method !== "POST") {
@@ -368,16 +385,26 @@ if (process.argv[1] !== undefined && import.meta.url === pathToFileURL(process.a
       }
 
       // Every request past initialize requires both the session id (matching
-      // the minted one) and the protocol version header — missing or wrong
-      // is a 400, no exceptions (Task 9 brief: deliberate strictness).
+      // the currently-valid one) and the protocol version header (Task 9 brief:
+      // deliberate strictness). A MISSING header is a 400 (malformed request); a
+      // PRESENT-but-wrong/expired Mcp-Session-Id is a 404 — protocol-correct,
+      // and what the real client's session-expiry retry keys on.
       const gotSessionId = req.headers["mcp-session-id"];
       const gotProtocolVersion = req.headers["mcp-protocol-version"];
+      if (gotSessionId === undefined) {
+        sendJson(res, 400, rpcError(id, -32600, "missing Mcp-Session-Id header"));
+        return;
+      }
       if (sessionId === undefined || gotSessionId !== sessionId) {
-        sendJson(res, 400, rpcError(id, -32600, "missing or invalid Mcp-Session-Id header"));
+        sendJson(res, 404, rpcError(id, -32001, "unknown or expired Mcp-Session-Id"));
+        return;
+      }
+      if (gotProtocolVersion === undefined) {
+        sendJson(res, 400, rpcError(id, -32600, "missing MCP-Protocol-Version header"));
         return;
       }
       if (gotProtocolVersion !== PROTOCOL_VERSION) {
-        sendJson(res, 400, rpcError(id, -32600, "missing or invalid MCP-Protocol-Version header"));
+        sendJson(res, 400, rpcError(id, -32600, "invalid MCP-Protocol-Version header"));
         return;
       }
 

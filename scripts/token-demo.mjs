@@ -144,7 +144,14 @@ async function postUpstream(port, diagnostics, body, headers) {
     );
   }
   if (!response.ok) {
-    fail(`upstream ${body.method} responded ${response.status}`);
+    // Surface the strict fixture's own explanation (its rpcError body) plus
+    // upstream diagnostics instead of discarding them — a bare status hides
+    // WHY it failed (e.g. the 404 "unknown or expired Mcp-Session-Id").
+    const bodyText = await response.text().catch(() => "");
+    fail(
+      `upstream ${body.method} responded ${response.status}: ${bodyText.slice(0, 300)}\n` +
+        `upstream diagnostics: ${diagnostics()}`,
+    );
   }
   return response;
 }
@@ -189,9 +196,17 @@ async function fetchRawTools(port, diagnostics) {
       `upstream tools/list body was not valid JSON: ${msg}\nupstream diagnostics: ${diagnostics()}`,
     );
   }
+  if (body?.error !== undefined) {
+    fail(
+      `upstream tools/list returned a JSON-RPC error: ${JSON.stringify(body.error)}\n` +
+        `upstream diagnostics: ${diagnostics()}`,
+    );
+  }
   const tools = body?.result?.tools;
   if (!Array.isArray(tools)) {
-    fail("upstream tools/list response missing result.tools");
+    fail(
+      `upstream tools/list response missing result.tools\nupstream diagnostics: ${diagnostics()}`,
+    );
   }
   return tools;
 }
