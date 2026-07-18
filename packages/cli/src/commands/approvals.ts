@@ -232,14 +232,19 @@ export async function runDecide(
     return { exitCode: 1 };
   }
   if (!outcome.decisionApplied) {
-    // Only status "completed" reaches here. The drive settled without the
-    // staged decision ever being consumed — the resumed replay never
-    // re-reached the pending call (a divergence that never manifested as a
-    // call). The pending call did not run, but the operator's verb did not
-    // land either; exit codes track the verb, for BOTH verbs symmetrically.
+    // Structurally only status "completed" reaches here today, but the
+    // message reports `outcome.status` rather than hardcoding it — the
+    // guarantee is branch ordering, not a type guard, so a future status arm
+    // reaching this branch must not describe the wrong fate. The drive
+    // settled without the staged decision
+    // ever being consumed — the resumed replay never re-reached the pending
+    // call (a divergence that never manifested as a call). The pending call
+    // did not run, but the operator's verb did not land either; exit codes
+    // track the verb, for BOTH verbs symmetrically.
     deps.stderr(
-      `[conduit approvals] ${kind} was never applied: the resumed execution completed without ` +
-        `re-reaching the pending call, so no decision was consumed. The pending call did not run.\n`,
+      `[conduit approvals] ${kind} was never applied: the resumed execution settled as ` +
+        `${outcome.status} without re-reaching the pending call, so no decision was consumed. ` +
+        `The pending call did not run.\n`,
     );
     return { exitCode: 1 };
   }
