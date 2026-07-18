@@ -102,6 +102,10 @@ the mcp integration test first); Ajv pre-flight input validation (D6, design
 question); `isError` trace-viewer filter; Aikido MCP still not connected
 (`/aikido:setup`, user terminal).
 
+### Session debrief (2026-07-18 evening)
+
+https://claude.ai/code/artifact/1ae30356-3bdc-4308-8b1c-7c9c485a3626
+
 ### KICKOFF PROMPT for the next session
 
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
