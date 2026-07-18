@@ -39,7 +39,7 @@ export async function runStdioServer(opts: { env?: NodeJS.ProcessEnv } = {}): Pr
     );
   }
   if ((await store.sources.list()).length === 0) {
-    console.error("[ConduitMcp] 0 sources in catalog — seed with scripts/seed-demo.mjs");
+    console.error("[ConduitMcp] 0 sources in catalog — onboard one with `conduit add-mcp`");
   }
   const server = createConduitMcpServer({ store, allowPrivateEgress: env.allowPrivateEgress });
   await server.connect(new StdioServerTransport());

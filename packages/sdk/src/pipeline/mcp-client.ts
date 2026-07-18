@@ -65,7 +65,13 @@ export interface McpEndpoint {
   target: URL;
   /** Auth and other fixed headers; content-type/accept/MCP-Protocol-Version/Mcp-Session-Id are managed internally. */
   headers: Record<string, string>;
-  /** Pinned lookup for serve-time; omit for onboarding (plain DNS). */
+  /**
+   * Pinned DNS lookup that forces the connection to a single pre-resolved,
+   * SSRF-vetted IP (§9.3, closes DNS-rebinding). SSRF-significant: OMITTING it
+   * means UNPINNED egress over plain DNS — correct ONLY for operator-typed URLs
+   * (onboarding, where the human owns the destination). An agent-driven URL
+   * MUST pass a pinned lookup; serve-time (`upstream.ts`) always does.
+   */
   lookup?: LookupFunction;
 }
 

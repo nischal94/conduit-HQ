@@ -519,11 +519,13 @@ already resolves to an absolute path via `homedir()`, and Node never expands
 `~`, so a literal `~/.conduit/conduit.db` in `env` would be
 read as relative to the client's own working directory and fail to start. `chmod 600`
 the client config file afterward — it now holds the master key.
-3. **Seed a demo source** so there's something to call:
-`node scripts/seed-demo.mjs <upstream-mcp-url>` (allow-only policies, so the walking
-skeleton can't strand on an unapproved pause). It prints the ready-to-paste config snippet above.
-4. **Interim approve/resume** (stands in for the step-3 `conduit approvals`
-CLI, not yet built): `node scripts/approve-demo.mjs <execId>`, run from a separate
+3. **Onboard an upstream source** so there's something to call:
+`conduit add-mcp --url <upstream-mcp-url> --namespace <ns> --prefix <prefix>`
+(fail-closed §10.2 policy defaults, so the walking skeleton can't strand on an unapproved pause
+for a safe-classified tool). See `packages/cli/README.md` for the full flag reference,
+`CONDUIT_ADD_SECRET` credential onboarding, and the retarget refusal.
+4. **Approve/resume a paused call:** `conduit approvals list` /
+`conduit approvals approve <execId>` (or `deny`), run from a separate
 process while the agent is waiting.
 5. **Restart the client** after editing its config — the startup-reload caveat above
 applies here too.

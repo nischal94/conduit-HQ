@@ -3,6 +3,7 @@ import {
   type ConduitStore,
   type Execution,
   type ExecutionOutcome,
+  GUEST_ERROR_NAMES,
   logSandboxDiagnosticsTo,
 } from "@conduithq/sdk";
 
@@ -161,6 +162,34 @@ export async function runDecide(
   // M6: fresh runtime per invocation — never cached across calls.
   const runtime = await deps.createRuntime({ store, allowPrivateEgress: env.allowPrivateEgress });
   const outcome = await runtime.manager.resume(executionId, { kind });
+
+  // A deny resolves the paused call as a failure named ConduitPolicyBlocked —
+  // deny deliberately REUSES that error name (design D1/M3) rather than minting
+  // a deny-specific one. When the operator asked for the deny, that
+  // policy-blocked failure IS the intended outcome, so report it as success
+  // ("denied", exit 0), not as a failure line.
+  //
+  // KNOWN LIMITATION (uncovered scenario, design question — see report):
+  // this matches on error NAME alone, not on the identity of the failing call.
+  // A drive can resume PAST the denied call: the guest catches the deny
+  // (ConduitPolicyBlocked is a guest-catchable throw), continues, and a LATER,
+  // UNRELATED upstream call is independently policy-blocked — finalizing the
+  // drive as `failed` with the SAME error name. That distinct block is then
+  // mislabeled "denied" (exit 0) as if it were the operator's deny landing.
+  // A clean local fix would compare the failing call's identity against the
+  // denied pause's requestKey, but `ExecutionOutcome.failed` carries only
+  // `SandboxError { name, message }` (the §5.3/§9.2 boundary error shape) — it
+  // does NOT carry the failing call's requestKey/toolName, so no local
+  // comparison is possible without reshaping the SDK boundary type (a design
+  // decision, deliberately not taken here).
+  if (
+    outcome.status === "failed" &&
+    kind === "deny" &&
+    outcome.error.name === GUEST_ERROR_NAMES.policyBlocked
+  ) {
+    deps.stdout("denied\n");
+    return { exitCode: 0 };
+  }
 
   deps.stdout(`${outcome.status}\n`);
 

@@ -17,7 +17,7 @@ async function doctor(): Promise<number> {
     console.error(`ok: key decodes (32 bytes)`);
     console.error(`ok: database opens at ${env.dbPath}`);
     console.error(
-      `ok: ${sources.length} source(s) in catalog${sources.length === 0 ? " — seed with scripts/seed-demo.mjs" : ""}`,
+      `ok: ${sources.length} source(s) in catalog${sources.length === 0 ? " — onboard one with `conduit add-mcp`" : ""}`,
     );
     console.error(
       `egress opt-in: ${env.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`,

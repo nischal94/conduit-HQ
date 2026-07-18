@@ -366,7 +366,9 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
       "github.acme.add",
     ]);
     expect(first.exitCode).toBe(0);
-    expect(first.stdout).toMatch(/seeded \d+ tools under github\.acme\.add:/);
+    expect(first.stdout).toMatch(
+      /seeded \d+ tools for connection github\.acme\.add \(namespace ghadd\):/,
+    );
 
     {
       const { store, close } = await openAddMcpDb();

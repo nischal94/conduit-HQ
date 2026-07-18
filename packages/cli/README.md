@@ -32,7 +32,7 @@ in this package). `--help` and `--version` are available at the top level.
    `add-mcp` fetches the upstream's `tools/list` first (5s timeout) and writes
    NOTHING unless the fetch succeeds — a dead upstream leaves zero rows. On
    success it prints a risk-class count summary (e.g.
-   `seeded 12 tools under github.acme.prod: 8 safe (auto-allow), 3 review (approval), 1 destructive (approval)`),
+   `seeded 12 tools for connection github.acme.prod (namespace github): 8 safe (auto-allow), 3 review (approval), 1 destructive (approval)`),
    stating the fail-closed §10.2 policy defaults. No policy rows are written.
 
    - **Credential (optional):** supply it via the `CONDUIT_ADD_SECRET` env
@@ -45,7 +45,18 @@ in this package). `--help` and `--version` are available at the top level.
      existing namespace is refused unless you pass `--replace` — retargeting
      an operator's trust is a conscious act, and manual policy overrides
      (keyed by tool name) carry over to the new upstream.
+   - **Rows onboarded before this release:** the upstream's original wire
+     name is now stored at normalize time and used at serve time to call
+     tools whose names don't survive namespacing byte-for-byte (e.g. a
+     hyphenated upstream name). A source onboarded before this change won't
+     have that stored name — one `add-mcp --replace` re-sync against the
+     same `--url` fully repairs it; nothing else is needed.
    - `--json` emits `{safe, review, destructive}` + `credential: present|absent`.
+   - **`--namespace` vs `--prefix`:** the agent-facing tool name is always
+     `<namespace>.<tool>` (e.g. `github.get_me`) — `--namespace` is the tool
+     path, not `--prefix`. `--prefix` is a separate, per-connection unique
+     identifier (surfaced in onboarding output and re-sync/retarget checks);
+     it does not appear in the tool name a client calls.
 
 3. Serve the catalog to an MCP client (Claude Desktop, Cursor, …):
 

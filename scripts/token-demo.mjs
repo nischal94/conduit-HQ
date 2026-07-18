@@ -117,25 +117,84 @@ function run(command, args, env) {
   });
 }
 
-/** Fetches the raw tools/list from the upstream — the "before" surface. */
-async function fetchRawTools(port, diagnostics) {
+// Task 9 upgraded the demo upstream to minimal streamable HTTP: it now
+// requires a real initialize handshake (session id + protocol version on
+// every request past initialize) before it will answer tools/list — the
+// bare single-POST dialect this fetched previously is gone by design (D1).
+// `fetchRawTools` speaks the same minimal handshake so the "before" side
+// still measures the upstream's real tools/list payload, unaffected by the
+// handshake itself (which is not part of either token count).
+const UPSTREAM_PROTOCOL_VERSION = "2025-06-18";
+
+/** POSTs one JSON-RPC request/notification to the upstream, honestly failing
+ * loud with the same diagnostics fetchRawTools has always surfaced. */
+async function postUpstream(port, diagnostics, body, headers) {
   let response;
   try {
     response = await fetch(`http://127.0.0.1:${port}`, {
       method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+      headers: { "content-type": "application/json", ...headers },
+      body: JSON.stringify(body),
       signal: AbortSignal.timeout(5000),
     });
   } catch (error) {
     const msg = error instanceof Error ? error.message : String(error);
     fail(
-      `upstream tools/list request failed (port ${port}): ${msg}\nupstream diagnostics: ${diagnostics()}`,
+      `upstream ${body.method} request failed (port ${port}): ${msg}\nupstream diagnostics: ${diagnostics()}`,
     );
   }
   if (!response.ok) {
-    fail(`upstream tools/list responded ${response.status}`);
+    // Surface the strict fixture's own explanation (its rpcError body) plus
+    // upstream diagnostics instead of discarding them — a bare status hides
+    // WHY it failed (e.g. the 404 "unknown or expired Mcp-Session-Id").
+    const bodyText = await response.text().catch(() => "");
+    fail(
+      `upstream ${body.method} responded ${response.status}: ${bodyText.slice(0, 300)}\n` +
+        `upstream diagnostics: ${diagnostics()}`,
+    );
   }
+  return response;
+}
+
+/** Fetches the raw tools/list from the upstream — the "before" surface.
+ * Speaks the upstream's required streamable-HTTP handshake first (Task 9);
+ * only the tools/list payload itself is counted toward the token estimate. */
+async function fetchRawTools(port, diagnostics) {
+  const initResponse = await postUpstream(port, diagnostics, {
+    jsonrpc: "2.0",
+    id: 0,
+    method: "initialize",
+    // The fixture validates the full initialize shape (protocolVersion +
+    // capabilities + clientInfo) like a conforming MCP server — a bare
+    // `initialize` with no params is a 400 there, as it should be.
+    params: {
+      protocolVersion: UPSTREAM_PROTOCOL_VERSION,
+      capabilities: {},
+      clientInfo: { name: "token-demo", version: "0.0.0" },
+    },
+  });
+  const sessionId = initResponse.headers.get("mcp-session-id");
+  if (!sessionId) {
+    fail(`upstream initialize response missing Mcp-Session-Id header`);
+  }
+  const sessionHeaders = {
+    "mcp-session-id": sessionId,
+    "mcp-protocol-version": UPSTREAM_PROTOCOL_VERSION,
+  };
+
+  await postUpstream(
+    port,
+    diagnostics,
+    { jsonrpc: "2.0", method: "notifications/initialized" },
+    sessionHeaders,
+  );
+
+  const response = await postUpstream(
+    port,
+    diagnostics,
+    { jsonrpc: "2.0", id: 1, method: "tools/list" },
+    sessionHeaders,
+  );
   let body;
   try {
     body = await response.json();
@@ -145,9 +204,17 @@ async function fetchRawTools(port, diagnostics) {
       `upstream tools/list body was not valid JSON: ${msg}\nupstream diagnostics: ${diagnostics()}`,
     );
   }
+  if (body?.error !== undefined) {
+    fail(
+      `upstream tools/list returned a JSON-RPC error: ${JSON.stringify(body.error)}\n` +
+        `upstream diagnostics: ${diagnostics()}`,
+    );
+  }
   const tools = body?.result?.tools;
   if (!Array.isArray(tools)) {
-    fail("upstream tools/list response missing result.tools");
+    fail(
+      `upstream tools/list response missing result.tools\nupstream diagnostics: ${diagnostics()}`,
+    );
   }
   return tools;
 }

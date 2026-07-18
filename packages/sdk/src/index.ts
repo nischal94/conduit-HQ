@@ -50,6 +50,13 @@ export {
 export type { CreateToolInvokerOptions, ToolInvokerDeps } from "./pipeline/invoker.js";
 export { createToolInvoker } from "./pipeline/invoker.js";
 export type {
+  McpBudget,
+  McpClient,
+  McpEndpoint,
+  McpSession,
+} from "./pipeline/mcp-client.js";
+export { createMcpClient, McpClientError } from "./pipeline/mcp-client.js";
+export type {
   UpstreamCaller,
   UpstreamOutcome,
   UpstreamRequest,
