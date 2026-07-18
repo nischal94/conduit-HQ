@@ -1571,3 +1571,47 @@ to lock the property. **The discipline that rejects a false Sev-8 is the same
 one that fixes a real P2 — severity from any reviewer (human, bot, or model)
 demands independent tracing before adoption. This is audit-recommendations-
 adversarially applied to a review finding, not an audit recommendation.**
+
+## 2026-07-17/18 — C4+C5 Lane B: build + gauntlet + live 9/9 matrix (PR #39 squash-merged → main `aca3840`)
+
+1. **`exit 124 + 0 stdout` from codex has TWO distinct causes — stderr size
+   tells them apart.** Near-empty stderr = the stdin hang (`</dev/null` didn't
+   take; use `printf '' |`). LARGE stderr (100KB+ of reasoning) = genuinely
+   working but killed before writing its final answer to stdout — the fix is
+   narrowing scope (name the exact files, forbid the full-diff walk) and
+   lowering reasoning effort, not retrying the same call. Also: grepping stderr
+   for `auth|unauthorized` false-matches codex's own streamed text (it echoes
+   "Reading additional input from stdin" and quotes `"unauthorized"` from code
+   under review). Match on specific phrases (`not logged in`, `run codex login`),
+   and treat stdout byte-count as the ground truth.
+2. **A transient safety-classifier outage gates ONLY sandbox-disabled Bash;
+   sandboxed reads keep working.** Right split: ledger the blocker + the exact
+   composed command, keep doing read-only work, retry on a short wakeup. Wrong
+   split: polling the gated call in a loop, or ending the turn with no way
+   forward.
+3. **zsh does NOT tilde-expand `VAR=~/path` when it's an argument to `env`**
+   (magicequalsubst is off by default; true prefix assignments DO expand). The
+   symptom: a literal `./~/` directory materialized in the repo cwd. Always
+   `$HOME` in commands handed to users or run via `env`.
+4. **"The INVARIANTS row overclaims relative to its test" is a review lens that
+   catches real credential-boundary gaps.** The retarget row said "never sent to
+   a different url" but only the REFUSAL branch was pinned — both PROCEED
+   branches (clear-credential, fresh-secret) could have leaked the old secret
+   without a test going red. Fix: spy the fetch and assert the auth actually
+   sent, and assert fetch-never-called on every refusal path.
+5. **The live matrix catches what fixtures structurally cannot: third-party
+   schema drift.** Context7's resolve tool changed (now requires BOTH
+   `libraryName` and `query`) between the 2026-07-16 dogfood and 2026-07-18.
+   Fixtures stayed green throughout. This is why the matrix is a PRE-merge
+   gate, run against servers we don't control.
+6. **A name-based success proxy is guest-influenceable; consumption is
+   host-truth.** The deny exit-0 check keyed on `error.name ===
+   "ConduitPolicyBlocked"` — wrong in both directions AND spoofable by the
+   guest. The durable pattern: never classify an outcome by an error NAME that
+   crossed the guest boundary when a host-side fact (the staged decision was
+   consumed) can carry the truth. Evaluated fix in HANDOFF (decisionApplied).
+7. **Permission-gate denials on pattern-shaped commands (sqlite3 on a
+   secrets-holding db; `rm -rf` on a tilde-looking path) are not obstacles to
+   engineer around.** Split the command, keep the evidence that made the action
+   safe, and hand the user the exact absolute-path command. The gate
+   pattern-matches for good reasons; fighting it burns trust for seconds saved.
