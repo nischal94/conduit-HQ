@@ -587,6 +587,24 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
     expect(deps.stderrLines.join("")).toMatch(/deny was never applied/i);
   });
 
+  it("INVARIANT /cli deny-verb-truth: an APPROVE that never applied while the drive COMPLETED also exits 1 — verb truth is symmetric", async () => {
+    // The same divergence-that-never-manifested-as-a-call class as the deny
+    // guard: reporting unqualified success for an approve that never landed
+    // is the same false-positive the deny fix exists to kill.
+    const store = await bareStore();
+    const outcome: ResumeOutcome = {
+      status: "completed",
+      executionId: "exec_approve_never_applied",
+      value: { done: true },
+      decisionApplied: false,
+    };
+    const deps = depsWithOutcome(outcome, store);
+    const result = await runDecide("approve", "exec_approve_never_applied", deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("completed\n");
+    expect(deps.stderrLines.join("")).toMatch(/approve was never applied/i);
+  });
+
   it("approve with a failed outcome still exits non-zero regardless of error name (unchanged)", async () => {
     const store = await bareStore();
     const outcome: ResumeOutcome = {
