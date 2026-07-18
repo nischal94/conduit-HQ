@@ -2,9 +2,8 @@ import { createApprovalRuntime, openStoreFromEnv, type ResolvedEnv } from "@cond
 import {
   type ConduitStore,
   type Execution,
-  type ExecutionOutcome,
-  GUEST_ERROR_NAMES,
   logSandboxDiagnosticsTo,
+  type ResumeOutcome,
 } from "@conduithq/sdk";
 
 /**
@@ -30,7 +29,7 @@ export interface ApprovalsDeps {
    * what production wiring exercises. */
   createRuntime: (opts: { store: ConduitStore; allowPrivateEgress: boolean }) => Promise<{
     manager: {
-      resume: (id: string, decision: { kind: "approve" | "deny" }) => Promise<ExecutionOutcome>;
+      resume: (id: string, decision: { kind: "approve" | "deny" }) => Promise<ResumeOutcome>;
     };
   }>;
   env: NodeJS.ProcessEnv;
@@ -163,31 +162,34 @@ export async function runDecide(
   const runtime = await deps.createRuntime({ store, allowPrivateEgress: env.allowPrivateEgress });
   const outcome = await runtime.manager.resume(executionId, { kind });
 
-  // A deny resolves the paused call as a failure named ConduitPolicyBlocked —
-  // deny deliberately REUSES that error name (design D1/M3) rather than minting
-  // a deny-specific one. When the operator asked for the deny, that
-  // policy-blocked failure IS the intended outcome, so report it as success
-  // ("denied", exit 0), not as a failure line.
-  //
-  // KNOWN LIMITATION (uncovered scenario, design question — see report):
-  // this matches on error NAME alone, not on the identity of the failing call.
-  // A drive can resume PAST the denied call: the guest catches the deny
-  // (ConduitPolicyBlocked is a guest-catchable throw), continues, and a LATER,
-  // UNRELATED upstream call is independently policy-blocked — finalizing the
-  // drive as `failed` with the SAME error name. That distinct block is then
-  // mislabeled "denied" (exit 0) as if it were the operator's deny landing.
-  // A clean local fix would compare the failing call's identity against the
-  // denied pause's requestKey, but `ExecutionOutcome.failed` carries only
-  // `SandboxError { name, message }` (the §5.3/§9.2 boundary error shape) — it
-  // does NOT carry the failing call's requestKey/toolName, so no local
-  // comparison is possible without reshaping the SDK boundary type (a design
-  // decision, deliberately not taken here).
-  if (
-    outcome.status === "failed" &&
-    kind === "deny" &&
-    outcome.error.name === GUEST_ERROR_NAMES.policyBlocked
-  ) {
+  // Deny verb-truth: the exit code and the "denied" line report the OPERATOR'S
+  // VERB, and the verb's success is `decisionApplied` — the manager's host-side
+  // record that the staged deny was consumed by the pending call (decisions
+  // seam, design D6). Never key this on the outcome's error name: names are
+  // guest-reachable (a guest can forge ConduitPolicyBlocked, or catch the real
+  // one and continue), so name-matching is wrong in both directions. The deny
+  // landing and the drive's own fate are independent axes — the guest may
+  // catch the (catchable) denial and complete, run into a later unrelated
+  // failure, or pause on a new approval; in every case the deny itself
+  // succeeded, so report "denied" (exit 0) plus one informational line about
+  // what the drive then did.
+  if (kind === "deny" && outcome.decisionApplied) {
     deps.stdout("denied\n");
+    if (outcome.status === "paused") {
+      deps.stderr(
+        `[conduit approvals] The deny was applied; the execution then paused again on a new approval: ` +
+          `${outcome.pending.toolName} (${outcome.pending.reason}). ` +
+          `Run "conduit approvals list" to see the queue and decide again.\n`,
+      );
+    } else {
+      const driveOutcome =
+        outcome.status === "failed"
+          ? `failed (${outcome.error.name}: ${outcome.error.message})`
+          : outcome.status;
+      deps.stderr(
+        `[conduit approvals] The deny was applied; the execution then settled as ${driveOutcome}.\n`,
+      );
+    }
     return { exitCode: 0 };
   }
 

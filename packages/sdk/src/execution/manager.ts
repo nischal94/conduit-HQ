@@ -47,7 +47,7 @@ export interface ExecutionManager {
     opts?: { limits?: Partial<SandboxLimits>; requestKey?: string },
   ): Promise<ExecutionOutcome>;
   /** Resume a paused execution after a human decision. */
-  resume(executionId: string, decision: ApprovalDecision): Promise<ExecutionOutcome>;
+  resume(executionId: string, decision: ApprovalDecision): Promise<ResumeOutcome>;
   /** Inspect the persisted execution (CLI / API surface). */
   get(executionId: string): Promise<Execution | undefined>;
 }
@@ -68,6 +68,20 @@ export type ExecutionOutcome =
   | { status: "paused"; executionId: string; pending: PendingApproval }
   | { status: "expired"; executionId: string; pending: PendingApproval }
   | { status: "conflict"; executionId: string };
+
+/**
+ * What `resume` returns: the drive outcome PLUS host-side truth about whether
+ * the operator's staged decision was actually CONSUMED by the pending call
+ * (the decisions seam's one-shot `take` — design D6). The two are independent
+ * axes: a deny can land and the guest still catch it and complete
+ * (`status:"completed", decisionApplied:true`), and a drive can fail with a
+ * guest-forged `ConduitPolicyBlocked` name without any decision applying
+ * (`status:"failed", decisionApplied:false`). Callers reporting the operator's
+ * VERB (the CLI's `approvals approve|deny`) must key on `decisionApplied`,
+ * never on the outcome's error name — error names are guest-reachable and
+ * therefore spoofable; consumption is recorded host-side by the invoker.
+ */
+export type ResumeOutcome = ExecutionOutcome & { decisionApplied: boolean };
 
 /**
  * The wiring the manager composes. The manager depends on the `ConduitStore`,
@@ -689,7 +703,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       const resumeAttemptId = newId();
       const won = await deps.store.executions.claimForResume(executionId, resumeAttemptId);
       if (!won) {
-        return { status: "conflict", executionId };
+        return { status: "conflict", executionId, decisionApplied: false };
       }
 
       // The claim just flipped the row to `running`. EVERYTHING from here until
@@ -722,6 +736,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               name: "ConduitInternalError",
               message: `[ExecutionManager] Resumed execution has no pending approval. Context: { executionId: ${executionId} }`,
             },
+            decisionApplied: false,
           };
         }
         const pausedOn = execution.pausedOn;
@@ -735,7 +750,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // discipline as finish()).
           delete expired.pausedOn;
           await persistOrFinalizeFailed(execution, () => deps.store.executions.put(expired));
-          return { status: "expired", executionId, pending: pausedOn };
+          return { status: "expired", executionId, pending: pausedOn, decisionApplied: false };
         }
 
         // Load the durable prefix and stage the decision bound to the pending
@@ -794,7 +809,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             deadline: deadlineFor(undefined),
             upstreamSession,
           });
-          return await drive(running, invoke, prefix, undefined, undefined);
+          const outcome = await drive(running, invoke, prefix, undefined, undefined);
+          // Read AFTER the drive settles: `consumed` is host-side truth that
+          // the staged decision was taken by the pending call (design D6) —
+          // the CLI's verb reporting keys on this, never on error names.
+          return { ...outcome, decisionApplied: decisions.consumed(executionId) };
         } finally {
           try {
             await upstreamSession.dispose();

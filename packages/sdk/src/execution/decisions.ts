@@ -66,6 +66,15 @@ export interface ApprovalDecisions {
    * later call, so it is discarded rather than left in place.
    */
   discard(executionId: string): void;
+  /**
+   * True iff a staged decision for this execution was CONSUMED by a matching
+   * `take` — i.e. the operator's decision actually applied to the pending
+   * call. Host-side truth, set only by the one consumption point (`take` on
+   * an exact identity match); a `discard` (divergence) never sets it. The
+   * manager reads this after a resumed drive to report `decisionApplied`
+   * without inferring it from guest-forgeable error names.
+   */
+  consumed(executionId: string): boolean;
 }
 
 interface StagedDecision {
@@ -90,6 +99,8 @@ export function identitiesMatch(a: PendingCallIdentity, b: PendingCallIdentity):
  */
 export function createInMemoryApprovalDecisions(): ApprovalDecisions {
   const staged = new Map<string, StagedDecision>();
+  // executionIds whose staged decision was consumed by a matching take.
+  const consumedIds = new Set<string>();
 
   return {
     stage(executionId, identity, decision) {
@@ -110,6 +121,7 @@ export function createInMemoryApprovalDecisions(): ApprovalDecisions {
         return undefined;
       }
       staged.delete(executionId); // one-shot: consumed on match
+      consumedIds.add(executionId);
       return entry.decision;
     },
 
@@ -119,6 +131,10 @@ export function createInMemoryApprovalDecisions(): ApprovalDecisions {
 
     discard(executionId) {
       staged.delete(executionId);
+    },
+
+    consumed(executionId) {
+      return consumedIds.has(executionId);
     },
   };
 }

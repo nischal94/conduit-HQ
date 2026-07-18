@@ -4,7 +4,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createApprovalRuntime } from "@conduithq/mcp";
-import type { ConduitStore, ExecutionOutcome } from "@conduithq/sdk";
+import type { ConduitStore, ResumeOutcome } from "@conduithq/sdk";
 import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
@@ -315,7 +315,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
     expect(row?.status).toBe("completed");
   });
 
-  it("deny maps to manager.resume({kind:'deny'}) and prints 'failed' (guest-reported denial), no tool call", async () => {
+  it("INVARIANT /cli deny-verb-truth: a REAL applied deny prints 'denied' and exits 0 — the operator's verb succeeded, no tool call", async () => {
     await setup();
     const executionId = await pauseOne();
     const deps = makeDeps({
@@ -325,10 +325,17 @@ describe("conduit approvals approve|deny — real runtime", () => {
     });
 
     const result = await runDecide("deny", executionId, deps);
-    // Denial resolves the pending call as blocked — the sandbox script above
-    // has no try/catch, so the guest throw surfaces as a failed outcome.
-    expect(["completed", "failed"]).toContain(result.exitCode === 0 ? "completed" : "failed");
+    // The deny APPLIED (host-side decision consumption — decisionApplied), so
+    // the CLI reports the operator's verb as a success, whatever the drive
+    // then did (here: the guest has no try/catch, so the drive itself failed
+    // with the guest-visible ConduitPolicyBlocked).
+    expect(result.exitCode).toBe(0);
+    expect(deps.stdoutLines.join("")).toBe("denied\n");
+    expect(deps.stderrLines.join("")).toMatch(/deny was applied/i);
     expect(upstream.calls).toHaveLength(0);
+
+    const row = await store.executions.get(executionId);
+    expect(row?.status).toBe("failed");
   });
 
   it("re-pause: approving the first of two require_approval calls surfaces the NEW pending approval and the execution is back in listPaused", async () => {
@@ -409,7 +416,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
 });
 
 describe("conduit approvals approve|deny — outcome mapping (injected runtime)", () => {
-  function depsWithOutcome(outcome: ExecutionOutcome, store: ConduitStore) {
+  function depsWithOutcome(outcome: ResumeOutcome, store: ConduitStore) {
     return makeDeps({
       store,
       createRuntime: async () => ({
@@ -425,10 +432,11 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
 
   it("expired outcome (from approve) prints the 'no tool call was made' line and exits 0", async () => {
     const store = await bareStore();
-    const outcome: ExecutionOutcome = {
+    const outcome: ResumeOutcome = {
       status: "expired",
       executionId: "exec_x",
       pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 1 },
+      decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome, store);
     const result = await runDecide("approve", "exec_x", deps);
@@ -441,10 +449,11 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
 
   it("expired outcome (from deny) ALSO prints the 'no tool call was made' line", async () => {
     const store = await bareStore();
-    const outcome: ExecutionOutcome = {
+    const outcome: ResumeOutcome = {
       status: "expired",
       executionId: "exec_y",
       pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 1 },
+      decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome, store);
     const result = await runDecide("deny", "exec_y", deps);
@@ -454,19 +463,24 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
 
   it("conflict outcome exits non-zero", async () => {
     const store = await bareStore();
-    const outcome: ExecutionOutcome = { status: "conflict", executionId: "exec_z" };
+    const outcome: ResumeOutcome = {
+      status: "conflict",
+      executionId: "exec_z",
+      decisionApplied: false,
+    };
     const deps = depsWithOutcome(outcome, store);
     const result = await runDecide("approve", "exec_z", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("conflict\n");
   });
 
-  it("failed outcome exits non-zero", async () => {
+  it("INVARIANT /cli deny-verb-truth: a deny that did NOT apply reports failure (exit 1), never 'denied'", async () => {
     const store = await bareStore();
-    const outcome: ExecutionOutcome = {
+    const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_w",
       error: { name: "SomeError", message: "boom" },
+      decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome, store);
     const result = await runDecide("deny", "exec_w", deps);
@@ -475,39 +489,91 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
     expect(deps.stderrLines.join("")).toMatch(/SomeError: boom/);
   });
 
-  it("deny with ConduitPolicyBlocked exits 0 and prints 'denied'", async () => {
+  it("INVARIANT /cli deny-verb-truth: an applied deny prints 'denied' and exits 0, keyed on decisionApplied — not the error name", async () => {
     const store = await bareStore();
-    const outcome: ExecutionOutcome = {
+    const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_denied",
       error: { name: "ConduitPolicyBlocked", message: "policy denied the execution" },
+      decisionApplied: true,
     };
     const deps = depsWithOutcome(outcome, store);
     const result = await runDecide("deny", "exec_denied", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
+    // One informational drive-outcome line: the operator sees what the
+    // execution did AFTER the deny landed.
+    expect(deps.stderrLines.join("")).toMatch(/deny was applied.*failed/is);
   });
 
-  it("deny with other error names still exits non-zero", async () => {
+  it("INVARIANT /cli deny-verb-truth: a guest-spoofed ConduitPolicyBlocked failure is NOT reported as 'denied' when the deny never applied", async () => {
     const store = await bareStore();
-    const outcome: ExecutionOutcome = {
+    const outcome: ResumeOutcome = {
       status: "failed",
-      executionId: "exec_other",
-      error: { name: "NetworkError", message: "connection failed" },
+      executionId: "exec_spoof",
+      error: { name: "ConduitPolicyBlocked", message: "guest-forged name" },
+      decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome, store);
-    const result = await runDecide("deny", "exec_other", deps);
+    const result = await runDecide("deny", "exec_spoof", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("failed\n");
-    expect(deps.stderrLines.join("")).toMatch(/NetworkError: connection failed/);
+    expect(deps.stdoutLines.join("")).not.toContain("denied");
   });
 
-  it("approve with ConduitPolicyBlocked still exits non-zero (unchanged)", async () => {
+  it("INVARIANT /cli deny-verb-truth: an applied deny is 'denied' (exit 0) even when the guest catches it and the drive COMPLETES", async () => {
     const store = await bareStore();
-    const outcome: ExecutionOutcome = {
+    const outcome: ResumeOutcome = {
+      status: "completed",
+      executionId: "exec_caught",
+      value: { blocked: true },
+      decisionApplied: true,
+    };
+    const deps = depsWithOutcome(outcome, store);
+    const result = await runDecide("deny", "exec_caught", deps);
+    expect(result.exitCode).toBe(0);
+    expect(deps.stdoutLines.join("")).toBe("denied\n");
+    expect(deps.stderrLines.join("")).toMatch(/deny was applied.*completed/is);
+  });
+
+  it("INVARIANT /cli deny-verb-truth: an applied deny followed by a later unrelated upstream failure is still 'denied' (exit 0)", async () => {
+    const store = await bareStore();
+    const outcome: ResumeOutcome = {
+      status: "failed",
+      executionId: "exec_later_fail",
+      error: { name: "NetworkError", message: "connection failed" },
+      decisionApplied: true,
+    };
+    const deps = depsWithOutcome(outcome, store);
+    const result = await runDecide("deny", "exec_later_fail", deps);
+    expect(result.exitCode).toBe(0);
+    expect(deps.stdoutLines.join("")).toBe("denied\n");
+    expect(deps.stderrLines.join("")).toMatch(/deny was applied.*failed.*NetworkError/is);
+  });
+
+  it("an applied deny that re-pauses on a NEW approval prints 'denied' plus the queue guidance", async () => {
+    const store = await bareStore();
+    const outcome: ResumeOutcome = {
+      status: "paused",
+      executionId: "exec_repause",
+      pending: { callId: "c", toolName: "github.push", input: {}, reason: "review", expiresAt: 9 },
+      decisionApplied: true,
+    };
+    const deps = depsWithOutcome(outcome, store);
+    const result = await runDecide("deny", "exec_repause", deps);
+    expect(result.exitCode).toBe(0);
+    expect(deps.stdoutLines.join("")).toBe("denied\n");
+    expect(deps.stderrLines.join("")).toMatch(/paused again on a new approval/i);
+    expect(deps.stderrLines.join("")).toMatch(/conduit approvals list/);
+  });
+
+  it("approve with a failed outcome still exits non-zero regardless of error name (unchanged)", async () => {
+    const store = await bareStore();
+    const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_approve_blocked",
       error: { name: "ConduitPolicyBlocked", message: "policy denied the execution" },
+      decisionApplied: true,
     };
     const deps = depsWithOutcome(outcome, store);
     const result = await runDecide("approve", "exec_approve_blocked", deps);

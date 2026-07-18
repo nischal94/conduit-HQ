@@ -26,6 +26,7 @@ export type {
   ExecutionManager,
   ExecutionManagerDeps,
   ExecutionOutcome,
+  ResumeOutcome,
 } from "./execution/manager.js";
 export { createExecutionManager } from "./execution/manager.js";
 export { scrubCredential } from "./execution/scrub.js";
