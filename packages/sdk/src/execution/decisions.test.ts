@@ -104,5 +104,18 @@ describe("createInMemoryApprovalDecisions (§5.5 design D6)", () => {
       expect(d.consumed("exec_1")).toBe(true);
       expect(d.consumed("exec_2")).toBe(false);
     });
+
+    it("re-staging for the same execution RESETS consumption — a long-lived seam cannot report a fresh decision as already applied", () => {
+      // The manager builds a fresh seam per resume, but the seam is public
+      // API: a long-lived instance staging a second decision for the same
+      // execution (a re-pause) must not inherit the first decision's
+      // consumed state.
+      const d = createInMemoryApprovalDecisions();
+      d.stage("exec_1", deleteRepo, { kind: "deny" });
+      d.take("exec_1", deleteRepo);
+      expect(d.consumed("exec_1")).toBe(true);
+      d.stage("exec_1", createIssue, { kind: "deny" });
+      expect(d.consumed("exec_1")).toBe(false);
+    });
   });
 });

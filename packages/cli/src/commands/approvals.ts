@@ -222,6 +222,18 @@ export async function runDecide(
     }
     return { exitCode: 1 };
   }
+  if (kind === "deny" && !outcome.decisionApplied) {
+    // The drive settled as completed without the staged deny ever being
+    // consumed — the resumed replay never re-reached the pending call (a
+    // divergence that never manifested as a call). The denied call did not
+    // run, but the operator's verb did not land either; exit codes track
+    // the verb.
+    deps.stderr(
+      `[conduit approvals] deny was never applied: the resumed execution completed without ` +
+        `re-reaching the pending call, so no decision was consumed. The denied call did not run.\n`,
+    );
+    return { exitCode: 1 };
+  }
   return { exitCode: 0 };
 }
 

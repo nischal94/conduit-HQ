@@ -105,6 +105,11 @@ export function createInMemoryApprovalDecisions(): ApprovalDecisions {
   return {
     stage(executionId, identity, decision) {
       staged.set(executionId, { identity, decision });
+      // A freshly staged decision is by definition not yet consumed. The
+      // manager builds a fresh seam per resume, but the seam is public API —
+      // a long-lived instance re-staging for the same execution must never
+      // report the NEW decision as applied on the strength of the OLD one.
+      consumedIds.delete(executionId);
     },
 
     take(executionId, identity) {
