@@ -23,39 +23,36 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-18 (C4+C5 COMPLETE: Lane B MERGED — PR #39 squash → main `aca3840`; matrix 9/9 live; next: §17 v1 surface sequence, step 1)
+## Current handoff — written 2026-07-18 evening (deny verb-truth side-PR DONE: PR #40 squash → main `69d4bfb`; next: §17 v1 surface sequence, step 1 — credential key lifecycle)
 
 ### Where things stand
 
-- **Main is `aca3840`** — C4+C5 **Lane B MERGED** (PR #39, squash, trailer-free
-  verified). The full transport-compatibility arc is DONE: onboarding fetch rides
-  the shared streamable-HTTP client (one 5s/5MiB/1024-tool whole-op budget),
-  `CONDUIT_ADD_SECRET` auth with stored-credential reuse ONLY on an unchanged url,
-  the `--replace` retarget refusal (INVARIANT-pinned, refuses before any network
-  I/O), per-kind error mapping ("unreachable" reserved for real network failure),
-  `add-mcp --help` + single-pass validation (incl. http(s) URL check),
-  `approvals deny` exit-0 on the operator's own deny, the demo fixture speaking
-  strict streamable HTTP (initialize-shape validation, 405 non-POST, 404 wrong
-  session, tools/call echo), seed-demo retired, READMEs truthful.
-  Branches: local + remote = ONLY `main` (feature branch auto-deleted on merge;
-  stale `docs/c4-c5-transport-compat-design` remote deleted after verifying its
-  content is on main via PR #38).
-- **Acceptance matrix 9/9 PASS live (2026-07-18), results on PR #39:** Context7
-  onboarded + real chained workflow (C5 proven ON THE WIRE — upstream errors named
-  hyphenated `resolve-library-id`); GitHub onboarded with a human-supplied PAT
-  (**44 tools: 27 safe / 16 review / 1 destructive — the first real mixed-risk
-  catalog through the classifier**); `github.get_me` returned real data with the
-  PAT resolved host-side from the sealed store; no-secret and Vercel/OAuth runs
-  fail with the truthful 401 line, zero writes. NOTE: Context7's resolve tool NOW
-  requires BOTH `{ libraryName, query }` (schema drifted since 2026-07-16).
-- **Full gauntlet passed** (ledger `.superpowers/sdd/progress-c4-c5.md` has the
-  blow-by-blow): per-task SDD reviews ×5 → whole-branch review → Tier-2 BOTH
-  mechanics (pre-PR 5-specialist `review-pr` with ONE consolidated A–L fix wave;
-  post-PR `code-review` high with 9 findings → fix wave) → `/security-review`
-  0 findings → codex CONVERGED (4 findings: 2 refuted on-code, 2 fixture notes
-  applied) → Greptile P2 fixed → CI 9/9 green → explainer quiz passed 5/5
-  (human-confirmed) → HUMAN-NAMED merge.
-  Explainer: https://claude.ai/code/artifact/0cebfa22-7173-4bdd-b786-253b3a48cf10
+- **Main is `69d4bfb`** — the deny verb-truth side-PR **MERGED** (PR #40, squash,
+  trailer-free verified, HUMAN-NAMED). What landed: the decisions seam records
+  consumption (`consumed()`, set only by the one-shot identity-matched `take`,
+  reset by `stage`, never by `discard`); `manager.resume` returns
+  `ResumeOutcome = ExecutionOutcome & { decisionApplied: boolean }`;
+  `conduit approvals` keys verb reporting on `decisionApplied` — an applied deny
+  is `denied`/exit 0 whatever the drive then did (guest-caught completion, later
+  unrelated failure, re-pause with queue guidance), a never-applied decision on a
+  completed drive exits 1 for BOTH verbs, and the guest-spoofable
+  `ConduitPolicyBlocked` name check is gone. 2 INVARIANTS rows added (§5.5 D6
+  decisionApplied; /cli deny verb-truth), all RED-first.
+- **Gauntlet (Tier 2 post-PR, classification stated on the PR, user-delegated):**
+  TDD build → independent staff audit (2 findings fixed: stage() consumption
+  reset; unapplied-deny-completed exit 1) → 8-angle `code-review` high (16
+  candidates → 4 survived → 2 fixed on-branch: approve-side symmetry, shared
+  operator wording; 2 deferred consider-class, documented as a PR #40 comment) →
+  Greptile P2 adjudicated + fixed (status-from-data message) → CI 9/9 green ×2
+  heads → HUMAN-NAMED merge. Suites at merge: sdk 425 / mcp 44 / cli 85.
+- **Hygiene done:** branches = only `main` (local + remote, prune verified); the
+  two open PR #39 review threads replied-to and resolved (they pointed at this
+  fix); `packages/sdk/dist` rebuilt locally (gitignored; CI builds its own).
+- **C4+C5 remains COMPLETE** (PR #38 + #39 → `aca3840`, acceptance matrix 9/9
+  live against Context7 + GitHub, full gauntlet; blow-by-blow in the 2026-07-18
+  morning handoff — git history of this file — and on PR #39). Standing note
+  from the matrix: Context7's resolve tool now requires BOTH
+  `{ libraryName, query }` (schema drifted since 2026-07-16).
 
 ### NEXT TASK — spec §17 v1 surface-product sequence, step 1: credential key lifecycle
 
@@ -70,19 +67,18 @@ load-bearing route (branch from origin/main → PR → Tier-2 both mechanics +
 /security-review + codex correctness-framed pass + /explain-diff quiz →
 HUMAN-NAMED merge).
 
-**Ready small side-PR (evaluated 2026-07-18, human may slot it first):** the deny
-verb-truth fix. Evidence-verified: the `ConduitPolicyBlocked` name-proxy in
-`approvals.ts` is wrong in BOTH directions (an unrelated post-deny block prints
-"denied"/exit 0; a landed deny + later upstream failure prints "deny failed"/
-exit 1) and the name is guest-spoofable. NO §9.2 boundary change needed: the D6/F2
-replay-divergence invariant makes decision-consumption host-side truth → add
-`decisionApplied: boolean` to the resume outcome (host-side type), key runDecide
-on `kind==="deny" && decisionApplied`, print one informational drive-outcome
-line, drop the name check. Verify the decisions seam already tracks consumption
-(it detects double-decision conflicts). One open PR-review thread on merged PR
-#39 is the pointer; close it when this lands.
-
 ### DEFERRED FOLLOW-UPS (carry; act where the trigger fires)
+
+New from PR #40's Tier-2 review (consider-class, documented on the PR):
+(1) `ResumeOutcome` intersection leaves `decisionApplied`
+representable-but-always-false on conflict/expired arms — four hand-maintained
+`false` literals; folding the field per-arm would let the type carry the
+invariant (trigger: next `ExecutionOutcome` shape change). (2) the decisions
+seam's `consumedIds` parallel Set is hand-maintained coupling with `staged`
+(stage must remember to reset); review angles disagreed on the right shape —
+per-entry consumed state vs. current Set (which IS the honest minimal
+representation given take/discard both delete) — decide deliberately (trigger:
+next decisions-seam change).
 
 Lane A (from 2026-07-17): (1) bound the DNS pre-flight with a timeout
 (§16/egress hardening pass); (2) thread real `res.statusCode` through
@@ -110,16 +106,16 @@ question); `isError` trace-viewer filter; Aikido MCP still not connected
 
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5`). **State:
-> C4+C5 is COMPLETE — Lane B merged (PR #39 squash → main `aca3840`); the
-> acceptance matrix passed 9/9 against live Context7 + GitHub; branches = only
-> main. Do NOT re-run the matrix or re-review Lane B.**
+> C4+C5 COMPLETE (PR #38/#39) and the deny verb-truth side-PR MERGED (PR #40
+> squash → main `69d4bfb`); branches = only main; the PR #39 review threads are
+> resolved. Do NOT re-review PR #40 or re-run the matrix.**
 >
 > **NEXT: spec §17 v1 surface sequence step 1 — credential key lifecycle**
-> (fold in the 0600-at-creation db-perms finding). START WITH
+> (fold in the 0600-at-creation db-perms finding: the store creates conduit.db
+> 0644; should be 0600 at creation — hand-fixed on the current one). START WITH
 > `superpowers:brainstorming` then `writing-plans`; load-bearing route (branch →
 > PR → Tier-2 both mechanics + /security-review + codex correctness-framed pass
-> + /explain-diff quiz → HUMAN-NAMED merge). The evaluated deny `decisionApplied`
-> fix is a ready small side-PR if the human prefers it first (see HANDOFF).
+> + /explain-diff quiz → HUMAN-NAMED merge).
 > Carry the deferred follow-ups; act on each where its trigger fires.
 
 ---

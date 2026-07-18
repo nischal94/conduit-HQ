@@ -1615,3 +1615,32 @@ adversarially applied to a review finding, not an audit recommendation.**
    engineer around.** Split the command, keep the evidence that made the action
    safe, and hand the user the exact absolute-path command. The gate
    pattern-matches for good reasons; fighting it burns trust for seconds saved.
+
+## 2026-07-18 — deny verb-truth side-PR (PR #40 squash-merged → main `69d4bfb`)
+
+1. **Once a truth field exists, SYMMETRY is the next bug class.** The build
+   keyed deny on `decisionApplied` exactly as evaluated (LEARNINGS #6's
+   pattern executed) — but the approve side had the same false-success
+   (completed-without-consumption → exit 0) and the BUILD didn't see it; the
+   review fan-out did, three angles independently. When you fix a truth
+   asymmetry for one verb/branch, grep for its siblings before calling it
+   done.
+2. **Two review angles disagreeing on a design's shape IS the verdict:
+   consider-class, document-don't-churn.** Simplification called the parallel
+   `consumedIds` Set "the honest minimal representation, load-bearing"
+   (deriving consumption from `staged` is WRONG because take and discard both
+   delete); altitude called the same Set "hand-maintained coupling." Both are
+   right about different costs — that tension means judgment call, not
+   auto-refactor. Deferred with triggers instead of churning mid-PR.
+3. **The multi-angle fan-out cross-verifies itself.** Angle B's
+   removed-behavior trace REFUTED Angle A's highest-confidence candidate
+   (unapplied-deny-on-paused exits 0) with line-cited mechanism: a staged
+   decision's first live call either consumes or terminalizes as
+   ConduitReplayDivergence, so a paused deny always carries
+   decisionApplied:true. Read all finders together before spawning dedicated
+   verifiers — one finder's evidence is another candidate's verdict.
+4. **A guard guaranteed only by branch ORDERING should still report from
+   data.** The never-applied message hardcoded "completed" because only
+   completed structurally reaches it — true today, wrong the day a status arm
+   is added. Report `outcome.status`; bots catch this class reliably
+   (Greptile P2) and the fix is free.
