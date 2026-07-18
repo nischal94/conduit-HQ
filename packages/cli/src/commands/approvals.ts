@@ -2,9 +2,8 @@ import { createApprovalRuntime, openStoreFromEnv, type ResolvedEnv } from "@cond
 import {
   type ConduitStore,
   type Execution,
-  type ExecutionOutcome,
-  GUEST_ERROR_NAMES,
   logSandboxDiagnosticsTo,
+  type ResumeOutcome,
 } from "@conduithq/sdk";
 
 /**
@@ -30,7 +29,7 @@ export interface ApprovalsDeps {
    * what production wiring exercises. */
   createRuntime: (opts: { store: ConduitStore; allowPrivateEgress: boolean }) => Promise<{
     manager: {
-      resume: (id: string, decision: { kind: "approve" | "deny" }) => Promise<ExecutionOutcome>;
+      resume: (id: string, decision: { kind: "approve" | "deny" }) => Promise<ResumeOutcome>;
     };
   }>;
   env: NodeJS.ProcessEnv;
@@ -148,6 +147,23 @@ const EXPIRED_LINE =
   "[conduit approvals] The approval expired before the decision applied: " +
   "the execution was finalized as expired, and no tool call was made.";
 
+/**
+ * Shared queue guidance for a drive that re-paused on a fresh approval —
+ * one source of truth for the wording, whichever branch reports it (the
+ * applied-deny informational line and the generic paused arm).
+ */
+function pausedAgainGuidance(pending: { toolName: string; reason: string }): string {
+  return (
+    `paused again on a new approval: ${pending.toolName} (${pending.reason}). ` +
+    `Run "conduit approvals list" to see the queue and decide again.`
+  );
+}
+
+/** One rendering of a SandboxError for operator-facing lines. */
+function formatSandboxError(error: { name: string; message: string }): string {
+  return `${error.name}: ${error.message}`;
+}
+
 export async function runDecide(
   kind: "approve" | "deny",
   executionId: string | undefined,
@@ -163,31 +179,32 @@ export async function runDecide(
   const runtime = await deps.createRuntime({ store, allowPrivateEgress: env.allowPrivateEgress });
   const outcome = await runtime.manager.resume(executionId, { kind });
 
-  // A deny resolves the paused call as a failure named ConduitPolicyBlocked —
-  // deny deliberately REUSES that error name (design D1/M3) rather than minting
-  // a deny-specific one. When the operator asked for the deny, that
-  // policy-blocked failure IS the intended outcome, so report it as success
-  // ("denied", exit 0), not as a failure line.
-  //
-  // KNOWN LIMITATION (uncovered scenario, design question — see report):
-  // this matches on error NAME alone, not on the identity of the failing call.
-  // A drive can resume PAST the denied call: the guest catches the deny
-  // (ConduitPolicyBlocked is a guest-catchable throw), continues, and a LATER,
-  // UNRELATED upstream call is independently policy-blocked — finalizing the
-  // drive as `failed` with the SAME error name. That distinct block is then
-  // mislabeled "denied" (exit 0) as if it were the operator's deny landing.
-  // A clean local fix would compare the failing call's identity against the
-  // denied pause's requestKey, but `ExecutionOutcome.failed` carries only
-  // `SandboxError { name, message }` (the §5.3/§9.2 boundary error shape) — it
-  // does NOT carry the failing call's requestKey/toolName, so no local
-  // comparison is possible without reshaping the SDK boundary type (a design
-  // decision, deliberately not taken here).
-  if (
-    outcome.status === "failed" &&
-    kind === "deny" &&
-    outcome.error.name === GUEST_ERROR_NAMES.policyBlocked
-  ) {
+  // Deny verb-truth: the exit code and the "denied" line report the OPERATOR'S
+  // VERB, and the verb's success is `decisionApplied` — the manager's host-side
+  // record that the staged deny was consumed by the pending call (decisions
+  // seam, design D6). Never key this on the outcome's error name: names are
+  // guest-reachable (a guest can forge ConduitPolicyBlocked, or catch the real
+  // one and continue), so name-matching is wrong in both directions. The deny
+  // landing and the drive's own fate are independent axes — the guest may
+  // catch the (catchable) denial and complete, run into a later unrelated
+  // failure, or pause on a new approval; in every case the deny itself
+  // succeeded, so report "denied" (exit 0) plus one informational line about
+  // what the drive then did.
+  if (kind === "deny" && outcome.decisionApplied) {
     deps.stdout("denied\n");
+    if (outcome.status === "paused") {
+      deps.stderr(
+        `[conduit approvals] The deny was applied; the execution then ${pausedAgainGuidance(outcome.pending)}\n`,
+      );
+    } else {
+      const driveOutcome =
+        outcome.status === "failed"
+          ? `failed (${formatSandboxError(outcome.error)})`
+          : outcome.status;
+      deps.stderr(
+        `[conduit approvals] The deny was applied; the execution then settled as ${driveOutcome}.\n`,
+      );
+    }
     return { exitCode: 0 };
   }
 
@@ -201,23 +218,34 @@ export async function runDecide(
     // The approved call ran, and the resumed execution reached ANOTHER
     // require_approval call (manager re-enters the drive loop on resume) —
     // a fresh pausedOn is persisted and a second human decision is needed.
-    deps.stderr(
-      `[conduit approvals] Execution paused again on a new approval: ` +
-        `${outcome.pending.toolName} (${outcome.pending.reason}). ` +
-        `Run "conduit approvals list" to see the queue and decide again.\n`,
-    );
+    deps.stderr(`[conduit approvals] Execution ${pausedAgainGuidance(outcome.pending)}\n`);
     return { exitCode: 0 };
   }
   if (outcome.status === "conflict" || outcome.status === "failed") {
     if (outcome.status === "failed") {
-      deps.stderr(
-        `[conduit approvals] ${kind} failed: ${outcome.error.name}: ${outcome.error.message}\n`,
-      );
+      deps.stderr(`[conduit approvals] ${kind} failed: ${formatSandboxError(outcome.error)}\n`);
     } else {
       deps.stderr(
         `[conduit approvals] ${kind}: execution ${executionId} was not in a resumable (paused) state.\n`,
       );
     }
+    return { exitCode: 1 };
+  }
+  if (!outcome.decisionApplied) {
+    // Structurally only status "completed" reaches here today, but the
+    // message reports `outcome.status` rather than hardcoding it — the
+    // guarantee is branch ordering, not a type guard, so a future status arm
+    // reaching this branch must not describe the wrong fate. The drive
+    // settled without the staged decision
+    // ever being consumed — the resumed replay never re-reached the pending
+    // call (a divergence that never manifested as a call). The pending call
+    // did not run, but the operator's verb did not land either; exit codes
+    // track the verb, for BOTH verbs symmetrically.
+    deps.stderr(
+      `[conduit approvals] ${kind} was never applied: the resumed execution settled as ` +
+        `${outcome.status} without re-reaching the pending call, so no decision was consumed. ` +
+        `The pending call did not run.\n`,
+    );
     return { exitCode: 1 };
   }
   return { exitCode: 0 };

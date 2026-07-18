@@ -67,4 +67,55 @@ describe("createInMemoryApprovalDecisions (§5.5 design D6)", () => {
     expect(() => d.discard("exec_none")).not.toThrow();
     expect(d.peek("exec_none")).toBe(false);
   });
+
+  describe("consumed — host-side truth that the staged decision was applied", () => {
+    it("is false before staging and while a decision is merely staged", () => {
+      const d = createInMemoryApprovalDecisions();
+      expect(d.consumed("exec_1")).toBe(false);
+      d.stage("exec_1", deleteRepo, { kind: "deny" });
+      expect(d.consumed("exec_1")).toBe(false);
+    });
+
+    it("becomes true only after a matching take consumes the decision", () => {
+      const d = createInMemoryApprovalDecisions();
+      d.stage("exec_1", deleteRepo, { kind: "deny" });
+      expect(d.take("exec_1", deleteRepo)).toEqual({ kind: "deny" });
+      expect(d.consumed("exec_1")).toBe(true);
+    });
+
+    it("stays false on an identity-mismatched take (nothing was consumed)", () => {
+      const d = createInMemoryApprovalDecisions();
+      d.stage("exec_1", deleteRepo, { kind: "approve" });
+      expect(d.take("exec_1", createIssue)).toBeUndefined();
+      expect(d.consumed("exec_1")).toBe(false);
+    });
+
+    it("stays false after a divergence discard — a discarded decision was never applied", () => {
+      const d = createInMemoryApprovalDecisions();
+      d.stage("exec_1", deleteRepo, { kind: "deny" });
+      d.discard("exec_1");
+      expect(d.consumed("exec_1")).toBe(false);
+    });
+
+    it("is scoped per executionId", () => {
+      const d = createInMemoryApprovalDecisions();
+      d.stage("exec_1", deleteRepo, { kind: "approve" });
+      d.take("exec_1", deleteRepo);
+      expect(d.consumed("exec_1")).toBe(true);
+      expect(d.consumed("exec_2")).toBe(false);
+    });
+
+    it("re-staging for the same execution RESETS consumption — a long-lived seam cannot report a fresh decision as already applied", () => {
+      // The manager builds a fresh seam per resume, but the seam is public
+      // API: a long-lived instance staging a second decision for the same
+      // execution (a re-pause) must not inherit the first decision's
+      // consumed state.
+      const d = createInMemoryApprovalDecisions();
+      d.stage("exec_1", deleteRepo, { kind: "deny" });
+      d.take("exec_1", deleteRepo);
+      expect(d.consumed("exec_1")).toBe(true);
+      d.stage("exec_1", createIssue, { kind: "deny" });
+      expect(d.consumed("exec_1")).toBe(false);
+    });
+  });
 });

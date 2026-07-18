@@ -14,7 +14,7 @@ import { createMcpUpstreamCaller } from "../pipeline/upstream.js";
 import type { UpstreamSessionScope } from "../pipeline/upstream-session.js";
 import { createStorePolicyEngine } from "../policy.js";
 import { QuickJSSandbox } from "../sandbox/quickjs.js";
-import type { Sandbox } from "../sandbox/sandbox.js";
+import { generateSeeds, type Sandbox } from "../sandbox/sandbox.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
@@ -1603,5 +1603,187 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
     // than surfacing as a rejection or flipping the outcome to failed.
     expect(result.status).toBe("completed");
     expect(events).toEqual(["created", "disposed"]);
+  });
+});
+
+describe("§5.5 resume outcome carries decisionApplied — host-side decision-consumption truth", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
+  });
+
+  /** Start the standard pause-on-create_issue run and return its id. */
+  async function pauseOnCreateIssue(
+    manager: ReturnType<typeof createExecutionManager>,
+    code?: string,
+  ): Promise<string> {
+    const first = await manager.start(
+      code ??
+        `
+      const created = await tools.github.create_issue({ title: "from agent" });
+      return created;
+    `,
+    );
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      throw new Error(`expected paused, got ${first.status}`);
+    }
+    return first.executionId;
+  }
+
+  it("INVARIANT §5.5: an applied approve reports decisionApplied:true", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+    const id = await pauseOnCreateIssue(manager);
+
+    const outcome = await manager.resume(id, { kind: "approve" });
+    expect(outcome.status).toBe("completed");
+    expect(outcome.decisionApplied).toBe(true);
+  });
+
+  it("INVARIANT §5.5: an applied deny reports decisionApplied:true even when the guest catches it and the drive COMPLETES", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+    const id = await pauseOnCreateIssue(
+      manager,
+      `
+      try {
+        await tools.github.create_issue({ title: "nope" });
+        return { blocked: false };
+      } catch (error) {
+        return { blocked: true, name: error.name };
+      }
+    `,
+    );
+
+    const outcome = await manager.resume(id, { kind: "deny" });
+    // The drive's own outcome is completed (guest handled the denial) — but the
+    // deny itself LANDED, and the outcome says so independently of drive status.
+    expect(outcome.status).toBe("completed");
+    expect(outcome.decisionApplied).toBe(true);
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.5: an applied deny reports decisionApplied:true when the guest does NOT catch (drive fails ConduitPolicyBlocked)", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+    const id = await pauseOnCreateIssue(manager);
+
+    const outcome = await manager.resume(id, { kind: "deny" });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitPolicyBlocked");
+    }
+    expect(outcome.decisionApplied).toBe(true);
+  });
+
+  it("a conflict (lost resume race) reports decisionApplied:false", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+    const id = await pauseOnCreateIssue(manager);
+
+    const [a, b] = await Promise.all([
+      manager.resume(id, { kind: "approve" }),
+      manager.resume(id, { kind: "approve" }),
+    ]);
+    const loser = a.status === "conflict" ? a : b;
+    expect(loser.status).toBe("conflict");
+    expect(loser.decisionApplied).toBe(false);
+  });
+
+  it("an expired resume reports decisionApplied:false — expiry short-circuits before the decision can apply", async () => {
+    const h = await makeHarness();
+    active = h;
+    let clock = 1_000_000;
+    const manager = createExecutionManager({ ...h.deps, now: () => clock });
+    const first = await manager.start(`
+      const created = await tools.github.create_issue({ title: "stale" });
+      return created;
+    `);
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      return;
+    }
+    clock = first.pending.expiresAt + 1;
+    const outcome = await manager.resume(first.executionId, { kind: "deny" });
+    expect(outcome.status).toBe("expired");
+    expect(outcome.decisionApplied).toBe(false);
+  });
+
+  it("a replay-divergence reports decisionApplied:false — a discarded decision was never applied (F2)", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+    const id = await pauseOnCreateIssue(
+      manager,
+      `
+      const r = await tools.github.delete_repo({ repo: "prod" });
+      return r;
+    `,
+    );
+    // Corrupt pausedOn to a different identity so the resume diverges (the
+    // same confused-deputy setup as the F2 invariant test above).
+    const persisted = await manager.get(id);
+    if (persisted?.pausedOn === undefined) {
+      throw new Error("expected a persisted pausedOn to corrupt");
+    }
+    await h.store.executions.put({
+      ...persisted,
+      pausedOn: { ...persisted.pausedOn, toolName: "github.create_issue", input: { title: "x" } },
+    });
+
+    const outcome = await manager.resume(id, { kind: "deny" });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitReplayDivergence");
+    }
+    expect(outcome.decisionApplied).toBe(false);
+  });
+
+  it("INVARIANT §5.5: a guest-spoofed ConduitPolicyBlocked failure does NOT read as an applied decision", async () => {
+    // The name-proxy hole this field closes: a drive can fail with an error
+    // NAMED ConduitPolicyBlocked while the staged decision was never consumed.
+    // decisionApplied keys on the decisions seam's consumption state — not the
+    // (guest-forgeable) error name — so it stays false here.
+    const store = await makeBareStore();
+    const spoofingSandbox: Sandbox = {
+      execute: async () => ({
+        status: "failed",
+        error: { name: "ConduitPolicyBlocked", message: "guest-spoofed name, no call made" },
+        seeds: generateSeeds(),
+        journal: [],
+      }),
+    };
+    const paused: Execution = {
+      id: "exec_spoof",
+      code: "irrelevant (stub sandbox)",
+      status: "paused",
+      seeds: generateSeeds(),
+      startedAt: Date.now(),
+      pausedOn: {
+        callId: "call_spoof",
+        toolName: "github.create_issue",
+        input: { title: "x" },
+        reason: "requires approval",
+        expiresAt: Date.now() + 60_000,
+      },
+    };
+    await store.executions.put(paused);
+
+    const manager = createExecutionManager(makeStubDeps(store, spoofingSandbox));
+    const outcome = await manager.resume("exec_spoof", { kind: "deny" });
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitPolicyBlocked");
+    }
+    expect(outcome.decisionApplied).toBe(false);
   });
 });
