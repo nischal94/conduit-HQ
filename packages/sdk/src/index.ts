@@ -92,6 +92,12 @@ export type {
 } from "./sandbox/sandbox.js";
 export { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "./sandbox/sandbox.js";
 export { SecretBox } from "./secrets.js";
+export {
+  CANARY_REF,
+  ensureKeyCanary,
+  KeyCanaryError,
+  type StoreKeyContext,
+} from "./store/key-lifecycle.js";
 export type { SqliteStoreOptions } from "./store/sqlite.js";
 export { openSqliteStore } from "./store/sqlite.js";
 export type {

@@ -545,10 +545,11 @@ describe("SqliteStore", () => {
           1,
         ],
       });
-      const reopened = await openSqliteStore({
-        client: legacy,
-        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
-      });
+      // Same key across both opens: a canary bootstrapped by the first open
+      // must verify on the second (a *different* random key would now be a
+      // legitimate wrong-key canary failure — not what this test exercises).
+      const secretBox = await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes());
+      const reopened = await openSqliteStore({ client: legacy, secretBox });
 
       // (a) the legacy output column is gone entirely — its absence is the
       // migration's completion marker.
@@ -564,10 +565,7 @@ describe("SqliteStore", () => {
 
       // (c) idempotent: a second reopen against the now-columnless table is
       // a no-op (the migration block is skipped) and does not throw.
-      const reopenedAgain = await openSqliteStore({
-        client: legacy,
-        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
-      });
+      const reopenedAgain = await openSqliteStore({ client: legacy, secretBox });
       const stillMasked = await reopenedAgain.trace.listByExecution("e1");
       expect(stillMasked[0]?.input).toEqual({ token: "[redacted]", repo: "hq" });
 

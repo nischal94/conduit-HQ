@@ -18,6 +18,7 @@ import type {
   Tool,
   TraceEvent,
 } from "../types.js";
+import { ensureKeyCanary, type StoreKeyContext } from "./key-lifecycle.js";
 import type { ConduitStore, ReplayJournalRow } from "./store.js";
 
 /**
@@ -30,6 +31,8 @@ export interface SqliteStoreOptions {
   client: Client;
   /** Encrypts SecretRepository contents at rest (spec §9.2). */
   secretBox: SecretBox;
+  /** Sanitized provenance for canary errors (db path + key source; design §2). NEVER key material. */
+  keyContext?: StoreKeyContext;
   /** Host-side sink for infra diagnostics (e.g. a WAL-pragma failure); NEVER guest-visible. */
   log?: (message: string) => void;
 }
@@ -254,6 +257,10 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       await client.execute("ALTER TABLE trace_events DROP COLUMN output");
     });
   }
+
+  // Design §2 (2026-07-19): wrong master key fails loud HERE, at open —
+  // not at the first secret decrypt. Every product bin routes through this.
+  await ensureKeyCanary(client, secretBox, options.keyContext);
 
   return {
     sources: {
