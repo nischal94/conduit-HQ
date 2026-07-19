@@ -20,8 +20,13 @@ precondition per the adversarial-convergence stop line — pass 3 attacked
 content durability, pass 4 directory-entry durability, the same
 interleaving class; plus 2 genuine smalls fixed: `.next` deletion now
 requires a CONFIRMED still-old outcome at the commit boundary, and promote
-distinguishes rename-failure from post-rename-fsync-failure) → this
-revision. The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
+distinguishes rename-failure from post-rename-fsync-failure) → codex pass 5:
+2 editorial residues of the pass-4 edits (a stale pre-commit sentence, a
+missing ledger row) + 1 category-(a) wording nit, all fixed in this
+revision; no design defect remained → **CONVERGED** per the
+adversarial-convergence criterion (the remaining attack surface is the
+documented-decision set: stop-first obligations, env/custom-path
+exclusions, best-effort hygiene). The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
 draft's `master-key.new` two-phase roll-forward manufactured the very lockout
 states it meant to prevent — so per the adversarial-convergence rule the fix is
 a SHAPE change (stop-first in-place rotation, manual documented recovery), not
@@ -202,9 +207,13 @@ is only DEFINED for the default pair (`~/.conduit/master-key` +
   v1; keep using the env key, or delete-and-re-onboard (`conduit key
   import` is the deferred migration path). (Review #4 — no env-sourced
   state ever enters the key-file machinery.)
-- `CONDUIT_DB` is set (custom db path) → refuse: one global key file cannot
-  serve N dbs (review #6). Custom-path installs are env-key installs by
-  definition; their rotation story is delete-and-re-onboard (documented).
+- `CONDUIT_DB` is set (custom db path) → refuse regardless of key source
+  (§1's resolver does permit a custom db with the file key, but ROTATION of
+  the shared global key file against one selected db would strand every
+  other db using it): one global key file cannot
+  serve N dbs (review #6). Custom-path installs should manage their key via
+  env; either way their rotation story is delete-and-re-onboard
+  (documented).
 - Another writer holds the db write lock → `SQLITE_BUSY` within
   `busy_timeout` → refuse: "stop running conduit processes first." (Verified:
   a held `transaction("write")` = `BEGIN IMMEDIATE` refuses a second writer
@@ -228,8 +237,9 @@ changes, so every crash state recovers by "try the other file"):
    with `finally { tx.close() }` — review #7): read every `secrets` row
    (canary included), `open()` with the old box, `seal()` with the new box,
    UPDATE. (Verified: async seal/open work inside the interactive tx —
-   `batch` would not allow awaiting.) Any failure → rollback; the db is
-   untouched — AND rotate deletes the `master-key.next` it created in step 3
+   `batch` would not allow awaiting.) A failure BEFORE COMMIT is issued (or
+   with a confirmed rollback) leaves the db untouched — AND rotate then
+   deletes the `master-key.next` it created in step 3
    (re-pass #3: the routine `SQLITE_BUSY` refusal must not strand a `.next`
    that poisons the operator's retry; pre-commit, this run's `.next` is
    provably meaningless). Scope of that cleanup (pass-3 #4, tightened by
@@ -356,6 +366,7 @@ operator owns file perms on custom paths. POSIX/local filesystems only
 | Key file wider than 0600 → stderr warning, still serves | mcp env test |
 | `key generate` refusals: file exists / env set / db has sealed rows | cli test |
 | `key generate` publishes via fsynced-temp + `link()` (0600; EEXIST loses; temp unlinked on handled failure), never prints key material | cli test |
+| `key generate` post-link directory-fsync failure → success with durability warning, key file intact | cli test |
 | `key rotate` refusals: env-sourced key / custom CONDUIT_DB / held write lock / leftover `master-key.next` | cli test |
 | `key rotate` BUSY refusal removes its own `master-key.next` (retry not poisoned) | cli test |
 | `key rotate` uncertain commit outcome (COMMIT throws) → `.next` NOT deleted, recovery printed | cli test |
