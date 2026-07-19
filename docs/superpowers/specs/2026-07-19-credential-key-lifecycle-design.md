@@ -14,7 +14,14 @@ contradiction, filename grammar) → revision (commit `fa633cb`) resolving
 those 6 → codex pass 3 (4 findings: 1 P1 / 2 P2 / 1 P3 — generate
 durability/visibility window → link-publication; a stale env-refusal line;
 probe-all not pinned in the ledger; the `.next` cleanup claim overbroad) →
-this revision resolves those 4. The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
+revision (commit `7e70827`) resolving those 4 → codex pass 4 (3 findings:
+the generate visibility window RELABELED as a documented stop-first
+precondition per the adversarial-convergence stop line — pass 3 attacked
+content durability, pass 4 directory-entry durability, the same
+interleaving class; plus 2 genuine smalls fixed: `.next` deletion now
+requires a CONFIRMED still-old outcome at the commit boundary, and promote
+distinguishes rename-failure from post-rename-fsync-failure) → this
+revision. The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
 draft's `master-key.new` two-phase roll-forward manufactured the very lockout
 states it meant to prevent — so per the adversarial-convergence rule the fix is
 a SHAPE change (stop-first in-place rotation, manual documented recovery), not
@@ -165,8 +172,23 @@ final name is only ever complete-and-durable: no reader can observe a
 partial key, and a host crash leaves at worst an inert `master-key.tmp-*`
 (never read by `resolveEnv`; the next `generate` reports leftovers and asks
 the operator to remove them — never silently reused). A handled failure
-unlinks this run's temp on the way out. Print next steps (snippet without
-embedded key). NEVER print the key.
+BEFORE the `link()` unlinks this run's temp; after a successful `link()`,
+unlinking the temp name is routine (same inode — the published content is
+unaffected), and a post-link directory-fsync failure is
+success-with-a-durability-warning, not a rollback. Print next steps
+(snippet without embedded key). NEVER print the key.
+
+**Honest limit (pass-4 #1, a documented precondition, not code):** between
+`link()` and the directory fsync there is a window where a CONCURRENT
+conduit process could read the key and seal a credential that a host crash
+then orphans (the directory entry was never durable). Closing every such
+interleaving requires resolver-side coordination that v1's single-user,
+onboarding-ordered scope deliberately omits — `generate` carries the same
+stop-first operator obligation as `rotate` (run it before wiring any
+client; documented in the README). Worst-case recovery is proportionate:
+re-run `generate`, re-onboard the one credential sealed inside the window
+(`add-mcp --replace`). This is the same accepted-limit category as
+rotation's idle-daemon window.
 
 ### `conduit key rotate`
 
@@ -210,15 +232,26 @@ changes, so every crash state recovers by "try the other file"):
    untouched — AND rotate deletes the `master-key.next` it created in step 3
    (re-pass #3: the routine `SQLITE_BUSY` refusal must not strand a `.next`
    that poisons the operator's retry; pre-commit, this run's `.next` is
-   provably meaningless). Scope of that cleanup (pass-3 #4): it applies to
-   handled PRE-COMMIT failures only, and if the deletion itself fails the
-   refusal message names the leftover file. A handled POST-COMMIT promote
-   failure (step 5) deliberately LEAVES `.next` — the crash-table row-2
-   recovery depends on it — and prints that row's procedure. So preflight's
-   leftover-`.next` refusal covers crashes and post-commit promote failures,
-   both resolved by the same documented table.
+   provably meaningless). Scope of that cleanup (pass-3 #4, tightened by
+   pass-4 #2): it applies ONLY to failures with a CONFIRMED
+   still-under-old-key outcome — the error occurred strictly before COMMIT
+   was issued, or the explicit ROLLBACK succeeded. If the commit/rollback
+   outcome is UNCERTAIN (COMMIT itself threw — SQLite may or may not have
+   committed), rotate must NOT delete `.next` (it could be the only copy of
+   the key the db is now under): it leaves both files and prints the
+   crash-table recovery ("whichever of `master-key`/`master-key.next` opens
+   the db is live"). If a confirmed-safe deletion itself fails, the refusal
+   message names the leftover file.
 5. **Promote:** rename `master-key.next` → `master-key`, fsync the
-   directory.
+   directory. Two distinct failure states (pass-4 #3): the RENAME fails →
+   `.next` is intact, print the crash-table row-2 procedure. The rename
+   succeeds but the directory FSYNC fails → `.next` is already consumed and
+   `master-key` IS the live new key (visible, correct); this is
+   success-with-a-durability-warning — the warning notes that until
+   durability is confirmed a host crash could revert the rename, and
+   `master-key.bak` (old) plus the re-sealed db then land in the standard
+   "whichever key opens the db" procedure. Never a rollback, never a `.next`
+   refusal.
 6. **Hygiene (best-effort defense-in-depth, NOT a boundary — re-pass #2):**
    `PRAGMA wal_checkpoint(TRUNCATE)` then `VACUUM` — old-key ciphertext
    otherwise lingers in WAL frames and freelist pages. On failure (busy
@@ -325,6 +358,8 @@ operator owns file perms on custom paths. POSIX/local filesystems only
 | `key generate` publishes via fsynced-temp + `link()` (0600; EEXIST loses; temp unlinked on handled failure), never prints key material | cli test |
 | `key rotate` refusals: env-sourced key / custom CONDUIT_DB / held write lock / leftover `master-key.next` | cli test |
 | `key rotate` BUSY refusal removes its own `master-key.next` (retry not poisoned) | cli test |
+| `key rotate` uncertain commit outcome (COMMIT throws) → `.next` NOT deleted, recovery printed | cli test |
+| `key rotate` promote: rename failure leaves `.next` + row-2 procedure; post-rename fsync failure = success + durability warning | cli test |
 | `key rotate` hygiene failure → rotation still succeeds with loud warning | cli test |
 | `key rotate` end-state: db + key file both new; `master-key.bak` = old; wal checkpointed | cli test |
 | Neither command ever writes key material to stdout/stderr | cli test |
