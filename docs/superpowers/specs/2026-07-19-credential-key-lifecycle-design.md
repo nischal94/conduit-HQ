@@ -10,7 +10,11 @@ plus the tracked 0644-at-creation `conduit.db` permissions finding.
 (commit `0defa52`) resolving all 13 → codex convergence re-pass (6 new-class
 findings: 2 P1 / 3 P2 / 1 P3 — generate clobber window, hygiene
 mis-classification, BUSY-strands-`.next`, probe overclaim, env-migration
-contradiction, filename grammar) → this revision resolves those 6. The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
+contradiction, filename grammar) → revision (commit `fa633cb`) resolving
+those 6 → codex pass 3 (4 findings: 1 P1 / 2 P2 / 1 P3 — generate
+durability/visibility window → link-publication; a stale env-refusal line;
+probe-all not pinned in the ledger; the `.next` cleanup claim overbroad) →
+this revision resolves those 4. The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
 draft's `master-key.new` two-phase roll-forward manufactured the very lockout
 states it meant to prevent — so per the adversarial-convergence rule the fix is
 a SHAPE change (stop-first in-place rotation, manual documented recovery), not
@@ -151,15 +155,18 @@ Refusals first (each names its reason and the way forward, review #5):
   locate the original key, or delete the db and re-onboard.
 
 Happy path: mint via `SecretBox.generateKeyBytes()`; create `~/.conduit`
-0700 if absent; write with `wx` (O_CREAT|O_EXCL, mode 0600) DIRECTLY on the
-final `master-key` name, fsync the file, fsync the directory. No temp+rename
-(re-pass #1: rename overwrites, so a temp+rename pair reopens the clobber
-window the existence refusal closed; `wx` on the final name is both the
-no-clobber guarantee and the serialization point — a concurrent `generate`
-loses with EEXIST). A crash mid-write leaves a malformed short file, which
-`resolveEnv`'s 32-byte validation rejects loudly; recovery is delete +
-regenerate (nothing is sealed yet — the sealed-rows refusal above ensured
-that). Print next steps (snippet without embedded key). NEVER print the key.
+0700 if absent; then durable-staging publication (pass-3 #1): write
+`master-key.tmp-<pid>` (`wx`, 0600), fsync the FILE, `link()` it to the
+final `master-key` name, fsync the DIRECTORY, unlink the temp. `link()`
+never replaces an existing name, so it is simultaneously the no-clobber
+guarantee and the serialization point (a concurrent `generate` loses with
+EEXIST) — and because the content is fsynced BEFORE the name exists, the
+final name is only ever complete-and-durable: no reader can observe a
+partial key, and a host crash leaves at worst an inert `master-key.tmp-*`
+(never read by `resolveEnv`; the next `generate` reports leftovers and asks
+the operator to remove them — never silently reused). A handled failure
+unlinks this run's temp on the way out. Print next steps (snippet without
+embedded key). NEVER print the key.
 
 ### `conduit key rotate`
 
@@ -168,10 +175,11 @@ is only DEFINED for the default pair (`~/.conduit/master-key` +
 `~/.conduit/conduit.db`). It refuses when:
 
 - `keySource === "env"` → the operator manages the key; the tool cannot
-  update every client config. Documented manual story: stop processes,
-  re-seal via a fresh `rotate` run WITHOUT the env var set once a key file
-  exists, or delete-and-re-onboard. (Review #4 — no env-sourced state ever
-  enters a file-promotion machine, because there is no promotion machine.)
+  update every client config. Message (consistent with `generate`'s v1
+  position — pass-3 #2): rotation is unsupported for env-managed keys in
+  v1; keep using the env key, or delete-and-re-onboard (`conduit key
+  import` is the deferred migration path). (Review #4 — no env-sourced
+  state ever enters the key-file machinery.)
 - `CONDUIT_DB` is set (custom db path) → refuse: one global key file cannot
   serve N dbs (review #6). Custom-path installs are env-key installs by
   definition; their rotation story is delete-and-re-onboard (documented).
@@ -202,8 +210,13 @@ changes, so every crash state recovers by "try the other file"):
    untouched — AND rotate deletes the `master-key.next` it created in step 3
    (re-pass #3: the routine `SQLITE_BUSY` refusal must not strand a `.next`
    that poisons the operator's retry; pre-commit, this run's `.next` is
-   provably meaningless). Only a crash — not a handled failure — leaves a
-   `.next` for preflight to refuse.
+   provably meaningless). Scope of that cleanup (pass-3 #4): it applies to
+   handled PRE-COMMIT failures only, and if the deletion itself fails the
+   refusal message names the leftover file. A handled POST-COMMIT promote
+   failure (step 5) deliberately LEAVES `.next` — the crash-table row-2
+   recovery depends on it — and prints that row's procedure. So preflight's
+   leftover-`.next` refusal covers crashes and post-commit promote failures,
+   both resolved by the same documented table.
 5. **Promote:** rename `master-key.next` → `master-key`, fsync the
    directory.
 6. **Hygiene (best-effort defense-in-depth, NOT a boundary — re-pass #2):**
@@ -300,6 +313,8 @@ operator owns file perms on custom paths. POSIX/local filesystems only
 | Legacy db (real rows, no canary) + wrong key → refused, canary NOT created | sdk store test |
 | Legacy db + correct key → canary created, subsequent opens pass | sdk store test |
 | Corrupted canary + healthy real row → canary-corruption error, not wrong-key | sdk store test |
+| Probe-all: corrupt FIRST real row + later good row → still canary-corruption (open path) / still bootstraps (legacy path) | sdk store test |
+| Canary fails + ALL real rows fail → ambiguous wrong-key-or-corruption error | sdk store test |
 | First open on empty db writes the canary; reopen with same key succeeds; M5 race idempotent | sdk store test |
 | `reencryptSecrets` atomic: injected mid-rotate failure leaves every row openable under the OLD key | sdk store test |
 | After re-seal, every row (canary incl.) opens under the NEW key, none under the old | sdk store test |
@@ -307,7 +322,7 @@ operator owns file perms on custom paths. POSIX/local filesystems only
 | Key resolution: env > file; `keySource` reported; neither → error naming `conduit key generate` | mcp env test |
 | Key file wider than 0600 → stderr warning, still serves | mcp env test |
 | `key generate` refusals: file exists / env set / db has sealed rows | cli test |
-| `key generate` writes 0600, `wx`, never prints key material | cli test |
+| `key generate` publishes via fsynced-temp + `link()` (0600; EEXIST loses; temp unlinked on handled failure), never prints key material | cli test |
 | `key rotate` refusals: env-sourced key / custom CONDUIT_DB / held write lock / leftover `master-key.next` | cli test |
 | `key rotate` BUSY refusal removes its own `master-key.next` (retry not poisoned) | cli test |
 | `key rotate` hygiene failure → rotation still succeeds with loud warning | cli test |
