@@ -23,7 +23,125 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-18 evening (deny verb-truth side-PR DONE: PR #40 squash → main `69d4bfb`; next: §17 v1 surface sequence, step 1 — credential key lifecycle)
+## Current handoff — written 2026-07-19 (§17 v1 step 1 DESIGN + PLAN done and codex-CONVERGED on branch `feat/credential-key-lifecycle`; next session BUILDS via SDD)
+
+### Where things stand
+
+- **Main is unchanged at `69d4bfb`** (nothing merged this session). All work
+  sits on branch **`feat/credential-key-lifecycle`** (pushed to origin as
+  backup, NO PR yet — LEARNINGS #21 applies: the git tripwire is silent about
+  it by design; `gh pr list` shows nothing open). 7 commits, all docs:
+  - **Design — CONVERGED after a 5-pass codex cross-model arc** (13 → 6 → 4 →
+    3 → editorial-only findings; the trail with per-pass resolutions is IN the
+    doc): `docs/superpowers/specs/2026-07-19-credential-key-lifecycle-design.md`
+    (final `3474321` + pass-4/5 fixes `0c1ac7b`, `e646179`-adjacent). Shape:
+    key-file-first resolution (`~/.conduit/master-key` 0600, env override,
+    `keySource` provenance) · startup canary in the secrets table
+    (verify-before-bind on legacy dbs, probe-all diagnosis) · `conduit key
+    generate` (3 refusals, fsynced-temp + `link()` publication) · `conduit key
+    rotate` (stop-first IN-PLACE, `.bak`/`.next` both on disk before the db
+    changes, commit-boundary honesty `unchanged|unknown`, MANUAL two-line
+    crash recovery — the draft's auto-roll-forward was deliberately deleted) ·
+    0600-at-creation db file. Load-bearing claims verified EMPIRICALLY against
+    the installed stack (9-check scratch script; results quoted in the doc).
+  - **Plan — 6 TDD tasks with complete code:**
+    `docs/superpowers/plans/2026-07-19-credential-key-lifecycle.md`
+    (`e646179`). T1 sdk canary (`store/key-lifecycle.ts` + wiring into
+    `openSqliteStore` via new `keyContext` option) · T2 sdk `reencryptSecrets`
+    + `ReencryptError.dbState` · T3 mcp env (key-file fallback, `keySource`,
+    `ensureDbFile` 0600, `openStoreClientFromEnv`) · T4 cli `key generate` +
+    dispatch · T5 cli `key rotate` · T6 docs (spec §14/§16/§17 + html2md
+    regen, READMEs with recovery procedures). Per-task INVARIANTS §16.3 rows,
+    RED-first. Global constraints in the plan header (zero new deps — cli
+    gets NO direct libsql; NO SQL schema changes; SecretBox frozen; key
+    material never printed; commit sandbox-disabled, never --no-verify).
+- **User decisions this session:** D1 build generate+rotate (not
+  verify-only); D2 key-file-first with env override; execution = **SDD in a
+  FRESH session** (project rule + Lane A/B precedent, user-confirmed).
+- The dev machine's `~/.conduit/conduit.db` is a LEGACY db for this work
+  (real sealed rows incl. the short-expiry test PAT, no canary) — T1's
+  legacy-bootstrap path gets exercised by the first real run after merge.
+
+### NEXT TASK — build the plan via superpowers:subagent-driven-development
+
+Check out `feat/credential-key-lifecycle`, run SDD over the plan task-by-task:
+fresh implementer per task → verify (unsandboxed vitest per package; the
+pre-commit hook runs the sdk suite) → two-verdict review → ledger
+(`.superpowers/sdd/progress-key-lifecycle.md`). Rebuild `packages/sdk/dist`
+(tsup) before mcp/cli tasks consume sdk changes. After T6: whole-branch
+review → PR (design + plan ride with it) → FULL load-bearing gauntlet
+(Tier-2 both mechanics + /security-review + codex correctness-framed CODE
+pass per codex-one-path — the 5-pass DESIGN convergence does NOT cover the
+code — + /explain-diff quiz) → HUMAN-NAMED merge. The agent never merges.
+
+### Session quirks worth inheriting
+
+- codex-one-path amendment: high-reasoning design reviews overrun the rule's
+  560s cap — run in background with `timeout 1500`, wait on stdout bytes
+  (stderr streams reasoning; stdout gets the answer only at the very end).
+  "Reading additional input from stdin..." in stderr is an info line, NOT the
+  stdin hang, when `</dev/null` is present.
+- Re-pass prompts must list already-fixed findings AND the deliberate
+  documented decisions ("do NOT re-report") — pass 5 classified correctly
+  only because the prompt carried the category-(a)/(b) framework explicitly.
+- Commits on this branch need `dangerouslyDisableSandbox` (pre-commit hook
+  mktemp) — never `--no-verify`.
+
+### DEFERRED FOLLOW-UPS (carry; act where the trigger fires)
+
+New this session: `conduit key import` (persist a verified env key to file —
+unlocks env→file migration for populated dbs; trigger: first real user asking
+to migrate). Fault-injection test seams for generate's dir-fsync warning and
+rotate's hygiene warning (trigger: reviewer asks for an injectable fs seam —
+the plan's self-review names this as the one deliberate test-depth deviation).
+
+Carried unchanged from 2026-07-18 (see that handoff below for full text):
+PR #40's two consider-class items (ResumeOutcome per-arm `decisionApplied`;
+decisions-seam `consumedIds` shape — triggers: next ExecutionOutcome /
+decisions-seam change). Lane A: DNS pre-flight timeout (§16 hardening);
+real `res.statusCode` through `requestAndAwait`; McpBudget sole-counter +
+McpSession generation-guard (PUBLIC-API-breaking — before external
+consumers). Lane B rides: `mapUpstreamError` `satisfies never`;
+`"2025-06-18"` literal tracking comments; 401-line precision; http(s)
+enforcement at `createMcpClient`; dispatch `-h` nit; orphaned legacy secret
+row on retarget. Hygiene: the sealed GitHub PAT in `~/.conduit` is a
+short-expiry TEST token (user deletes or lets lapse). Pre-existing: resume
+drops caller-supplied limits (P2, own PR); `isHostStackOverflow` heuristic;
+approve-demo.mjs retirement; Ajv pre-flight validation (D6); `isError`
+trace-viewer filter; Aikido MCP not connected (`/aikido:setup`, user
+terminal). Codex left two inert scratch dirs in system tmp
+(`conduit-key-review-*`, `conduit-lock-review-*`) — deletion was
+permission-denied this session; OS tmp cleanup handles them.
+
+### Session debrief (2026-07-19)
+
+https://claude.ai/code/artifact/c80773ad-14d2-4725-a059-a5bf8679d9aa
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: the §17 v1 step-1 credential-key-lifecycle DESIGN is
+> codex-CONVERGED (5-pass arc, trail in the doc) and the 6-task PLAN is
+> committed, both on branch `feat/credential-key-lifecycle` (pushed, no PR).
+> Do NOT redesign, re-review the design, or re-run the convergence arc.**
+>
+> **NEXT: BUILD the plan** — check out `feat/credential-key-lifecycle` and
+> run superpowers:subagent-driven-development over
+> docs/superpowers/plans/2026-07-19-credential-key-lifecycle.md: fresh
+> implementer per task, unsandboxed vitest verify, two-verdict review,
+> ledger in .superpowers/sdd/progress-key-lifecycle.md. Global constraints
+> live in the plan header (zero new deps; NO SQL schema changes; SecretBox
+> frozen; key material never printed; commit sandbox-disabled, never
+> --no-verify; rebuild sdk dist before mcp/cli tasks). After T6:
+> whole-branch review → PR (design+plan ride) → full load-bearing gauntlet
+> (Tier-2 both mechanics + /security-review + codex correctness-framed CODE
+> pass + /explain-diff quiz) → HUMAN-NAMED merge. Carry the deferred
+> follow-ups; act where triggers fire.
+
+---
+
+## Superseded handoff — written 2026-07-18 evening (deny verb-truth side-PR DONE: PR #40 squash → main `69d4bfb`; its NEXT TASK [§17 v1 step 1 design] was completed 2026-07-19 by the section above)
 
 ### Where things stand
 
