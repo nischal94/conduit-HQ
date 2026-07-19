@@ -520,13 +520,28 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     expect(stderr).toMatch(/--doctor/);
   });
 
+  // env.ts's resolveEnv falls back to reading `${HOME}/.conduit/master-key`
+  // when CONDUIT_MASTER_KEY is absent — so a spawn env that merely deletes
+  // the var still leaks the REAL key on any machine that has one. These
+  // "missing key" cases point HOME at a fresh, empty temp dir (never
+  // touching the real ~/.conduit) so the file fallback provably has nothing
+  // to find and the missing-key path is exercised deterministically.
   it("--doctor against a missing CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
-    const env: Record<string, string | undefined> = { ...process.env, ...baseEnv() };
-    delete env.CONDUIT_MASTER_KEY;
-    await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
-      code: 1,
-      stderr: expect.stringContaining("Missing CONDUIT_MASTER_KEY"),
-    });
+    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nohome-"));
+    try {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        ...baseEnv(),
+        HOME: emptyHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringMatching(/Missing master key/),
+      });
+    } finally {
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
   });
 
   it("--doctor against a malformed CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
@@ -537,16 +552,25 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     };
     await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
       code: 1,
-      stderr: expect.stringContaining("Malformed CONDUIT_MASTER_KEY"),
+      stderr: expect.stringMatching(/Malformed master key in CONDUIT_MASTER_KEY/),
     });
   });
 
   it("no flag + missing CONDUIT_MASTER_KEY: startup fails fast, exits 1 with a stderr diagnostic", async () => {
-    const env: Record<string, string | undefined> = { ...process.env, ...baseEnv() };
-    delete env.CONDUIT_MASTER_KEY;
-    await expect(execFileAsync("node", [binPath], { env })).rejects.toMatchObject({
-      code: 1,
-      stderr: expect.stringContaining("Missing CONDUIT_MASTER_KEY"),
-    });
+    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nohome-"));
+    try {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        ...baseEnv(),
+        HOME: emptyHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      await expect(execFileAsync("node", [binPath], { env })).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringMatching(/Missing master key/),
+      });
+    } finally {
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
   });
 });
