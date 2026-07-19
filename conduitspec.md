@@ -509,16 +509,23 @@ before Conduit's tools appear.
 **`/mcp` stdio server onboarding (§17 build-order step 2 — see
 `packages/mcp/README.md` for the full walkthrough):**
 
-1. **Generate a master key** — base64 encoding of exactly 32 random bytes:
-`node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`.
+1. **Generate a master key:** `conduit key generate` mints
+`~/.conduit/master-key` (0600) — the default, file-based path. Refuses if a key file
+already exists, `CONDUIT_MASTER_KEY` is set, or the default db already holds sealed
+secrets under some other key. The raw base64-of-32-random-bytes one-liner —
+`node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`
+— remains the env-var alternative for containers/custom-path installs that manage the key via
+`CONDUIT_MASTER_KEY` instead of the key file.
 2. **Config snippet, honest pre-publish command:** nothing is on npm yet, so the client
 config's `command`/`args` point at the built file directly — `node
-<abs path>/packages/mcp/dist/bin.js` — with `CONDUIT_MASTER_KEY` in its
-`env` block. Leave `CONDUIT_DB` out of the snippet: the built-in default
-already resolves to an absolute path via `homedir()`, and Node never expands
-`~`, so a literal `~/.conduit/conduit.db` in `env` would be
-read as relative to the client's own working directory and fail to start. `chmod 600`
-the client config file afterward — it now holds the master key.
+<abs path>/packages/mcp/dist/bin.js`. For a default-path key generated via
+`conduit key generate`, the `env` block needs no
+`CONDUIT_MASTER_KEY` entry at all — the server resolves the key from
+`~/.conduit/master-key` automatically (env, when set, still overrides the file). Leave
+`CONDUIT_DB` out of the snippet: the built-in default already resolves to an absolute
+path via `homedir()`, and Node never expands `~`, so a literal
+`~/.conduit/conduit.db` in `env` would be read as relative to the client's
+own working directory and fail to start.
 3. **Onboard an upstream source** so there's something to call:
 `conduit add-mcp --url <upstream-mcp-url> --namespace <ns> --prefix <prefix>`
 (fail-closed §10.2 policy defaults, so the walking skeleton can't strand on an unapproved pause
@@ -535,15 +542,15 @@ applies here too.
 | Var | Meaning | Default |
 | --- | --- | --- |
 | `CONDUIT_DB` | SQLite database path. Node does not expand `~` — if set, use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run) |
-| `CONDUIT_MASTER_KEY` | SecretBox key, base64 encoding of exactly 32 bytes. Required. | none (required) |
+| `CONDUIT_MASTER_KEY` | SecretBox key, base64 encoding of exactly 32 bytes. | optional when `~/.conduit/master-key` exists (env overrides file) |
 | `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Allow loopback/private-network upstreams. Dev/demo only. | off (fail-closed) |
 | `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72h) |
 
 - **`/mcp` troubleshooting:** tools don't appear → restart the client (macOS
 Claude Desktop server logs: `~/Library/Logs/Claude/mcp-server-*.log`); egress blocked → set
 `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1` for a loopback/demo upstream (the agent-visible
-error deliberately doesn't name this var); a wrong master key fails at first secret decrypt, not
-startup; a call that timed out may have finished — pass a `requestKey` to
+error deliberately doesn't name this var); a wrong master key fails at STARTUP (the key canary
+verified during store open), not at first secret decrypt; a call that timed out may have finished — pass a `requestKey` to
 `execute` and recover the outcome via `check_execution`; back up the single
 SQLite database file before upgrading; v1 calls MCP-over-HTTP upstreams only.
 
@@ -574,7 +581,14 @@ conduit trace [list|show <run_id>]      # observability (Conduit addition)
 1. **Sandboxed execution** (QuickJS) for all tool code.
 2. **Credential-boundary invariant** (§9.2): host-side resolution, outbound-only injection,
 four exclusion zones, reference-not-secret in the sandbox.
-3. **Secrets encrypted at rest** (master key, operator-manageable).
+3. **Secrets encrypted at rest** (master key, operator-manageable). Key lifecycle
+(§16.3): the master key lives at `~/.conduit/master-key` (0600) with an env-var
+override; a startup canary fails loud on a wrong key before any tool call runs; `conduit key
+generate`/`rotate` mint and re-seal it; rotation is stop-first (stop all conduit
+processes and MCP clients before running) and re-seals every stored secret in one transaction;
+crash recovery is a manual procedure over `master-key.bak`/`master-key.next`;
+and the db file and key file are always backed up together — a db backup only pairs with the key
+that was live when it was taken.
 4. **Per-tool + input-aware policy** gating every call (allow/approval/block).
 5. **SSRF control**: private-network egress off by default.
 6. **Sandbox resource limits**: per-execution wall-clock timeout, memory ceiling, and
@@ -673,9 +687,10 @@ pagination and basic indexed filters (time/execution/tool/verdict; no FTS). NEVE
 unredacted `replay_journal` (§18). Escaped rendering + CSP. NO export and NO
 retention/GC (both stay deferred, below); a durable local store SHOULD offer a confirmed manual purge
 that preserves pending executions + replay data.
-- **Prerequisite — verify credential key lifecycle.** Secrets-at-rest is built
-(SecretBox); before external users store real credentials, confirm the master-key generation, file
-permissions, and a defined recovery/rotation story (§16.3, Phase 0).
+- **Prerequisite — verify credential key lifecycle. ✅ BUILT** (2026-07-19 design,
+`docs/superpowers/specs/2026-07-19-credential-key-lifecycle-design.md`). Master-key
+generation, file permissions, and the recovery/rotation story are now product behavior, pinned by
+the §16.3 rows in `INVARIANTS.md`.
 
 **Deferred OUT of v1** (each follows from the local/loopback/single-user scope):
 `/mcp` streamable-HTTP transport (stdio already serves local Claude Desktop/Cursor; HTTP is a

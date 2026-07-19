@@ -10,7 +10,17 @@ package adds no core logic of its own; it is a thin transport shell over
 
 ## Quick start
 
-1. Generate a master key (base64 encoding of 32 random bytes):
+1. Generate a master key:
+
+   ```bash
+   conduit key generate
+   ```
+
+   Mints `~/.conduit/master-key` (0600) — the default, file-based path. See
+   `packages/cli/README.md`'s `conduit key` section for the full reference
+   (refusals, rotation, crash recovery). Managing the key via
+   `CONDUIT_MASTER_KEY` instead (containers, custom paths) remains supported —
+   use the raw base64-of-32-random-bytes one-liner in that case:
 
    ```bash
    node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"
@@ -36,13 +46,19 @@ package adds no core logic of its own; it is a thin transport shell over
      "mcpServers": {
        "conduit": {
          "command": "node",
-         "args": ["<abs path>/packages/mcp/dist/bin.js"],
-         "env": {
-           "CONDUIT_MASTER_KEY": "<your key>"
-         }
+         "args": ["<abs path>/packages/mcp/dist/bin.js"]
        }
      }
    }
+   ```
+
+   For a default-path key generated via `conduit key generate`, no
+   `CONDUIT_MASTER_KEY` entry is needed — the server resolves the key from
+   `~/.conduit/master-key` automatically. If you're managing the key via the
+   env var instead (containers, custom paths), add it to the `env` block:
+
+   ```json
+   "env": { "CONDUIT_MASTER_KEY": "<your key>" }
    ```
 
    `CONDUIT_DB` is omitted deliberately: Node never expands `~`, so a literal
@@ -52,8 +68,8 @@ package adds no core logic of its own; it is a thin transport shell over
    — see the env vars table below. If you need a custom location, use an
    absolute path (e.g. `/Users/you/.conduit/conduit.db`), never `~`.
 
-   `chmod 600` the client config file after editing it — it now holds your
-   master key.
+   `chmod 600` the client config file after editing it if it holds a key via
+   the env variant above.
 
 3. Paste the snippet into your client's MCP config (e.g. Claude Desktop's
    `claude_desktop_config.json`), then **restart the client** (see
@@ -76,7 +92,7 @@ package adds no core logic of its own; it is a thin transport shell over
 | Var | Meaning | Default |
 | --- | --- | --- |
 | `CONDUIT_DB` | Path to the SQLite database file. Node does not expand `~` — if you set this yourself, use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
-| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. Required — the process exits nonzero at startup if missing or malformed. | none (required) |
+| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. Overrides the key file when set; the process exits nonzero at startup if malformed. | optional when `~/.conduit/master-key` exists (env overrides file) |
 | `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only** — prints a loud stderr warning at startup when enabled. | off (fail-closed; §9.3) |
 | `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72 hours) |
 
@@ -102,11 +118,11 @@ troubleshooting doc's first step before touching your MCP client at all.
   override — an agent should not be taught to ask its human to flip a
   security control. If you're running a local/demo upstream on purpose, set
   `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1` in the server's env.
-- **Wrong master key fails at first use, not startup.** A well-formed but
-  non-matching key decodes fine at startup — decoding only checks length and
-  encoding, not correctness. It fails the first time a secret is actually
-  decrypted (the first tool call that resolves a credential), not when the
-  server starts.
+- **Wrong master key fails at startup, not first use.** A key canary is
+  verified during store open, so a well-formed but non-matching key fails
+  loud at startup rather than on the first tool call that resolves a
+  credential. See `packages/cli/README.md`'s `conduit key` section for
+  rotation and crash recovery.
 - **A call timed out but may have finished.** MCP clients default to a ~60s
   request timeout, which can race the sandbox's own default wall-clock cap.
   If the client gives up before the response arrives, the execution still
@@ -114,7 +130,8 @@ troubleshooting doc's first step before touching your MCP client at all.
   when you call `execute` so you can recover the outcome by that key via
   `check_execution` even if you never saw the `executionId`.
 - **Back up the database before upgrading.** The store is a single SQLite
-  file at `CONDUIT_DB` — copy it before upgrading `@conduithq/mcp` or running
-  a schema migration.
+  file at `CONDUIT_DB` — copy it, and `~/.conduit/master-key` alongside it
+  (a db backup only decrypts under the key that was live when it was taken),
+  before upgrading `@conduithq/mcp` or running a schema migration.
 - **Upstream compatibility.** v1 calls MCP-over-HTTP upstreams only. Other
   source types fail closed as "not yet callable."
