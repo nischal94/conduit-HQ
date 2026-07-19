@@ -155,6 +155,10 @@ describe("ensureDbFile (design §4)", () => {
     const { store, client } = await openStoreClientFromEnv({ CONDUIT_DB: dbPath }, { keyFilePath });
     try {
       await store.secrets.put("cred_seed", "seed-secret");
+      // Pin that the WAL sidecar actually materializes here — without this,
+      // the perms asserts below could pass vacuously if libsql never
+      // created -wal/-shm for this write pattern.
+      expect(existsSync(`${dbPath}-wal`)).toBe(true);
       for (const suffix of ["-wal", "-shm"]) {
         const sidecar = `${dbPath}${suffix}`;
         if (existsSync(sidecar)) {

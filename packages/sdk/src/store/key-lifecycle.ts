@@ -142,7 +142,12 @@ export class ReencryptError extends Error {
   }
 }
 
-/** Exported for the invariant pin on commit-boundary classification (design pass-4 #2). */
+/**
+ * Exported for the invariant pin on commit-boundary classification (design
+ * pass-4 #2). `_cause` is deliberately ignored — classification is by PHASE
+ * only (before-commit vs. commit/rollback-failed), never by inspecting the
+ * error's shape or message.
+ */
 export function classifyReencryptFailure(
   phase: "before-commit" | "commit" | "rollback-failed",
   _cause: unknown,
@@ -167,9 +172,13 @@ export async function reencryptSecrets(
   try {
     tx = await client.transaction("write");
   } catch (cause) {
+    // Neutral: this catch covers ANY transaction-acquire failure (a busy
+    // writer, but also disk I/O, a corrupt db, ENOSPC) — the caller (CLI)
+    // owns classifying "busy" specifically and attaching the stop-first
+    // remedy; this message stays cause-agnostic.
     throw new ReencryptError(
       "unchanged",
-      `[KeyLifecycle] Rotation failed: could not acquire the write lock — stop running conduit processes first. Context: { cause: ${String(cause)} }`,
+      `[KeyLifecycle] Rotation failed: could not begin the rotation transaction. Context: { cause: ${String(cause)} }`,
       cause,
     );
   }
@@ -178,7 +187,14 @@ export async function reencryptSecrets(
     try {
       const rows = await tx.execute("SELECT ref, sealed FROM secrets ORDER BY ref");
       for (const row of rows.rows) {
-        const plaintext = await oldBox.open(String(row.sealed));
+        let plaintext: string;
+        try {
+          plaintext = await oldBox.open(String(row.sealed));
+        } catch (cause) {
+          throw new Error(`row "${String(row.ref)}" failed to open under the current key`, {
+            cause,
+          });
+        }
         await tx.execute({
           sql: "UPDATE secrets SET sealed = ? WHERE ref = ?",
           args: [await newBox.seal(plaintext), String(row.ref)],
@@ -212,6 +228,12 @@ export async function reencryptSecrets(
     }
     return count;
   } finally {
-    tx.close();
+    try {
+      tx.close();
+    } catch {
+      // Teardown failure after the outcome above is already determined
+      // (return or a classified throw) — must not replace it with an
+      // unclassified throw that would misroute the caller to UNCERTAIN.
+    }
   }
 }

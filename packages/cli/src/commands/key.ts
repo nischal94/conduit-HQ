@@ -12,7 +12,7 @@ import {
   writeSync,
 } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_CONDUIT_DIR, openStoreClientFromEnv } from "@conduithq/mcp";
+import { DEFAULT_CONDUIT_DIR, ensureDbFile, openStoreClientFromEnv } from "@conduithq/mcp";
 import { ReencryptError, reencryptSecrets, SecretBox } from "@conduithq/sdk";
 
 export const KEY_USAGE = `conduit key — manage the Conduit master key
@@ -59,7 +59,7 @@ export async function runKey(args: string[], overrides?: Partial<KeyDeps>): Prom
   return { exitCode: 1 };
 }
 
-/** fsync a directory so a just-created/renamed entry survives a host crash. Best-effort on non-POSIX. */
+/** fsync a directory so a just-created/renamed entry survives a host crash. THROWS on failure — each caller decides whether to degrade (generate/post-promote: warn) or abort (pre-tx staging: refuse). */
 function fsyncDir(dir: string): void {
   const fd = openSync(dir, "r");
   try {
@@ -69,16 +69,29 @@ function fsyncDir(dir: string): void {
   }
 }
 
+class CountSealedRowsError extends Error {}
+
+/**
+ * Raw count — no key needed, and MUST NOT create the db as a side effect.
+ * Returns 0 ONLY when the cause chain looks like "no such table" (a fresh or
+ * legacy db with no secrets table = nothing sealed, by construction). Any
+ * OTHER failure (SQLITE_BUSY, a corrupt/non-db file, EACCES) throws
+ * CountSealedRowsError instead of silently reading as "nothing sealed" —
+ * generate's refusal is a documented guarantee and must not be downgraded
+ * by an inspection failure that has nothing to do with the db's contents.
+ */
 async function countSealedRows(dbPath: string): Promise<number> {
-  // Raw count — no key needed, and MUST NOT create the db as a side effect.
   if (!existsSync(dbPath)) return 0;
   const { createClient } = await import("@libsql/client");
   const client = createClient({ url: `file:${dbPath}` });
   try {
     const rs = await client.execute("SELECT COUNT(*) AS n FROM secrets");
     return Number(rs.rows[0]?.n ?? 0);
-  } catch {
-    return 0; // no secrets table = nothing sealed
+  } catch (cause) {
+    if (/no such table/i.test(cause instanceof Error ? cause.message : String(cause))) {
+      return 0; // no secrets table = nothing sealed
+    }
+    throw new CountSealedRowsError(`could not inspect ${dbPath}: ${String(cause)}`, { cause });
   } finally {
     client.close();
   }
@@ -103,7 +116,17 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
     return { exitCode: 1 };
   }
   const dbPath = join(deps.conduitDir, "conduit.db");
-  if ((await countSealedRows(dbPath)) > 0) {
+  let sealedCount: number;
+  try {
+    sealedCount = await countSealedRows(dbPath);
+  } catch (cause) {
+    deps.stderr(
+      `[ConduitKey] generate refused: could not inspect ${dbPath}: ${String(cause)}. If a conduit ` +
+        "process is running, stop it and re-run; if the file is not a conduit db, move it aside.\n",
+    );
+    return { exitCode: 1 };
+  }
+  if (sealedCount > 0) {
     deps.stderr(
       `[ConduitKey] generate refused: ${dbPath} already holds sealed rows under some other key ` +
         "(possibly only the key canary from a previous run) — a fresh key cannot open them. Locate " +
@@ -111,6 +134,10 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
     );
     return { exitCode: 1 };
   }
+  // A successful count against an EXISTING db only reads it — the WAL read
+  // may have materialized -wal/-shm sidecars at default (not 0600) perms;
+  // heal them now. No-op on a fresh/nonexistent db (nothing to heal yet).
+  if (existsSync(dbPath)) ensureDbFile(dbPath);
 
   mkdirSync(deps.conduitDir, { recursive: true, mode: 0o700 });
   const stale = readdirSync(deps.conduitDir).filter((f) => f.startsWith("master-key.tmp-"));
@@ -123,10 +150,10 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
 
   const keyBase64 = Buffer.from(SecretBox.generateKeyBytes()).toString("base64");
   const tmpPath = join(deps.conduitDir, `master-key.tmp-${process.pid}`);
-  // Durable-staging publication (design pass-3 #1 / pass-4 #1): content is
-  // fsynced BEFORE the final name exists; link() never replaces, so EEXIST
-  // is the concurrent-generate loser. Same inode — unlinking the temp after
-  // link leaves the published key untouched.
+  // Durable-staging publication (design pass-3 #1): content is fsynced
+  // BEFORE the final name exists; link() never replaces, so EEXIST is the
+  // concurrent-generate loser. Same inode — unlinking the temp after link
+  // leaves the published key untouched.
   const fd = openSync(tmpPath, "wx", 0o600);
   try {
     writeSync(fd, `${keyBase64}\n`);
@@ -137,8 +164,17 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
   try {
     linkSync(tmpPath, keyPath);
   } catch (cause) {
-    unlinkSync(tmpPath);
-    if ((cause as NodeJS.ErrnoException).code === "EEXIST") {
+    const isConcurrentWinner = (cause as NodeJS.ErrnoException).code === "EEXIST";
+    // Cleanup the temp BEFORE classifying the cause — a throw here must not
+    // mask whether the ORIGINAL link failure was the benign EEXIST race.
+    try {
+      unlinkSync(tmpPath);
+    } catch {
+      deps.stderr(
+        `[ConduitKey] note: leftover temp key file ${tmpPath} — inert (never read); remove it at leisure.\n`,
+      );
+    }
+    if (isConcurrentWinner) {
       deps.stderr(
         `[ConduitKey] generate refused: ${keyPath} appeared concurrently — another generate won. ` +
           "Re-run to inspect state; nothing was overwritten.\n",
@@ -150,12 +186,22 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
   let durabilityWarning = "";
   try {
     fsyncDir(deps.conduitDir);
-  } catch {
+  } catch (cause) {
     durabilityWarning =
       "[ConduitKey] WARNING: directory fsync failed — the key file is live and correct, but until " +
-      "the entry is durable a host crash could lose it. Verify the disk, then re-run any command to confirm.\n";
+      "the entry is durable a host crash could lose it. Verify the disk, then re-run any command to " +
+      `confirm. Context: { cause: ${String(cause)} }\n`;
   }
-  unlinkSync(tmpPath);
+  // The key is already published (link succeeded) — a failure to unlink the
+  // now-redundant temp is inert leftover, never a reason to report generate
+  // as failed.
+  try {
+    unlinkSync(tmpPath);
+  } catch {
+    deps.stderr(
+      `[ConduitKey] note: leftover temp key file ${tmpPath} — inert (never read); remove it at leisure.\n`,
+    );
+  }
 
   if (durabilityWarning) deps.stderr(durabilityWarning);
   deps.stdout(
@@ -178,8 +224,18 @@ function isBusyCause(cause: unknown): boolean {
   let current = cause;
   while (current !== undefined && current !== null && !seen.has(current)) {
     seen.add(current);
+    if (current instanceof Error) {
+      // Structured code first — @libsql/client's LibsqlError carries `code`
+      // (string, e.g. "SQLITE_BUSY") and `rawCode` (numeric); check those
+      // BEFORE the message regex so a differently-worded but same-coded
+      // error still classifies correctly.
+      const code = (current as { code?: unknown }).code;
+      const rawCode = (current as { rawCode?: unknown }).rawCode;
+      if (typeof code === "string" && /^SQLITE_(BUSY|LOCKED)$/.test(code)) return true;
+      if (rawCode === 5 || rawCode === 6) return true; // SQLITE_BUSY / SQLITE_LOCKED
+    }
     const message = current instanceof Error ? current.message : String(current);
-    if (/SQLITE_BUSY|database is locked/i.test(message)) return true;
+    if (/SQLITE_BUSY|SQLITE_LOCKED|database is locked/i.test(message)) return true;
     current = current instanceof Error ? current.cause : undefined;
   }
   return false;
@@ -216,10 +272,13 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
 
   // 1. Preflight: open the store — the canary proves the old key (design §2).
   //    deps.env deliberately lacks CONDUIT_MASTER_KEY here (checked above), so
-  //    resolution is file-sourced. CONDUIT_DB and the key-file path are pinned
-  //    to deps.conduitDir (controller deviation D1) — in production
-  //    deps.conduitDir === DEFAULT_CONDUIT_DIR so this is a no-op; in tests it
-  //    keeps rotation inside the temp dir instead of touching ~/.conduit.
+  //    resolution is file-sourced — and resolveEnv's own refusal check uses
+  //    the SAME trim-predicate as the guard above, so an empty/whitespace
+  //    CONDUIT_MASTER_KEY is consistently treated as absent by both. CONDUIT_DB
+  //    and the key-file path are pinned to deps.conduitDir (controller
+  //    deviation D1) — in production deps.conduitDir === DEFAULT_CONDUIT_DIR so
+  //    this is a no-op; in tests it keeps rotation inside the temp dir instead
+  //    of touching ~/.conduit.
   let opened: Awaited<ReturnType<typeof deps.openStoreClient>>;
   try {
     opened = await deps.openStoreClient(
@@ -229,7 +288,8 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
   } catch (cause) {
     if (isBusyCause(cause)) {
       deps.stderr(
-        `[ConduitKey] rotate preflight failed: could not acquire the write lock — stop running conduit processes first. Context: { cause: ${String(cause)} }\n`,
+        "[ConduitKey] rotate preflight failed: could not acquire the write lock — stop running " +
+          `conduit processes and MCP clients, then re-run. Context: { cause: ${String(cause)} }\n`,
       );
       return { exitCode: 1 };
     }
@@ -272,13 +332,14 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
         ? `${nextPath} appeared concurrently — another rotation is in flight or crashed mid-write`
         : String(cause);
       deps.stderr(
-        `[ConduitKey] rotation failed before the db was touched: ${detail}. The key file and db are ` +
-          "unchanged; if master-key.next exists, delete it and re-run.\n",
+        `[ConduitKey] rotation failed before the db was touched: ${detail}. The live key file and ` +
+          "db are unchanged (a fresh master-key.bak copy of the CURRENT key may already exist — " +
+          "harmless); if master-key.next exists, delete it and re-run.\n",
       );
       return { exitCode: 1 };
     }
 
-    // 4. Re-seal in ONE write transaction (Task 2 owns atomicity + classification).
+    // 4. Re-seal in ONE write transaction (reencryptSecrets owns atomicity + classification).
     const oldBox = await SecretBox.fromKeyBytes(opened.env.keyBytes);
     const newBox = await SecretBox.fromKeyBytes(newKeyBytes);
     let count: number;
@@ -289,14 +350,18 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
         // Confirmed still-old → this run's .next is provably meaningless.
         try {
           unlinkSync(nextPath);
-        } catch {
-          deps.stderr(
-            `[ConduitKey] note: could not remove ${nextPath} — delete it before retrying.\n`,
-          );
+        } catch (unlinkCause) {
+          if ((unlinkCause as NodeJS.ErrnoException).code !== "ENOENT") {
+            deps.stderr(
+              `[ConduitKey] note: could not remove ${nextPath} — delete it before retrying.\n`,
+            );
+          }
+          // ENOENT: already gone — nothing to note.
         }
         if (isBusyCause(cause)) {
           deps.stderr(
-            `[ConduitKey] rotation failed: could not acquire the write lock — stop running conduit processes first. Context: { cause: ${cause.message} }\n`,
+            "[ConduitKey] rotation failed: could not acquire the write lock — stop running " +
+              `conduit processes and MCP clients, then re-run. Context: { cause: ${cause.message} }\n`,
           );
         } else {
           deps.stderr(`[ConduitKey] rotation failed (db unchanged): ${cause.message}\n`);
@@ -323,11 +388,11 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
     let promoteWarning = "";
     try {
       fsyncDir(deps.conduitDir);
-    } catch {
+    } catch (cause) {
       promoteWarning =
         "[ConduitKey] WARNING: directory fsync failed after promotion — the new key is live and " +
         "correct, but until the entry is durable a host crash could revert it; master-key.bak " +
-        "still holds the old key.\n";
+        `still holds the old key. Context: { cause: ${String(cause)} }\n`;
     }
 
     // 6. Hygiene — best-effort defense-in-depth (design pass-2 #2), never a failure.

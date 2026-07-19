@@ -45,6 +45,7 @@ describe("conduit key generate (design §3)", () => {
     const all = [...io.out, ...io.err].join("\n");
     expect(all).not.toContain(key); // NEVER prints the key
     expect(existsSync(join(dir, `master-key.tmp-${process.pid}`))).toBe(false); // temp unlinked
+    expect(existsSync(join(dir, "conduit.db"))).toBe(false); // generate must not create the db
   });
 
   it("INVARIANT §16.3: refuses when the key file exists (points at rotate)", async () => {
@@ -78,6 +79,17 @@ describe("conduit key generate (design §3)", () => {
     expect(result.exitCode).toBe(1);
     expect(io.err.join("\n")).toMatch(/sealed/i);
     expect(existsSync(join(dir, "master-key"))).toBe(false);
+  });
+
+  it("INVARIANT §16.3: db path is a directory (unreadable as a db) → generate refuses loudly, not the fresh-key happy path", async () => {
+    const dbPath = join(dir, "conduit.db");
+    const { mkdirSync } = await import("node:fs");
+    mkdirSync(dbPath); // a directory at the db path — SELECT against it fails, not "no such table"
+    const io = makeIo();
+    const result = await runKey(["generate"], { env: {}, conduitDir: dir, ...io });
+    expect(result.exitCode).toBe(1);
+    expect(io.err.join("\n")).toMatch(/could not inspect/i);
+    expect(existsSync(join(dir, "master-key"))).toBe(false); // refused, not the happy path
   });
 
   it("bare `conduit key` / unknown subcommand → usage on stderr, exit 1", async () => {
@@ -249,6 +261,49 @@ describe("conduit key rotate (design §3)", () => {
     } finally {
       chmodSync(dir, 0o700); // restore so afterEach's rmSync can clean up
     }
+  });
+
+  it("INVARIANT §16.3: an UNCERTAIN reencrypt outcome (commit throws) exits 1, PRESERVES master-key.next, and names UNCERTAIN + recovery", async () => {
+    const { keyPath, key } = await rotatableInstall(dir);
+    const io = makeIo();
+    const result = await runKey(["rotate"], {
+      env: {},
+      conduitDir: dir,
+      ...io,
+      // Preflight resolves normally against the real dir/key; the returned
+      // client's transaction("write") is wrapped so its tx.commit() throws
+      // — driving reencryptSecrets to a dbState "unknown" ReencryptError.
+      openStoreClient: async (env, opts) => {
+        const opened = await openStoreClientFromEnv(env, opts);
+        const realClient = opened.client;
+        // Bind methods to `realClient` explicitly rather than proxying the
+        // whole client — @libsql/client's methods (e.g. close()) read private
+        // class fields via `this`, which breaks if `this` resolves to a Proxy
+        // instead of the real instance.
+        const proxyClient = {
+          ...realClient,
+          close: realClient.close.bind(realClient),
+          transaction: async (...args: Parameters<typeof realClient.transaction>) => {
+            const realTx = await realClient.transaction(...args);
+            return {
+              ...realTx,
+              commit: async () => {
+                throw new Error("simulated commit failure");
+              },
+              rollback: realTx.rollback.bind(realTx),
+              execute: realTx.execute.bind(realTx),
+              close: realTx.close.bind(realTx),
+            };
+          },
+        } as typeof realClient;
+        return { ...opened, client: proxyClient };
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    expect(existsSync(join(dir, "master-key.next"))).toBe(true); // preserved — uncertain outcome
+    expect(io.err.join("\n")).toMatch(/UNCERTAIN/i);
+    expect(io.err.join("\n")).toMatch(/master-key\.bak|whichever/i);
+    expect(readFileSync(keyPath, "utf8").trim()).toBe(key); // master-key itself untouched (promote never ran)
   });
 
   it("INVARIANT §16.3: crash-table row 2 — .next promotes manually and the db opens", async () => {

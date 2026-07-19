@@ -207,17 +207,107 @@ describe("reencryptSecrets (design §3)", () => {
     await expect(oldBox.open(String(canary.rows[0]?.sealed))).resolves.toBe(CANARY_SENTINEL);
   });
 
-  it("ReencryptError.dbState is 'unknown' when COMMIT itself fails", async () => {
-    const client = createClient({ url: ":memory:" });
-    const { right: oldBox } = await freshBoxes();
-    await openSqliteStore({ client, secretBox: oldBox });
-    // Force COMMIT failure: close the client's underlying connection is not
-    // reachable through the public API, so pin the classification seam
-    // directly with a stub tx-shaped failure via the exported classifier.
-    // (See implementation: classifyReencryptFailure is exported for this pin.)
+  it("a mid-rotate failure names the failing row's ref in the error message", async () => {
+    const client = createClient({ url: tempFileDbUrl() });
+    const { right: oldBox, wrong: foreignBox } = await freshBoxes();
+    const newBox = await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes());
+    const store = await openSqliteStore({ client, secretBox: oldBox });
+    await store.secrets.put("cred_a", "s1");
+    await client.execute({
+      sql: "UPDATE secrets SET sealed = ? WHERE ref = ?",
+      args: [await foreignBox.seal("alien"), "cred_a"],
+    });
+
+    const err = await reencryptSecrets(client, oldBox, newBox).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(ReencryptError);
+    expect((err as ReencryptError).message).toContain('row "cred_a" failed to open');
+  });
+
+  it("classifyReencryptFailure maps phases to db states (classifier pin)", async () => {
+    // Unit pin on the classification seam itself — phase alone determines the
+    // db state, regardless of the cause's shape or message. The END-TO-END
+    // wiring — that reencryptSecrets ACTUALLY reaches "unknown" through a
+    // real commit/rollback failure — is pinned separately below by the
+    // proxy-client tests ("commit throws" / "rollback throws"), since a
+    // COMMIT can't be forced to fail through the public libsql API.
     const { classifyReencryptFailure } = await import("./key-lifecycle.js");
     expect(classifyReencryptFailure("commit", new Error("io"))).toBe("unknown");
     expect(classifyReencryptFailure("before-commit", new Error("SQLITE_BUSY"))).toBe("unchanged");
     expect(classifyReencryptFailure("rollback-failed", new Error("io"))).toBe("unknown");
+  });
+
+  describe("proxy-client wiring: reencryptSecrets reaches 'unknown' end-to-end", () => {
+    /**
+     * A real file-backed client cannot be coerced into failing COMMIT or
+     * ROLLBACK through its public API — so these tests wrap a REAL client's
+     * `transaction("write")` in a thin proxy whose returned tx proxy forwards
+     * every method to the real tx EXCEPT the one under test, which throws.
+     * This exercises reencryptSecrets' actual catch/classify wiring
+     * end-to-end, not just the classifier function in isolation.
+     */
+    it("INVARIANT §16.3: a throwing commit() drives reencryptSecrets to dbState 'unknown'", async () => {
+      const realClient = createClient({ url: tempFileDbUrl() });
+      const { right: oldBox } = await freshBoxes();
+      const newBox = await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes());
+      const store = await openSqliteStore({ client: realClient, secretBox: oldBox });
+      await store.secrets.put("cred_a", "s1");
+
+      // Bind methods to the real client/tx explicitly rather than proxying —
+      // @libsql/client's methods read private class fields via `this`, which
+      // breaks if `this` resolves to a Proxy instead of the real instance.
+      const proxyClient = {
+        ...realClient,
+        transaction: async (...args: Parameters<typeof realClient.transaction>) => {
+          const realTx = await realClient.transaction(...args);
+          return {
+            ...realTx,
+            commit: async () => {
+              throw new Error("simulated commit failure");
+            },
+            rollback: realTx.rollback.bind(realTx),
+            execute: realTx.execute.bind(realTx),
+            close: realTx.close.bind(realTx),
+          };
+        },
+      } as typeof realClient;
+
+      const err = await reencryptSecrets(proxyClient, oldBox, newBox).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ReencryptError);
+      expect((err as ReencryptError).dbState).toBe("unknown");
+    });
+
+    it("INVARIANT §16.3: a throwing rollback() (after a mid-loop failure) drives reencryptSecrets to dbState 'unknown'", async () => {
+      const realClient = createClient({ url: tempFileDbUrl() });
+      const { right: oldBox, wrong: foreignBox } = await freshBoxes();
+      const newBox = await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes());
+      const store = await openSqliteStore({ client: realClient, secretBox: oldBox });
+      await store.secrets.put("cred_a", "s1");
+      // Foreign-sealed row makes the row-loop's oldBox.open() throw mid-loop,
+      // driving reencryptSecrets into its rollback() call.
+      await realClient.execute({
+        sql: "UPDATE secrets SET sealed = ? WHERE ref = ?",
+        args: [await foreignBox.seal("alien"), "cred_a"],
+      });
+
+      const proxyClient = {
+        ...realClient,
+        transaction: async (...args: Parameters<typeof realClient.transaction>) => {
+          const realTx = await realClient.transaction(...args);
+          return {
+            ...realTx,
+            rollback: async () => {
+              throw new Error("simulated rollback failure");
+            },
+            commit: realTx.commit.bind(realTx),
+            execute: realTx.execute.bind(realTx),
+            close: realTx.close.bind(realTx),
+          };
+        },
+      } as typeof realClient;
+
+      const err = await reencryptSecrets(proxyClient, oldBox, newBox).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(ReencryptError);
+      expect((err as ReencryptError).dbState).toBe("unknown");
+    });
   });
 });

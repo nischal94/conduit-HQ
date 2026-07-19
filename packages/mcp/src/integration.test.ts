@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -571,6 +571,62 @@ describe("ring-2: bin flag and doctor exit paths", () => {
       });
     } finally {
       rmSync(emptyHome, { recursive: true, force: true });
+    }
+  });
+
+  it("--doctor resolves the default ~/.conduit/master-key path end-to-end with no CONDUIT_MASTER_KEY set", async () => {
+    // Proves the headline default-path resolution: a valid 0600 key file at
+    // the DEFAULT location (${HOME}/.conduit/master-key), no env override.
+    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-defaultkey-"));
+    try {
+      const conduitDir = join(isolatedHome, ".conduit");
+      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      const keyBytes = SecretBox.generateKeyBytes();
+      writeFileSync(
+        join(conduitDir, "master-key"),
+        `${Buffer.from(keyBytes).toString("base64")}\n`,
+        {
+          mode: 0o600,
+        },
+      );
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
+        HOME: isolatedHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      delete env.CONDUIT_DB;
+      const { stdout, stderr } = await execFileAsync("node", [binPath, "--doctor"], { env });
+      expect(stdout).toBe("");
+      expect(stderr).toMatch(/ok: key decodes/);
+      expect(stderr).toMatch(/ok: database opens/);
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it("M8: a wide-perms (0644) default key file warns on stderr only, stdout carries no warning text", async () => {
+    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-wideperms-"));
+    try {
+      const conduitDir = join(isolatedHome, ".conduit");
+      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      const keyBytes = SecretBox.generateKeyBytes();
+      const keyPath = join(conduitDir, "master-key");
+      writeFileSync(keyPath, `${Buffer.from(keyBytes).toString("base64")}\n`, { mode: 0o644 });
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
+        HOME: isolatedHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      delete env.CONDUIT_DB;
+      const { stdout, stderr } = await execFileAsync("node", [binPath, "--doctor"], { env });
+      expect(stderr).toMatch(
+        new RegExp(`WARNING.*${keyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*0600`),
+      );
+      expect(stdout).not.toMatch(/WARNING/);
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
     }
   });
 });
