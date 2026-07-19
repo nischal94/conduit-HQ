@@ -76,6 +76,8 @@ promise the product makes but does not yet enforce.
 | /cli approvals — deny verb-truth: `approvals deny` reports the OPERATOR'S verb from `decisionApplied`, never the outcome's error name — an applied deny prints `denied`/exit 0 whatever the drive then did (guest-caught completion, later unrelated failure, re-pause), and a deny that never applied (incl. a guest-spoofed `ConduitPolicyBlocked`) exits 1 and is never labeled `denied` | `packages/cli/src/approvals.test.ts` ("INVARIANT /cli deny-verb-truth: …" — real-runtime applied deny + applied-deny completed/failed/spoof/not-applied variants) | ✅ pinned |
 | §16.3 — wrong master key fails at store open (canary), not first use | `packages/sdk/src/store/key-lifecycle.test.ts` | ✅ pinned |
 | §16.3 — legacy db is never bound to an unverified key (probe-before-bootstrap); one corrupt row cannot condemn a correct key (probe-all); canary corruption is distinguished from wrong key | `packages/sdk/src/store/key-lifecycle.test.ts` | ✅ pinned |
+| §16.3 — rotation re-seal is atomic: a mid-rotate failure leaves every secret under the OLD key (confirmed via rollback); after success every row (canary incl.) opens ONLY under the new key | `packages/sdk/src/store/key-lifecycle.test.ts` | ✅ pinned |
+| §16.3 — commit-boundary honesty: an uncertain COMMIT outcome is classified "unknown" (caller must not delete either candidate key) | `packages/sdk/src/store/key-lifecycle.test.ts` | ✅ pinned |
 
 ---
 

@@ -96,6 +96,8 @@ export {
   CANARY_REF,
   ensureKeyCanary,
   KeyCanaryError,
+  ReencryptError,
+  reencryptSecrets,
   type StoreKeyContext,
 } from "./store/key-lifecycle.js";
 export type { SqliteStoreOptions } from "./store/sqlite.js";

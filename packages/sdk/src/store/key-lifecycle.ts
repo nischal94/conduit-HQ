@@ -125,3 +125,93 @@ export async function ensureKeyCanary(
   }
   throw wrongKey();
 }
+
+export class ReencryptError extends Error {
+  /**
+   * "unchanged" — the failure occurred strictly before COMMIT was issued, or
+   * the explicit rollback succeeded: every row is still under the OLD key and
+   * the caller may safely delete a staged new-key file.
+   * "unknown" — COMMIT itself threw (SQLite may or may not have committed) or
+   * the rollback failed: the caller must NOT delete either candidate key.
+   */
+  readonly dbState: "unchanged" | "unknown";
+  constructor(dbState: "unchanged" | "unknown", message: string, cause?: unknown) {
+    super(message, cause === undefined ? undefined : { cause });
+    this.name = "ReencryptError";
+    this.dbState = dbState;
+  }
+}
+
+/** Exported for the invariant pin on commit-boundary classification (design pass-4 #2). */
+export function classifyReencryptFailure(
+  phase: "before-commit" | "commit" | "rollback-failed",
+  _cause: unknown,
+): "unchanged" | "unknown" {
+  return phase === "before-commit" ? "unchanged" : "unknown";
+}
+
+/**
+ * Re-seal every secrets row (canary included) from oldBox to newBox inside
+ * ONE interactive write transaction (BEGIN IMMEDIATE — writer exclusion for
+ * the duration; a competing writer surfaces as SQLITE_BUSY within
+ * busy_timeout, which lands here as dbState "unchanged": the refusal path).
+ * Returns the number of rows re-sealed. The store handle that supplied
+ * oldBox is DEAD after a successful return — its SecretBox is the old key.
+ */
+export async function reencryptSecrets(
+  client: Client,
+  oldBox: SecretBox,
+  newBox: SecretBox,
+): Promise<number> {
+  let tx: Awaited<ReturnType<Client["transaction"]>>;
+  try {
+    tx = await client.transaction("write");
+  } catch (cause) {
+    throw new ReencryptError(
+      "unchanged",
+      `[KeyLifecycle] Rotation failed: could not acquire the write lock — stop running conduit processes first. Context: { cause: ${String(cause)} }`,
+      cause,
+    );
+  }
+  try {
+    let count = 0;
+    try {
+      const rows = await tx.execute("SELECT ref, sealed FROM secrets ORDER BY ref");
+      for (const row of rows.rows) {
+        const plaintext = await oldBox.open(String(row.sealed));
+        await tx.execute({
+          sql: "UPDATE secrets SET sealed = ? WHERE ref = ?",
+          args: [await newBox.seal(plaintext), String(row.ref)],
+        });
+        count++;
+      }
+    } catch (cause) {
+      try {
+        await tx.rollback();
+      } catch (rollbackCause) {
+        throw new ReencryptError(
+          classifyReencryptFailure("rollback-failed", rollbackCause),
+          `[KeyLifecycle] Rotation failed AND rollback failed — db state uncertain; do NOT delete either key file. Context: { cause: ${String(cause)} }`,
+          cause,
+        );
+      }
+      throw new ReencryptError(
+        classifyReencryptFailure("before-commit", cause),
+        `[KeyLifecycle] Rotation failed before commit; every secret is still under the old key. Context: { cause: ${String(cause)} }`,
+        cause,
+      );
+    }
+    try {
+      await tx.commit();
+    } catch (cause) {
+      throw new ReencryptError(
+        classifyReencryptFailure("commit", cause),
+        `[KeyLifecycle] Rotation COMMIT outcome uncertain — do NOT delete either key file; whichever key opens the db is live. Context: { cause: ${String(cause)} }`,
+        cause,
+      );
+    }
+    return count;
+  } finally {
+    tx.close();
+  }
+}
