@@ -1644,3 +1644,41 @@ adversarially applied to a review finding, not an audit recommendation.**
    completed structurally reaches it — true today, wrong the day a status arm
    is added. Report `outcome.status`; bots catch this class reliably
    (Greptile P2) and the fix is free.
+
+## 2026-07-19 — credential key lifecycle DESIGN converged (§17 v1 step 1; branch `feat/credential-key-lifecycle`, no code yet)
+
+1. **A crash-recovery state machine can BE the failure surface.** Draft v1's
+   `master-key.new` auto-roll-forward existed to survive crashes — and codex
+   pass 1 showed it MANUFACTURED the lockout states it guarded against
+   (concurrent-rotate clobber, env-key omission, multi-db divergence). The
+   converged shape is stop-first + in-place with both candidate keys on disk
+   and a HUMAN two-line recovery ("try the other file"). When the failure
+   modes of the recovery mechanism outnumber the failures it recovers,
+   delete the mechanism, not the edge cases.
+2. **The adversarial stop-line works on designs, not just code — watch for
+   the class repeating across passes.** Passes 1–2 found distinct root
+   causes (fix each); passes 3–4 attacked successive durability
+   interleavings of ONE class (content fsync, then directory-entry fsync) —
+   the denylist signal. The convergent move was relabeling the window a
+   documented stop-first precondition with proportionate recovery, not a
+   fifth filesystem trick. Same rule as Issue #21, now proven at the
+   design tier.
+3. **Verify a design's load-bearing library claims EMPIRICALLY before
+   review, and say so in the review prompt.** A 9-check scratch script
+   against the installed stack (0600 empty-file db + sidecar inheritance,
+   SQLITE_BUSY under a held write tx, async re-seal inside one BEGIN
+   IMMEDIATE tx, tampered-canary distinguishability) turned four "should
+   hold" claims into evidence, and telling codex "already verified, do not
+   redo" kept every pass pointed at the design instead of the stack.
+4. **Commit-boundary uncertainty is its own state — never collapse it into
+   "failed."** If COMMIT throws, SQLite may or may not have committed;
+   deleting the staged new key on that ambiguity can destroy the only key
+   the db is now under. The primitive returns `dbState:
+   "unchanged" | "unknown"` and the caller deletes staged artifacts ONLY on
+   confirmed-unchanged. Generalizes: cleanup decisions keyed on a failure
+   must know whether the failure is confirmed-rolled-back or indeterminate.
+5. **An unverified-key bootstrap can permanently strand a legacy store.**
+   Creating the canary under whatever key arrives first would BIND a
+   populated db to a wrong key forever (the real rows stay under the true
+   key; the canary now vouches for the impostor). Probe an existing row
+   before writing any trust anchor into a store that predates the anchor.
