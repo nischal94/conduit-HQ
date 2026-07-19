@@ -81,6 +81,8 @@ promise the product makes but does not yet enforce.
 | §16.3 — key resolution: env overrides file; neither → loud error naming `conduit key generate`; wide key-file perms warn-and-serve | `packages/mcp/src/env.test.ts` | ✅ pinned |
 | §16.3 — conduit.db (and sidecars) 0600 at creation via the env open path; wider existing perms healed | `packages/mcp/src/env.test.ts` | ✅ pinned |
 | §16.3 — `key generate` refusals (file exists / env set / db has sealed rows) and 0600 link-publication; key material never printed | `packages/cli/src/key.test.ts` | ✅ pinned |
+| §16.3 — `key rotate` refusals (env-sourced key / custom CONDUIT_DB / held write lock / leftover master-key.next); a BUSY refusal removes its own `.next` so the retry is not poisoned | `packages/cli/src/key.test.ts` | ✅ pinned |
+| §16.3 — rotation end-state: db + key file both new, `master-key.bak` = old, real secret round-trips; crash-table row-2 manual promotion recovers; key material never printed | `packages/cli/src/key.test.ts` | ✅ pinned |
 
 ---
 
