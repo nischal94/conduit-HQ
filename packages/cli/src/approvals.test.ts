@@ -127,6 +127,7 @@ function makeDeps(
       env: {
         dbPath: "",
         keyBytes: new Uint8Array(32) as Uint8Array<ArrayBuffer>,
+        keySource: "env",
         allowPrivateEgress: allowPrivateEgress ?? false,
       },
       store,
