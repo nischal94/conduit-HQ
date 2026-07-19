@@ -1,4 +1,5 @@
 import {
+  chmodSync,
   existsSync,
   mkdtempSync,
   readFileSync,
@@ -223,6 +224,32 @@ describe("conduit key rotate (design §3)", () => {
       holder?.client.close();
     }
   }, 10_000); // the 5000ms busy_timeout means this refusal alone takes ~5-6s
+
+  it("INVARIANT §16.3: a pre-transaction fs failure (backup/stage) names the way forward, db untouched", async () => {
+    const { keyPath, key } = await rotatableInstall(dir);
+    const io = makeIo();
+    try {
+      const result = await runKey(["rotate"], {
+        env: {},
+        conduitDir: dir,
+        ...io,
+        // Let preflight resolve normally, then — AFTER it succeeds — strip
+        // write access from the conduit dir so step 2's copyFileSync(bak)
+        // fails EACCES, before reencryptSecrets is ever called.
+        openStoreClient: async (env, opts) => {
+          const opened = await openStoreClientFromEnv(env, opts);
+          chmodSync(dir, 0o500);
+          return opened;
+        },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(io.err.join("\n")).toMatch(/unchanged/);
+      expect(io.err.join("\n")).toMatch(/master-key\.next/);
+      expect(readFileSync(keyPath, "utf8").trim()).toBe(key); // untouched
+    } finally {
+      chmodSync(dir, 0o700); // restore so afterEach's rmSync can clean up
+    }
+  });
 
   it("INVARIANT §16.3: crash-table row 2 — .next promotes manually and the db opens", async () => {
     // Simulate "crash after commit, before promote": run a real rotate, then

@@ -55,7 +55,7 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("--help → lists all three commands", () => {
+  it("--help → lists all four commands", () => {
     const result = dispatch(["--help"]);
     expect(result.kind).toBe("help");
     if (result.kind === "help") {
@@ -73,7 +73,7 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("-h → behaves like --help (lists all three commands)", () => {
+  it("-h → behaves like --help (lists all four commands)", () => {
     const result = dispatch(["-h"]);
     expect(result.kind).toBe("help");
     if (result.kind === "help") {

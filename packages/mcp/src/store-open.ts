@@ -9,10 +9,11 @@ import { ensureDbFile, type ResolvedEnv, type ResolveEnvOptions, resolveEnv } fr
  * `conduit-mcp`'s bin (--doctor), `runStdioServer`, and the CLI.
  *
  * `opts` threads `ResolveEnvOptions` through to `resolveEnv` — needed so
- * `conduit key rotate` can point key resolution at a temp `conduitDir` in
- * tests instead of the real `~/.conduit` (controller-logged deviation D1).
- * Production call sites never pass `opts`, so `resolveEnv` still resolves
- * `DEFAULT_KEY_FILE` unless a caller explicitly opts out.
+ * `conduit key rotate` can point key resolution at a temp `keyFilePath` (and
+ * `CONDUIT_DB` via `env`) in tests instead of the real `~/.conduit`
+ * (controller-logged deviation D1). Production call sites never pass
+ * `opts`, so `resolveEnv` still resolves `DEFAULT_KEY_FILE` unless a caller
+ * explicitly opts out.
  */
 export async function openStoreClientFromEnv(
   env: NodeJS.ProcessEnv = process.env,

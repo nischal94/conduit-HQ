@@ -22,7 +22,8 @@ Flags:
   --help     Show this help text
   --version  Show the CLI version
 
-Run "conduit add-mcp --help" for add-mcp's full flag reference.`;
+Run "conduit add-mcp --help" for add-mcp's full flag reference.
+Run "conduit key --help" for key's generate/rotate subcommands.`;
 
 function usage(unknown?: string): string {
   const reason = unknown ? `Unknown command: ${unknown}\n\n` : "";

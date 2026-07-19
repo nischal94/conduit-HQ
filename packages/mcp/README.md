@@ -105,6 +105,9 @@ sources are in the catalog (with a seeding hint if empty), and whether the
 private-egress opt-in is enabled. Each check prints its own pass/fail line to
 stderr and the command exits nonzero on the first failure — this is the
 troubleshooting doc's first step before touching your MCP client at all.
+Note that on a previously-unopened or legacy db, `--doctor` WRITES (canary
+bootstrap, file-permission healing) — it is a diagnostic that initializes,
+not a read-only check.
 
 ## Troubleshooting
 

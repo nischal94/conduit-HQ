@@ -105,8 +105,9 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
   const dbPath = join(deps.conduitDir, "conduit.db");
   if ((await countSealedRows(dbPath)) > 0) {
     deps.stderr(
-      `[ConduitKey] generate refused: ${dbPath} already holds sealed secrets under some other key — a ` +
-        "fresh key cannot decrypt them. Locate the original key, or delete the db and re-onboard.\n",
+      `[ConduitKey] generate refused: ${dbPath} already holds sealed rows under some other key ` +
+        "(possibly only the key canary from a previous run) — a fresh key cannot open them. Locate " +
+        "the original key, or delete the db and re-onboard.\n",
     );
     return { exitCode: 1 };
   }
@@ -238,26 +239,44 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
   const { client } = opened;
 
   try {
-    // 2. Backup the old key (overwritten each rotation — crash insurance, not history).
-    copyFileSync(keyPath, bakPath);
-    const bakFd = openSync(bakPath, "r");
+    // 2-3. Backup + stage the new key BEFORE the db is touched. Any raw fs
+    // failure here is provably pre-transaction: the db is still under the
+    // OLD key and nothing has been re-sealed yet (unlike step 4+, these
+    // steps have no reencrypt-side classification to fall back on, so they
+    // get their own catch naming that fact explicitly).
+    let newKeyBytes: ReturnType<typeof SecretBox.generateKeyBytes>;
     try {
-      fsyncSync(bakFd);
-    } finally {
-      closeSync(bakFd);
-    }
+      // 2. Backup the old key (overwritten each rotation — crash insurance, not history).
+      copyFileSync(keyPath, bakPath);
+      const bakFd = openSync(bakPath, "r");
+      try {
+        fsyncSync(bakFd);
+      } finally {
+        closeSync(bakFd);
+      }
 
-    // 3. Persist the NEW key BEFORE the db changes (wx: a racing rotate loses here).
-    const newKeyBytes = SecretBox.generateKeyBytes();
-    const newKeyBase64 = Buffer.from(newKeyBytes).toString("base64");
-    const nextFd = openSync(nextPath, "wx", 0o600);
-    try {
-      writeSync(nextFd, `${newKeyBase64}\n`);
-      fsyncSync(nextFd);
-    } finally {
-      closeSync(nextFd);
+      // 3. Persist the NEW key BEFORE the db changes (wx: a racing rotate loses here).
+      newKeyBytes = SecretBox.generateKeyBytes();
+      const newKeyBase64 = Buffer.from(newKeyBytes).toString("base64");
+      const nextFd = openSync(nextPath, "wx", 0o600);
+      try {
+        writeSync(nextFd, `${newKeyBase64}\n`);
+        fsyncSync(nextFd);
+      } finally {
+        closeSync(nextFd);
+      }
+      fsyncDir(deps.conduitDir);
+    } catch (cause) {
+      const isConcurrentNext = (cause as NodeJS.ErrnoException).code === "EEXIST";
+      const detail = isConcurrentNext
+        ? `${nextPath} appeared concurrently — another rotation is in flight or crashed mid-write`
+        : String(cause);
+      deps.stderr(
+        `[ConduitKey] rotation failed before the db was touched: ${detail}. The key file and db are ` +
+          "unchanged; if master-key.next exists, delete it and re-run.\n",
+      );
+      return { exitCode: 1 };
     }
-    fsyncDir(deps.conduitDir);
 
     // 4. Re-seal in ONE write transaction (Task 2 owns atomicity + classification).
     const oldBox = await SecretBox.fromKeyBytes(opened.env.keyBytes);

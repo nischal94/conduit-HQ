@@ -12,6 +12,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { ensureDbFile, resolveEnv } from "./env.js";
+import { openStoreClientFromEnv } from "./store-open.js";
 
 const KEY = Buffer.alloc(32, 7).toString("base64");
 
@@ -145,5 +146,24 @@ describe("ensureDbFile (design §4)", () => {
     ensureDbFile(dbPath);
     ensureDbFile(dbPath); // second call: file exists, already 0600 — no-op
     expect(existsSync(dbPath)).toBe(true);
+  });
+
+  it("INVARIANT §16.3: a real store open + write leaves any materialized WAL sidecars 0600", async () => {
+    const dbPath = join(dir, "conduit.db");
+    const keyFilePath = join(dir, "master-key");
+    writeFileSync(keyFilePath, `${KEY}\n`, { mode: 0o600 });
+    const { store, client } = await openStoreClientFromEnv({ CONDUIT_DB: dbPath }, { keyFilePath });
+    try {
+      await store.secrets.put("cred_seed", "seed-secret");
+      for (const suffix of ["-wal", "-shm"]) {
+        const sidecar = `${dbPath}${suffix}`;
+        if (existsSync(sidecar)) {
+          expect(mode(sidecar)).toBe(0o600);
+        }
+      }
+      expect(mode(dbPath)).toBe(0o600);
+    } finally {
+      client.close();
+    }
   });
 });
