@@ -24,7 +24,7 @@ export interface ResolvedEnv {
 }
 
 export interface ResolveEnvOptions {
-  /** Test seam; production always uses DEFAULT_KEY_FILE. */
+  /** Only `conduit key rotate` passes this in production, with a value equal to DEFAULT_KEY_FILE; tests use it to redirect into a temp dir. */
   keyFilePath?: string;
   /** Sink for the wide-perms warning (default: console.error — stdout is the MCP wire). */
   warn?: (message: string) => void;
@@ -94,9 +94,10 @@ export function ensureDbDir(dbPath: string): void {
  * Design §4: the db file is 0600 from birth. Create it empty (`wx`, 0600)
  * BEFORE @libsql/client touches the path — SQLite accepts a zero-length file
  * as a fresh db and creates -wal/-shm with the db file's permissions
- * (verified 2026-07-19). Existing wider-perms files (and sidecars) are
- * healed. Guarantee scope: everything opening through openStoreFromEnv /
- * openStoreClientFromEnv; direct createClient callers bypass by design.
+ * (pinned by the WAL-sidecar test in env.test.ts). Existing wider-perms
+ * files (and sidecars) are healed. Guarantee scope: everything opening
+ * through openStoreFromEnv / openStoreClientFromEnv; direct createClient
+ * callers bypass by design.
  */
 export function ensureDbFile(dbPath: string): void {
   ensureDbDir(dbPath);

@@ -231,6 +231,13 @@ changes, so every crash state recovers by "try the other file"):
 2. **Backup the old key:** copy `master-key` → `master-key.bak` (0600,
    temp+rename+fsync). Overwritten on each rotation — it exists to survive
    a crash of THIS run, not as key history.
+
+   **Erratum (2026-07-19):** the as-built implementation uses
+   `copyFileSync` directly onto `master-key.bak` in place (+ fsync), not the
+   temp+rename sequence described above. A crash mid-copy can truncate only
+   the PRIOR rotation's `.bak` — harmless crash-insurance semantics either
+   way, since `.bak` is overwritten scratch, not history. Not re-implemented
+   to match this text; recorded here for accuracy.
 3. **Persist the new key BEFORE the db changes:** mint, write to
    `master-key.next` (`wx`, 0600, fsync file + directory).
 4. **Re-seal in ONE interactive write transaction** (`transaction("write")`,

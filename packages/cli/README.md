@@ -1,15 +1,19 @@
 # @conduithq/cli
 
-The minimal `conduit` command (spec §17 step 3). Subcommands over the same
-SDK pipeline and security boundary the `/mcp` server uses — this package adds
-no core logic of its own; every command calls a shared seam:
+The minimal `conduit` command (spec §17 step 3). Most subcommands are thin
+wrappers over the same SDK pipeline and security boundary the `/mcp` server
+uses. `conduit key` is the exception: `generate` is CLI-resident logic
+(SecretBox + raw fs, no sdk seam), and `rotate`'s orchestration (backup,
+staging, promotion, crash recovery) lives in the CLI too — only the re-seal
+transaction itself is delegated to the sdk.
 
 | Command | What it does | Seam it calls |
 | --- | --- | --- |
 | `conduit serve` | Runs the stdio MCP server (identical to `conduit-mcp`). | `runStdioServer` (`@conduithq/mcp`) |
 | `conduit add-mcp` | Onboards or re-syncs an upstream MCP source. | `provisionSource` (`@conduithq/sdk`) |
 | `conduit approvals list\|approve\|deny` | The human approval queue. | `listPaused` + `createApprovalRuntime` |
-| `conduit key generate\|rotate` | Mints or rotates the master key. | `key-lifecycle` (`@conduithq/sdk`) |
+| `conduit key generate` | Mints the master key. | CLI-resident (SecretBox + fs; no sdk seam) |
+| `conduit key rotate` | Rotates the master key. | CLI-resident orchestration; re-seal via `reencryptSecrets` (`@conduithq/sdk`) |
 
 Nothing is published to npm yet — run the built file directly:
 `node <abs path>/packages/cli/dist/bin.js <command>` (build with `npm run build`
@@ -143,7 +147,10 @@ cases, each naming the way forward:
   re-onboard.
 
 On the happy path it writes the key file via durable-staging publication
-(fsynced temp file, hard-linked into place, directory fsynced) and prints:
+(fsynced temp file, hard-linked into place, directory fsynced) and prints
+(the path shown here is illustrative — the actual output substitutes the
+expanded absolute path, e.g. `/Users/you/.conduit/master-key`, not the
+literal `~`):
 
 ```
 [ConduitKey] master key generated at ~/.conduit/master-key (0600).
@@ -156,7 +163,13 @@ Next steps:
 ### Rotation walkthrough
 
 Rotation is **stop-first**: every conduit process and MCP client must be
-stopped before you run it, or the write-lock preflight will refuse.
+stopped before you run it. This is an operator obligation, not something
+`rotate` verifies for you — the write-lock preflight refuses an ACTIVELY
+LOCKING process (one mid-transaction against the db right now), but it
+cannot detect an idle client that merely holds a stale in-memory copy of the
+old key and will resume using it after rotation completes. Stopping
+everything first is the only way to guarantee no process is left holding a
+stale key.
 
 1. **Stop clients.** Quit/stop every MCP client and any `conduit serve` /
    `conduit-mcp` process pointed at the default db.
@@ -200,11 +213,17 @@ interrupted mid-flight, `master-key.next` is left behind and a re-run refuses
   ```
 
 - **Last resort — neither key opens the db, or you need to undo a completed
-  rotation.** Restore the pre-rotation key from the backup (only safe if your
-  db backup is from before that rotation too — see "Backup rule" below):
+  rotation.** Restore the pre-rotation key from the backup — but the key
+  alone is not enough: `master-key.bak` only decrypts the db that was live
+  when THAT rotation ran, so undoing a completed rotation also requires
+  restoring the PAIRED pre-rotation db backup, not just the key file (see
+  "Backup rule" below). Restoring the key alone against the current
+  (post-rotation) db will not open it.
 
   ```bash
   cp ~/.conduit/master-key.bak ~/.conduit/master-key
+  # AND restore the db backup taken before that same rotation, if undoing:
+  cp /path/to/your/pre-rotation-backup/conduit.db ~/.conduit/conduit.db
   ```
 
 Whichever of `master-key` / `master-key.next` actually opens the db is the

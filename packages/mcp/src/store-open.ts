@@ -11,9 +11,9 @@ import { ensureDbFile, type ResolvedEnv, type ResolveEnvOptions, resolveEnv } fr
  * `opts` threads `ResolveEnvOptions` through to `resolveEnv` — needed so
  * `conduit key rotate` can point key resolution at a temp `keyFilePath` (and
  * `CONDUIT_DB` via `env`) in tests instead of the real `~/.conduit`
- * (controller-logged deviation D1). Production call sites never pass
- * `opts`, so `resolveEnv` still resolves `DEFAULT_KEY_FILE` unless a caller
- * explicitly opts out.
+ * (controller-logged deviation D1). Only `conduit key rotate` passes `opts`
+ * in production, with values equal to the defaults; tests use it to redirect
+ * into a temp dir.
  */
 export async function openStoreClientFromEnv(
   env: NodeJS.ProcessEnv = process.env,
