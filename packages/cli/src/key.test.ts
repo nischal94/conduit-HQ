@@ -185,6 +185,45 @@ describe("conduit key rotate (design §3)", () => {
     }
   }, 10_000); // the 5000ms busy_timeout means this refusal alone takes ~5-6s
 
+  it("INVARIANT §16.3: reencrypt-acquire BUSY removes the already-written .next — retry not poisoned", async () => {
+    const { keyPath, key } = await rotatableInstall(dir);
+    let holder: Awaited<ReturnType<typeof openStoreClientFromEnv>> | undefined;
+    let tx:
+      | Awaited<
+          ReturnType<Awaited<ReturnType<typeof openStoreClientFromEnv>>["client"]["transaction"]>
+        >
+      | undefined;
+    try {
+      const io = makeIo();
+      const result = await runKey(["rotate"], {
+        env: {},
+        conduitDir: dir,
+        ...io,
+        // Let preflight resolve normally against the real dir/key, then —
+        // AFTER preflight succeeds — grab the write lock from a second
+        // connection, so the BUSY hits reencryptSecrets' OWN
+        // client.transaction("write") acquire instead of preflight's.
+        openStoreClient: async (env, opts) => {
+          const opened = await openStoreClientFromEnv(env, opts);
+          holder = await openStoreClientFromEnv(env, opts);
+          tx = await holder.client.transaction("write");
+          await tx.execute("SELECT 1"); // materialize BEGIN IMMEDIATE
+          return opened;
+        },
+      });
+      expect(result.exitCode).toBe(1);
+      expect(io.err.join("\n")).toMatch(/stop running conduit processes/i);
+      expect(existsSync(join(dir, "master-key.next"))).toBe(false); // written in step 3, removed by cleanup
+      expect(readFileSync(keyPath, "utf8").trim()).toBe(key); // untouched
+    } finally {
+      if (tx) {
+        await tx.rollback();
+        tx.close();
+      }
+      holder?.client.close();
+    }
+  }, 10_000); // the 5000ms busy_timeout means this refusal alone takes ~5-6s
+
   it("INVARIANT §16.3: crash-table row 2 — .next promotes manually and the db opens", async () => {
     // Simulate "crash after commit, before promote": run a real rotate, then
     // reconstruct row-2 state from its outputs (bak=old, next=new via rename back).
