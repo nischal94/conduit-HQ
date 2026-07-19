@@ -80,6 +80,7 @@ promise the product makes but does not yet enforce.
 | §16.3 — commit-boundary honesty: an uncertain COMMIT outcome is classified "unknown" (caller must not delete either candidate key) | `packages/sdk/src/store/key-lifecycle.test.ts` | ✅ pinned |
 | §16.3 — key resolution: env overrides file; neither → loud error naming `conduit key generate`; wide key-file perms warn-and-serve | `packages/mcp/src/env.test.ts` | ✅ pinned |
 | §16.3 — conduit.db (and sidecars) 0600 at creation via the env open path; wider existing perms healed | `packages/mcp/src/env.test.ts` | ✅ pinned |
+| §16.3 — `key generate` refusals (file exists / env set / db has sealed rows) and 0600 link-publication; key material never printed | `packages/cli/src/key.test.ts` | ✅ pinned |
 
 ---
 

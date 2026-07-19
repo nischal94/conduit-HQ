@@ -1,8 +1,9 @@
 import { USAGE as ADD_MCP_USAGE } from "./commands/add-mcp.js";
+import { KEY_USAGE } from "./commands/key.js";
 
 export const VERSION = "0.1.0";
 
-export const COMMANDS = ["serve", "add-mcp", "approvals"] as const;
+export const COMMANDS = ["serve", "add-mcp", "approvals", "key"] as const;
 
 export type Command = (typeof COMMANDS)[number];
 
@@ -15,6 +16,7 @@ Commands:
   add-mcp    Register conduit-mcp with an MCP client
              (--namespace <ns> --url <url> --prefix <prefix> [--replace] [--clear-credential] [--json])
   approvals  Manage pending tool-call approvals
+  key        Manage the master key (generate | rotate)
 
 Flags:
   --help     Show this help text
@@ -91,6 +93,11 @@ export function dispatch(argv: string[]): DispatchResult {
     // VALUE (falls through to validation), not a help request.
     if (first === "add-mcp" && requestsAddMcpHelp(rest)) {
       return { kind: "help", stdout: `${ADD_MCP_USAGE}\n` };
+    }
+    // key has NO value-taking flags, so any --help/-h token anywhere in rest
+    // is a genuine help request — no flag-vs-value disambiguation needed.
+    if (first === "key" && rest.some((token) => token === "--help" || token === "-h")) {
+      return { kind: "help", stdout: `${KEY_USAGE}\n` };
     }
     return { kind: "route", command: first, args: rest };
   }
