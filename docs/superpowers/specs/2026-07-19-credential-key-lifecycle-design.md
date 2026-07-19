@@ -6,8 +6,11 @@ file permissions, and a defined recovery/rotation story (§16.3, Phase 0)" —
 plus the tracked 0644-at-creation `conduit.db` permissions finding.
 
 **Review trail:** draft v1 (commit `8aaf37b`) → codex cross-model design review
-(gpt-5.6, high reasoning, 13 findings: 6 P1 / 5 P2 / 2 P3) → this revision
-resolves all 13. The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
+(gpt-5.6, high reasoning, 13 findings: 6 P1 / 5 P2 / 2 P3) → revision
+(commit `0defa52`) resolving all 13 → codex convergence re-pass (6 new-class
+findings: 2 P1 / 3 P2 / 1 P3 — generate clobber window, hygiene
+mis-classification, BUSY-strands-`.next`, probe overclaim, env-migration
+contradiction, filename grammar) → this revision resolves those 6. The P1 cluster (#2/#3/#4/#6/#8) shared one root cause — the
 draft's `master-key.new` two-phase roll-forward manufactured the very lockout
 states it meant to prevent — so per the adversarial-convergence rule the fix is
 a SHAPE change (stop-first in-place rotation, manual documented recovery), not
@@ -80,21 +83,25 @@ the decrypted value to the sentinel. Diagnosis is honest about what AES-GCM
 can and cannot prove (review #9):
 
 - Opens AND matches sentinel → key is correct; proceed.
-- Fails to open (or opens to a wrong value): probe ONE real secret row if any
-  exists. Real row opens → the KEY IS FINE, the canary itself is
-  damaged/overwritten → a DISTINCT canary-corruption error. Recovery is
-  documented, not tooled (no `repair-canary` command — YAGNI): the README's
-  procedure is a SQL one-liner deleting the canary row, then reopen
-  (bootstrap recreates it under the verified-good key). Real row also fails
-  (or none exists) → wrong master key → loud error naming db path + key
-  source.
+- Fails to open (or opens to a wrong value): probe the real secret rows —
+  ALL of them, until one opens (re-pass #4: one arbitrary row may itself be
+  corrupt; certainty must not outrun the probe). ANY real row opens → the
+  KEY IS FINE, the canary itself is damaged/overwritten → a DISTINCT
+  canary-corruption error. Recovery is documented, not tooled (no
+  `repair-canary` command — YAGNI): the README's procedure is a SQL
+  one-liner deleting the canary row, then reopen (bootstrap recreates it
+  under the verified-good key). NO row opens (or none exists) → an honestly
+  AMBIGUOUS error: "wrong master key — or, if this key is known-correct,
+  the stored rows are corrupted/foreign" — naming db path + key source.
 
 **Bootstrap (canary absent) — verify BEFORE binding (review #1, the draft's
 worst defect):**
 
-- Secrets table has real rows (legacy db): decrypt one existing row with the
-  candidate key FIRST. Success → create the canary. Failure → refuse with the
-  wrong-key error; the db is never bound to an unverified key.
+- Secrets table has real rows (legacy db): decrypt existing rows with the
+  candidate key FIRST — until one succeeds (re-pass #4: a single corrupt row
+  must not refuse a correct key). Any success → create the canary. ALL fail
+  → refuse with the ambiguous wrong-key-or-corruption error; the db is never
+  bound to an unverified key.
 - Secrets table empty: create the canary freely (nothing to strand).
 - Creation uses `INSERT OR IGNORE` inside a write transaction, then re-reads
   and verifies — idempotent under the M5 multi-process first-run race (both
@@ -133,20 +140,26 @@ Refusals first (each names its reason and the way forward, review #5):
   secret; that footgun stays unbuildable.
 - `CONDUIT_MASTER_KEY` is set → refuse: the env var would override the file,
   and a file differing from the env key is a delayed lockout (env removal
-  later strands the db). Message: unset the env var to move to file-based
-  keys, or keep managing the key via env (no file needed).
+  later strands the db). Message states the v1 position consistently
+  (re-pass #5): a FRESH install can unset the env var and generate; an
+  env-key install with a POPULATED db cannot migrate to file keys in v1 —
+  keep the env key, or delete-and-re-onboard. (A `conduit key import` that
+  persists the verified env key to file is the deferred fix — see out of
+  scope.)
 - The default db exists AND holds sealed rows → refuse: those rows are under
   some other key; generating a fresh one cannot decrypt them. Recovery story:
   locate the original key, or delete the db and re-onboard.
 
 Happy path: mint via `SecretBox.generateKeyBytes()`; create `~/.conduit`
-0700 if absent; write with `wx` (O_CREAT|O_EXCL, mode 0600) to a temp name in
-the same directory, fsync the file, rename into place, fsync the directory —
-`wx` on the final existence-sensitive step means a concurrent `generate`
-cannot clobber (review #8: rename overwrites, so the no-clobber guarantee
-comes from `wx` + the existence refusal, and the fsyncs make it
-host-crash-durable, not just process-crash-safe). Print next steps (snippet
-without embedded key). NEVER print the key.
+0700 if absent; write with `wx` (O_CREAT|O_EXCL, mode 0600) DIRECTLY on the
+final `master-key` name, fsync the file, fsync the directory. No temp+rename
+(re-pass #1: rename overwrites, so a temp+rename pair reopens the clobber
+window the existence refusal closed; `wx` on the final name is both the
+no-clobber guarantee and the serialization point — a concurrent `generate`
+loses with EEXIST). A crash mid-write leaves a malformed short file, which
+`resolveEnv`'s 32-byte validation rejects loudly; recovery is delete +
+regenerate (nothing is sealed yet — the sealed-rows refusal above ensured
+that). Print next steps (snippet without embedded key). NEVER print the key.
 
 ### `conduit key rotate`
 
@@ -186,16 +199,26 @@ changes, so every crash state recovers by "try the other file"):
    (canary included), `open()` with the old box, `seal()` with the new box,
    UPDATE. (Verified: async seal/open work inside the interactive tx —
    `batch` would not allow awaiting.) Any failure → rollback; the db is
-   untouched.
+   untouched — AND rotate deletes the `master-key.next` it created in step 3
+   (re-pass #3: the routine `SQLITE_BUSY` refusal must not strand a `.next`
+   that poisons the operator's retry; pre-commit, this run's `.next` is
+   provably meaningless). Only a crash — not a handled failure — leaves a
+   `.next` for preflight to refuse.
 5. **Promote:** rename `master-key.next` → `master-key`, fsync the
    directory.
-6. **Hygiene:** `PRAGMA wal_checkpoint(TRUNCATE)` then `VACUUM` — old-key
-   ciphertext otherwise lingers in WAL frames and freelist pages, which
-   defeats a rotation whose threat model is "the old key leaked." Documented
-   caveat: filesystem-level remnants (backups, snapshots, unlinked blocks)
-   are out of scope of what a userspace tool can scrub.
-7. Print completion + "restart your MCP clients" + the backup note. Never
-   print either key.
+6. **Hygiene (best-effort defense-in-depth, NOT a boundary — re-pass #2):**
+   `PRAGMA wal_checkpoint(TRUNCATE)` then `VACUUM` — old-key ciphertext
+   otherwise lingers in WAL frames and freelist pages. On failure (busy
+   checkpoint, full disk, crash before this step) rotation is still
+   SUCCESSFUL but the completion message is replaced by a LOUD warning
+   naming the manual procedure (README: run checkpoint+VACUUM via the
+   documented one-liner once processes are stopped). This layer is labeled
+   best-effort because completeness is impossible from userspace anyway:
+   filesystem-level remnants (backups, snapshots, unlinked blocks) are
+   untouchable regardless — the real guarantee against a leaked old key
+   remains the re-seal itself plus the paired-backup discipline.
+7. Print completion (or the hygiene warning) + "restart your MCP clients" +
+   the backup note. Never print either key.
 
 **Crash recovery — a documented manual procedure, not code** (review
 #2/#8/#10): the on-disk states and their two-line recoveries:
@@ -285,7 +308,9 @@ operator owns file perms on custom paths. POSIX/local filesystems only
 | Key file wider than 0600 → stderr warning, still serves | mcp env test |
 | `key generate` refusals: file exists / env set / db has sealed rows | cli test |
 | `key generate` writes 0600, `wx`, never prints key material | cli test |
-| `key rotate` refusals: env-sourced key / custom CONDUIT_DB / held write lock / leftover `.next-*` | cli test |
+| `key rotate` refusals: env-sourced key / custom CONDUIT_DB / held write lock / leftover `master-key.next` | cli test |
+| `key rotate` BUSY refusal removes its own `master-key.next` (retry not poisoned) | cli test |
+| `key rotate` hygiene failure → rotation still succeeds with loud warning | cli test |
 | `key rotate` end-state: db + key file both new; `master-key.bak` = old; wal checkpointed | cli test |
 | Neither command ever writes key material to stdout/stderr | cli test |
 
@@ -302,7 +327,7 @@ Ledger: each row lands in `INVARIANTS.md` with its test in the same commit
   and the paired db+key backup rule.
 - `packages/cli/README.md`: `conduit key` reference; rotation walkthrough
   (stop clients → rotate → restart clients); crash-recovery procedure
-  (try `master-key.bak` / promote `master-key.next-*`); canary-corruption
+  (try `master-key.bak` / promote `master-key.next`); canary-corruption
   recovery; custom-path/env-key rotation story (delete-and-re-onboard).
 - `packages/mcp/README.md`: onboarding starts with `conduit key generate`;
   snippet drops the embedded key for default-path setups.
@@ -314,7 +339,10 @@ Ledger: each row lands in `INVARIANTS.md` with its test in the same commit
   this design's write-lock probe + honest stop-first documentation is the v1
   floor. (Review #3 accepted as a documented limit, not closed.)
 - Rotation for env-key or custom-`CONDUIT_DB` installs (documented
-  delete-and-re-onboard story instead — review #6).
+  delete-and-re-onboard story instead — review #6). Likewise `conduit key
+  import` (persist a verified env key to file, unlocking env→file migration
+  for populated dbs — re-pass #5); trigger: the first real user asking to
+  migrate an env-key install.
 - Key derivation from passphrases, OS keychain integration, multi-key/tenant.
 - Trace/`replay_journal` re-encryption: not sealed with the master key
   (redaction, not encryption, per §11) — nothing to rotate.
