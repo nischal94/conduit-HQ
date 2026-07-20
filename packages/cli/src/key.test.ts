@@ -178,6 +178,37 @@ describe("conduit key rotate (design §3)", () => {
     expect(readFileSync(join(dir, "master-key.next"), "utf8")).toBe("leftover");
   });
 
+  it("INVARIANT §16.3: EEXIST on the .next claim (concurrent/crashed rotation) refuses without ever advising deletion, and never touches .bak", async () => {
+    const { keyPath, key } = await rotatableInstall(dir);
+    const io = makeIo();
+    // The plain leftover-`.next` pre-check only fires BEFORE preflight. To
+    // exercise the wx-claim's OWN EEXIST arm, the file must appear AFTER
+    // that pre-check passes but BEFORE the wx open — i.e. from inside the
+    // DI-wrapped openStoreClient, once preflight has already succeeded.
+    const result = await runKey(["rotate"], {
+      env: {},
+      conduitDir: dir,
+      ...io,
+      openStoreClient: async (env, opts) => {
+        const opened = await openStoreClientFromEnv(env, opts);
+        writeFileSync(join(dir, "master-key.next"), "winner-in-flight", { mode: 0o600 });
+        return opened;
+      },
+    });
+    expect(result.exitCode).toBe(1);
+    // Must warn about an in-flight/crashed rotation, and must NEVER say to
+    // unconditionally delete `.next` — that advice is what would let an
+    // EEXIST loser destroy a concurrent winner's only copy of the new key.
+    expect(io.err.join("\n")).toMatch(/in flight or crashed mid-write/i);
+    expect(io.err.join("\n")).not.toMatch(/delete it and re-run/i);
+    // The pre-created `.next` is untouched — neither deleted nor overwritten.
+    expect(readFileSync(join(dir, "master-key.next"), "utf8")).toBe("winner-in-flight");
+    // .bak must never be touched: the wx claim is the FIRST step now, so a
+    // loser that fails there must not have copied `.bak` either.
+    expect(existsSync(join(dir, "master-key.bak"))).toBe(false);
+    expect(readFileSync(keyPath, "utf8").trim()).toBe(key); // live key untouched
+  });
+
   it("INVARIANT §16.3: BUSY refusal removes its own .next — retry is not poisoned", async () => {
     const { dbPath, key } = await rotatableInstall(dir);
     // Hold the write lock from a second connection.
@@ -237,7 +268,7 @@ describe("conduit key rotate (design §3)", () => {
     }
   }, 10_000); // the 5000ms busy_timeout means this refusal alone takes ~5-6s
 
-  it("INVARIANT §16.3: a pre-transaction fs failure (backup/stage) names the way forward, db untouched", async () => {
+  it("INVARIANT §16.3: a pre-transaction fs failure (backup/stage) names the way forward, db untouched, .next self-cleaned", async () => {
     const { keyPath, key } = await rotatableInstall(dir);
     const io = makeIo();
     try {
@@ -246,20 +277,24 @@ describe("conduit key rotate (design §3)", () => {
         conduitDir: dir,
         ...io,
         // Let preflight resolve normally, then — AFTER it succeeds — strip
-        // write access from the conduit dir so step 2's copyFileSync(bak)
-        // fails EACCES, before reencryptSecrets is ever called.
+        // read access from the CURRENT key file so `.next` is created and
+        // claimed successfully (step 2), then step 3's copyFileSync(bak)
+        // fails EACCES reading the source, before reencryptSecrets is ever
+        // called. Since `.next` provably belongs to THIS run, rotate must
+        // clean it up itself rather than leave it for the next invocation.
         openStoreClient: async (env, opts) => {
           const opened = await openStoreClientFromEnv(env, opts);
-          chmodSync(dir, 0o500);
+          chmodSync(keyPath, 0o000);
           return opened;
         },
       });
       expect(result.exitCode).toBe(1);
       expect(io.err.join("\n")).toMatch(/unchanged/);
-      expect(io.err.join("\n")).toMatch(/master-key\.next/);
-      expect(readFileSync(keyPath, "utf8").trim()).toBe(key); // untouched
+      expect(io.err.join("\n")).toMatch(/nothing was left behind/);
+      expect(existsSync(join(dir, "master-key.next"))).toBe(false); // self-cleaned — belonged to this run
     } finally {
-      chmodSync(dir, 0o700); // restore so afterEach's rmSync can clean up
+      chmodSync(keyPath, 0o600); // restore so afterEach's rmSync can clean up
+      expect(readFileSync(keyPath, "utf8").trim()).toBe(key); // untouched
     }
   });
 

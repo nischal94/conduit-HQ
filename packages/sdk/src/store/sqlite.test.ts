@@ -12,6 +12,7 @@ import type {
   SourceType,
   Tool,
 } from "../types.js";
+import { CANARY_REF } from "./key-lifecycle.js";
 import { openSqliteStore } from "./sqlite.js";
 import type { ConduitStore } from "./store.js";
 
@@ -669,6 +670,30 @@ describe("SqliteStore", () => {
       await store.secrets.put("cred_x", "old");
       await store.secrets.put("cred_x", "new");
       expect(await store.secrets.reveal("cred_x")).toBe("new");
+    });
+
+    it("INVARIANT §16.3: put refuses the canary ref — a colliding put cannot corrupt the canary", async () => {
+      const before = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      await expect(store.secrets.put(CANARY_REF, "attacker-controlled")).rejects.toThrow(
+        /reserved for the key canary/,
+      );
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows[0]?.sealed).toBe(before.rows[0]?.sealed); // canary row untouched
+    });
+
+    it("INVARIANT §16.3: remove refuses the canary ref — the canary row survives", async () => {
+      await expect(store.secrets.remove(CANARY_REF)).rejects.toThrow(/reserved for the key canary/);
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows).toHaveLength(1); // canary row still present
     });
   });
 

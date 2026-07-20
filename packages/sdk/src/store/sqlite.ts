@@ -18,7 +18,7 @@ import type {
   Tool,
   TraceEvent,
 } from "../types.js";
-import { ensureKeyCanary, type StoreKeyContext } from "./key-lifecycle.js";
+import { CANARY_REF, ensureKeyCanary, type StoreKeyContext } from "./key-lifecycle.js";
 import type { ConduitStore, ReplayJournalRow } from "./store.js";
 
 /**
@@ -605,6 +605,11 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
 
     secrets: {
       async put(ref: string, secret: string): Promise<void> {
+        if (ref === CANARY_REF) {
+          throw new Error(
+            `[SqliteStore] Secret ref "${ref}" is reserved for the key canary. Context: { ref: ${JSON.stringify(ref)} }`,
+          );
+        }
         const sealed = await secretBox.seal(secret);
         await client.execute({
           sql: `INSERT INTO secrets (ref, sealed, created_at) VALUES (?, ?, ?)
@@ -621,6 +626,11 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         return row === undefined ? undefined : secretBox.open(text(row, "sealed"));
       },
       async remove(ref: string): Promise<void> {
+        if (ref === CANARY_REF) {
+          throw new Error(
+            `[SqliteStore] Secret ref "${ref}" is reserved for the key canary. Context: { ref: ${JSON.stringify(ref)} }`,
+          );
+        }
         await client.execute({ sql: "DELETE FROM secrets WHERE ref = ?", args: [ref] });
       },
     },

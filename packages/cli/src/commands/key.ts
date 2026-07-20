@@ -9,11 +9,11 @@ import {
   readdirSync,
   renameSync,
   unlinkSync,
-  writeSync,
 } from "node:fs";
 import { join } from "node:path";
 import { DEFAULT_CONDUIT_DIR, ensureDbFile, openStoreClientFromEnv } from "@conduithq/mcp";
 import { ReencryptError, reencryptSecrets, SecretBox } from "@conduithq/sdk";
+import { writeAllAndFsync } from "./key-fs.js";
 
 export const KEY_USAGE = `conduit key — manage the Conduit master key
 
@@ -156,8 +156,7 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
   // leaves the published key untouched.
   const fd = openSync(tmpPath, "wx", 0o600);
   try {
-    writeSync(fd, `${keyBase64}\n`);
-    fsyncSync(fd);
+    writeAllAndFsync(fd, `${keyBase64}\n`);
   } finally {
     closeSync(fd);
   }
@@ -299,14 +298,32 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
   const { client } = opened;
 
   try {
-    // 2-3. Backup + stage the new key BEFORE the db is touched. Any raw fs
-    // failure here is provably pre-transaction: the db is still under the
-    // OLD key and nothing has been re-sealed yet (unlike step 4+, these
-    // steps have no reencrypt-side classification to fall back on, so they
-    // get their own catch naming that fact explicitly).
+    // 2-3. Stage the new key BEFORE the db is touched, THEN back up the old
+    // one. Creating `.next` (wx) FIRST is the mutual-exclusion point: an
+    // EEXIST here means another rotation already claimed it, and this run
+    // must not touch `.bak` at all — a concurrent loser that copied `.bak`
+    // BEFORE staging would have already overwritten it ahead of the winner
+    // claiming ownership. Any raw fs failure here is provably pre-transaction:
+    // the db is still under the OLD key and nothing has been re-sealed yet
+    // (unlike step 4+, these steps have no reencrypt-side classification to
+    // fall back on, so they get their own catch naming that fact explicitly).
     let newKeyBytes: ReturnType<typeof SecretBox.generateKeyBytes>;
+    let nextClaimed = false;
     try {
-      // 2. Backup the old key (overwritten each rotation — crash insurance, not history).
+      // 2. Persist the NEW key BEFORE anything else (wx: a racing rotate
+      // loses here — this IS the claim on the rotation).
+      newKeyBytes = SecretBox.generateKeyBytes();
+      const newKeyBase64 = Buffer.from(newKeyBytes).toString("base64");
+      const nextFd = openSync(nextPath, "wx", 0o600);
+      try {
+        writeAllAndFsync(nextFd, `${newKeyBase64}\n`);
+      } finally {
+        closeSync(nextFd);
+      }
+      nextClaimed = true;
+
+      // 3. Backup the old key (overwritten each rotation — crash insurance,
+      // not history). Only reached once THIS run provably owns `.next`.
       copyFileSync(keyPath, bakPath);
       const bakFd = openSync(bakPath, "r");
       try {
@@ -315,26 +332,37 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
         closeSync(bakFd);
       }
 
-      // 3. Persist the NEW key BEFORE the db changes (wx: a racing rotate loses here).
-      newKeyBytes = SecretBox.generateKeyBytes();
-      const newKeyBase64 = Buffer.from(newKeyBytes).toString("base64");
-      const nextFd = openSync(nextPath, "wx", 0o600);
-      try {
-        writeSync(nextFd, `${newKeyBase64}\n`);
-        fsyncSync(nextFd);
-      } finally {
-        closeSync(nextFd);
-      }
       fsyncDir(deps.conduitDir);
     } catch (cause) {
-      const isConcurrentNext = (cause as NodeJS.ErrnoException).code === "EEXIST";
-      const detail = isConcurrentNext
-        ? `${nextPath} appeared concurrently — another rotation is in flight or crashed mid-write`
-        : String(cause);
+      const isConcurrentNext = !nextClaimed && (cause as NodeJS.ErrnoException).code === "EEXIST";
+      if (isConcurrentNext) {
+        // Another rotation is in flight or crashed mid-write. `.next` may be
+        // the WINNER's live, uncommitted key — deleting it here (even
+        // conditionally) risks destroying the only copy of a new key whose
+        // db has already been re-sealed under it. NEVER advise deletion.
+        deps.stderr(
+          `[ConduitKey] rotation refused: ${nextPath} exists — another rotation is in flight or ` +
+            "crashed mid-write. The live key file and db are unchanged. Do NOT delete master-key.next " +
+            "unless you are certain no rotation is currently running; if you're certain, see the " +
+            "crash-recovery procedure in packages/cli/README.md before removing it and re-running.\n",
+        );
+        return { exitCode: 1 };
+      }
+      // `.next` (if present) provably belongs to THIS run — clean it up
+      // ourselves rather than leaving it for the next invocation to trip on.
+      let cleanupNote = "nothing was left behind";
+      if (nextClaimed) {
+        try {
+          unlinkSync(nextPath);
+        } catch (unlinkCause) {
+          if ((unlinkCause as NodeJS.ErrnoException).code !== "ENOENT") {
+            cleanupNote = `${nextPath} could not be removed — delete it before retrying (cause: ${String(unlinkCause)})`;
+          }
+        }
+      }
       deps.stderr(
-        `[ConduitKey] rotation failed before the db was touched: ${detail}. The live key file and ` +
-          "db are unchanged (a fresh master-key.bak copy of the CURRENT key may already exist — " +
-          "harmless); if master-key.next exists, delete it and re-run.\n",
+        `[ConduitKey] rotation failed before the db was touched: ${String(cause)}. The live key file ` +
+          `and db are unchanged; ${cleanupNote}.\n`,
       );
       return { exitCode: 1 };
     }
