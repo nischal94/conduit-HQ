@@ -143,7 +143,7 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
   const stale = readdirSync(deps.conduitDir).filter((f) => f.startsWith("master-key.tmp-"));
   if (stale.length > 0) {
     deps.stderr(
-      `[ConduitKey] note: leftover temp key files from a crashed run: ${stale.join(", ")} — inert ` +
+      `[ConduitKey] note: leftover temp key files from a crashed run: ${stale.map((f) => join(deps.conduitDir, f)).join(", ")} — inert ` +
         "(never read); remove them at leisure.\n",
     );
   }
