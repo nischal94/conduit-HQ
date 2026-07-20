@@ -23,7 +23,25 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-20 (§17 v1 step 1 BUILT: PR #41 open, FULL gauntlet passed agent-side; remaining: human quiz + HUMAN-NAMED merge)
+## Current handoff — updated 2026-07-20 (§17 v1 step 1 MERGED: PR #41 squash → main `983be17`, post-merge sweep DONE; next: §17 v1 step 2 daemon ownership)
+
+**MERGE + SWEEP UPDATE (same day, same session):** the human named the merge
+→ PR #41 squash-merged → **main is `983be17`** (trailer-free verified). A
+prose-only conflict (HANDOFF/LEARNINGS both-modified vs main `2649368`) was
+resolved branch-side with a provably tree-identical merge commit (0 diff
+bytes vs the CI-green head). Post-merge sweep: branches = only `main` (local
+deleted; GitHub auto-deleted remote; prune verified) · **real-db
+verification PASSED** — `conduit approvals list` on main's rebuilt dists
+opened the real `~/.conduit` store via key-file resolution + canary
+(exit 0) · dists rebuilt. ONE step left for the user's own terminal (the
+agent's permission gate declined deleting a dir containing a key-file
+copy): `rm -rf ~/.conduit.bak-sdd-keylifecycle` — verified safe, its
+protective purpose is spent. **NEXT SESSION: go straight to §17 v1 step 2
+(daemon ownership)** — the "If MERGED / If OPEN" branching in the kickoff
+below is RESOLVED: merged, sweep done.
+
+The section below is the as-written state at PR-open time (kept for the
+record; its NEXT/kickoff superseded by the paragraph above).
 
 ### Where things stand
 
