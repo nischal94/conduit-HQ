@@ -1682,3 +1682,75 @@ adversarially applied to a review finding, not an audit recommendation.**
    populated db to a wrong key forever (the real rows stay under the true
    key; the canary now vouches for the impostor). Probe an existing row
    before writing any trust anchor into a store that predates the anchor.
+
+## 2026-07-20 — §17 v1 step 1 build session (SDD → PR #41 full gauntlet)
+
+Shipped: the credential key lifecycle built via subagent-driven development
+over the converged design — startup canary, reencryptSecrets, key-file-first
+resolution, 0600-at-birth db, `conduit key generate`/`rotate`. PR #41 through
+the complete load-bearing gauntlet (6 task reviews, whole-branch, 5-specialist
+wave, security review, codex 3-pass CONVERGED, CI 9/9); merge left to the
+human quiz gate. sdk 444 / mcp 56 / cli 105.
+
+### 1. Pre-flight a plan's TEST SETUP against production path resolution
+
+The committed plan's rotate tests passed a temp `conduitDir` while the
+production resolver had no path seam — executed as written, the tests would
+have re-encrypted the REAL ~/.conduit db under a throwaway key deleted in
+afterEach. Caught in the controller's pre-flight scan, not by any reviewer
+of the plan. The pattern: "test seam; production always uses defaults"
+comments hide exactly the seams tests need threaded; check every test
+override against where the code under test actually resolves paths. A
+same-session echo confirmed the class: T3's RED phase briefly leaked the
+real key file into two pre-existing tests via default-path resolution.
+
+### 2. `:memory:` libsql + `transaction()` silently swaps databases
+
+@libsql/client's sqlite3 driver detaches the connection onto the Transaction
+and lazily reopens — for `:memory:` that new connection is a DIFFERENT empty
+db, so post-transaction assertions pass vacuously against a fresh bootstrap.
+The atomic-rollback invariant test was proven meaningful only by mutation
+testing (break the rollback, watch the test fail). Rule of thumb promoted:
+file-backed temp dbs for any test asserting post-transaction client state,
+and mutation-test the test when the assertion guards a catastrophic path.
+
+### 3. A pure-function pin is not a wiring pin
+
+`classifyReencryptFailure("commit") === "unknown"` passed regardless of
+whether `reencryptSecrets` actually routed a commit-throw through it — the
+one bit standing between an operator and unrecoverable credential loss was
+untested as WIRED behavior. Proxy-client tests (a real client whose tx
+proxies throw on commit/rollback) closed it end-to-end, including the CLI
+preserving `.next`. When an invariant lives in a classification, pin the
+call path, not the mapping table.
+
+### 4. Recovery guidance is part of the crash-safety surface
+
+Two codex passes, two findings of the same class one branch apart: an error
+message advising "delete master-key.next" is itself the destructive action
+when another rotation is mid-re-seal. Fixed at the shape per the
+adversarial-convergence rule — ONE shared no-touch refusal text for every
+`.next`-exists surface (both code arms + README), gating recovery on
+"confirm no rotation is running". Messages that prescribe filesystem actions
+deserve the same crash-window analysis as the code.
+
+### 5. Your secrets scanner will flag your own sentinel constants
+
+gitleaks' entropy heuristic read the PUBLIC canary ref in the docs' recovery
+one-liner (`…FROM secrets WHERE ref = '__conduit.key-canary.v1__'`) as a
+leaked credential — and the failure surfaced only at PR time because docs
+commits on an un-PR'd branch are never CI-scanned (LEARNINGS #21 corollary:
+the tripwire blind spot extends to every branch-only CI signal). Fix shape:
+a scoped `.gitleaks.toml` regex allowlist for exactly that constant,
+verified against the same pinned scanner image CI runs — never a blanket
+rule disable.
+
+### 6. Subagent background jobs die with the subagent's turn
+
+An implementer launched its test suite with run_in_background and ended its
+turn "waiting" — the runs were killed, nothing committed, the report never
+written. Background tasks belong to the controller; subagent dispatches now
+carry an explicit ALL-COMMANDS-FOREGROUND instruction. Same session, second
+process lesson: the confirming codex pass on a FIX commit found three real
+new defects in the reordered code — a re-pass after fixes is discovery, not
+ceremony.
