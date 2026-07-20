@@ -175,6 +175,10 @@ describe("conduit key rotate (design §3)", () => {
     const result = await runKey(["rotate"], { env: {}, conduitDir: dir, ...io });
     expect(result.exitCode).toBe(1);
     expect(io.err.join("\n")).toMatch(/master-key\.next/);
+    expect(io.err.join("\n")).toMatch(/in flight.*or a prior one crashed/i);
+    expect(io.err.join("\n")).toMatch(
+      /make ABSOLUTELY SURE no .conduit key rotate. is currently running/i,
+    );
     expect(readFileSync(join(dir, "master-key.next"), "utf8")).toBe("leftover");
   });
 
@@ -199,7 +203,10 @@ describe("conduit key rotate (design §3)", () => {
     // Must warn about an in-flight/crashed rotation, and must NEVER say to
     // unconditionally delete `.next` — that advice is what would let an
     // EEXIST loser destroy a concurrent winner's only copy of the new key.
-    expect(io.err.join("\n")).toMatch(/in flight or crashed mid-write/i);
+    expect(io.err.join("\n")).toMatch(/in flight.*or a prior one crashed/i);
+    expect(io.err.join("\n")).toMatch(
+      /make ABSOLUTELY SURE no .conduit key rotate. is currently running/i,
+    );
     expect(io.err.join("\n")).not.toMatch(/delete it and re-run/i);
     // The pre-created `.next` is untouched — neither deleted nor overwritten.
     expect(readFileSync(join(dir, "master-key.next"), "utf8")).toBe("winner-in-flight");

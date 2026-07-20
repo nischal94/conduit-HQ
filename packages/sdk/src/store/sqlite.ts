@@ -648,6 +648,20 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           "[ConduitStore] provisionSource: `secret` and `removeSecretRef` are mutually exclusive.",
         );
       }
+      // INVARIANT §16.3: the canary ref is reserved for key-lifecycle's own
+      // raw-SQL access — same guard as secrets.put/remove, applied here too
+      // since provisionSource upserts/deletes secrets rows directly rather
+      // than going through the secrets repository.
+      if (input.secret?.ref === CANARY_REF) {
+        throw new Error(
+          `[ConduitStore] Secret ref "${CANARY_REF}" is reserved for the key canary. Context: { ref: ${JSON.stringify(CANARY_REF)} }`,
+        );
+      }
+      if (input.removeSecretRef === CANARY_REF) {
+        throw new Error(
+          `[ConduitStore] Secret ref "${CANARY_REF}" is reserved for the key canary. Context: { ref: ${JSON.stringify(CANARY_REF)} }`,
+        );
+      }
 
       // The seal MUST happen before the batch is built — `client.batch`
       // takes a plain statement array, so nothing inside it can be awaited.

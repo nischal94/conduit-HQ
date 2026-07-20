@@ -1,0 +1,11 @@
+# Gitleaks config: extend the default ruleset; allowlist ONLY the public
+# key-canary ref constant (spec §16.3) — docs quote the recovery one-liner
+# `DELETE FROM secrets WHERE ref = '__conduit.key-canary.v1__'`, and the
+# generic-api-key rule reads that constant as a credential. It is a fixed
+# public sentinel ref, never secret material.
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Conduit key-canary ref — public constant, not a credential"
+regexes = ['''__conduit\.key-canary\.v1__''']

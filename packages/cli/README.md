@@ -191,9 +191,19 @@ custom `CONDUIT_DB` paths — see "Env-key and custom-path installs" below.
 ### Crash recovery
 
 Rotation writes the new key to `master-key.next` before touching the db, and
-only renames it to `master-key` after the re-seal succeeds. If rotation is
-interrupted mid-flight, `master-key.next` is left behind and a re-run refuses
-(pointing you here). Recover manually:
+only renames it to `master-key` after the re-seal succeeds. If `master-key.next`
+exists, a re-run refuses (pointing you here) — but `master-key.next` existing
+does NOT by itself mean a prior rotation crashed. It equally means another
+rotation is **currently in flight right now**, on this host or another one
+sharing `~/.conduit`, possibly mid-re-seal with `.next` holding the ONLY
+persisted copy of its new key.
+
+**Before following any recovery step below, first make ABSOLUTELY SURE no
+`conduit key rotate` is currently running anywhere.** Deleting or overwriting
+`master-key.next` while a rotation is genuinely in flight destroys that
+run's only copy of the new key — its re-seal can then commit against a key
+that no longer exists anywhere, permanently sealing the db. Only once you
+have confirmed no rotation is running does the manual recovery below apply:
 
 - **The db won't open, and `master-key.next` is present.** The rename to
   `master-key` never completed but the re-seal did — the db is under the

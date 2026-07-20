@@ -1406,6 +1406,54 @@ describe("SqliteStore", () => {
       expect(await store.sources.get("src_v")).toBeUndefined();
     });
 
+    it("INVARIANT §16.3: provisionSource refuses secret.ref === CANARY_REF — canary intact", async () => {
+      const before = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      await expect(
+        store.provisionSource({
+          source: { id: "src_canary1", type: "mcp", namespace: "canary1", location: "http://u" },
+          integration: { id: "int_canary1", sourceId: "src_canary1", namespace: "canary1" },
+          connection: {
+            id: "conn_canary1",
+            integrationId: "int_canary1",
+            prefix: "canary1.acme.prod",
+          },
+          secret: { ref: CANARY_REF, value: "attacker-controlled" },
+          tools: [tool({ name: "canary1.search", namespace: "canary1" })],
+        }),
+      ).rejects.toThrow(/reserved for the key canary/);
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows[0]?.sealed).toBe(before.rows[0]?.sealed);
+      expect(await store.sources.get("src_canary1")).toBeUndefined();
+    });
+
+    it("INVARIANT §16.3: provisionSource refuses removeSecretRef === CANARY_REF — canary intact", async () => {
+      await expect(
+        store.provisionSource({
+          source: { id: "src_canary2", type: "mcp", namespace: "canary2", location: "http://u" },
+          integration: { id: "int_canary2", sourceId: "src_canary2", namespace: "canary2" },
+          connection: {
+            id: "conn_canary2",
+            integrationId: "int_canary2",
+            prefix: "canary2.acme.prod",
+          },
+          removeSecretRef: CANARY_REF,
+          tools: [tool({ name: "canary2.search", namespace: "canary2" })],
+        }),
+      ).rejects.toThrow(/reserved for the key canary/);
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows).toHaveLength(1);
+      expect(await store.sources.get("src_canary2")).toBeUndefined();
+    });
+
     it("throws when both `secret` and `removeSecretRef` are provided (contract violation)", async () => {
       await expect(
         store.provisionSource({

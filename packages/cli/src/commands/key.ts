@@ -217,6 +217,20 @@ const RECOVERY_HINT =
   "Recovery: whichever of master-key / master-key.next opens the db is live — " +
   "promote it (mv) or restore master-key.bak; see packages/cli/README.md.";
 
+// Shared by BOTH `.next`-exists refusal arms (the pre-check below and the
+// wx-EEXIST claim further down): `.next` existing means either another
+// rotation is CURRENTLY in flight, or one crashed mid-write — this process
+// cannot tell which. A concurrent winner may be mid-re-seal with `.next`
+// holding the ONLY persisted copy of its new key; deleting it out from under
+// that winner permanently seals the db under a lost key. The recovery
+// procedure (whichever key opens the db is live) is only safe to follow
+// once no rotation is running anywhere — never as a first response.
+const NEXT_EXISTS_REFUSAL =
+  "another rotation may be IN FLIGHT right now, or a prior one crashed mid-write — this process " +
+  "cannot tell which from here. First make ABSOLUTELY SURE no `conduit key rotate` is currently " +
+  "running anywhere (check processes on this host and any others sharing ~/.conduit). Only once " +
+  `that is confirmed does recovery apply: ${RECOVERY_HINT}`;
+
 /** True iff the failure's cause chain looks like a busy/locked SQLite database. */
 function isBusyCause(cause: unknown): boolean {
   const seen = new Set<unknown>();
@@ -263,9 +277,7 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
     return { exitCode: 1 };
   }
   if (existsSync(nextPath)) {
-    deps.stderr(
-      `[ConduitKey] rotate refused: ${nextPath} exists — a prior rotation crashed mid-flight. ${RECOVERY_HINT}\n`,
-    );
+    deps.stderr(`[ConduitKey] rotate refused: ${nextPath} exists — ${NEXT_EXISTS_REFUSAL}\n`);
     return { exitCode: 1 };
   }
 
@@ -315,12 +327,18 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
       newKeyBytes = SecretBox.generateKeyBytes();
       const newKeyBase64 = Buffer.from(newKeyBytes).toString("base64");
       const nextFd = openSync(nextPath, "wx", 0o600);
+      // Ownership is claimed the INSTANT the exclusive create succeeds — not
+      // after write+fsync+close. If writeAllAndFsync or closeSync throws
+      // below, `.next` already exists on disk as THIS run's file; claiming
+      // ownership late would skip the self-clean unlink in the catch below,
+      // leaving a partial `.next` that poisons the next attempt while the
+      // failure message wrongly claims "nothing was left behind".
+      nextClaimed = true;
       try {
         writeAllAndFsync(nextFd, `${newKeyBase64}\n`);
       } finally {
         closeSync(nextFd);
       }
-      nextClaimed = true;
 
       // 3. Backup the old key (overwritten each rotation — crash insurance,
       // not history). Only reached once THIS run provably owns `.next`.
@@ -340,12 +358,7 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
         // the WINNER's live, uncommitted key — deleting it here (even
         // conditionally) risks destroying the only copy of a new key whose
         // db has already been re-sealed under it. NEVER advise deletion.
-        deps.stderr(
-          `[ConduitKey] rotation refused: ${nextPath} exists — another rotation is in flight or ` +
-            "crashed mid-write. The live key file and db are unchanged. Do NOT delete master-key.next " +
-            "unless you are certain no rotation is currently running; if you're certain, see the " +
-            "crash-recovery procedure in packages/cli/README.md before removing it and re-running.\n",
-        );
+        deps.stderr(`[ConduitKey] rotation refused: ${nextPath} exists — ${NEXT_EXISTS_REFUSAL}\n`);
         return { exitCode: 1 };
       }
       // `.next` (if present) provably belongs to THIS run — clean it up
