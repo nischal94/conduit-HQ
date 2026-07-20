@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 import { addMcp } from "./commands/add-mcp.js";
 import { approvals } from "./commands/approvals.js";
+import { runKey } from "./commands/key.js";
 import { serve } from "./commands/serve.js";
 import { type Command, dispatch } from "./dispatch.js";
 
@@ -17,6 +18,8 @@ async function runCommand(command: Command, args: string[]): Promise<number> {
       return addMcp(args);
     case "approvals":
       return approvals(args);
+    case "key":
+      return (await runKey(args)).exitCode;
     default: {
       const _exhaustive: never = command;
       return _exhaustive;

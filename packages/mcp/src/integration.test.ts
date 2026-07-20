@@ -1,5 +1,5 @@
 import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -520,13 +520,28 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     expect(stderr).toMatch(/--doctor/);
   });
 
+  // env.ts's resolveEnv falls back to reading `${HOME}/.conduit/master-key`
+  // when CONDUIT_MASTER_KEY is absent — so a spawn env that merely deletes
+  // the var still leaks the REAL key on any machine that has one. These
+  // "missing key" cases point HOME at a fresh, empty temp dir (never
+  // touching the real ~/.conduit) so the file fallback provably has nothing
+  // to find and the missing-key path is exercised deterministically.
   it("--doctor against a missing CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
-    const env: Record<string, string | undefined> = { ...process.env, ...baseEnv() };
-    delete env.CONDUIT_MASTER_KEY;
-    await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
-      code: 1,
-      stderr: expect.stringContaining("Missing CONDUIT_MASTER_KEY"),
-    });
+    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nohome-"));
+    try {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        ...baseEnv(),
+        HOME: emptyHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringMatching(/Missing master key/),
+      });
+    } finally {
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
   });
 
   it("--doctor against a malformed CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
@@ -537,16 +552,81 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     };
     await expect(execFileAsync("node", [binPath, "--doctor"], { env })).rejects.toMatchObject({
       code: 1,
-      stderr: expect.stringContaining("Malformed CONDUIT_MASTER_KEY"),
+      stderr: expect.stringMatching(/Malformed master key in CONDUIT_MASTER_KEY/),
     });
   });
 
   it("no flag + missing CONDUIT_MASTER_KEY: startup fails fast, exits 1 with a stderr diagnostic", async () => {
-    const env: Record<string, string | undefined> = { ...process.env, ...baseEnv() };
-    delete env.CONDUIT_MASTER_KEY;
-    await expect(execFileAsync("node", [binPath], { env })).rejects.toMatchObject({
-      code: 1,
-      stderr: expect.stringContaining("Missing CONDUIT_MASTER_KEY"),
-    });
+    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nohome-"));
+    try {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        ...baseEnv(),
+        HOME: emptyHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      await expect(execFileAsync("node", [binPath], { env })).rejects.toMatchObject({
+        code: 1,
+        stderr: expect.stringMatching(/Missing master key/),
+      });
+    } finally {
+      rmSync(emptyHome, { recursive: true, force: true });
+    }
+  });
+
+  it("--doctor resolves the default ~/.conduit/master-key path end-to-end with no CONDUIT_MASTER_KEY set", async () => {
+    // Proves the headline default-path resolution: a valid 0600 key file at
+    // the DEFAULT location (${HOME}/.conduit/master-key), no env override.
+    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-defaultkey-"));
+    try {
+      const conduitDir = join(isolatedHome, ".conduit");
+      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      const keyBytes = SecretBox.generateKeyBytes();
+      writeFileSync(
+        join(conduitDir, "master-key"),
+        `${Buffer.from(keyBytes).toString("base64")}\n`,
+        {
+          mode: 0o600,
+        },
+      );
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
+        HOME: isolatedHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      delete env.CONDUIT_DB;
+      const { stdout, stderr } = await execFileAsync("node", [binPath, "--doctor"], { env });
+      expect(stdout).toBe("");
+      expect(stderr).toMatch(/ok: key decodes/);
+      expect(stderr).toMatch(/ok: database opens/);
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it("M8: a wide-perms (0644) default key file warns on stderr only, stdout carries no warning text", async () => {
+    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-wideperms-"));
+    try {
+      const conduitDir = join(isolatedHome, ".conduit");
+      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      const keyBytes = SecretBox.generateKeyBytes();
+      const keyPath = join(conduitDir, "master-key");
+      writeFileSync(keyPath, `${Buffer.from(keyBytes).toString("base64")}\n`, { mode: 0o644 });
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
+        HOME: isolatedHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      delete env.CONDUIT_DB;
+      const { stdout, stderr } = await execFileAsync("node", [binPath, "--doctor"], { env });
+      expect(stderr).toMatch(
+        new RegExp(`WARNING.*${keyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*0600`),
+      );
+      expect(stdout).not.toMatch(/WARNING/);
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
   });
 });

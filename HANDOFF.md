@@ -23,7 +23,137 @@ at session start.
 
 ---
 
-## Current handoff — written 2026-07-19 (§17 v1 step 1 DESIGN + PLAN done and codex-CONVERGED on branch `feat/credential-key-lifecycle`; next session BUILDS via SDD)
+## Current handoff — written 2026-07-20 (§17 v1 step 1 BUILT: PR #41 open, FULL gauntlet passed agent-side; remaining: human quiz + HUMAN-NAMED merge)
+
+### Where things stand
+
+- **Main is unchanged at `69d4bfb`.** All work is on **PR #41**
+  (`feat/credential-key-lifecycle`, head `cfe475e`, 15 build commits over the
+  7 design/plan docs commits). Built via SDD exactly per the plan: sdk startup
+  key canary (`store/key-lifecycle.ts`: probe-before-bootstrap, probe-all
+  diagnosis, canary-ref reserved across put/remove/provisionSource) +
+  `reencryptSecrets` (one BEGIN IMMEDIATE tx, `dbState unchanged|unknown`
+  commit-boundary honesty, wiring pinned end-to-end by proxy-client tests) ·
+  mcp key-file-first resolution (`~/.conduit/master-key` 0600, env override,
+  `keySource`, `ensureDbFile` 0600-at-birth incl. sidecars,
+  `openStoreClientFromEnv(env?, opts?)`) · cli `conduit key generate`
+  (3 refusals + honest inspect-failure refusal; fsynced-temp + link()
+  publication; write-all) and `conduit key rotate` (.next claimed FIRST via
+  wx as the mutual-exclusion point → .bak → re-seal → promote; shared
+  no-touch NEXT_EXISTS_REFUSAL text everywhere; manual crash recovery) ·
+  docs (spec §14/§16/§17, both READMEs with recovery procedures). Suites at
+  head: **sdk 444 / mcp 56 / cli 105**, tsc+biome+spec-drift clean; 15+
+  INVARIANT §16.3 pins, ledger rows quote test titles verbatim.
+- **Gauntlet — COMPLETE agent-side, all trails on the PR + SDD ledger
+  (`.superpowers/sdd/progress-key-lifecycle.md`):** 6 task reviews (all
+  Approved) → whole-branch review (fable; fix wave → re-verified READY) →
+  Tier-2 pre-PR 5-specialist wave (28 findings fixed incl. two High
+  silent-failures + the untested dbState-"unknown" credential-loss wiring) →
+  post-PR code-review mechanic (no issues, comment posted) →
+  /security-review (zero net-new) → **codex 3-pass arc: 3 → 3 → CONVERGED**
+  (fixed: .next-after-.bak ordering + delete-advice-on-live-.next [the
+  destructive-guidance class, fixed at the SHAPE], writeSync short-write,
+  canary-ref reservation incl. provisionSource, late ownership claim) → CI
+  9/9 green → Greptile P2s adjudicated (one applied `cfe475e`, one declined
+  with rationale on the thread). CI incident fixed in-branch: gitleaks
+  false-positived the PUBLIC canary-ref constant in the docs' recovery
+  one-liner → scoped `.gitleaks.toml` allowlist, verified with the pinned CI
+  image. Deviations D1–D3 documented in the PR body (D1 prevented the plan's
+  rotate tests from re-encrypting the REAL ~/.conduit db).
+- **Explainer + quiz (merge gate):**
+  https://claude.ai/code/artifact/f5f87a83-d3f9-4f30-b9a5-98ceff33d869
+  (also linked on the PR). Aikido scan still N/A (MCP not connected —
+  `/aikido:setup`, user terminal; carried).
+- **Environment notes:** `~/.conduit.bak-sdd-keylifecycle` holds the
+  pre-session state of the real ~/.conduit (taken as D1 defense-in-depth) —
+  KEEP until post-merge dogfood confirms the real db opens clean, then
+  delete. During T3's RED phase a benign correct-key canary row was written
+  into the real db's WAL (verified: master-key/main-db/snippet hash-identical
+  to backup; leak closed same-commit) — the post-merge first run will simply
+  find the canary already bootstrapped. A fresh LOW esbuild advisory
+  (GHSA-g7r4-m6w7-qqqr, dev-only tsup bundler, Windows-dev-server vector)
+  exists; CI audits at --audit-level high so it does not gate — triage at the
+  next audit-cadence sweep.
+
+### NEXT — the human's two steps, then the next session
+
+1. **Human: pass the quiz FULLY** (all 5 — a miss means reread + retake),
+   then **name the merge** of PR #41. The agent never merges.
+2. **Post-merge session:** branch hygiene sweep (delete local+remote branch
+   after verifying squash content on main) → real-db verification (run any
+   conduit command against ~/.conduit; expect clean canary-verified open;
+   then delete `~/.conduit.bak-sdd-keylifecycle`) → optionally `conduit key
+   generate` on a scratch HOME as a smoke → then **§17 v1 step 2: daemon
+   ownership** — START WITH `superpowers:brainstorming` then
+   `writing-plans`; full load-bearing route. The idle-client stop-first gap
+   (accepted limit this step) is a step-2 design input: process detection
+   becomes possible once a daemon owns the db.
+
+### Session quirks worth inheriting
+
+- Subagent background test runs DIE when the subagent's turn ends — instruct
+  implementers to run ALL test commands in the FOREGROUND (T2 incident).
+- `:memory:` libsql + `client.transaction()` silently swaps to a fresh empty
+  db on the client's next use — atomicity tests MUST use file-backed temp
+  dbs; verify the test catches a mutation before trusting it (T2 discovery).
+- gh/codex/docker/vitest/pnpm-audit all need `dangerouslyDisableSandbox`;
+  `npx`/`pnpm exec` are BLOCKED by the sfw guard — use
+  `packages/<p>/node_modules/.bin/tsc` directly for typechecks.
+- codex 3-pass pattern held: the confirming pass on a FIX commit finds real
+  new findings in the reordered code — never skip it; re-pass prompts must
+  list fixed findings AND documented decisions or convergence never happens.
+
+### DEFERRED FOLLOW-UPS (carry; act where the trigger fires)
+
+New this session (full list with rationale in the SDD ledger §Follow-up):
+narrow probe catches to WebCrypto OperationError (a broken SecretBox
+currently presents as "wrong master key") · rotate boundary tests (keyless
+install; canary-only db) · heal existing ~/.conduit DIR perms (mkdir mode
+no-ops on existing 0755) · EACCES rotate test assumes non-root runner ·
+TOCTOU/symlink notes → future multi-user hardening pass · resolveEnv
+missing-key error suggests CONDUIT_MASTER_KEY which rotate itself refuses
+(cosmetic dead-end half) · idle-client stop-first gap → §17 step 2 design
+input · fault-injection fs seams for promote-failure + hygiene/dir-fsync
+warning arms (the documented test-depth deviation; promote-failure arm now
+explicitly part of that accepted set) · `conduit key import` (env→file
+migration; trigger: first real user asking).
+
+Carried unchanged from 2026-07-19/18 (see superseded sections below): PR #40
+consider-class items · Lane A DNS-preflight timeout + res.statusCode +
+McpBudget/McpSession refactors · Lane B rides (satisfies-never, version
+literals, 401 precision, http(s) at createMcpClient, orphaned legacy secret
+row) · short-expiry test PAT in ~/.conduit (user deletes or lets lapse) ·
+resume drops caller-supplied limits (P2) · isHostStackOverflow heuristic ·
+approve-demo.mjs retirement · Ajv pre-flight (D6) · isError trace-viewer
+filter · Aikido MCP not connected.
+
+### Session debrief (2026-07-20)
+
+https://claude.ai/code/artifact/db223229-62c7-4402-ab55-c08ea9b08eb4
+(full machine-readable trail in `.superpowers/sdd/progress-key-lifecycle.md`)
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: §17 v1 step 1 (credential key lifecycle) is BUILT on PR #41 —
+> full gauntlet passed, explainer/quiz linked on the PR. If the PR is
+> MERGED: do the post-merge sweep (branch hygiene; real-db canary-verified
+> open; delete ~/.conduit.bak-sdd-keylifecycle after verifying; scratch-HOME
+> generate smoke). If still OPEN: the only blockers are the human quiz +
+> human-named merge — do NOT re-run the gauntlet or re-review.**
+>
+> **THEN: §17 v1 step 2 — daemon ownership.** START WITH
+> `superpowers:brainstorming` then `writing-plans` (the idle-client
+> stop-first gap from step 1 is a design input: a db-owning daemon enables
+> real process detection). Full load-bearing route (branch → PR → Tier-2
+> both mechanics + /security-review + codex correctness pass + /explain-diff
+> quiz → HUMAN-NAMED merge). Carry the deferred follow-ups; act where
+> triggers fire.
+
+---
+
+## Superseded handoff — written 2026-07-19 (§17 v1 step 1 DESIGN + PLAN done and codex-CONVERGED on branch `feat/credential-key-lifecycle`; its NEXT TASK [build via SDD] was completed 2026-07-19/20 by the section above)
 
 ### Where things stand
 

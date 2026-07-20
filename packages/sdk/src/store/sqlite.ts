@@ -18,6 +18,7 @@ import type {
   Tool,
   TraceEvent,
 } from "../types.js";
+import { CANARY_REF, ensureKeyCanary, type StoreKeyContext } from "./key-lifecycle.js";
 import type { ConduitStore, ReplayJournalRow } from "./store.js";
 
 /**
@@ -30,6 +31,8 @@ export interface SqliteStoreOptions {
   client: Client;
   /** Encrypts SecretRepository contents at rest (spec §9.2). */
   secretBox: SecretBox;
+  /** Sanitized provenance for canary errors (db path + key source; design §2). NEVER key material. */
+  keyContext?: StoreKeyContext;
   /** Host-side sink for infra diagnostics (e.g. a WAL-pragma failure); NEVER guest-visible. */
   log?: (message: string) => void;
 }
@@ -254,6 +257,10 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       await client.execute("ALTER TABLE trace_events DROP COLUMN output");
     });
   }
+
+  // Design §2 (2026-07-19): wrong master key fails loud HERE, at open —
+  // not at the first secret decrypt. Every product bin routes through this.
+  await ensureKeyCanary(client, secretBox, options.keyContext);
 
   return {
     sources: {
@@ -598,6 +605,11 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
 
     secrets: {
       async put(ref: string, secret: string): Promise<void> {
+        if (ref === CANARY_REF) {
+          throw new Error(
+            `[SqliteStore] Secret ref "${ref}" is reserved for the key canary. Context: { ref: ${JSON.stringify(ref)} }`,
+          );
+        }
         const sealed = await secretBox.seal(secret);
         await client.execute({
           sql: `INSERT INTO secrets (ref, sealed, created_at) VALUES (?, ?, ?)
@@ -614,6 +626,11 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         return row === undefined ? undefined : secretBox.open(text(row, "sealed"));
       },
       async remove(ref: string): Promise<void> {
+        if (ref === CANARY_REF) {
+          throw new Error(
+            `[SqliteStore] Secret ref "${ref}" is reserved for the key canary. Context: { ref: ${JSON.stringify(ref)} }`,
+          );
+        }
         await client.execute({ sql: "DELETE FROM secrets WHERE ref = ?", args: [ref] });
       },
     },
@@ -629,6 +646,20 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       if (input.secret !== undefined && input.removeSecretRef !== undefined) {
         throw new Error(
           "[ConduitStore] provisionSource: `secret` and `removeSecretRef` are mutually exclusive.",
+        );
+      }
+      // INVARIANT §16.3: the canary ref is reserved for key-lifecycle's own
+      // raw-SQL access — same guard as secrets.put/remove, applied here too
+      // since provisionSource upserts/deletes secrets rows directly rather
+      // than going through the secrets repository.
+      if (input.secret?.ref === CANARY_REF) {
+        throw new Error(
+          `[ConduitStore] Secret ref "${CANARY_REF}" is reserved for the key canary. Context: { ref: ${JSON.stringify(CANARY_REF)} }`,
+        );
+      }
+      if (input.removeSecretRef === CANARY_REF) {
+        throw new Error(
+          `[ConduitStore] Secret ref "${CANARY_REF}" is reserved for the key canary. Context: { ref: ${JSON.stringify(CANARY_REF)} }`,
         );
       }
 

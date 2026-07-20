@@ -55,7 +55,7 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("--help → lists all three commands", () => {
+  it("--help → lists all four commands", () => {
     const result = dispatch(["--help"]);
     expect(result.kind).toBe("help");
     if (result.kind === "help") {
@@ -73,7 +73,7 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("-h → behaves like --help (lists all three commands)", () => {
+  it("-h → behaves like --help (lists all four commands)", () => {
     const result = dispatch(["-h"]);
     expect(result.kind).toBe("help");
     if (result.kind === "help") {
@@ -83,8 +83,8 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("COMMANDS contains exactly the three routed commands", () => {
-    expect(COMMANDS).toEqual(["serve", "add-mcp", "approvals"]);
+  it("COMMANDS contains exactly the four routed commands", () => {
+    expect(COMMANDS).toEqual(["serve", "add-mcp", "approvals", "key"]);
   });
 
   it("--help mentions add-mcp's flags (D5)", () => {
@@ -149,6 +149,25 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     expect(result.kind).toBe("help");
     if (result.kind === "help") {
       expect(result.stdout).toContain("--prefix");
+    }
+  });
+
+  it("routes `key` with its args", () => {
+    expect(dispatch(["key", "generate"])).toEqual({
+      kind: "route",
+      command: "key",
+      args: ["generate"],
+    });
+  });
+
+  it("`key --help`, `key generate --help`, `key rotate -h` print the family usage, exit 0", () => {
+    for (const argv of [
+      ["key", "--help"],
+      ["key", "generate", "--help"],
+      ["key", "rotate", "-h"],
+    ]) {
+      const result = dispatch(argv);
+      expect(result.kind).toBe("help");
     }
   });
 });

@@ -12,6 +12,7 @@ import type {
   SourceType,
   Tool,
 } from "../types.js";
+import { CANARY_REF } from "./key-lifecycle.js";
 import { openSqliteStore } from "./sqlite.js";
 import type { ConduitStore } from "./store.js";
 
@@ -545,10 +546,11 @@ describe("SqliteStore", () => {
           1,
         ],
       });
-      const reopened = await openSqliteStore({
-        client: legacy,
-        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
-      });
+      // Same key across both opens: a canary bootstrapped by the first open
+      // must verify on the second (a *different* random key would now be a
+      // legitimate wrong-key canary failure — not what this test exercises).
+      const secretBox = await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes());
+      const reopened = await openSqliteStore({ client: legacy, secretBox });
 
       // (a) the legacy output column is gone entirely — its absence is the
       // migration's completion marker.
@@ -564,10 +566,7 @@ describe("SqliteStore", () => {
 
       // (c) idempotent: a second reopen against the now-columnless table is
       // a no-op (the migration block is skipped) and does not throw.
-      const reopenedAgain = await openSqliteStore({
-        client: legacy,
-        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
-      });
+      const reopenedAgain = await openSqliteStore({ client: legacy, secretBox });
       const stillMasked = await reopenedAgain.trace.listByExecution("e1");
       expect(stillMasked[0]?.input).toEqual({ token: "[redacted]", repo: "hq" });
 
@@ -671,6 +670,30 @@ describe("SqliteStore", () => {
       await store.secrets.put("cred_x", "old");
       await store.secrets.put("cred_x", "new");
       expect(await store.secrets.reveal("cred_x")).toBe("new");
+    });
+
+    it("INVARIANT §16.3: put refuses the canary ref — a colliding put cannot corrupt the canary", async () => {
+      const before = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      await expect(store.secrets.put(CANARY_REF, "attacker-controlled")).rejects.toThrow(
+        /reserved for the key canary/,
+      );
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows[0]?.sealed).toBe(before.rows[0]?.sealed); // canary row untouched
+    });
+
+    it("INVARIANT §16.3: remove refuses the canary ref — the canary row survives", async () => {
+      await expect(store.secrets.remove(CANARY_REF)).rejects.toThrow(/reserved for the key canary/);
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows).toHaveLength(1); // canary row still present
     });
   });
 
@@ -1381,6 +1404,54 @@ describe("SqliteStore", () => {
       // secret still reveals, and no other chain rows were written.
       expect(await store.secrets.reveal("cred_v_old")).toBe("Bearer old-token");
       expect(await store.sources.get("src_v")).toBeUndefined();
+    });
+
+    it("INVARIANT §16.3: provisionSource refuses secret.ref === CANARY_REF — canary intact", async () => {
+      const before = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      await expect(
+        store.provisionSource({
+          source: { id: "src_canary1", type: "mcp", namespace: "canary1", location: "http://u" },
+          integration: { id: "int_canary1", sourceId: "src_canary1", namespace: "canary1" },
+          connection: {
+            id: "conn_canary1",
+            integrationId: "int_canary1",
+            prefix: "canary1.acme.prod",
+          },
+          secret: { ref: CANARY_REF, value: "attacker-controlled" },
+          tools: [tool({ name: "canary1.search", namespace: "canary1" })],
+        }),
+      ).rejects.toThrow(/reserved for the key canary/);
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows[0]?.sealed).toBe(before.rows[0]?.sealed);
+      expect(await store.sources.get("src_canary1")).toBeUndefined();
+    });
+
+    it("INVARIANT §16.3: provisionSource refuses removeSecretRef === CANARY_REF — canary intact", async () => {
+      await expect(
+        store.provisionSource({
+          source: { id: "src_canary2", type: "mcp", namespace: "canary2", location: "http://u" },
+          integration: { id: "int_canary2", sourceId: "src_canary2", namespace: "canary2" },
+          connection: {
+            id: "conn_canary2",
+            integrationId: "int_canary2",
+            prefix: "canary2.acme.prod",
+          },
+          removeSecretRef: CANARY_REF,
+          tools: [tool({ name: "canary2.search", namespace: "canary2" })],
+        }),
+      ).rejects.toThrow(/reserved for the key canary/);
+      const after = await client.execute({
+        sql: "SELECT sealed FROM secrets WHERE ref = ?",
+        args: [CANARY_REF],
+      });
+      expect(after.rows).toHaveLength(1);
+      expect(await store.sources.get("src_canary2")).toBeUndefined();
     });
 
     it("throws when both `secret` and `removeSecretRef` are provided (contract violation)", async () => {

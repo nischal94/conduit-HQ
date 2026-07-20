@@ -732,16 +732,23 @@ before Conduit&#39;s tools appear.</li>
 <p><strong><code>/mcp</code> stdio server onboarding (§17 build-order step 2 — see
 <code>packages/mcp/README.md</code> for the full walkthrough):</strong></p>
 <ol>
-<li><strong>Generate a master key</strong> — base64 encoding of exactly 32 random bytes:
-<code>node -e &quot;console.log(require('node:crypto').randomBytes(32).toString('base64'))&quot;</code>.</li>
+<li><strong>Generate a master key:</strong> <code>conduit key generate</code> mints
+<code>~/.conduit/master-key</code> (0600) — the default, file-based path. Refuses if a key file
+already exists, <code>CONDUIT_MASTER_KEY</code> is set, or the default db already holds sealed
+secrets under some other key. The raw base64-of-32-random-bytes one-liner —
+<code>node -e &quot;console.log(require('node:crypto').randomBytes(32).toString('base64'))&quot;</code>
+— remains the env-var alternative for containers/custom-path installs that manage the key via
+<code>CONDUIT_MASTER_KEY</code> instead of the key file.</li>
 <li><strong>Config snippet, honest pre-publish command:</strong> nothing is on npm yet, so the client
 config's <code>command</code>/<code>args</code> point at the built file directly — <code>node
-&lt;abs path&gt;/packages/mcp/dist/bin.js</code> — with <code>CONDUIT_MASTER_KEY</code> in its
-<code>env</code> block. Leave <code>CONDUIT_DB</code> out of the snippet: the built-in default
-already resolves to an absolute path via <code>homedir()</code>, and Node never expands
-<code>~</code>, so a literal <code>~/.conduit/conduit.db</code> in <code>env</code> would be
-read as relative to the client's own working directory and fail to start. <code>chmod 600</code>
-the client config file afterward — it now holds the master key.</li>
+&lt;abs path&gt;/packages/mcp/dist/bin.js</code>. For a default-path key generated via
+<code>conduit key generate</code>, the <code>env</code> block needs no
+<code>CONDUIT_MASTER_KEY</code> entry at all — the server resolves the key from
+<code>~/.conduit/master-key</code> automatically (env, when set, still overrides the file). Leave
+<code>CONDUIT_DB</code> out of the snippet: the built-in default already resolves to an absolute
+path via <code>homedir()</code>, and Node never expands <code>~</code>, so a literal
+<code>~/.conduit/conduit.db</code> in <code>env</code> would be read as relative to the client's
+own working directory and fail to start.</li>
 <li><strong>Onboard an upstream source</strong> so there's something to call:
 <code>conduit add-mcp --url &lt;upstream-mcp-url&gt; --namespace &lt;ns&gt; --prefix &lt;prefix&gt;</code>
 (fail-closed §10.2 policy defaults, so the walking skeleton can't strand on an unapproved pause
@@ -770,8 +777,8 @@ applies here too.</li>
 </tr>
 <tr>
 <td><code>CONDUIT_MASTER_KEY</code></td>
-<td>SecretBox key, base64 encoding of exactly 32 bytes. Required.</td>
-<td>none (required)</td>
+<td>SecretBox key, base64 encoding of exactly 32 bytes.</td>
+<td>optional when <code>~/.conduit/master-key</code> exists (env overrides file)</td>
 </tr>
 <tr>
 <td><code>CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS</code></td>
@@ -789,8 +796,8 @@ applies here too.</li>
 <li><strong><code>/mcp</code> troubleshooting:</strong> tools don't appear → restart the client (macOS
 Claude Desktop server logs: <code>~/Library/Logs/Claude/mcp-server-*.log</code>); egress blocked → set
 <code>CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1</code> for a loopback/demo upstream (the agent-visible
-error deliberately doesn't name this var); a wrong master key fails at first secret decrypt, not
-startup; a call that timed out may have finished — pass a <code>requestKey</code> to
+error deliberately doesn't name this var); a wrong master key fails at STARTUP (the key canary
+verified during store open), not at first secret decrypt; a call that timed out may have finished — pass a <code>requestKey</code> to
 <code>execute</code> and recover the outcome via <code>check_execution</code>; back up the single
 SQLite database file before upgrading; v1 calls MCP-over-HTTP upstreams only.</li>
 </ul>
@@ -817,7 +824,14 @@ conduit trace [list|show &lt;run_id&gt;]      # observability (Conduit addition)
 <li><strong>Sandboxed execution</strong> (QuickJS) for all tool code.</li>
 <li><strong>Credential-boundary invariant</strong> (§9.2): host-side resolution, outbound-only injection,
 four exclusion zones, reference-not-secret in the sandbox.</li>
-<li><strong>Secrets encrypted at rest</strong> (master key, operator-manageable).</li>
+<li><strong>Secrets encrypted at rest</strong> (master key, operator-manageable). Key lifecycle
+(§16.3): the master key lives at <code>~/.conduit/master-key</code> (0600) with an env-var
+override; a startup canary fails loud on a wrong key before any tool call runs; <code>conduit key
+generate</code>/<code>rotate</code> mint and re-seal it; rotation is stop-first (stop all conduit
+processes and MCP clients before running) and re-seals every stored secret in one transaction;
+crash recovery is a manual procedure over <code>master-key.bak</code>/<code>master-key.next</code>;
+and the db file and key file are always backed up together — a db backup only pairs with the key
+that was live when it was taken.</li>
 <li><strong>Per-tool + input-aware policy</strong> gating every call (allow/approval/block).</li>
 <li><strong>SSRF control</strong>: private-network egress off by default.</li>
 <li><strong>Sandbox resource limits</strong>: per-execution wall-clock timeout, memory ceiling, and
@@ -913,9 +927,10 @@ pagination and basic indexed filters (time/execution/tool/verdict; no FTS). NEVE
 unredacted <code>replay_journal</code> (§18). Escaped rendering + CSP. NO export and NO
 retention/GC (both stay deferred, below); a durable local store SHOULD offer a confirmed manual purge
 that preserves pending executions + replay data.</li>
-<li><strong>Prerequisite — verify credential key lifecycle.</strong> Secrets-at-rest is built
-(SecretBox); before external users store real credentials, confirm the master-key generation, file
-permissions, and a defined recovery/rotation story (§16.3, Phase 0).</li>
+<li><strong>Prerequisite — verify credential key lifecycle. ✅ BUILT</strong> (2026-07-19 design,
+<code>docs/superpowers/specs/2026-07-19-credential-key-lifecycle-design.md</code>). Master-key
+generation, file permissions, and the recovery/rotation story are now product behavior, pinned by
+the §16.3 rows in <code>INVARIANTS.md</code>.</li>
 </ul>
 
 <p><strong>Deferred OUT of v1</strong> (each follows from the local/loopback/single-user scope):
