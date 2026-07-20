@@ -129,9 +129,8 @@ filter · Aikido MCP not connected.
 
 ### Session debrief (2026-07-20)
 
-(published at session end — see the debrief artifact link in the final chat
-summary; full machine-readable trail in
-`.superpowers/sdd/progress-key-lifecycle.md`)
+https://claude.ai/code/artifact/db223229-62c7-4402-ab55-c08ea9b08eb4
+(full machine-readable trail in `.superpowers/sdd/progress-key-lifecycle.md`)
 
 ### KICKOFF PROMPT for the next session
 
