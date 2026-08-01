@@ -40,8 +40,30 @@ protective purpose is spent. **NEXT SESSION: go straight to §17 v1 step 2
 (daemon ownership)** — the "If MERGED / If OPEN" branching in the kickoff
 below is RESOLVED: merged, sweep done.
 
+**DOGFOOD WIRING (2026-08-01, user-directed):** Conduit is now the daily
+credential boundary for both clients. Claude Code: fresh user-scope MCP
+entry (`claude mcp add --scope user conduit -- node <repo>/packages/cli/
+dist/bin.js serve`) — verified `✔ Connected` with ZERO env config (key-file
+resolution + canary, the #41 payoff live). Claude Desktop: conduit entry's
+env block DELETED (`CONDUIT_MASTER_KEY` obsolete; the gate-one
+`CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1` relic removed so §9.3 is active for
+real upstreams); backup at `claude_desktop_config.json.bak-pre-dogfood` —
+delete it once Desktop is confirmed working. The `rm -rf
+~/.conduit.bak-sdd-keylifecycle` step above was completed by the user
+2026-07-20. USER'S REMAINING STEP (own terminal; fresh scoped PAT): re-run
+`add-mcp --replace` for `github` (with CONDUIT_ADD_SECRET) and `context7`
+per packages/cli/README.md — the db's sources still point at dead gate-one
+ports until then. Serve runs from dist: REBUILD (`pnpm -r build`) after
+every merge until §17 step 7 (service lifecycle).
+
+### DOGFOOD FRICTION LOG (append one line per snag; feed into §17 steps 5–6 design)
+
+- 2026-08-01 · no CLI verb to REMOVE a source/namespace — `--replace` only
+  retargets; the stale gate-one namespaces are unremovable without sqlite
+  surgery. Console (step 5) or an `add-mcp --remove` needs this.
+
 The section below is the as-written state at PR-open time (kept for the
-record; its NEXT/kickoff superseded by the paragraph above).
+record; its NEXT/kickoff superseded by the paragraphs above).
 
 ### Where things stand
 
