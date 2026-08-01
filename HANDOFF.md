@@ -62,6 +62,12 @@ every merge until §17 step 7 (service lifecycle).
 - 2026-08-01 · no CLI verb to REMOVE a source/namespace — `--replace` only
   retargets; the stale gate-one namespaces are unremovable without sqlite
   surgery. Console (step 5) or an `add-mcp --remove` needs this.
+- 2026-08-01 · secret intake depends on operator shell discipline —
+  CONDUIT_ADD_SECRET must be threaded via `read -s`/Keychain by hand; the
+  CLI should own it (interactive silent prompt or `--secret-stdin`), so the
+  token never rides a user-managed env var. Surfaced by the user asking
+  "is even the terminal safe?" — the right question, and the product
+  should be the one answering it.
 
 The section below is the as-written state at PR-open time (kept for the
 record; its NEXT/kickoff superseded by the paragraphs above).
