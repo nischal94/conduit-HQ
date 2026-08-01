@@ -47,8 +47,9 @@ dist/bin.js serve`) — verified `✔ Connected` with ZERO env config (key-file
 resolution + canary, the #41 payoff live). Claude Desktop: conduit entry's
 env block DELETED (`CONDUIT_MASTER_KEY` obsolete; the gate-one
 `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1` relic removed so §9.3 is active for
-real upstreams); backup at `claude_desktop_config.json.bak-pre-dogfood` —
-delete it once Desktop is confirmed working. The `rm -rf
+real upstreams); Desktop restart CONFIRMED connected (mcp log,
+2026-08-01) and the pre-dogfood config backup deleted — the master key now
+exists in exactly one place: `~/.conduit/master-key` (0600). The `rm -rf
 ~/.conduit.bak-sdd-keylifecycle` step above was completed by the user
 2026-07-20. USER'S REMAINING STEP (own terminal; fresh scoped PAT): re-run
 `add-mcp --replace` for `github` (with CONDUIT_ADD_SECRET) and `context7`
