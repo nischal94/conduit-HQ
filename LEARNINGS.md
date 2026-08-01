@@ -1754,3 +1754,23 @@ carry an explicit ALL-COMMANDS-FOREGROUND instruction. Same session, second
 process lesson: the confirming codex pass on a FIX commit found three real
 new defects in the reordered code — a re-pass after fixes is discovery, not
 ceremony.
+
+## 2026-08-01 — Dogfood wiring session (addendum)
+
+### 7. Operational advice has no review net — verify the CONSUMER, not just the issuer
+
+Recommending a fine-grained GitHub PAT for the hosted MCP gateway cost a
+wasted mint and a debugging detour: the gateway rejects that token class
+outright (blanket 401), a constraint present in training knowledge and
+retrievable in one docs check — but the recommendation was made on the
+general least-privilege default without asking "does the consumer accept
+this credential format?". Every project quality gate watches code; chat-
+surface operational guidance is reviewed by nobody. The rule that was
+already on file ("audit recommendations adversarially; verify before
+asserting") applies to the agent's own advice, not just external advice.
+Concrete check promoted: before recommending any credential/config format,
+name the consumer and verify its accepted formats (docs or an existing
+working example — the July dogfood PAT was evidence on disk the whole
+time). Fail-forward note: the detour surfaced two real product findings
+(indistinguishable 401 classes; CLI-owned secret intake) — the friction
+log works.
