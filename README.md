@@ -40,27 +40,24 @@ flowchart LR
     end
     subgraph Conduit[Conduit gateway]
         C[Catalog + search]
+        S[QuickJS sandbox<br/>runs the execution,<br/>hard resource limits]
         P[Policy engine<br/>allow / approve / block]
-        S[QuickJS sandbox<br/>resource limits]
         B[Credential boundary<br/>sealed secrets, edge injection]
         E[Egress guard<br/>resolved-IP pinning]
         T[Trace<br/>write-time redaction]
     end
-    subgraph Upstreams
-        U1[GitHub MCP]
-        U2[Context7 MCP]
-        U3[Your MCP servers]
-    end
-    A1 & A2 & A3 -->|MCP stdio| C --> P --> S --> B --> E -->|streamable HTTP| U1 & U2 & U3
-    P -.paused calls.-> Q[Approval queue<br/>conduit approvals]
-    S -.every call.-> T
+    A1 & A2 & A3 -->|MCP stdio| C
+    C --> S
+    S -->|each tool call| P --> B --> E -->|streamable HTTP| U[Upstream MCP servers<br/>GitHub · Context7 · yours]
+    P -.paused.-> Q[Approval queue<br/>conduit approvals]
+    E -->|call outcome, recorded| T
 ```
 
 Agents see a deliberately small MCP surface: search the catalog, execute a
 tool. Progressive disclosure keeps a 40-tool upstream from flooding an
-agent's context. Between "execute" and the upstream, every call crosses the
-policy engine, the sandbox, the credential boundary, and the egress guard —
-and lands in the trace.
+agent's context. Execution runs inside the sandbox; every tool call it
+makes crosses the policy engine, the credential boundary, and the egress
+guard on its way out, and its outcome is recorded in the trace.
 
 ## Quick start
 
@@ -85,20 +82,20 @@ env var — never a flag, so it stays out of argv and shell history — and is
 SecretBox-encrypted at rest:
 
 ```bash
-CONDUIT_ADD_SECRET=<token> conduit add-mcp \
+CONDUIT_ADD_SECRET=YOUR_TOKEN conduit add-mcp \
   --url https://api.githubcopilot.com/mcp/ \
   --namespace github --prefix github.personal
 ```
 
 `add-mcp` fetches the upstream's tool list first and writes nothing unless
-that succeeds, then reports each tool's risk class and its fail-closed
-policy default: `safe (auto-allow) · review (approval) · destructive
+that succeeds, then reports a count per risk class with the fail-closed
+policy defaults: `safe (auto-allow) · review (approval) · destructive
 (approval)`.
 
 **3. Point any MCP client at the gateway.** For Claude Code:
 
 ```bash
-claude mcp add --scope user conduit -- node <abs-path>/packages/cli/dist/bin.js serve
+claude mcp add --scope user conduit -- node ABS_PATH/packages/cli/dist/bin.js serve
 ```
 
 or in a client's JSON config:
@@ -108,7 +105,7 @@ or in a client's JSON config:
   "mcpServers": {
     "conduit": {
       "command": "node",
-      "args": ["<abs-path>/packages/cli/dist/bin.js", "serve"]
+      "args": ["ABS_PATH/packages/cli/dist/bin.js", "serve"]
     }
   }
 }
@@ -121,11 +118,12 @@ it's waiting; you decide from your terminal:
 
 ```bash
 conduit approvals list              # oldest-first queue: id · tool · waiting-since · expiry
-conduit approvals approve <execId>  # or: deny <execId>
+conduit approvals approve EXEC_ID   # or: deny EXEC_ID
 ```
 
-Verified live against real upstreams: GitHub's 44-tool MCP surface and
-Context7, end to end through the boundary.
+Verified live against real upstreams (2026-08-03 dogfood run, recorded in
+[`HANDOFF.md`](HANDOFF.md)): GitHub's MCP surface (44 tools) and Context7,
+end to end through the boundary with a sealed credential.
 
 ## What's enforced (not promised)
 
@@ -150,7 +148,7 @@ commit.
 | `conduit serve` | Run the stdio MCP gateway (same startup as the `conduit-mcp` bin) |
 | `conduit add-mcp` | Onboard or re-sync an upstream MCP source (`--replace` to retarget, `--clear-credential` to deauth) |
 | `conduit approvals list` | Show the pending approval queue |
-| `conduit approvals approve\|deny <execId>` | Decide a paused call; exit codes track the decision |
+| `conduit approvals approve\|deny EXEC_ID` | Decide a paused call; exit codes track the decision |
 | `conduit key generate` | Mint the master key (refuses to overwrite) |
 | `conduit key rotate` | Rotate the key and re-seal every credential in one transaction, with crash recovery |
 
