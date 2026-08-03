@@ -30,9 +30,9 @@
 # 4. [DONE — verified 2026-07-03 via gh api] Default GITHUB_TOKEN is
 #    read-only repo-wide, can_approve_pull_request_reviews=false (the
 #    permissions block below also enforces it per-workflow).
-# 5. BEFORE GOING PUBLIC: sweep HANDOFF.md and LEARNINGS.md (and their
-#    git history) for internal details — strip or relocate session docs.
-#    Work this alongside items 2-3 the day the repo goes public.
+# 5. [DONE 2026-08-03] Full-history privacy audit passed; HANDOFF.md and
+#    LEARNINGS.md stay public by decision (spec §18) under the CLAUDE.md
+#    public-safe writing rule. Items 2-3 completed at the public flip.
 name: CI
 
 on:
