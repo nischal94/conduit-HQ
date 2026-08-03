@@ -42,6 +42,21 @@ this update onward. Remaining human leisure items: npm `conduithq` org
 reservation; ci.yml checklist item-5 edit (text in PR #42 body).
 **This HANDOFF update doubles as the push-docs probe under protection.**
 
+**SESSION CLOSEOUT (same day, later):** two follow-up PRs merged
+(human-named): **#43 README v2** — seasoned front door (why → mermaid
+architecture diagram → quick start with only verified commands →
+"enforced, not promised" invariants table → CLI/layout tables → roadmap);
+4 review findings (Greptile ×2, CodeRabbit ×2) fixed pre-merge, incl. an
+inaccurate sandbox/trace diagram and shell-unsafe placeholders. **#44 ci
+checklist item 5 closed** (human-authored edit; workflow files stay
+agent-read-only). Fork-PR approval policy API-confirmed
+(`first_time_contributors`). Dependabot: ZERO open alerts — the post-flip
+re-scan against the fixed lockfile cleared the set (the "moderate
+@hono/node-server" record answers stale-open by number but is absent from
+the live list; its dismissal rationale is preserved above if it ever
+regenerates). Branches = main only; dists rebuilt at `6eab753`. LAST
+remaining human item: reserve the `conduithq` npm org.
+
 ### Where things stand
 
 - **PR #42 (`docs/open-source-preflight`) is OPEN** — the one-PR preflight
