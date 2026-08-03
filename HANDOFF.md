@@ -139,7 +139,34 @@ record; its NEXT/kickoff superseded by the paragraphs above).
   exists; CI audits at --audit-level high so it does not gate — triage at the
   next audit-cadence sweep.
 
-### NEXT — the human's two steps, then the next session
+### DECIDED 2026-08-03 (user, in-session): OPEN-SOURCE THE REPO — preflight session comes BEFORE daemon ownership
+
+Three decisions, made explicitly by the user (record in spec §18 as the
+preflight PR's first commit): (1) **flip conduit-HQ public AS-IS with full
+history**, gated on a privacy audit of that history (secrets already proven
+clean by CI's full-history gitleaks; the audit targets PERSONAL-OPERATIONAL
+material — machine paths, incident narratives, private artifact URLs —
+categorized with exact locations so the final flip is evidence-based);
+(2) **HANDOFF/LEARNINGS stay in the public repo** with a codified
+public-safe writing rule from the flip onward (no machine paths, no
+personal URLs; rule lands in project CLAUDE.md); (3) **Apache-2.0**.
+
+### NEXT SESSION — open-source preflight (ONE session, then flip)
+
+One PR carrying: spec §18 decision record · LICENSE (Apache-2.0) ·
+SECURITY.md (vuln-reporting policy — non-negotiable for a security
+product) · CONTRIBUTING.md · public-front-door README rewrite ·
+CLAUDE.md public-safe-writing rule. Plus: the full-history privacy audit
+(report to the user; flip only on their explicit go after reading it) ·
+work `.github/ci.draft.yml`'s ACTIVATION CHECKLIST (branch protection +
+required checks become available on the public repo — commit-routing
+rules already anticipate this; verify scripts/push-docs still works under
+protection or route HANDOFF pushes through it) · npm package-name check
+(reserve if needed) · THEN the human flips visibility in GitHub settings
+(agent never does). Daemon ownership (§17 step 2) moves to the session
+after.
+
+### The human's two steps, then the next session (COMPLETED 2026-07-20/08-03: merged 983be17; dogfood wiring live)
 
 1. **Human: pass the quiz FULLY** (all 5 — a miss means reread + retake),
    then **name the merge** of PR #41. The agent never merges.
