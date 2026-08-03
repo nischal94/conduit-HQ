@@ -23,7 +23,24 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-03 (OPEN-SOURCE PREFLIGHT DONE on PR #42; flip gated on the human reading the audit + flip-day settings steps; next after flip: §17 v1 step 2 daemon ownership)
+## Current handoff — updated 2026-08-03 (REPO IS PUBLIC: PR #42 merged, flip executed same session; next: §17 v1 step 2 daemon ownership)
+
+**FLIP COMPLETE (2026-08-03, same session, human-executed):** the human read
+the audit (independently re-verified by the agent: identities, paths,
+emails, IPs, screenshots all re-checked against history), ran the
+dependency bump (fast-uri 3.1.5, postcss 8.5.25 — cleared the 3 HIGH
+advisories that had turned CI's audit gate red mid-session), named the
+merge (PR #42 squash → main `2046e0c`, trailer-free), and flipped
+visibility. Verified from outside: public, Apache-2.0 detected, README
+front door + SECURITY.md live. **Branch protection ON** (5 required
+checks, strict up-to-date, enforce_admins=false, no force-push/deletions
+— API-verified). Fork-PR first-contributor approval + the moderate
+@hono/node-server dismissal (rationale: serve-static unused) were handed
+to the human as UI steps. Post-merge sweep done: branches = main only,
+dists rebuilt. The public-safe writing rule (CLAUDE.md) is ACTIVE from
+this update onward. Remaining human leisure items: npm `conduithq` org
+reservation; ci.yml checklist item-5 edit (text in PR #42 body).
+**This HANDOFF update doubles as the push-docs probe under protection.**
 
 ### Where things stand
 
