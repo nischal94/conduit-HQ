@@ -23,7 +23,80 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-07-20 (§17 v1 step 1 MERGED: PR #41 squash → main `983be17`, post-merge sweep DONE; next: §17 v1 step 2 daemon ownership)
+## Current handoff — updated 2026-08-03 (OPEN-SOURCE PREFLIGHT DONE on PR #42; flip gated on the human reading the audit + flip-day settings steps; next after flip: §17 v1 step 2 daemon ownership)
+
+### Where things stand
+
+- **PR #42 (`docs/open-source-preflight`) is OPEN** — the one-PR preflight
+  exactly as decided 2026-08-03: spec §18 decision record (first commit;
+  also fixed the stale `License: MIT` spec-header line to Apache-2.0) ·
+  LICENSE (Apache-2.0) · SECURITY.md (private advisories, SLOs, scope =
+  §9.2/§9.3/§10/§11/§16) · CONTRIBUTING.md · root README.md (new — none
+  existed) · CLAUDE.md public-safe-writing rule (effective from the flip).
+- **Full-history privacy audit COMPLETE (171 commits): SAFE TO FLIP AS-IS;
+  nothing at should-not-publish level.** Four conscious-accept items
+  reported to the human in-session: ~38 private claude.ai artifact URLs in
+  HANDOFF/history/commit messages (dead links to outsiders); the handled
+  demo-key incident narrative; master-key/PAT-location prose in the
+  dogfood-wiring section; competitor screenshots in history blobs. Commit
+  author identity is the GitHub noreply address (fine). No absolute
+  machine paths, no personal emails, no other-project references anywhere
+  in history.
+- **npm check:** `@conduithq/cli|sdk|mcp` all 404 (unpublished, free);
+  the `conduithq` org/scope itself couldn't be confirmed anonymously
+  (403/401) — reserving it = creating the npm org (user step).
+- **Dependabot: 4 open alerts on main** (surfaced at push): fast-uri ×2
+  HIGH (runtime, via ajv ← @modelcontextprotocol/sdk — low impact: §9.3
+  egress checks the resolved pinned IP, not fast-uri parsing); postcss
+  HIGH (dev-only via tsup, GitHub mislabels scope); @hono/node-server
+  MODERATE (Windows serve-static; Conduit serves nothing static).
+  Per-advisory triage/bump BEFORE or shortly after flip (project rule:
+  deliberate triage, never bot merges; installs in user terminal).
+- `.github/workflows/ci.yml` is agent-read-only on this machine — the
+  checklist item-5 update must be applied by the human (exact text below).
+
+### The human's steps (in order)
+
+1. **Read the privacy audit** (in the 2026-08-03 session report/debrief);
+   accept or redline the four items.
+2. **Review + merge PR #42** (docs-only; CI + CodeRabbit; agent never
+   merges).
+3. **Apply the ci.yml checklist edit** (item 5): mark it DONE 2026-08-03 —
+   audit complete, HANDOFF/LEARNINGS stay public by §18 decision with the
+   CLAUDE.md writing rule; note flip-day remainder = items 2–3.
+4. **Flip visibility to public** in GitHub settings, then same day:
+   checklist item 2 (first-contributor approval for fork PRs) and item 3
+   (branch protection: require the five checks, branches up-to-date,
+   admin bypass ON so scripts/push-docs keeps working).
+5. **Reserve the `conduithq` npm org** (user account, own terminal).
+6. **Dependabot triage** per above (bump fast-uri/ajv chain + tsup's
+   postcss on a reviewed-lockfile PR, or per-advisory dismiss with
+   rationale).
+
+### NEXT SESSION — §17 v1 step 2: daemon ownership
+
+START WITH `superpowers:brainstorming` then `writing-plans` (the
+idle-client stop-first gap from step 1 is a design input: a db-owning
+daemon enables real process detection). Full load-bearing route (branch →
+PR → Tier-2 both mechanics + /security-review + codex correctness pass +
+/explain-diff quiz → HUMAN-NAMED merge). Carry the deferred follow-ups
+below; act where triggers fire. Remember: serve runs from dist — REBUILD
+(`pnpm -r build`) after every merge until §17 step 7.
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: the open-source preflight is DONE (PR #42; audit verdict: safe
+> to flip). If PR #42 is merged and the repo is public, verify branch
+> protection is on and push-docs still works, then go to §17 v1 step 2 —
+> daemon ownership (brainstorm → plan → full load-bearing route). If #42
+> is still open, the blockers are human steps (audit read, merge, flip) —
+> do NOT redo the audit or the docs.**
+
+---
+
+## Superseded handoff — updated 2026-07-20 (§17 v1 step 1 MERGED: PR #41 squash → main `983be17`, post-merge sweep DONE; its NEXT was displaced by the 2026-08-03 open-source decision, executed above)
 
 **MERGE + SWEEP UPDATE (same day, same session):** the human named the merge
 → PR #41 squash-merged → **main is `983be17`** (trailer-free verified). A

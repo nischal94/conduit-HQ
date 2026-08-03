@@ -15,6 +15,28 @@
   only in chat does not exist — spec §18 for product decisions, this
   file for rules, HANDOFF.md for state.
 
+## Public-safe writing (repo is public from the 2026-08 flip onward)
+
+Everything committed here — HANDOFF.md, LEARNINGS.md, commit messages,
+docs — is published. From the visibility flip onward (§18 decision,
+2026-08-03):
+
+- **No machine-specific paths.** Write `~/.conduit/...` or
+  `<repo>/packages/...`, never an absolute `/Users/<name>/...` path or
+  other host-layout detail beyond the product's documented defaults.
+- **No personal URLs.** No `claude.ai/code/artifact/...` links or other
+  private/session URLs in committed files or commit messages — session
+  debrief artifacts are referenced by title/date only ("debrief published
+  2026-08-03"), with the URL kept in chat or private notes.
+- **No personal-operational narrative** that maps the maintainer's real
+  machine or accounts: where live keys/backups/PATs sit on the dev box,
+  local client wiring specifics, schedule details. Incident write-ups stay
+  (honesty is the point) but are written product-relative, not
+  machine-relative.
+- History predating the flip was audited and consciously accepted as-is
+  (2026-08-03 privacy audit); the rule is forward-looking, not a license
+  to rewrite history.
+
 ## Spec files: HTML is the source of truth
 
 `conduitspec.html` is the source. `conduitspec.md` is a derived, text-only copy
