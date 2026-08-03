@@ -54,8 +54,14 @@ agent-read-only). Fork-PR approval policy API-confirmed
 re-scan against the fixed lockfile cleared the set (the "moderate
 @hono/node-server" record answers stale-open by number but is absent from
 the live list; its dismissal rationale is preserved above if it ever
-regenerates). Branches = main only; dists rebuilt at `6eab753`. LAST
-remaining human item: reserve the `conduithq` npm org.
+regenerates). Branches = main only; dists rebuilt at `6eab753`. **PR #45 (owner-review
+follow-up, agent-merged on explicit delegation):** Mermaid diagram replaced
+with a renderer-safe plain-text one (raw flowchart source was visible
+outside github.com), Status & roadmap section removed (internal sequencing
+is not adopter-relevant), test counts + built-in-the-open section dropped.
+Standing README rule from this review: no renderer-dependent markup, no
+internal status/roadmap broadcast on the public front door. LAST remaining
+human item: reserve the `conduithq` npm org.
 
 ### Where things stand
 
