@@ -2,7 +2,7 @@
 
 **Product:** Conduit — the open-source integration layer for AI agents.
 **Domain:** useconduithq.com · **npm scope:** `@conduithq/*` · **CLI binary:** `conduit`
-**License:** MIT (open-core; hosted Cloud is the commercial layer)
+**License:** Apache-2.0 (decided 2026-08-03, §18; open-core — hosted Cloud is the commercial layer)
 **Status:** For review.
 
 ---
