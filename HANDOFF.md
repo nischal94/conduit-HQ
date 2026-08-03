@@ -234,6 +234,14 @@ https://claude.ai/code/artifact/db223229-62c7-4402-ab55-c08ea9b08eb4
 > generate smoke). If still OPEN: the only blockers are the human quiz +
 > human-named merge — do NOT re-run the gauntlet or re-review.**
 >
+> **FIRST (decided 2026-08-03, supersedes the line below): the
+> OPEN-SOURCE PREFLIGHT session** — see "NEXT SESSION — open-source
+> preflight" above: one PR (spec §18 record, Apache-2.0 LICENSE,
+> SECURITY.md, CONTRIBUTING.md, README front door, CLAUDE.md public-safe
+> rule) + full-history privacy audit reported to the human + ci.draft
+> ACTIVATION CHECKLIST; the human flips visibility on their explicit go
+> after reading the audit. ONLY THEN:
+>
 > **THEN: §17 v1 step 2 — daemon ownership.** START WITH
 > `superpowers:brainstorming` then `writing-plans` (the idle-client
 > stop-first gap from step 1 is a design input: a db-owning daemon enables
