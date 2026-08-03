@@ -1774,3 +1774,30 @@ working example — the July dogfood PAT was evidence on disk the whole
 time). Fail-forward note: the detour surfaced two real product findings
 (indistinguishable 401 classes; CLI-owned secret intake) — the friction
 log works.
+
+## 2026-08-03 — Open-source preflight session (PR #42)
+
+### 1. A "derived copy" can contradict a decision the source never recorded
+
+The spec header still said `License: MIT` five days after Apache-2.0 was
+decided — the decision had lived only in HANDOFF/chat. Recording a decision
+means grepping the spec for statements the decision falsifies, not just
+appending the new §18 entry. The stale line was found by accident (reading
+the intro for README material), not by process.
+
+### 2. A privacy audit is cheap when the hygiene was continuous
+
+171 commits audited in one background-agent pass with a clean verdict
+because the scars (no secrets in repo, noreply commit identity, no personal
+paths) had been enforced all along. The only conscious-accept residue is
+exactly the material no rule governed yet: private artifact URLs and
+operational narrative — which is why the public-safe writing rule now
+exists in CLAUDE.md rather than as an audit-day cleanup.
+
+### 3. Going public turns silent facts into surfaces
+
+The push output surfaced 4 open Dependabot alerts nobody had looked at —
+invisible while private, reputation-relevant the moment the repo is public.
+"Flip visibility" is not a settings toggle; it re-scopes every open alert,
+dead link, and TODO into public product surface. The flip checklist must
+sweep those, not just add the missing files.
