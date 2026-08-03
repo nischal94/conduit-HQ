@@ -62,6 +62,23 @@ every merge until §17 step 7 (service lifecycle).
 - 2026-08-01 · no CLI verb to REMOVE a source/namespace — `--replace` only
   retargets; the stale gate-one namespaces are unremovable without sqlite
   surgery. Console (step 5) or an `add-mcp --remove` needs this.
+- 2026-08-03 · github + context7 namespaces LIVE end-to-end (44 + 2 tools;
+  verified via sandboxed get_commit with the sealed classic PAT). Two finds
+  from the wiring: Conduit's upstream-401 message can't distinguish
+  invalid-token / unsupported-token-class / insufficient-grant — needs
+  differentiated guidance; catalog search ranked `list_repository_collaborators`
+  first for "get repository details" (relevance miss, step-6 data point).
+- 2026-08-03 · SECRET INTAKE IS THE #1 FRICTION so far: SIX consecutive
+  failed intakes of one PAT (silent read -s swallow ×2, clipboard raced by
+  instruction-copying ×3, Keychain locked-refusal ×1) before a visible-paste
+  `cat >` flow landed it. Root cause is structural: the operator's clipboard
+  is one register fought over by the token and the instructions, and every
+  blind prompt hides the loss. `add-mcp` must own intake: interactive
+  visible-length prompt or `--secret-stdin`, with shape validation (length +
+  ghp_/known prefixes) BEFORE any network call — the HTTP 400-vs-401 noise
+  all came from sealing junk. GitHub-MCP nuance for the docs: the gateway
+  400s a malformed bearer and 401s a wrong-but-well-formed one; fine-grained
+  PATs are rejected as a class (classic `repo` PAT is the supported shape).
 - 2026-08-01 · secret intake depends on operator shell discipline —
   CONDUIT_ADD_SECRET must be threaded via `read -s`/Keychain by hand; the
   CLI should own it (interactive silent prompt or `--secret-stdin`), so the
