@@ -1801,3 +1801,12 @@ invisible while private, reputation-relevant the moment the repo is public.
 "Flip visibility" is not a settings toggle; it re-scopes every open alert,
 dead link, and TODO into public product surface. The flip checklist must
 sweep those, not just add the missing files.
+
+### 4. A by-ID record can outlive the truth — verify against the listing
+
+Post-flip, the agent twice sent the human hunting for Dependabot alert #8:
+the by-number API record still answered "open" while the live list (and the
+human's screen) correctly showed zero — the public-flip re-scan had rebuilt
+the alert set. When a human's observation contradicts a cached individual
+record, re-query the authoritative collection before insisting. The human's
+"always verify before telling me" was the correct protocol, stated better.
