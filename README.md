@@ -31,33 +31,21 @@ traced. **The whole idea: make the safe path the easy path.**
 
 ## How it works
 
-```mermaid
-flowchart LR
-    subgraph Agents
-        A1[Claude Code]
-        A2[Claude Desktop]
-        A3[Any MCP client]
-    end
-    subgraph Conduit[Conduit gateway]
-        C[Catalog + search]
-        S[QuickJS sandbox<br/>runs the execution,<br/>hard resource limits]
-        P[Policy engine<br/>allow / approve / block]
-        B[Credential boundary<br/>sealed secrets, edge injection]
-        E[Egress guard<br/>resolved-IP pinning]
-        T[Trace<br/>write-time redaction]
-    end
-    A1 & A2 & A3 -->|MCP stdio| C
-    C --> S
-    S -->|each tool call| P --> B --> E -->|streamable HTTP| U[Upstream MCP servers<br/>GitHub · Context7 · yours]
-    P -.paused.-> Q[Approval queue<br/>conduit approvals]
-    E -->|call outcome, recorded| T
+```text
+Claude Code    ┐                                              ┌▶ GitHub MCP
+Claude Desktop ├─ MCP ─▶  Conduit gateway  ─ streamable HTTP ─┼▶ Context7
+any MCP client ┘          catalog · sandbox · policy          └▶ your servers
+                          credentials · egress · trace
 ```
 
 Agents see a deliberately small MCP surface: search the catalog, execute a
-tool. Progressive disclosure keeps a 40-tool upstream from flooding an
-agent's context. Execution runs inside the sandbox; every tool call it
-makes crosses the policy engine, the credential boundary, and the egress
-guard on its way out, and its outcome is recorded in the trace.
+tool. Execution runs inside a QuickJS sandbox with hard resource limits;
+every tool call it makes crosses the policy engine
+(allow / require-approval / block), the credential boundary (secrets sealed
+at rest, injected only at the gateway edge), and the fail-closed egress
+guard on its way out — and its outcome lands in the trace, secrets redacted
+at write time. Paused calls wait in an approval queue you decide from your
+terminal.
 
 ## Quick start
 
@@ -170,30 +158,14 @@ Full flag reference and recovery procedures: [`packages/cli/README.md`](packages
 ```bash
 pnpm install --frozen-lockfile --ignore-scripts   # build scripts are default-deny
 pnpm -r build
-pnpm -r test          # sdk 444 · mcp 56 · cli 105
+pnpm -r test
 pnpm lint && pnpm typecheck
 ```
 
 CI runs the same five checks required on `main`. Dependency policy, commit
 conventions, and the review pipeline: [CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Status & roadmap
-
-Pre-1.0. The MVP core (catalog, policy, sandbox, boundary, trace, real
-streamable-HTTP upstreams) is built and dogfooded daily as the credential
-boundary for the maintainer's own agents. The v1 surface sequence (spec
-§17): credential key lifecycle ✅ → daemon ownership → control API →
-request-authenticity floor → console → trace viewer → service lifecycle.
-OAuth-class upstreams are deliberately out of scope for v1.
-
-## Built in the open
-
-This repo is developed AI-agent-first under an unusually strict pipeline:
-spec-recorded decisions, invariant-pinned security claims, multi-model
-adversarial review with a written convergence criterion, and a human who
-owns every merge. [`HANDOFF.md`](HANDOFF.md) and
-[`LEARNINGS.md`](LEARNINGS.md) are the unedited working record — public on
-purpose.
+Pre-1.0 and not yet on npm; the core above is what works today, dogfooded
+daily as the credential boundary for the maintainer's own agents.
 
 ## Security
 
