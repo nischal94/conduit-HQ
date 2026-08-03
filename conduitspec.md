@@ -848,6 +848,16 @@ shape is per-connection egress policy.
 poll design (`check_execution`) is skeleton-scoped: MCP-native completion signaling
 (progress notifications / task semantics) is the recorded Phase-1 successor — deferred, not
 forgotten.
+- **Open-sourcing the repo (2026-08-03):** ✅ three decisions, made explicitly by the
+product owner: (1) **conduit-HQ goes public AS-IS with full git history**, gated on a
+privacy audit of that history — secrets are already proven absent by CI's full-history gitleaks
+scan; the audit targets personal-operational material (machine paths, incident narratives, private
+artifact URLs), categorized with exact locations, so the final flip is an evidence-based human
+decision, never an agent action. (2) **HANDOFF.md and LEARNINGS.md remain in the public
+repo** — the working-in-the-open record is part of the product's story — under a codified
+public-safe writing rule (project CLAUDE.md) from the flip onward: no machine-specific paths, no
+personal URLs. (3) License is **Apache-2.0** (patent grant matters for a security
+product; permissive adoption over copyleft).
 
 **Deferred (future phases — none block v0.1 / Phase 0):**
 
