@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 2 — adversarially reviewed and corrected
+**Status:** design, revision 3 — two adversarial passes; rev-2 NOT CONVERGED findings fixed
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -250,14 +250,40 @@ violation on its face, but shipping plaintext across a new IPC boundary
 in a product built on credential containment is the wrong default.
 
 **Decision: the daemon performs the credential-bearing fetch on the
-client's behalf.** `add-mcp` sends "validate this source URL, using the
-credential already sealed under ref X" and receives back the tool list or
-a typed error. The plaintext never leaves the daemon. Fresh secrets
+client's behalf.** The plaintext never leaves the daemon. Fresh secrets
 supplied at onboarding still travel client→daemon once (unavoidable —
 the operator is providing them), but never daemon→client.
 
+**The client MUST NOT pair a credential with a destination.** An earlier
+revision had `add-mcp` send "validate this URL, using the credential
+sealed under ref X." That is a **credential-forwarding oracle**: a client
+able to name both halves can instruct the daemon to attach credential X
+to an attacker-chosen URL Y, turning the daemon into an exfiltration
+tool for secrets it is holding precisely so nobody else can read them.
+Redirects reintroduce the same problem even with a well-formed initial
+URL.
+
+Required shape instead — the daemon derives BOTH halves from stored
+state:
+
+- The client names a **source/connection identity**, never a
+  `(url, credentialRef)` pair.
+- The daemon looks up that identity's URL and credential ref from its own
+  store. A ref the client supplies is never honored.
+- Before attaching a credential the daemon enforces scheme, host, and
+  port against the stored source's origin.
+- **Redirects are not followed with the credential attached.** A
+  cross-origin redirect drops the credential or fails the request; the
+  §9.3 egress guard and its pinned lookup still apply on every hop.
+- Onboarding a *new* source, where no stored identity exists yet, is the
+  one case where the operator supplies both URL and secret in the same
+  request — that is the operator's own data going in, not a stored
+  credential being redirected out. The daemon still applies §9.3 and
+  never echoes the secret back.
+
 This is a real behavior change to `add-mcp`, not a default swap, and the
-plan must budget for it.
+plan must budget for it. **Invariant test required:** a client naming a
+foreign destination cannot cause any stored credential to be sent there.
 
 `conduit serve` keeps its stdio MCP surface toward the agent. Behind it,
 tool calls become daemon RPCs. The M8 stdout-purity invariant
@@ -282,14 +308,17 @@ the check and the rotation — including after rotate has loaded the old
 key but before the re-seal transaction commits. Auto-start makes this
 worse than the status quo, because daemons now appear spontaneously.
 
-**Rotation and daemon startup must share one kernel-held exclusive
-maintenance lock** — the same lock as §3.5's lifecycle lock:
+**Rotation and daemon startup must share the kernel-held maintenance
+lock** (§3.5's two-lock table: daemon holds it SHARED for its lifetime;
+rotation takes it EXCLUSIVE):
 
-- Rotate acquires it BEFORE reading the key, opening the db, or touching
-  `.next`, and holds it through key promotion, directory fsync,
-  checkpoint, and hygiene.
-- Daemon startup acquires it before resolving its key or opening the db.
-- An auto-start that finds rotation's lock held reports "rotation in
+- Rotate acquires it exclusively BEFORE reading the key, opening the db,
+  or touching `.next`, and holds it through key promotion, directory
+  fsync, checkpoint, and hygiene. It cannot acquire while any daemon
+  holds it shared — the kernel enforces stop-first.
+- Daemon startup acquires it shared before resolving its key or opening
+  the db.
+- An auto-start that finds it held exclusive reports "rotation in
   progress" and does not spawn — and must not spin retrying.
 
 The registry may still report *metadata* for a good error message ("which
@@ -321,17 +350,45 @@ is also what makes rotation exclusion non-trivial, and §9 open item 4
 records that idle-exit + auto-start together do not survive contact with
 a browser console.
 
-**Single instance — one kernel-held lifecycle lock.** An exclusive
-`flock`/`O_EXCL` lock file held for the daemon's ENTIRE lifetime, acquired
-before bind and released last, after the socket is safely removed. Two
-clients racing to auto-start must result in one daemon: the loser detects
-the winner's socket and connects. This race is a required test, not an
-edge case — two MCP clients starting together at login is the normal
-case.
+**Two kernel locks, not one.** An earlier revision used a single
+exclusive lock for both daemon lifetime and rotation exclusion. That
+excludes correctly but is **undiagnosable**: an anonymous held lock
+cannot tell a client whether rotation is running, a daemon is starting,
+or a daemon is draining — and since pidfile metadata is explicitly
+non-authoritative, nothing is left to branch on. Those three states need
+opposite client behavior (fail fast / connect / wait-then-start), so the
+lock must carry that distinction structurally.
 
-A pidfile may exist as **diagnostic metadata only**. A PID plus
-`kill(pid, 0)` is not proof of liveness: PIDs are reused, so a stale
-pidfile can name an unrelated live process. Nothing may branch on it.
+| lock | daemon holds | rotation holds | purpose |
+|---|---|---|---|
+| **maintenance** | SHARED, for its lifetime | EXCLUSIVE | mutual exclusion between normal runtime and offline maintenance |
+| **lifecycle** | EXCLUSIVE, for its lifetime | — | singleton enforcement among daemons |
+
+A client can now distinguish states from lock modes alone, with no
+metadata trust:
+
+- Maintenance lock held EXCLUSIVE → rotation in progress → **fail fast**,
+  no retry spin.
+- Maintenance held shared + lifecycle held + socket connectable → a
+  healthy daemon → connect.
+- Lifecycle held + socket refuses → daemon starting or draining → wait
+  under a bounded startup deadline (see the drain state machine below).
+- Neither held → no daemon → acquire and start.
+
+Rotation taking the maintenance lock exclusively is naturally blocked
+while any daemon holds it shared — which is exactly the stop-first
+precondition step 1 requires, now enforced by the kernel instead of by
+asking the operator.
+
+The lifecycle lock is acquired before bind and released last, after the
+socket is safely removed. Two clients racing to auto-start must produce
+one daemon: the loser detects the winner and connects. This race is a
+required test, not an edge case — two MCP clients starting together at
+login is the normal case.
+
+A pidfile may exist as **diagnostic metadata only** (for error messages:
+which process, since when). A PID plus `kill(pid, 0)` is not proof of
+liveness — PIDs are reused — so no control flow may branch on it.
 
 **Idle exit — PROVISIONALLY yes, but see the console conflict below.**
 The daemon exits after a period with no connected clients and no
@@ -363,11 +420,39 @@ other liveness dependencies exist:
   `dispose()` contract. Idle exit must not race an in-flight scope; this
   is what "no in-flight requests" must actually mean (§5).
 
-**Exact idle definition.** A connection counts from `accept`, not from
-its first complete frame. A request stays in-flight until DB
-finalization, upstream-session disposal, AND response drain complete.
-Shutdown enters a draining state: close the listener, re-check
-accepted/in-flight/queued work, then release the lifecycle lock last.
+**Exact idle definition and the drain state machine.** A connection
+counts from `accept`, not from its first complete frame. A request stays
+in-flight until DB finalization, upstream-session disposal, AND response
+drain complete.
+
+Daemon states: `RUNNING → DRAINING → STOPPED`.
+
+- `RUNNING`: listener open, requests served.
+- `DRAINING`: idle timeout fired. Close the listener, re-check
+  accepted/in-flight/queued work (a connection accepted a microsecond
+  before close still gets served), finish everything, remove the socket
+  under the §3.2 device+inode check, then release the locks — lifecycle
+  last. Draining is not cancellable; a daemon that has begun draining
+  completes its exit.
+- `STOPPED`: no locks held, no socket.
+
+**The client contract during DRAINING** (closes the liveness hole where a
+client could fail to connect, fail to auto-start because the lifecycle
+lock is still held, and burn its retry against a daemon that will never
+serve it):
+
+- A client that cannot connect but observes the lifecycle lock held —
+  and the maintenance lock NOT held exclusive — treats the daemon as
+  starting-or-draining and **waits under one bounded startup deadline**
+  for the lifecycle lock to release, then races to acquire-and-start or
+  connects to whichever daemon won.
+- The wait happens BEFORE any request bytes are written, so it composes
+  with §5's retry rule: the client has not sent anything, so the
+  eventual attempt against the new daemon is a first attempt, not a
+  replay.
+- Rotation contention stays fail-fast and never enters this wait path —
+  the exclusive maintenance lock is distinguishable by mode (§ two-lock
+  table above).
 
 **Unresolved conflict — idle-exit vs. the console (step 3).** A browser
 cannot launch a local binary. Once the typed HTTP API and console exist,
@@ -443,7 +528,9 @@ Failure modes and required behavior:
 | daemon dies mid-request | `outcome unknown` with a stable request ID — see below |
 | two clients race to start | exactly one daemon; loser connects to winner |
 | key resolution fails | unchanged from step 1 — daemon refuses to start |
-| maintenance lock held (rotation) | daemon refuses to start, "rotation in progress", no retry spin |
+| maintenance lock held EXCLUSIVE (rotation) | fail fast, "rotation in progress", no retry spin, never the wait path |
+| lifecycle lock held, socket refuses (starting/draining) | wait under one bounded startup deadline for lock release, then connect-or-start (§3.5 drain contract) |
+| custom `CONDUIT_DB` in client env | typed handshake refusal — v1 daemon is default-paths-only (§9.3) |
 
 **Retry has one safe boundary, and it is narrower than "before
 acceptance."** An earlier revision said retry is safe until the daemon
@@ -566,6 +653,15 @@ processes, not mocks):
   never replay
 - an execution left `running` by a killed daemon reaches a defined
   terminal state on restart
+- a client naming a foreign destination cannot cause any stored
+  credential to be sent there (the §3.3.1 anti-oracle invariant)
+- a cross-origin redirect never carries a stored credential
+- rotation's exclusive maintenance acquisition blocks while a daemon
+  holds it shared, and vice versa (kernel-enforced stop-first)
+- a client arriving during DRAINING waits, then reaches whichever daemon
+  wins — no burned retry against a draining daemon
+- a client with custom `CONDUIT_DB` gets the typed handshake refusal;
+  daemon config never inherits the auto-starting client's env
 
 **Not invariant, still required:** state-directory and socket modes;
 stable error codes with redacted cause; same-UID exposure documented as
@@ -611,30 +707,47 @@ layout; the exact idle timeout value; log line wording.
 
 ## 9. Open items for review
 
-1. **`--doctor` is not read-only today.** It calls `openStoreFromEnv`
-   (`bin.ts:15`), and that path creates/heals files, sets journal mode,
-   runs migrations, and may bootstrap the key canary
-   (`store/sqlite.ts:140`). So "keep it direct, read-only" is not
-   available as written — the current opener mutates. Either make doctor
-   a daemon client (losing the ability to diagnose a sick daemon), or
-   build a genuinely non-mutating offline diagnostic that participates in
-   the maintenance lock. The diagnostic argument still favours the
-   latter; it is more work than the earlier revision assumed.
+1. **`--doctor` — DECIDED: split it.** It is not read-only today: it
+   calls `openStoreFromEnv` (`bin.ts:15`), and that path creates/heals
+   files, sets journal mode, runs migrations, and may bootstrap the key
+   canary (`store/sqlite.ts:140`). Leaving it as an unguarded direct
+   opener would be a second writer outside the ownership model. v1 shape:
+   - **Daemon-backed diagnosis** is the default `--doctor` path: connect,
+     handshake, report the daemon's own health (key source, db path,
+     source count) — this is what a working install needs.
+   - **Offline diagnostic** (`--doctor --offline`) for diagnosing a sick
+     daemon: acquires the maintenance lock EXCLUSIVE (so it cannot run
+     beside a live daemon or a rotation), and runs a genuinely
+     non-mutating inspection — it must NOT call `openStoreFromEnv`;
+     it opens read-only and reports, never heals. If the current opener
+     cannot do that, the offline mode reports what it can without
+     opening the store (file existence, permissions, key-file shape).
+   The current direct, potentially-mutating path outside any lock is
+   retired in the same PR that introduces the daemon.
 2. Idle timeout value — proposed 15 minutes, trivially tunable, and
    subordinate to item 4.
-3. **Daemon identity and config.** The endpoint is a fixed path, but
-   `CONDUIT_DB`, `CONDUIT_MASTER_KEY`, approval TTL, and the
-   security-relevant `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` are today
-   process-local environment variables. With auto-start, **whichever
-   client wins the startup race silently sets global behavior for every
-   later client** — including enabling private egress. Unacceptable as-is.
-   Pick one before implementing: (a) v1 supports only the default db,
-   file key, and a canonical config source; or (b) the endpoint is keyed
-   from a canonical db identity and the handshake carries protocol
-   version, db identity, and effective non-secret security settings, with
-   clients rejecting mismatches. Leaning (a) for v1.
+3. **Daemon identity and config — DECIDED: option (a), default-only
+   v1.** The daemon serves exactly the default pair
+   (`~/.conduit/conduit.db` + key file), mirroring rotation's own
+   default-paths-only decision from step 1. Security-relevant behavior is
+   NEVER inherited from the auto-starting client's environment:
+   - The daemon resolves its config from its own canonical source
+     (key-file resolution as today, default db path). A client-side
+     `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` or `CONDUIT_DB` does NOT
+     transfer to the daemon.
+   - A client whose env sets `CONDUIT_DB` to a custom path gets a typed
+     refusal from the daemon handshake ("custom db paths bypass the
+     daemon in v1") — the same delete-and-re-onboard posture step 1 took
+     for custom-path rotation. Custom-path installs keep direct store
+     access and forgo daemon features in v1; this is a documented limit.
+   - The handshake reports protocol version, db path, and effective
+     non-secret security settings; clients print them on mismatch.
+   This removes the "first client silently sets global egress policy"
+   hole by construction rather than by validation.
 4. **Idle-exit vs. the browser console (§3.5).** Must be resolved before
-   step 3 ships. A browser cannot auto-start the daemon.
+   step 3 ships. A browser cannot auto-start the daemon. (Out-of-scope
+   for step 2 by the documented provisional-idle-exit decision; the
+   conflict is recorded so step 3 cannot claim surprise.)
 5. **Steps 3 and 4 must land as one externally-reachable increment.** The
    spec already says the §16 floor ships in the same increment as the
    console. A mutating loopback HTTP API must never bind between the two.
@@ -669,3 +782,29 @@ conversion would have moved plaintext credentials across the new IPC
 boundary while the document claimed the §9.2 boundary was strengthened.
 §3.3.1 now forbids credential-returning RPCs and moves the
 credential-bearing fetch into the daemon.
+
+**Second pass (2026-08-15, document inlined): NOT CONVERGED — 5
+category-(c) breaks, all fixed in revision 3:**
+
+1. Config identity was an open item, not a decision → DECIDED
+   default-paths-only v1; daemon config never inherited from client env
+   (§9.3).
+2. One anonymous lock could not distinguish rotation / starting /
+   draining → two-lock design: shared/exclusive maintenance +
+   exclusive lifecycle (§3.5), giving kernel-enforced stop-first.
+3. Drain had a client liveness hole (retry burned against a draining
+   daemon) → explicit RUNNING→DRAINING→STOPPED machine with a
+   wait-under-deadline client contract (§3.5).
+4. The rev-2 credential fetch was a forwarding oracle (client named both
+   URL and credential ref) → daemon derives both from stored source
+   identity; no credential on cross-origin redirects; anti-oracle
+   invariant test (§3.3.1).
+5. `--doctor` had no ownership contract and mutates today → split:
+   daemon-backed default + non-mutating offline mode under the exclusive
+   maintenance lock; the unguarded direct path retires with this PR
+   (§9.1).
+
+Second-pass items accepted without change: same-UID scope (documented
+decision), QuickJS counter reset (best-effort layer), idle-exit vs.
+console (provisional pending §9.4), crash-recovery mechanism selection
+(deferred to planning as a stop-and-ask).
