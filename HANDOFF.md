@@ -155,8 +155,21 @@ PR → Tier-2 both mechanics + /security-review + codex correctness pass +
 below; act where triggers fire. Remember: serve runs from dist — REBUILD
 (`pnpm -r build`) after every merge until §17 step 7.
 
-**Brainstorm OPENED 2026-08-15 — exploration done, NOTHING decided, no
-branch/PR/code.** Findings established (skip re-deriving these):
+**DESIGN CONVERGED 2026-08-15 — branch `docs/daemon-ownership-design`
+(pushed, no PR yet; LEARNINGS #25-27 ride the branch).** The design doc
+`docs/superpowers/specs/2026-08-15-daemon-ownership-design.md` is at
+revision 5, CONVERGED after a 5-pass codex arc (9 → 5 → 3 → 2 → 0) plus
+an independent claim-verification pass; the full trail is in the doc's
+§10. Decision: one daemon owns the store; narrow capability-scoped RPCs
+over a UDS (never a remote ConduitStore; no credential-returning RPC);
+two-lock protocol (maintenance shared/exclusive + lifecycle) with
+kernel-enforced stop-first for rotation; constructed spawn environment;
+READY-gated connections; default-paths-only v1. AWAITING: human review
+of the spec, then `superpowers:writing-plans`, then the build via SDD in
+a fresh session. LEARNINGS #21 applies: the branch is invisible to the
+git tripwire — pair with `gh pr list`.
+
+Original exploration findings below (still accurate; kept for context):
 
 - **There is no owning process today.** Every entry point opens its own
   libsql client against the same `~/.conduit/conduit.db`:
