@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -7,6 +8,7 @@ import { createClient } from "@libsql/client";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { DaemonUnavailable, daemonRequest, UNCORRELATED } from "./client.js";
 import { daemonPaths } from "./conduitd.js";
+import { encodeFrame } from "./frames.js";
 import { acquireExclusive, type HeldLock, probeShared } from "./locks.js";
 import { DAEMON_LOG, daemonEntryPoint, daemonSpawnEnv, PLATFORM_PATH } from "./spawn.js";
 
@@ -271,6 +273,61 @@ describe("daemonRequest — the §3.5 decision table", () => {
   );
 });
 
+describe("the READY-gate decoder handoff", () => {
+  it(
+    "does not lose a frame that arrives coalesced with READY in one chunk",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+
+      // A stand-in daemon that writes READY and the handshake reply in a
+      // SINGLE write, so both frames land in one chunk. The real daemon
+      // cannot currently produce this — it is purely reactive after
+      // READY — which is exactly why the client must not depend on that
+      // timing. This is the regression pin for the decoder handoff:
+      // before it, the READY gate's decoder was discarded along with
+      // everything it had read past READY, and the client hung until its
+      // deadline and reported a spurious outcome-unknown.
+      const server = createServer((socket) => {
+        socket.write(
+          Buffer.concat([
+            encodeFrame({ kind: "ready" }),
+            encodeFrame({
+              kind: "handshake.ok",
+              protocol: 1,
+              dbPath: paths.db,
+              allowPrivateEgress: false,
+            }),
+          ]),
+        );
+        socket.once("data", () => {
+          socket.write(encodeFrame({ kind: "result", requestId: "r1", payload: ["coalesced"] }));
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(paths.socket, resolve));
+
+      // The client only takes the connect path when lifecycle reads busy.
+      const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+      expect(lifecycle).not.toBeNull();
+      if (lifecycle) locks.push(lifecycle);
+
+      try {
+        const response = await daemonRequest({
+          stateDir,
+          role: "serve",
+          request: { kind: "search", query: "anything" },
+          deadlineMs: 15_000,
+          spawn: () => {},
+        });
+        expect(response).toMatchObject({ kind: "result", payload: ["coalesced"] });
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe("daemonRequest — the §5 retry rule", () => {
   it(
     "INVARIANT §17: a daemon killed after the request is written yields outcome-unknown, never a retry",
@@ -299,9 +356,13 @@ describe("daemonRequest — the §5 retry rule", () => {
 
       const response = await pending;
 
-      // The honest answer: the daemon may or may not have executed this.
-      // Inventing either a success or a failure would be a lie, and a
-      // retry could duplicate upstream side effects that already landed.
+      // Scope, stated exactly: this pins the CLIENT-SIDE §5 contract —
+      // once the request bytes are written and the connection then dies,
+      // the client returns `outcome-unknown` and does not retry. It does
+      // NOT pin that a real in-flight execution was ambiguous: the
+      // fixture stubs `manager.start`, so no genuine work was running.
+      // That the daemon's stranded row reaches a defined terminal state
+      // is the separate invariant below.
       expect(response.kind).toBe("outcome-unknown");
       // Never re-attempted against a freshly spawned daemon.
       expect(spawnCalls).toBe(0);
@@ -360,17 +421,26 @@ describe("daemonRequest — the §5 retry rule", () => {
 
       const runningBefore = await runningIds(paths.db);
       expect(runningBefore.length).toBeGreaterThan(0);
-      // The durable record of upstream calls. Its count must not move
-      // across the restart: an upstream call is the side effect a replay
-      // would duplicate, and trace_events is where such a call would
-      // leave its mark. This is the assertion that "never re-runs" is
-      // about — the status column alone would also read `failed` after a
-      // replay that ran and then failed.
+
+      // Attribute a real audit row to the stranded execution, standing in
+      // for the upstream call it had already made before the daemon died.
+      // Seeding is what gives this assertion teeth: the stalled fixture
+      // makes no upstream calls of its own, so a count that starts at
+      // zero stays at zero even if the sweep DID replay — the comparison
+      // would hold vacuously. Starting from a non-zero count means a
+      // replay, which re-enters the pipeline and appends fresh trace
+      // rows, moves the number and fails the test.
+      const strandedId = runningBefore[0];
+      if (strandedId === undefined) throw new Error("no stranded execution to seed");
+      await seedTraceRow(paths.db, strandedId);
       const tracesBefore = await traceCount(paths.db);
+      expect(tracesBefore).toBeGreaterThan(0);
 
       // Restart: the sweep runs after both locks and before bind.
       await runningDaemon(stateDir, ["--sweep-on-start"]);
 
+      // The audit trail is untouched — nothing re-ran. A replay would
+      // have appended at least one more row here.
       expect(await traceCount(paths.db)).toBe(tracesBefore);
 
       // Terminalized, and terminalized as AMBIGUOUS rather than as an
@@ -514,6 +584,26 @@ function observedChildEnv(): Promise<NodeJS.ProcessEnv> {
       resolve(JSON.parse(out.trim()) as NodeJS.ProcessEnv);
     });
   });
+}
+
+/**
+ * Writes one audit row against `executionId`, standing in for an upstream
+ * call the execution had already made when its daemon was killed. Written
+ * directly rather than through the store seam because the point is to
+ * establish a non-zero baseline, not to exercise the write path.
+ */
+async function seedTraceRow(dbPath: string, executionId: string): Promise<void> {
+  const client = createClient({ url: `file:${dbPath}` });
+  try {
+    await client.execute({
+      sql: `INSERT INTO trace_events
+              (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      args: [`call_${executionId}`, executionId, "ns.tool", "ns", "{}", "allow", Date.now()],
+    });
+  } finally {
+    client.close();
+  }
 }
 
 /** Rows in the audit trail — one per upstream tool call (§11). */

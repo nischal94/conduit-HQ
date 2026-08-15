@@ -136,10 +136,12 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
       const socket = await tryConnect(paths.socket);
       if (socket !== null) {
         const ready = await awaitReady(socket, remaining(expiry));
-        if (ready) {
+        if (ready.ready) {
           // Past this point the request bytes go out and the retryable
-          // zone ends.
-          return await exchange(socket, opts.role, opts.request, expiry);
+          // zone ends. The READY gate's decoder and any frames it already
+          // read past READY travel into the exchange — see `awaitReady`
+          // for why starting a fresh decoder here would be a bug.
+          return await exchange(socket, opts.role, opts.request, expiry, ready);
         }
         // Connected but no READY — accepted-or-queued during DRAINING.
         // Identical to a refused connect, and crucially NOTHING was
@@ -203,41 +205,71 @@ function tryConnect(socketPath: string): Promise<Socket | null> {
 }
 
 /**
- * Waits for the daemon's READY preface. Resolves false if the connection
- * closes or the deadline passes first — both meaning the daemon never
- * accepted this connection while RUNNING. No bytes are written here; that
- * is the entire point of the gate.
+ * The outcome of the READY gate. On success it carries the decoder state
+ * forward — see `awaitReady` for why that is mandatory rather than tidy.
  */
-function awaitReady(socket: Socket, timeoutMs: number): Promise<boolean> {
+type ReadyResult =
+  | { ready: false }
+  | {
+      ready: true;
+      /** The SAME decoder that consumed the READY frame. */
+      decoder: FrameDecoder;
+      /** Frames that arrived in the READY chunk, after the READY frame. */
+      pending: unknown[];
+    };
+
+/**
+ * Waits for the daemon's READY preface. Resolves `{ready: false}` if the
+ * connection closes or the deadline passes first — both meaning the
+ * daemon never accepted this connection while RUNNING. No bytes are
+ * written here; that is the entire point of the gate.
+ *
+ * **The decoder is handed to the caller, never discarded.** A UDS
+ * delivers arbitrary chunk boundaries, so bytes following READY can
+ * arrive coalesced into the same chunk — and a frame can also be split
+ * across chunks, leaving a partial body buffered inside this decoder.
+ * Constructing a fresh decoder for the next phase would silently drop
+ * both: the already-decoded frames, and the partial-frame bytes this one
+ * still holds. That loss would surface as a response that never arrives,
+ * i.e. a spurious `outcome-unknown` on a request the daemon actually
+ * answered — the single worst failure this module can produce, since it
+ * is indistinguishable from a genuine ambiguity.
+ *
+ * Today the daemon writes nothing between READY and the handshake
+ * response, so neither case can fire in practice. That is a property of
+ * the current daemon, not of the protocol, and this seam must not depend
+ * on it.
+ */
+function awaitReady(socket: Socket, timeoutMs: number): Promise<ReadyResult> {
   return new Promise((resolve) => {
     const decoder = new FrameDecoder();
     let settled = false;
-    const finish = (ok: boolean): void => {
+    const finish = (result: ReadyResult): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
       socket.removeListener("data", onData);
-      resolve(ok);
+      resolve(result);
     };
-    const timer = setTimeout(() => finish(false), timeoutMs);
+    const timer = setTimeout(() => finish({ ready: false }), timeoutMs);
     const onData = (chunk: Buffer): void => {
       let messages: unknown[];
       try {
         messages = decoder.push(chunk);
       } catch {
-        finish(false);
+        finish({ ready: false });
         return;
       }
-      for (const msg of messages) {
-        if (isKind(msg, "ready")) {
-          finish(true);
-          return;
-        }
+      const at = messages.findIndex((msg) => isKind(msg, "ready"));
+      if (at !== -1) {
+        // Everything after READY in this same chunk belongs to the next
+        // phase and travels with the decoder rather than being dropped.
+        finish({ ready: true, decoder, pending: messages.slice(at + 1) });
       }
     };
     socket.on("data", onData);
-    socket.once("close", () => finish(false));
-    socket.once("error", () => finish(false));
+    socket.once("close", () => finish({ ready: false }));
+    socket.once("error", () => finish({ ready: false }));
   });
 }
 
@@ -257,8 +289,11 @@ async function exchange(
   role: keyof typeof CAPABILITIES,
   request: RpcRequest,
   expiry: number,
+  ready: Extract<ReadyResult, { ready: true }>,
 ): Promise<RpcResponse> {
-  const reader = createReader(socket);
+  // Continues the READY gate's decoder rather than starting a new one, so
+  // no byte the daemon has already sent can be lost at the phase boundary.
+  const reader = createReader(socket, ready.decoder, ready.pending);
   try {
     // The client's own CONDUIT_DB, when set, is declared rather than
     // hidden: the daemon refuses it with `refused-custom-db` (§9.3 item
@@ -311,9 +346,13 @@ interface Reader {
   dispose(): void;
 }
 
-function createReader(socket: Socket): Reader {
-  const decoder = new FrameDecoder();
-  const buffered: unknown[] = [];
+/**
+ * `decoder` and `alreadyRead` come from the READY gate: the decoder may
+ * hold a partially-received frame, and `alreadyRead` holds frames that
+ * arrived coalesced with READY. Both must be adopted, never recreated.
+ */
+function createReader(socket: Socket, decoder: FrameDecoder, alreadyRead: unknown[]): Reader {
+  const buffered: unknown[] = [...alreadyRead];
   let waiter: ((msg: unknown | null) => void) | null = null;
   let closed = false;
 

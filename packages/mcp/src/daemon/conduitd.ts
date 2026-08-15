@@ -599,6 +599,12 @@ async function serve(opts: ServeOptions): Promise<void> {
       socket.destroy();
     });
 
+    // READY is the ONLY frame written before the client's first request:
+    // the daemon is purely reactive from here, replying only to frames it
+    // receives. Clients need not depend on that — `client.ts` carries its
+    // READY-gate decoder into the next phase, so a frame coalesced with
+    // READY (or split across chunks) survives regardless. Anything added
+    // here that writes unprompted must keep that decoder-handoff intact.
     send(socket, { kind: "ready" });
   }
 
