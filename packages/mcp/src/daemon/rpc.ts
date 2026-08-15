@@ -27,8 +27,22 @@
  * never echoed back in any response.
  */
 
+export type Capability = keyof typeof CAPABILITIES;
+
 export type RpcRequest =
-  | { kind: "handshake"; protocol: 1 }
+  | {
+      kind: "handshake";
+      protocol: 1;
+      capability: Capability;
+      /**
+       * Present only when the client's own environment sets `CONDUIT_DB`.
+       * The daemon refuses any handshake carrying it (§9.3 item 3): v1
+       * serves exactly the default database, and a client pointing at a
+       * custom path must be told so rather than silently served against
+       * a different store than it asked for.
+       */
+      dbPath?: string;
+    }
   | { kind: "execute"; code: string; deadlineMs: number }
   | { kind: "search"; query: string }
   | { kind: "describe"; toolName: string }
@@ -64,6 +78,15 @@ function isString(v: unknown): v is string {
   return typeof v === "string";
 }
 
+/**
+ * Narrows to a capability name by consulting CAPABILITIES itself, so the
+ * decoder can never drift from the §3.3 table: adding a role there makes
+ * it decodable here with no second list to keep in sync.
+ */
+function isCapability(v: unknown): v is Capability {
+  return isString(v) && Object.hasOwn(CAPABILITIES, v);
+}
+
 /** Rejects any object carrying keys outside the given allowed set. */
 function assertNoExtraKeys(obj: Record<string, unknown>, allowed: readonly string[]): void {
   for (const key of Object.keys(obj)) {
@@ -84,11 +107,23 @@ export function decodeRequest(v: unknown): RpcRequest {
 
   switch (kind) {
     case "handshake": {
-      assertNoExtraKeys(v, ["kind", "protocol"]);
+      assertNoExtraKeys(v, ["kind", "protocol", "capability", "dbPath"]);
       if (v.protocol !== 1) {
         throw new InvalidRpcRequest("handshake.protocol must be 1");
       }
-      return { kind: "handshake", protocol: 1 };
+      if (!isCapability(v.capability)) {
+        throw new InvalidRpcRequest(
+          `handshake.capability must be one of ${Object.keys(CAPABILITIES).join(" | ")}`,
+        );
+      }
+      if (v.dbPath !== undefined && !isString(v.dbPath)) {
+        throw new InvalidRpcRequest("handshake.dbPath must be a string when present");
+      }
+      const handshake: RpcRequest = { kind: "handshake", protocol: 1, capability: v.capability };
+      if (v.dbPath !== undefined) {
+        (handshake as { dbPath?: string }).dbPath = v.dbPath;
+      }
+      return handshake;
     }
     case "execute": {
       assertNoExtraKeys(v, ["kind", "code", "deadlineMs"]);

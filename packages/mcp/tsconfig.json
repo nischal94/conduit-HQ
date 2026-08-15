@@ -5,5 +5,5 @@
     "rootDir": "src"
   },
   "include": ["src"],
-  "exclude": ["src/daemon/helpers/hold-lock.ts"]
+  "exclude": ["src/daemon/helpers/hold-lock.ts", "src/daemon/helpers/run-daemon.ts"]
 }

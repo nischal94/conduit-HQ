@@ -1,5 +1,6 @@
 #!/usr/bin/env node
-import { KEYGEN_ONE_LINER } from "./env.js";
+import { DaemonExit, runDaemon } from "./daemon/conduitd.js";
+import { DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
 import { openStoreFromEnv } from "./store-open.js";
 
@@ -8,7 +9,8 @@ const HELP = `conduit-mcp ${VERSION} — Conduit MCP server (stdio)
 Env: CONDUIT_DB (default ~/.conduit/conduit.db) · CONDUIT_MASTER_KEY (base64, 32 bytes;
 generate: ${KEYGEN_ONE_LINER}) · CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1 (dev/demo ONLY)
 · CONDUIT_APPROVAL_TTL (milliseconds)
-Flags: --version · --help · --doctor (validate config without an MCP client)`;
+Flags: --version · --help · --doctor (validate config without an MCP client)
+· --daemon (run the store-owning daemon; stop with SIGTERM/SIGINT)`;
 
 async function doctor(): Promise<number> {
   try {
@@ -41,6 +43,21 @@ async function main(): Promise<void> {
   }
   if (arg === "--doctor") {
     process.exitCode = await doctor();
+    return;
+  }
+  if (arg === "--daemon") {
+    try {
+      await runDaemon({ stateDir: DEFAULT_CONDUIT_DIR });
+    } catch (error) {
+      // The two refusal paths carry their own exit codes (§3.5's client
+      // decision table) — a client branches on the code, not on prose.
+      if (error instanceof DaemonExit) {
+        console.error(error.message);
+        process.exitCode = error.code;
+        return;
+      }
+      throw error;
+    }
     return;
   }
   await runStdioServer();

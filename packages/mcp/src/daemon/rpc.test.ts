@@ -1,11 +1,12 @@
 import { describe, expect, it } from "vitest";
-import { CAPABILITIES, decodeRequest } from "./rpc.js";
+import { CAPABILITIES, decodeRequest, InvalidRpcRequest } from "./rpc.js";
 
 describe("decodeRequest", () => {
   it("accepts each valid RpcRequest shape", () => {
-    expect(decodeRequest({ kind: "handshake", protocol: 1 })).toEqual({
+    expect(decodeRequest({ kind: "handshake", protocol: 1, capability: "serve" })).toEqual({
       kind: "handshake",
       protocol: 1,
+      capability: "serve",
     });
     expect(decodeRequest({ kind: "execute", code: "1+1", deadlineMs: 5000 })).toEqual({
       kind: "execute",
@@ -54,7 +55,9 @@ describe("decodeRequest", () => {
   });
 
   it("rejects wrong field types", () => {
-    expect(() => decodeRequest({ kind: "handshake", protocol: "1" })).toThrow();
+    expect(() =>
+      decodeRequest({ kind: "handshake", protocol: "1", capability: "serve" }),
+    ).toThrow();
     expect(() => decodeRequest({ kind: "execute", code: 123, deadlineMs: 5000 })).toThrow();
     expect(() => decodeRequest({ kind: "execute", code: "1+1", deadlineMs: "5000" })).toThrow();
     expect(() => decodeRequest({ kind: "search", query: 42 })).toThrow();
@@ -80,6 +83,51 @@ describe("decodeRequest", () => {
 
   it("rejects missing kind", () => {
     expect(() => decodeRequest({})).toThrow();
+  });
+
+  it("accepts every capability the §3.3 table declares", () => {
+    for (const capability of Object.keys(CAPABILITIES)) {
+      expect(decodeRequest({ kind: "handshake", protocol: 1, capability })).toEqual({
+        kind: "handshake",
+        protocol: 1,
+        capability,
+      });
+    }
+  });
+
+  it("requires handshake.capability and rejects anything outside the table", () => {
+    expect(() => decodeRequest({ kind: "handshake", protocol: 1 })).toThrow(InvalidRpcRequest);
+    expect(() => decodeRequest({ kind: "handshake", protocol: 1, capability: "root" })).toThrow(
+      InvalidRpcRequest,
+    );
+    expect(() => decodeRequest({ kind: "handshake", protocol: 1, capability: 1 })).toThrow(
+      InvalidRpcRequest,
+    );
+    // Prototype keys are not capabilities: the guard consults the table's
+    // own keys, so an inherited property name can never narrow.
+    expect(() =>
+      decodeRequest({ kind: "handshake", protocol: 1, capability: "constructor" }),
+    ).toThrow(InvalidRpcRequest);
+  });
+
+  it("carries an optional dbPath so the daemon can refuse a custom-db client", () => {
+    expect(
+      decodeRequest({
+        kind: "handshake",
+        protocol: 1,
+        capability: "serve",
+        dbPath: "/tmp/x.db",
+      }),
+    ).toEqual({ kind: "handshake", protocol: 1, capability: "serve", dbPath: "/tmp/x.db" });
+    expect(() =>
+      decodeRequest({ kind: "handshake", protocol: 1, capability: "serve", dbPath: 5 }),
+    ).toThrow(InvalidRpcRequest);
+  });
+
+  it("still rejects extra keys on handshake — the widening is two named fields, not a hole", () => {
+    expect(() =>
+      decodeRequest({ kind: "handshake", protocol: 1, capability: "serve", masterKey: "x" }),
+    ).toThrow(InvalidRpcRequest);
   });
 });
 
