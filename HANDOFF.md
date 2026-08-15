@@ -37,9 +37,9 @@ at session start.
 
 - **Repo state:** public, Apache-2.0, branch protection ON (5 checks,
   strict; enforce_admins=false so scripts/push-docs works). Branches:
-  `main`, `docs/daemon-ownership-design` (remote), plus LOCAL-ONLY
-  `feat/daemon-core` (already cut at the design branch's tip `d834a0a`,
-  zero commits of its own). No open PRs. Serve runs from dist — REBUILD
+  `main`, `docs/daemon-ownership-design` (remote), No open PRs, no other
+  local branches (a leftover `feat/daemon-core` from a killed sub-agent
+  was verified commit-free and deleted 2026-08-16). Serve runs from dist — REBUILD
   (`pnpm -r build`) after every merge until §17 step 7.
 - **Design:** `docs/superpowers/specs/2026-08-15-daemon-ownership-design.md`
   revision 8, CONVERGED across two review arcs — codex passes 1–5 on the
@@ -66,9 +66,10 @@ at session start.
 
 ### NEXT SESSION — build Lane A (plan Tasks 1–5) via SDD
 
-`git fetch origin`, check out the EXISTING local branch `feat/daemon-core`
-(do NOT re-cut it, and NOT from origin/main — that would exclude the
-design/plan docs, which ride Lane A's PR per the PR #41 precedent). Run
+`git fetch origin`, then cut the working branch from the DESIGN branch —
+`git checkout -b feat/daemon-core origin/docs/daemon-ownership-design` —
+NOT from origin/main (main lacks the design/plan docs, which ride Lane
+A's PR per the PR #41 precedent). Run
 superpowers:subagent-driven-development over the plan task-by-task: fresh
 implementer per task → vitest in the FOREGROUND → two-verdict review →
 ledger `.superpowers/sdd/progress-daemon-core.md`. Global constraints
@@ -86,9 +87,9 @@ sandbox-disabled Bash (pre-commit runs the sdk suite), never
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
 > first and follow its protocol (incl. `gh pr list --state all --limit 5`).
 > **State: daemon-ownership design rev 8 is CONVERGED and the 10-task
-> plan is committed, both on `docs/daemon-ownership-design`; the working
-> branch `feat/daemon-core` already exists at that branch's tip. Do NOT
-> redesign, re-review, or re-cut the branch.** BUILD Lane A (plan Tasks
+> plan is committed, both on `docs/daemon-ownership-design`. Cut
+> `feat/daemon-core` from THAT branch (not main). Do NOT redesign or
+> re-review.** BUILD Lane A (plan Tasks
 > 1–5) via superpowers:subagent-driven-development per the NEXT SESSION
 > section above. The agent never merges.
 
