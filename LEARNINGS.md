@@ -1810,3 +1810,43 @@ human's screen) correctly showed zero — the public-flip re-scan had rebuilt
 the alert set. When a human's observation contradicts a cached individual
 record, re-query the authoritative collection before insisting. The human's
 "always verify before telling me" was the correct protocol, stated better.
+
+## 2026-08-15 — Daemon-ownership brainstorm opened; Dependabot drift caught
+
+### 1. The staleness tripwire cannot see facts that live outside the repo
+
+HANDOFF's tripwire compares `git log -1 --format=%h` against the same for
+HANDOFF.md — it detects *commits*, so it is blind to any claim about an
+EXTERNAL system. "Dependabot: ZERO open alerts" was true when written
+(2026-08-03) and had rotted to 8 open alerts by 2026-08-15 with the
+tripwire perfectly green, because nothing in the repo changed. It was
+caught only incidentally, by `scripts/push-docs` echoing GitHub's
+vulnerability banner on push.
+
+The lesson is a category distinction the protocol did not draw: handoff
+facts about the repo are hash-verifiable; handoff facts about external
+systems (advisories, org/package reservations, branch-protection
+settings, upstream API shapes) are NOT, and need re-verification on read
+rather than trust. Where such a fact is recorded, it now carries an
+explicit "AS OF <date>" so a future reader sees the claim's age instead
+of inheriting it as current.
+
+### 2. A transitive advisory against your own security domain deserves a
+### code check, not a severity read
+
+Three of the eight alerts were `ip-address` "special address classified
+as public" bugs — textbook SSRF-bypass, and Conduit's §9.3 egress
+boundary is exactly that control. The reflex read is HIGH-on-our-core.
+The actual answer came from grepping: zero uses of
+`ip-address|Address4|Address6` anywhere in `packages/sdk/src`. The egress
+guard uses `node:dns`/`node:net` and pins the socket to the resolved
+binary IP via `createPinnedLookup` — the canonicalize-then-check shape
+adopted after Issue #21 precisely so that string-parsing bugs in address
+classifiers cannot be our bugs.
+
+That earlier SHAPE decision paid off here in a way worth naming: it did
+not just fix the findings of the day, it made a whole future class of
+third-party advisory non-applicable. Structural fixes retire future
+alerts; denylist fixes accumulate them. The triage note records residual
+exposure honestly (whatever the MCP SDK does with these at runtime) —
+the point is that the boundary's own guarantee was verified, not assumed.

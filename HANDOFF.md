@@ -50,11 +50,12 @@ architecture diagram → quick start with only verified commands →
 inaccurate sandbox/trace diagram and shell-unsafe placeholders. **#44 ci
 checklist item 5 closed** (human-authored edit; workflow files stay
 agent-read-only). Fork-PR approval policy API-confirmed
-(`first_time_contributors`). Dependabot: ZERO open alerts — the post-flip
-re-scan against the fixed lockfile cleared the set (the "moderate
-@hono/node-server" record answers stale-open by number but is absent from
-the live list; its dismissal rationale is preserved above if it ever
-regenerates). Branches = main only; dists rebuilt at `6eab753`. **PR #45 (owner-review
+(`first_time_contributors`). Dependabot: ZERO open alerts AS OF 2026-08-03
+— the post-flip re-scan against the fixed lockfile cleared the set (the
+"moderate @hono/node-server" record answers stale-open by number but is
+absent from the live list; its dismissal rationale is preserved above if
+it ever regenerates). **SUPERSEDED 2026-08-15 — 8 open alerts, see the
+Dependabot section below.** Branches = main only; dists rebuilt at `6eab753`. **PR #45 (owner-review
 follow-up, agent-merged on explicit delegation):** Mermaid diagram replaced
 with a renderer-safe plain-text one (raw flowchart source was visible
 outside github.com), Status & roadmap section removed (internal sequencing
@@ -110,6 +111,48 @@ human item: reserve the `conduithq` npm org.
 6. **Dependabot triage** per above (bump fast-uri/ajv chain + tsup's
    postcss on a reviewed-lockfile PR, or per-advisory dismiss with
    rationale).
+
+### OPEN — Dependabot triage (surfaced 2026-08-15, NOT actioned)
+
+**8 open alerts on main** (2 high/medium `ip-address` set, 4 `hono`, 1
+`@hono/node-server`), verified against the authoritative listing —
+`gh api repos/:owner/:repo/dependabot/alerts` — not the push banner,
+which said 9 (LEARNINGS #22: trust the listing, not a by-ID/summary
+count). All `runtime` scope. **Every one is transitive via a single
+root: `@modelcontextprotocol/sdk@1.29.0`** (→ `hono` +
+`@hono/node-server` as its HTTP adapter; → `ip-address` via the
+socks/eventsource proxy-agent chain). Conduit imports none of the three
+directly.
+
+| sev | package | first patched |
+|-----|---------|---------------|
+| HIGH | ip-address | 10.3.1 (leading-zero octets decoded as decimal) |
+| MED | ip-address | 10.2.1 (IPv4-mapped/NAT64 misclassification) |
+| MED | ip-address | 10.2.2 (CIDR suffix suppresses special-use class) |
+| MED ×3 + LOW | hono | 4.12.34 (Lang-middleware DoS, CORS ReDoS, memo() SSR cross-user, proxy Connection headers) |
+| MED | @hono/node-server | 1.19.15 (serve-static path traversal, Windows) |
+
+**Threat-model note (verified this turn, changes the urgency):** the
+`ip-address` advisories are all "special/private address classified as
+public" — the SSRF-bypass class §9.3 exists to stop. **Conduit's egress
+guard does NOT use `ip-address`:** zero hits for
+`ip-address|Address4|Address6` across `packages/sdk/src`;
+`pipeline/egress.ts` uses `node:dns` + `node:net` `isIP`, and the
+authoritative check is `createPinnedLookup` (resolve once, pin the
+socket to the vetted binary IP) — the canonicalize-then-check shape from
+`~/.claude/rules/adversarial-convergence.md`. So the HIGH does not reach
+Conduit's own boundary through our code path. `@hono/node-server`'s
+serve-static traversal keeps its prior rationale (Conduit serves nothing
+static, and this is Windows-only). Residual exposure is whatever the MCP
+SDK itself does with these at runtime — that is the open question, not
+whether our egress guard is broken.
+
+**Not actioned by decision, not omission:** project rule is deliberate
+triage (never bot lockfile merges), and **the agent never installs
+packages** — any bump runs in the human's terminal through Socket
+Firewall. A fix is one root bump (`@modelcontextprotocol/sdk`) if a
+version carrying patched transitives exists; otherwise per-advisory
+dismissals with the rationale above. Human call.
 
 ### NEXT SESSION — §17 v1 step 2: daemon ownership
 
