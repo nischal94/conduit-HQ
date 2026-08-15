@@ -112,47 +112,38 @@ human item: reserve the `conduithq` npm org.
    postcss on a reviewed-lockfile PR, or per-advisory dismiss with
    rationale).
 
-### OPEN — Dependabot triage (surfaced 2026-08-15, NOT actioned)
+### OPEN — Dependabot triage (parked 2026-08-15, NOT a blocker)
 
-**8 open alerts on main** (2 high/medium `ip-address` set, 4 `hono`, 1
-`@hono/node-server`), verified against the authoritative listing —
-`gh api repos/:owner/:repo/dependabot/alerts` — not the push banner,
-which said 9 (LEARNINGS #22: trust the listing, not a by-ID/summary
-count). All `runtime` scope. **Every one is transitive via a single
-root: `@modelcontextprotocol/sdk@1.29.0`** (→ `hono` +
-`@hono/node-server` as its HTTP adapter; → `ip-address` via the
-socks/eventsource proxy-agent chain). Conduit imports none of the three
-directly.
+**8 open alerts on main**, all transitive via one root:
+`@modelcontextprotocol/sdk@1.29.0` (→ `hono` + `@hono/node-server`; →
+`ip-address`). Conduit imports none of the three directly. Alert list:
+`gh api repos/:owner/:repo/dependabot/alerts` (the authoritative
+listing — not the push banner's count, LEARNINGS #22).
 
-| sev | package | first patched |
-|-----|---------|---------------|
-| HIGH | ip-address | 10.3.1 (leading-zero octets decoded as decimal) |
-| MED | ip-address | 10.2.1 (IPv4-mapped/NAT64 misclassification) |
-| MED | ip-address | 10.2.2 (CIDR suffix suppresses special-use class) |
-| MED ×3 + LOW | hono | 4.12.34 (Lang-middleware DoS, CORS ReDoS, memo() SSR cross-user, proxy Connection headers) |
-| MED | @hono/node-server | 1.19.15 (serve-static path traversal, Windows) |
+All 8 were created 2026-08-04 → 08-12, i.e. AFTER the 08-03 session:
+nothing was missed earlier, the "zero alerts" line above was true when
+written. Seven are newly-published advisories; the `@hono/node-server`
+one is the same advisory already dismissed on 08-03 ("serve-static
+unused"), regenerated exactly as that line anticipated.
 
-**Threat-model note (verified this turn, changes the urgency):** the
-`ip-address` advisories are all "special/private address classified as
-public" — the SSRF-bypass class §9.3 exists to stop. **Conduit's egress
-guard does NOT use `ip-address`:** zero hits for
-`ip-address|Address4|Address6` across `packages/sdk/src`;
-`pipeline/egress.ts` uses `node:dns` + `node:net` `isIP`, and the
-authoritative check is `createPinnedLookup` (resolve once, pin the
-socket to the vetted binary IP) — the canonicalize-then-check shape from
-`~/.claude/rules/adversarial-convergence.md`. So the HIGH does not reach
-Conduit's own boundary through our code path. `@hono/node-server`'s
-serve-static traversal keeps its prior rationale (Conduit serves nothing
-static, and this is Windows-only). Residual exposure is whatever the MCP
-SDK itself does with these at runtime — that is the open question, not
-whether our egress guard is broken.
+Checked once, because three are SSRF-class ("private address classified
+as public") and §9.3 is the product's own boundary: **they do not reach
+it** — zero `ip-address` uses in `packages/sdk/src`; the guard uses
+`node:dns`/`node:net` and pins to the resolved binary IP via
+`createPinnedLookup`. Residual exposure is only whatever the MCP SDK
+does with these internally.
 
-**Not actioned by decision, not omission:** project rule is deliberate
-triage (never bot lockfile merges), and **the agent never installs
-packages** — any bump runs in the human's terminal through Socket
-Firewall. A fix is one root bump (`@modelcontextprotocol/sdk`) if a
-version carrying patched transitives exists; otherwise per-advisory
-dismissals with the rationale above. Human call.
+Fix when convenient: one root bump if a version with patched transitives
+exists, else per-advisory dismissals. Installs run in the human's
+terminal (agent never installs); triage is deliberate by project rule.
+
+**Worth knowing:** no routine mechanism surfaces these. Dependabot PRs
+are OFF by decision, CI's audit gate only runs on PRs, and the audit
+cadence is milestone-triggered. These became visible only because
+`scripts/push-docs` echoed GitHub's server-side banner into agent
+output. Expect silent drift between deliberate sweeps.
+
+### NEXT SESSION — §17 v1 step 2: daemon ownership
 
 ### NEXT SESSION — §17 v1 step 2: daemon ownership
 
