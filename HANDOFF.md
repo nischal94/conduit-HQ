@@ -16,6 +16,14 @@ If they differ, work happened after this handoff was written — it is
 stale by exactly the commits between them. Reconstruct state from
 `git log` over that range, rewrite this file FIRST, then start the task.
 A session that ends abnormally can't lie here; git tells on it.
+
+**Rewrite self-check (added 2026-08-16 — the DONE criterion; run after any
+rewrite, then STOP checking):** (1) tripwire passes; (2) exactly ONE
+`## Current handoff` header and it is the first section a reader meets;
+(3) every branch/PR/file the current section names exists as stated;
+(4) the kickoff is executable verbatim against the real repo state.
+All four green = done — further findings in superseded sections are
+archive cosmetics, out of scope by definition. Do not rescan.
 **Known blind spot (LEARNINGS #21): the tripwire only sees main.** Work
 that lives on an unmerged PR branch leaves main untouched and the
 tripwire silent. Always pair it with `gh pr list --state all --limit 5`
