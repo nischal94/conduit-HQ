@@ -3,8 +3,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it } from "vitest";
-import { acquireExclusive, probeShared } from "./locks.js";
+import { acquireExclusive, acquireShared, probeShared } from "./locks.js";
 
 /**
  * Real-process lock tests (design §3.5, normative — no in-memory fakes):
@@ -73,6 +74,23 @@ async function waitFor(check: () => Promise<boolean>, timeoutMs = 5000): Promise
   throw new Error(`waitFor: condition not met within ${timeoutMs}ms`);
 }
 
+/**
+ * Polls until an EXCLUSIVE acquire succeeds, releasing it immediately —
+ * used to detect "the lock is free again" without leaking the acquired
+ * HeldLock (and its open transaction + client) past the check. A bare
+ * `waitFor(async () => (await acquireExclusive(db)) !== null)` would hold
+ * the successful acquire open for the rest of the test, racing afterEach's
+ * rmSync against a still-open sqlite connection on that file.
+ */
+async function waitForExclusiveFree(db: string, timeoutMs = 5000): Promise<void> {
+  await waitFor(async () => {
+    const held = await acquireExclusive(db);
+    if (!held) return false;
+    await held.release();
+    return true;
+  }, timeoutMs);
+}
+
 describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
   it("INVARIANT §17: lock-db-shared-blocks-exclusive-through-libsql", async () => {
     const db = newLockDbPath();
@@ -81,7 +99,7 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
     expect(await acquireExclusive(db)).toBeNull();
 
     holder.kill("SIGKILL");
-    await waitFor(async () => (await acquireExclusive(db)) !== null);
+    await waitForExclusiveFree(db);
   });
 
   it("INVARIANT §17: lock-db-probe-distinguishes-shared-and-exclusive", async () => {
@@ -109,21 +127,31 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
     expect(await acquireExclusive(db)).toBeNull();
 
     holder.kill("SIGKILL");
-    await waitFor(async () => (await acquireExclusive(db)) !== null);
+    await waitForExclusiveFree(db);
   });
 
   it("INVARIANT §17: lock-db-sibling-connection-close-does-not-release-lock", async () => {
     const db = newLockDbPath();
     const { child: holder } = await spawnHolder("exclusive", db);
 
-    // A second, unrelated client opens and closes against the SAME file
-    // while the hold lives — must not disturb the held lock.
-    expect(await probeShared(db)).toBe("busy");
-    expect(await probeShared(db)).toBe("busy");
+    // A second, unrelated client actually opens against the SAME file
+    // and closes — the plain POSIX close-drops-locks footgun this
+    // invariant pins. Its own read is refused (the holder's EXCLUSIVE
+    // lock correctly blocks it too — expected, not the thing under
+    // test), but the open + refused-read + close sequence must not
+    // disturb the holder's lock. If close() dropped ALL locks on the
+    // shared fd (rather than just this connection's own advisory range),
+    // that's exactly what would silently release it.
+    const sibling = createClient({ url: `file:${db}` });
+    await expect(sibling.execute("SELECT count(*) FROM sqlite_schema")).rejects.toThrow(
+      /SQLITE_BUSY/,
+    );
+    sibling.close();
+
     expect(await acquireExclusive(db)).toBeNull();
 
     holder.kill("SIGKILL");
-    await waitFor(async () => (await acquireExclusive(db)) !== null);
+    await waitForExclusiveFree(db);
   });
 
   it("INVARIANT §17: lock-db-releases-after-sigkill-with-orphan-child-alive", async () => {
@@ -139,11 +167,38 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
     holder.kill("SIGKILL");
     // The lock must free even though the grandchild (an orphan once
     // holder dies) is still running.
-    await waitFor(async () => (await acquireExclusive(db)) !== null);
+    await waitForExclusiveFree(db);
 
     // Confirm the grandchild really did outlive its parent's death, then
     // clean it up — it is not attached to our children[] kill list.
     expect(() => process.kill(grandchildPid, 0)).not.toThrow();
     process.kill(grandchildPid, "SIGKILL");
+  });
+
+  it("acquireShared: acquires in-process, survives while held, and blocks a concurrent EXCLUSIVE holder", async () => {
+    const db = newLockDbPath();
+
+    const held = await acquireShared(db);
+    expect(held).not.toBeNull();
+
+    // The in-process SHARED hold survives while a real cross-process
+    // EXCLUSIVE attempt is made against the same file.
+    expect(await acquireExclusive(db)).toBeNull();
+
+    await held?.release();
+    // Released — a fresh EXCLUSIVE acquire now succeeds.
+    const afterRelease = await acquireExclusive(db);
+    expect(afterRelease).not.toBeNull();
+    await afterRelease?.release();
+  });
+
+  it("acquireShared: returns null (BUSY) while a real EXCLUSIVE holder lives", async () => {
+    const db = newLockDbPath();
+    const { child: holder } = await spawnHolder("exclusive", db);
+
+    expect(await acquireShared(db)).toBeNull();
+
+    holder.kill("SIGKILL");
+    await waitForExclusiveFree(db);
   });
 });
