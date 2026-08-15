@@ -119,9 +119,9 @@ resume into.
 ```
 
 "Sole opener" is deliberately qualified: rotation retains direct access
-by design, and `--doctor`'s status is an open item (§9). The accurate
-claim is *one owner during normal runtime; offline maintenance tools take
-exclusive ownership via the lock.*
+by design, and `--doctor --offline` runs under the exclusive maintenance
+lock (§9.1). The accurate claim is *one owner during normal runtime;
+offline maintenance tools take exclusive ownership via the lock.*
 
 ### 3.1 The daemon (`conduitd`)
 
