@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 5 — four adversarial passes; pass-4 residuals fixed
+**Status:** design, revision 5 — CONVERGED after a 5-pass codex arc (9 → 5 → 3 → 2 → 0)
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -937,3 +937,13 @@ confirmed complete; 2 residual breaks, fixed in revision 5:**
    locks opened close-on-exec, never passed to children; fork/exec
    semantics of the primitive verified per platform; orphan-child
    real-process test (§3.1).
+
+**Fifth pass (2026-08-15): CONVERGED.** Both pass-4 fixes verified
+correct and complete; no new in-scope breaks; zero category-(c) findings.
+Remaining items are all documented decisions (same-UID scope, direct
+rotation, single-daemon choice, provisional idle exit, deferred
+crash-recovery mechanism, default-paths-only identity, macOS/Linux v1,
+diagnostic-only pidfile) or explicit best-effort layers (QuickJS
+process-scoped counters). The idle-exit/browser-console conflict and the
+crash-recovery mechanism are bounded planning obligations, not defects in
+this ownership decision. Five-pass arc: 9 → 5 → 3 → 2 → 0.
