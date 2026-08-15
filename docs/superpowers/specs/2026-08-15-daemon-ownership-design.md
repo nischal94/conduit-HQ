@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 3 — two adversarial passes; rev-2 NOT CONVERGED findings fixed
+**Status:** design, revision 4 — three adversarial passes; pass-3 refinements applied
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -134,9 +134,29 @@ owns:
   step 3's hot-reload builds on)
 - the upstream MCP session scope
 
-It does **not** own the master key beyond what `openStoreFromEnv`
-already resolves. Key resolution is unchanged from step 1: key-file-first
-with env override, canary-verified at open.
+**The spawn boundary — the daemon's environment is constructed, never
+inherited.** A spawned child ordinarily inherits the client's entire
+environment — including `CONDUIT_MASTER_KEY`, `CONDUIT_DB`,
+`CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS`, and even `HOME` (which determines
+where `~/.conduit` resolves). Auto-start from an arbitrary client would
+therefore let that client smuggle security config into the daemon,
+defeating §9.3's default-only decision. So:
+
+- The auto-starting client spawns the daemon with an **allowlisted,
+  constructed environment**: `PATH` and platform essentials only. Every
+  `CONDUIT_*` variable is stripped.
+- The daemon derives its state directory from the **authenticated OS
+  UID** (`os.userInfo().homedir`-equivalent resolved from the uid, not
+  the inherited `HOME` string).
+- The daemon resolves configuration itself — key-file-first as step 1
+  built it — and receives it as explicit resolved values into the store
+  opener, not implicitly via `openStoreFromEnv(process.env)`. The env
+  *override* path (`CONDUIT_MASTER_KEY`) remains supported only for a
+  daemon an operator starts BY HAND with that env set; it never
+  transfers through auto-start.
+- Required tests: hostile client values for `HOME`, `CONDUIT_MASTER_KEY`,
+  `CONDUIT_DB`, and the private-egress flag must all be inert through
+  auto-start.
 
 ### 3.2 Transport: Unix domain socket
 
@@ -364,27 +384,51 @@ lock must carry that distinction structurally.
 | **maintenance** | SHARED, for its lifetime | EXCLUSIVE | mutual exclusion between normal runtime and offline maintenance |
 | **lifecycle** | EXCLUSIVE, for its lifetime | — | singleton enforcement among daemons |
 
-A client can now distinguish states from lock modes alone, with no
-metadata trust:
+**The total acquisition protocol** (order is normative — two separate
+locks cannot be observed atomically, so coherence comes from ordering
+plus re-probing, not from a snapshot):
 
-- Maintenance lock held EXCLUSIVE → rotation in progress → **fail fast**,
-  no retry spin.
-- Maintenance held shared + lifecycle held + socket connectable → a
-  healthy daemon → connect.
-- Lifecycle held + socket refuses → daemon starting or draining → wait
-  under a bounded startup deadline (see the drain state machine below).
-- Neither held → no daemon → acquire and start.
+1. **Daemon startup:** acquire lifecycle EXCLUSIVE **first**, then
+   maintenance SHARED, both non-blocking, BEFORE resolving keys or
+   opening the db. If maintenance is held exclusive (rotation), release
+   lifecycle immediately and report "rotation in progress". This
+   ordering means "maintenance shared + lifecycle free" is not a
+   reachable daemon state.
+2. **The daemon itself acquires its own locks.** The auto-starting
+   client never acquires a lock and hands it to the child — there is no
+   reliable cross-process lock handoff; the client only spawns and then
+   probes like any other client.
+3. **Rotation:** attempt maintenance EXCLUSIVE **non-blocking**. Held
+   shared (live daemon) → refuse with the daemon's identity from
+   diagnostic metadata. Never block-wait: blocking would starve behind
+   daemon lifetimes and stack rotations behind each other invisibly.
+4. **Shutdown:** release maintenance BEFORE lifecycle; lifecycle release
+   is the very last act (§ drain machine).
+5. **Clients re-probe after every wait.** A client's view is stale the
+   moment it is taken; any branch taken on lock state is revalidated
+   after a wait completes (e.g. after a lifecycle-release wait, probe
+   maintenance again before deciding "start" vs "rotation in
+   progress").
 
-Rotation taking the maintenance lock exclusively is naturally blocked
-while any daemon holds it shared — which is exactly the stop-first
-precondition step 1 requires, now enforced by the kernel instead of by
-asking the operator.
+Client decision table (each row re-checked after any wait):
 
-The lifecycle lock is acquired before bind and released last, after the
-socket is safely removed. Two clients racing to auto-start must produce
-one daemon: the loser detects the winner and connects. This race is a
-required test, not an edge case — two MCP clients starting together at
-login is the normal case.
+- Maintenance EXCLUSIVE → rotation → **fail fast**, no retry spin.
+- Lifecycle held + socket connectable → healthy daemon → connect (and
+  see the readiness gate below).
+- Lifecycle held + socket refuses → starting or draining → wait under
+  one bounded deadline for lifecycle release, then **re-probe from the
+  top**.
+- Neither lock held → spawn the daemon (§3.1 spawn boundary), then probe
+  again.
+
+Rotation taking maintenance EXCLUSIVE is blocked while any daemon holds
+it SHARED — step 1's stop-first precondition, now kernel-enforced
+instead of operator-trusted.
+
+Two clients racing to auto-start must produce one daemon: both spawn,
+one child wins lifecycle, the other child exits, both clients converge
+by re-probing. This race is a required test, not an edge case — two MCP
+clients starting together at login is the normal case.
 
 A pidfile may exist as **diagnostic metadata only** (for error messages:
 which process, since when). A PID plus `kill(pid, 0)` is not proof of
@@ -429,11 +473,30 @@ Daemon states: `RUNNING → DRAINING → STOPPED`.
 
 - `RUNNING`: listener open, requests served.
 - `DRAINING`: idle timeout fired. Close the listener, re-check
-  accepted/in-flight/queued work (a connection accepted a microsecond
-  before close still gets served), finish everything, remove the socket
-  under the §3.2 device+inode check, then release the locks — lifecycle
-  last. Draining is not cancellable; a daemon that has begun draining
-  completes its exit.
+  accepted/in-flight/queued work, finish everything, remove the socket
+  under the §3.2 device+inode check, then release the locks —
+  maintenance first, lifecycle last. Draining is not cancellable; a
+  daemon that has begun draining completes its exit.
+
+**The readiness gate** (closes the successful-connect race): a
+`connect()` can succeed at the kernel level — queued in the listen
+backlog — moments before the daemon closes its listener, and the queued
+connection is then discarded without ever being accepted. A client that
+wrote request bytes on such a connection would get `outcome unknown` at
+an ordinary idle boundary, and the §3.5 wait path would never engage
+because its trigger is a *failed* connect. Therefore:
+
+- After connecting, a client sends **no operation bytes** until the
+  daemon sends a `READY` preface on that connection.
+- The daemon sends `READY` only for connections it has accepted while in
+  `RUNNING`; a connection accepted-or-queued during `DRAINING` never
+  receives one.
+- A connection that has received `READY` counts as active work — drain
+  cannot begin beneath it.
+- No `READY` within the bounded deadline → the client treats it exactly
+  like a refused connect: wait for lifecycle release, re-probe from the
+  top. Nothing was written, so retrying is a first attempt, not a
+  replay.
 - `STOPPED`: no locks held, no socket.
 
 **The client contract during DRAINING** (closes the liveness hole where a
@@ -662,6 +725,12 @@ processes, not mocks):
   wins — no burned retry against a draining daemon
 - a client with custom `CONDUIT_DB` gets the typed handshake refusal;
   daemon config never inherits the auto-starting client's env
+- hostile client `HOME` / `CONDUIT_MASTER_KEY` / `CONDUIT_DB` /
+  private-egress values are inert through auto-start (spawn boundary)
+- a connection queued during listener close gets no READY and the client
+  writes nothing (readiness-gate race)
+- lock-order test: daemon startup during rotation releases lifecycle and
+  reports; rotation during a live daemon refuses non-blocking
 
 **Not invariant, still required:** state-directory and socket modes;
 stable error codes with redacted cause; same-UID exposure documented as
@@ -808,3 +877,20 @@ Second-pass items accepted without change: same-UID scope (documented
 decision), QuickJS counter reset (best-effort layer), idle-exit vs.
 console (provisional pending §9.4), crash-recovery mechanism selection
 (deferred to planning as a stop-and-ask).
+
+**Third pass (2026-08-15): NOT CONVERGED — oracle and --doctor fixes
+confirmed complete; 3 category-(c) refinements, all fixed in revision 4:**
+
+1. Config decision was defeatable through the spawn environment (child
+   inherits `HOME`/`CONDUIT_*`) → constructed allowlisted spawn env,
+   uid-derived state dir, explicit resolved config into the opener
+   (§3.1).
+2. Lock protocol lacked acquisition order and atomic observation →
+   normative total order (lifecycle EXCLUSIVE then maintenance SHARED,
+   both non-blocking; rotation non-blocking; daemon acquires its own
+   locks, no handoff; release maintenance before lifecycle; clients
+   re-probe after every wait) (§3.5).
+3. A kernel-queued `connect()` could succeed just before listener close
+   and be discarded → READY preface gate: no operation bytes until the
+   daemon confirms RUNNING-state acceptance; a READY connection blocks
+   drain; a missing READY is treated as a refused connect (§3.5).
