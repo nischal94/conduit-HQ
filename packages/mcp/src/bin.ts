@@ -1,5 +1,7 @@
 #!/usr/bin/env node
+import type { ConduitStore } from "@conduithq/sdk";
 import { DaemonExit, runDaemon } from "./daemon/conduitd.js";
+import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
 import { openStoreFromEnv } from "./store-open.js";
@@ -31,6 +33,18 @@ async function doctor(): Promise<number> {
   }
 }
 
+/**
+ * Adapts the sweep to the daemon's `CrashTerminalSweep` seam, which is
+ * `(store) => Promise<void>`. The swept count is already logged by the
+ * sweep itself, so discarding the return value here loses nothing — the
+ * seam exists to fix WHERE the sweep runs in the startup order, not to
+ * report on it. Lines go to stderr, which under `--daemon` is the
+ * inherited log descriptor the spawning client opened.
+ */
+async function sweepDaemonStore(store: ConduitStore): Promise<void> {
+  await sweepOrphanedExecutions(store);
+}
+
 async function main(): Promise<void> {
   const arg = process.argv[2];
   if (arg === "--version") {
@@ -47,7 +61,7 @@ async function main(): Promise<void> {
   }
   if (arg === "--daemon") {
     try {
-      await runDaemon({ stateDir: DEFAULT_CONDUIT_DIR });
+      await runDaemon({ stateDir: DEFAULT_CONDUIT_DIR, sweep: sweepDaemonStore });
     } catch (error) {
       // The two refusal paths carry their own exit codes (§3.5's client
       // decision table) — a client branches on the code, not on prose.

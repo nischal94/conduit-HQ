@@ -27,6 +27,7 @@ import { writeFileSync } from "node:fs";
 // resolver needs the literal on-disk extension.
 import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
+import { sweepOrphanedExecutions } from "../sweep.ts";
 
 const [, , stateDir, ...rest] = process.argv;
 
@@ -39,14 +40,28 @@ const markerFlag = rest.indexOf("--sweep-marker");
 const sweepMarker = markerFlag === -1 ? undefined : rest[markerFlag + 1];
 const stallSweep = rest.includes("--stall-sweep");
 const stallExecute = rest.includes("--stall-execute");
+const stallRunning = rest.includes("--stall-running");
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
   return new Promise<never>(() => {});
 }
 
-const sweep: CrashTerminalSweep | undefined =
-  stallSweep || sweepMarker !== undefined
+/**
+ * With --sweep-on-start the REAL crash-terminal sweep is wired into the
+ * seam, exactly as `bin.ts` wires it for a production daemon. The
+ * marker/stall variants below stay synthetic because they test WHERE the
+ * seam fires, not what the sweep does.
+ */
+const realSweep = rest.includes("--sweep-on-start");
+
+const sweep: CrashTerminalSweep | undefined = realSweep
+  ? async (store) => {
+      await sweepOrphanedExecutions(store, (line) => {
+        console.log(line);
+      });
+    }
+  : stallSweep || sweepMarker !== undefined
     ? async () => {
         if (sweepMarker !== undefined) writeFileSync(sweepMarker, "swept");
         if (stallSweep) {
@@ -78,7 +93,33 @@ const createRuntime = stallExecute
         },
       };
     }
-  : undefined;
+  : stallRunning
+    ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+        const built = await createApprovalRuntime(runtimeOpts);
+        return {
+          ...built,
+          manager: {
+            ...built.manager,
+            // Unlike --stall-execute, this PERSISTS the execution row
+            // first and stalls afterwards, leaving the row durably
+            // `running` — the state a SIGKILLed daemon actually strands,
+            // and the precondition the crash-terminal sweep recovers.
+            // Stalling before the write would leave nothing to sweep.
+            start: async (code: string) => {
+              await runtimeOpts.store.executions.put({
+                id: `exec_stalled_${Date.now()}`,
+                code,
+                status: "running",
+                seeds: { now: Date.now(), random: 0.5 },
+                startedAt: Date.now(),
+              });
+              console.log("stalling running");
+              return forever();
+            },
+          },
+        };
+      }
+    : undefined;
 
 try {
   await runDaemon({

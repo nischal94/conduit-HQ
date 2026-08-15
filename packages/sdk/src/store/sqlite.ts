@@ -485,7 +485,11 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         });
         return rs.rowsAffected === 1;
       },
-      async failClaimedResume(id: string, reason: string): Promise<void> {
+      async failClaimedResume(
+        id: string,
+        reason: string,
+        errorName = "ConduitInternalError",
+      ): Promise<void> {
         // Guarded terminalizer for a row THIS resume claimed (design §8/F5).
         // The `WHERE status='running'` clause means it ONLY finalizes a row a
         // successful `claimForResume` left `running` — never a row another
@@ -496,7 +500,7 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         await client.execute({
           sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL, error = ?
                 WHERE id = ? AND status = 'running'`,
-          args: [Date.now(), JSON.stringify({ name: "ConduitInternalError", message: reason }), id],
+          args: [Date.now(), JSON.stringify({ name: errorName, message: reason }), id],
         });
       },
       async listPaused(): Promise<Execution[]> {
@@ -504,6 +508,17 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           "SELECT * FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC",
         );
         return rs.rows.map((row) => hydrateExecutionRow(row, text(row, "id")));
+      },
+      async listRunningIds(): Promise<string[]> {
+        // Ids only, never hydrated: the crash-terminal sweep's whole job
+        // is to recover rows a dead process left behind, and one of those
+        // rows having corrupt JSON is a realistic outcome of that same
+        // crash. Selecting the id column alone means no row can throw on
+        // the way out and strand its siblings.
+        const rs = await client.execute(
+          "SELECT id FROM executions WHERE status = 'running' ORDER BY started_at ASC, id ASC",
+        );
+        return rs.rows.map((row) => text(row, "id"));
       },
     },
 

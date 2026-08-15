@@ -1,0 +1,396 @@
+/**
+ * The daemon client (design §3.5's decision table + §5's retry rule).
+ *
+ * The whole module is organized around one asymmetry: **before the first
+ * request byte is written, every failure is retryable; after it, none
+ * are.** A client that has written nothing can wait, re-probe, spawn, and
+ * try again, and its eventual attempt is a FIRST attempt — nothing
+ * reached a daemon, so nothing can have been half-done. Once a byte is on
+ * the wire that reasoning collapses: a lost connection no longer
+ * distinguishes "the daemon never saw it" from "the daemon executed it
+ * and died before replying", and those have opposite correct responses.
+ * §5 resolves the ambiguity by refusing to guess — the client reports
+ * `outcome-unknown` and never retries, because a retried execution can
+ * duplicate upstream side effects that already landed.
+ *
+ * This is why the READY gate exists and why it is load-bearing rather
+ * than decorative. A `connect()` can succeed at the kernel level, sitting
+ * in the listen backlog, moments before the daemon closes its listener;
+ * that connection is discarded without ever being accepted. Writing
+ * immediately on connect would put such a request into the ambiguous zone
+ * for a daemon that provably never saw it. Waiting for READY keeps it in
+ * the retryable zone instead.
+ *
+ * Clients NEVER unlink the socket (§3.2). A failed connect does not prove
+ * the daemon is dead — it may be starting, its backlog may be transiently
+ * full, or shutdown may be racing — and unlinking a live UDS does not
+ * close the listener: it only frees the name, letting a second daemon
+ * bind and produce two owners of one database.
+ */
+import { connect, type Socket } from "node:net";
+import { daemonPaths } from "./conduitd.js";
+import { encodeFrame, FrameDecoder } from "./frames.js";
+import { probeShared } from "./locks.js";
+import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
+import { spawnDaemon } from "./spawn.js";
+import { assertStateDir } from "./state-dir.js";
+
+export interface DaemonRequestOptions {
+  stateDir: string;
+  role: keyof typeof CAPABILITIES;
+  request: RpcRequest;
+  /** One bounded budget for the WHOLE attempt, waits and spawn included. */
+  deadlineMs: number;
+  /** Injectable for tests; production spawns the real daemon. */
+  spawn?: (stateDir: string) => void;
+}
+
+/**
+ * The correlation id on a client-synthesized `outcome-unknown`.
+ *
+ * Correlation ids are DAEMON-assigned (`conduitd.ts`: no request variant
+ * carries one, and the decoder's extra-key rejection refuses one a client
+ * sends). So when the connection dies before any response arrives, there
+ * is genuinely no id to echo — the daemon never told us one. Rather than
+ * invent a plausible-looking id that no daemon log will ever contain,
+ * this sentinel says so explicitly: a reader correlating against the
+ * daemon log needs to know the lookup is impossible, not to search for a
+ * number that was never assigned.
+ *
+ * If a partial response DID deliver an id before the connection dropped,
+ * that real id is used instead — it is correlatable, and strictly more
+ * useful than the sentinel.
+ */
+export const UNCORRELATED = "uncorrelated";
+
+/** How long to wait for the lifecycle lock to release before re-probing. */
+const LIFECYCLE_WAIT_POLL_MS = 50;
+
+/**
+ * How many times the top of the decision table may be re-entered. Each
+ * pass corresponds to a state transition the design names (rotation
+ * clears, a starting daemon finishes, a spawn lands), and every pass is
+ * additionally bounded by `deadlineMs`. The count exists so a pathological
+ * flapping daemon produces a typed refusal rather than spinning until the
+ * deadline: §3.5 says spawn-then-re-probe happens ONCE, and the wait path
+ * re-probes from the top, so a small fixed bound covers every legitimate
+ * sequence.
+ */
+const MAX_PASSES = 4;
+
+export class DaemonUnavailable extends Error {
+  readonly code: "rotation-in-progress" | "unavailable";
+
+  constructor(code: "rotation-in-progress" | "unavailable", message: string) {
+    super(message);
+    this.name = "DaemonUnavailable";
+    this.code = code;
+  }
+}
+
+/**
+ * Runs one request against the daemon, auto-starting it if absent.
+ *
+ * Returns an `RpcResponse`. A returned `outcome-unknown` is a real,
+ * terminal answer — the caller must NOT retry it (§5). A thrown
+ * `DaemonUnavailable` means nothing was ever written, so the caller may
+ * retry as a first attempt.
+ */
+export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResponse> {
+  const paths = daemonPaths(opts.stateDir);
+  const spawnChild = opts.spawn ?? spawnDaemon;
+  const expiry = Date.now() + opts.deadlineMs;
+
+  // The client-side half of the §3.2 boundary. `connect` mode verifies
+  // only — a client never mutates the state directory (that is the
+  // daemon's prerogative), but it must refuse to hand a request to a
+  // socket sitting in a directory whose ownership or mode would let
+  // another uid reach it.
+  await assertStateDir(opts.stateDir, "connect");
+
+  let spawned = false;
+
+  for (let pass = 0; pass < MAX_PASSES; pass++) {
+    if (Date.now() >= expiry) break;
+
+    // Row 1 — rotation. Checked FIRST and every pass, including after a
+    // wait: §3.5 step 5 is explicit that a client's view is stale the
+    // moment it is taken, so the branch is revalidated rather than
+    // remembered. Rotation is fail-fast with no spawn: a daemon started
+    // now would only exit "rotation in progress" itself, and spinning
+    // would starve the rotation this refusal exists to let finish.
+    if ((await probeShared(paths.maintenanceLockDb)) === "busy") {
+      throw new DaemonUnavailable(
+        "rotation-in-progress",
+        "[conduit] Daemon unavailable: key rotation is in progress. Context: {stateDir: " +
+          `${opts.stateDir}} — retry once rotation finishes`,
+      );
+    }
+
+    const lifecycle = await probeShared(paths.lifecycleLockDb);
+
+    if (lifecycle === "busy") {
+      // Row 2/3 — a daemon holds lifecycle: it is running, starting, or
+      // draining. Try to connect; only a connect that reaches READY is a
+      // healthy daemon.
+      const socket = await tryConnect(paths.socket);
+      if (socket !== null) {
+        const ready = await awaitReady(socket, remaining(expiry));
+        if (ready) {
+          // Past this point the request bytes go out and the retryable
+          // zone ends.
+          return await exchange(socket, opts.role, opts.request, expiry);
+        }
+        // Connected but no READY — accepted-or-queued during DRAINING.
+        // Identical to a refused connect, and crucially NOTHING was
+        // written, so the next attempt is still a first attempt.
+        socket.destroy();
+      }
+
+      // Row 3 — starting or draining. One bounded wait for lifecycle
+      // release, then RE-PROBE FROM THE TOP rather than assuming the
+      // reason it released. Rotation may have taken maintenance in the
+      // meantime, which is why the loop re-runs row 1 rather than
+      // falling through to spawn.
+      await waitForLifecycleRelease(paths.lifecycleLockDb, expiry);
+      continue;
+    }
+
+    // Row 4 — neither lock held: no daemon and no rotation. Spawn, then
+    // probe again. Once only: a second spawn after a failed re-probe
+    // would mean something is wrong that another process cannot fix, and
+    // spawn loops are how fork bombs happen.
+    if (spawned) {
+      break;
+    }
+    spawnChild(opts.stateDir);
+    spawned = true;
+    // The child must acquire its locks and bind before the next pass can
+    // see it. Waiting for the lifecycle lock to be TAKEN is the earliest
+    // observable evidence the child is alive, and it is strictly better
+    // than a fixed sleep.
+    await waitForLifecycleHeld(paths.lifecycleLockDb, expiry);
+  }
+
+  throw new DaemonUnavailable(
+    "unavailable",
+    `[conduit] Daemon unavailable: no daemon could be reached or started within the deadline. Context: {stateDir: ${opts.stateDir}, deadlineMs: ${opts.deadlineMs}}`,
+  );
+}
+
+function remaining(expiry: number): number {
+  return Math.max(0, expiry - Date.now());
+}
+
+/**
+ * Connects, or resolves null if the endpoint refuses/is absent. A refusal
+ * is information, not an error, and it explicitly does NOT license
+ * removing the socket (§3.2) — hence no unlink anywhere in this module.
+ */
+function tryConnect(socketPath: string): Promise<Socket | null> {
+  return new Promise((resolve) => {
+    const socket = connect(socketPath);
+    const onError = (): void => {
+      socket.destroy();
+      resolve(null);
+    };
+    socket.once("error", onError);
+    socket.once("connect", () => {
+      socket.removeListener("error", onError);
+      resolve(socket);
+    });
+  });
+}
+
+/**
+ * Waits for the daemon's READY preface. Resolves false if the connection
+ * closes or the deadline passes first — both meaning the daemon never
+ * accepted this connection while RUNNING. No bytes are written here; that
+ * is the entire point of the gate.
+ */
+function awaitReady(socket: Socket, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    const decoder = new FrameDecoder();
+    let settled = false;
+    const finish = (ok: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      socket.removeListener("data", onData);
+      resolve(ok);
+    };
+    const timer = setTimeout(() => finish(false), timeoutMs);
+    const onData = (chunk: Buffer): void => {
+      let messages: unknown[];
+      try {
+        messages = decoder.push(chunk);
+      } catch {
+        finish(false);
+        return;
+      }
+      for (const msg of messages) {
+        if (isKind(msg, "ready")) {
+          finish(true);
+          return;
+        }
+      }
+    };
+    socket.on("data", onData);
+    socket.once("close", () => finish(false));
+    socket.once("error", () => finish(false));
+  });
+}
+
+/**
+ * Handshake, then the request — the only place this module writes bytes.
+ *
+ * Everything after the first write is in §5's ambiguous zone, so every
+ * failure path below resolves `outcome-unknown` rather than throwing a
+ * retryable error or retrying internally. The handshake write counts:
+ * once ANY byte has gone out, the client can no longer prove the daemon
+ * did nothing, and a caller that treated a handshake-phase drop as
+ * retryable would eventually replay a request that had in fact been
+ * delivered on a later connection.
+ */
+async function exchange(
+  socket: Socket,
+  role: keyof typeof CAPABILITIES,
+  request: RpcRequest,
+  expiry: number,
+): Promise<RpcResponse> {
+  const reader = createReader(socket);
+  try {
+    // The client's own CONDUIT_DB, when set, is declared rather than
+    // hidden: the daemon refuses it with `refused-custom-db` (§9.3 item
+    // 3). Concealing it would serve the client against a database it did
+    // not ask for, which is the failure this field exists to prevent.
+    const dbPath = process.env.CONDUIT_DB?.trim();
+    socket.write(
+      encodeFrame({
+        kind: "handshake",
+        protocol: 1,
+        capability: role,
+        ...(dbPath ? { dbPath } : {}),
+      }),
+    );
+
+    const handshake = await reader.next(remaining(expiry));
+    if (handshake === null) return unknownOutcome(null);
+    if (isKind(handshake, "error")) return handshake as RpcResponse;
+    if (!isKind(handshake, "handshake.ok")) return unknownOutcome(handshake);
+
+    socket.write(encodeFrame(request));
+    const response = await reader.next(remaining(expiry));
+    if (response === null) return unknownOutcome(null);
+    return response as RpcResponse;
+  } finally {
+    reader.dispose();
+    socket.destroy();
+  }
+}
+
+/**
+ * Synthesizes the §5 `outcome unknown` verdict client-side. There is no
+ * wire message for it — the daemon that would have sent one is gone —
+ * so the id is taken from whatever partial response arrived, and falls
+ * back to the sentinel when nothing did. See UNCORRELATED.
+ */
+function unknownOutcome(partial: unknown): RpcResponse {
+  const requestId =
+    typeof partial === "object" &&
+    partial !== null &&
+    typeof (partial as { requestId?: unknown }).requestId === "string"
+      ? (partial as { requestId: string }).requestId
+      : UNCORRELATED;
+  return { kind: "outcome-unknown", requestId };
+}
+
+interface Reader {
+  /** Next decoded frame, or null if the connection closed / time ran out. */
+  next(timeoutMs: number): Promise<unknown | null>;
+  dispose(): void;
+}
+
+function createReader(socket: Socket): Reader {
+  const decoder = new FrameDecoder();
+  const buffered: unknown[] = [];
+  let waiter: ((msg: unknown | null) => void) | null = null;
+  let closed = false;
+
+  const deliver = (msg: unknown | null): void => {
+    if (waiter) {
+      const w = waiter;
+      waiter = null;
+      w(msg);
+    } else if (msg !== null) {
+      buffered.push(msg);
+    }
+  };
+
+  const onData = (chunk: Buffer): void => {
+    let messages: unknown[];
+    try {
+      messages = decoder.push(chunk);
+    } catch {
+      closed = true;
+      deliver(null);
+      return;
+    }
+    for (const msg of messages) deliver(msg);
+  };
+  const onEnd = (): void => {
+    closed = true;
+    deliver(null);
+  };
+
+  socket.on("data", onData);
+  socket.once("close", onEnd);
+  socket.once("error", onEnd);
+
+  return {
+    next(timeoutMs: number): Promise<unknown | null> {
+      const ready = buffered.shift();
+      if (ready !== undefined) return Promise.resolve(ready);
+      if (closed) return Promise.resolve(null);
+      return new Promise((resolve) => {
+        const timer = setTimeout(() => {
+          waiter = null;
+          resolve(null);
+        }, timeoutMs);
+        waiter = (msg) => {
+          clearTimeout(timer);
+          resolve(msg);
+        };
+      });
+    },
+    dispose(): void {
+      socket.removeListener("data", onData);
+      socket.removeListener("close", onEnd);
+      socket.removeListener("error", onEnd);
+    },
+  };
+}
+
+/** Polls until the lifecycle lock is free, or the deadline passes. */
+async function waitForLifecycleRelease(lockDb: string, expiry: number): Promise<void> {
+  while (Date.now() < expiry) {
+    if ((await probeShared(lockDb)) === "free") return;
+    await sleep(Math.min(LIFECYCLE_WAIT_POLL_MS, remaining(expiry)));
+  }
+}
+
+/** Polls until a spawned daemon has TAKEN the lifecycle lock. */
+async function waitForLifecycleHeld(lockDb: string, expiry: number): Promise<void> {
+  while (Date.now() < expiry) {
+    if ((await probeShared(lockDb)) === "busy") return;
+    await sleep(Math.min(LIFECYCLE_WAIT_POLL_MS, remaining(expiry)));
+  }
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+function isKind(msg: unknown, kind: string): boolean {
+  return typeof msg === "object" && msg !== null && (msg as { kind?: unknown }).kind === kind;
+}

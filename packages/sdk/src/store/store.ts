@@ -110,10 +110,31 @@ export interface ExecutionRepository {
    * `get` returned corrupt/unparseable JSON, so there may be no Execution to
    * spread. Returns nothing; a no-op (0 rows) means the row was already
    * terminal or re-claimed, which is fine.
+   *
+   * `errorName` classifies the stored failure for a later reader and
+   * defaults to the resume-path's `ConduitInternalError`. The
+   * crash-terminal sweep (mcp design §3.5) passes its own name: a row
+   * failed because a daemon died mid-flight has a genuinely UNKNOWN
+   * outcome — its upstream calls may have landed — and a reader must be
+   * able to tell that apart from an execution that simply threw.
    */
-  failClaimedResume(id: string, reason: string): Promise<void>;
+  failClaimedResume(id: string, reason: string, errorName?: string): Promise<void>;
   /** Paused executions awaiting a human, oldest-first (spec §10.2 approval queue). */
   listPaused(): Promise<Execution[]>;
+  /**
+   * Executions still durably `running`, oldest-first (mcp design §3.5,
+   * the crash-terminal sweep). Only meaningful to a caller that knows no
+   * execution can be live — the daemon at startup, holding both locks,
+   * where single-daemon plus kernel-enforced stop-first makes every such
+   * row provably owned by a process that is gone. Any other caller would
+   * be reading rows that are legitimately in flight.
+   *
+   * Returns ids rather than parsed `Execution`s on purpose: the crash
+   * this recovers from can itself be what left a row's JSON columns
+   * unparseable, and a sweep that throws while hydrating a corrupt row
+   * would strand exactly the rows it exists to terminalize.
+   */
+  listRunningIds(): Promise<string[]>;
 }
 
 export interface TraceRepository {
