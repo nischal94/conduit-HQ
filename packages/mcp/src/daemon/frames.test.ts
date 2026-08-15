@@ -43,6 +43,24 @@ describe("encodeFrame / FrameDecoder round-trip", () => {
     expect(results).toEqual([msg]);
   });
 
+  it("does not retain a reference to the caller's chunk: mutating the source buffer after a partial push does not corrupt the pending frame", () => {
+    const msg = { kind: "search", query: "hello world this is a payload" };
+    const frame = encodeFrame(msg);
+    const decoder = new FrameDecoder();
+
+    const mid = Math.floor(frame.length / 2);
+    const first = Buffer.from(frame.subarray(0, mid)); // owned, mutable copy
+    const second = frame.subarray(mid);
+
+    expect(decoder.push(first)).toEqual([]);
+    // Mutate the source buffer after the partial push returns. If the
+    // decoder aliased `first` instead of copying it, this corrupts the
+    // in-flight frame.
+    first.fill(0);
+
+    expect(decoder.push(second)).toEqual([msg]);
+  });
+
   it("decodes multiple frames delivered in a single chunk", () => {
     const msg1 = { kind: "handshake", protocol: 1 };
     const msg2 = { kind: "approvals.list" };

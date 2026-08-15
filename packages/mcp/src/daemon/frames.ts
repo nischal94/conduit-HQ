@@ -84,6 +84,25 @@ function checkDepth(value: unknown, depth: number): void {
  * frame. Any bytes already consumed toward the frame that caused the
  * error are dropped; subsequent, independent `push` calls with
  * well-formed frames continue to work normally.
+ *
+ * Memory bound: this class answers "how much memory can a hostile local
+ * process force this decoder to hold?" `buf` only ever retains bytes
+ * belonging to a not-yet-complete frame (a partial header, or a partial
+ * body whose declared length has already been checked against
+ * FRAME_CAP). Every fully-received frame is sliced off and discarded from
+ * `buf` in the same `push` call that completes it. So at any point
+ * between calls, `buf.length < HEADER_LEN + FRAME_CAP` — strictly less
+ * than a 4-byte length prefix plus one capped body. Transiently, mid-call,
+ * `buf` can briefly be as large as the previous residual plus one whole
+ * incoming chunk (`Buffer.concat` in the line below), but that too is
+ * bounded by the caller's chunk size, which for a UDS read is bounded by
+ * the OS socket buffer.
+ *
+ * Ownership: `push` never retains a reference to the caller's `chunk`
+ * buffer past the end of the call. Any unconsumed tail is always copied
+ * into `buf` (via `Buffer.concat`, which always allocates a fresh
+ * buffer) rather than aliased — a caller that mutates or reuses `chunk`
+ * after `push` returns can never corrupt a partially-assembled frame.
  */
 export class FrameDecoder {
   private buf: Buffer<ArrayBufferLike> = Buffer.alloc(0);
@@ -93,7 +112,10 @@ export class FrameDecoder {
   private pendingBodyLen: number | null = null;
 
   push(chunk: Buffer): unknown[] {
-    this.buf = this.buf.length === 0 ? chunk : Buffer.concat([this.buf, chunk]);
+    // Always copy into a fresh buffer — never alias the caller's chunk.
+    // `Buffer.concat` always allocates, even for a single-element array,
+    // so this holds whether or not there's residual state to merge with.
+    this.buf = Buffer.concat([this.buf, chunk]);
     const out: unknown[] = [];
 
     for (;;) {
