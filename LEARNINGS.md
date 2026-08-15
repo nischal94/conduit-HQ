@@ -1891,3 +1891,25 @@ and each consumed a full relaunch. The tell that should have stopped it:
 ~/.claude/rules/codex-one-path.md (liveness check, wait-on-process
 pattern, 1400s budget for design reviews, inline-the-document for
 document reviews).
+
+## 2026-08-16 — Design review closeout + plan (daemon ownership)
+
+### 1. Cross-model convergence does not cover the implementation platform
+
+Five codex passes converged the design as LOGIC; a platform-focused eng
+review then found both load-bearing mechanisms unimplementable in the
+actual runtime — Node ≥20 stdlib has neither flock(2) nor
+SO_PEERCRED/getpeereid. Neither fact was findable by reviewing the
+design's reasoning; both were findable by one grep and one stdlib check.
+A converged design review answers "is this correct?"; a separate pass
+must answer "can THIS stack build it?" — run both before writing a plan.
+(Resolution reused shipped machinery: SQLite lock databases as the
+kernel-lock primitive; the 0700 directory as the UID boundary.)
+
+### 2. The second arc converged too, and faster (5→1→0)
+
+Fixing the platform findings triggered its own codex arc (passes 6-8),
+same shape as the design arc but shorter — each fix wave's residue was
+specification tightening (probe modes, ACL detection, queue bounds), not
+new architecture. Consistent with the step-1 pattern: budget confirming
+passes for every fix wave, expect the residue to shrink by class.
