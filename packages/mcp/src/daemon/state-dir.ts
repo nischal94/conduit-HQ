@@ -45,12 +45,22 @@ const REQUIRED_MODE = 0o700;
  * lstat (no symlink), owner uid === process uid, mode 0700, no extended
  * ACL. mode="bind" strips ACLs before verifying (daemon side);
  * mode="connect" only verifies (clients never mutate).
+ *
+ * Ordering is deliberate and security-load-bearing: the full
+ * lstat/symlink/owner/mode validation runs FIRST, entirely before any
+ * mutation. Only after the target is confirmed to be a real,
+ * self-owned, 0700 directory does bind mode strip ACLs — and the
+ * final verify runs last. `chmod` without `-h` follows symlinks, so
+ * stripping before validating would let a symlink planted at the
+ * state-dir path use bind mode as an ACL-clearing primitive against an
+ * arbitrary target, before rejection ever triggers. Running strip only
+ * after ownership/mode are confirmed leaves a narrow strip-then-verify
+ * window that is owner-only: a 0700 parent means only the owning uid
+ * can race the target between those two calls, which is inside this
+ * module's own trust boundary, not a boundary break. Do not reorder
+ * this without re-reading that reasoning.
  */
 export async function assertStateDir(dir: string, mode: StateDirMode): Promise<void> {
-  if (mode === "bind" && process.platform === "darwin") {
-    await stripDarwinAcl(dir);
-  }
-
   const stat = await lstat(dir);
 
   if (stat.isSymbolicLink()) {
@@ -74,6 +84,9 @@ export async function assertStateDir(dir: string, mode: StateDirMode): Promise<v
   }
 
   if (process.platform === "darwin") {
+    if (mode === "bind") {
+      await stripDarwinAcl(dir);
+    }
     await assertNoDarwinAcl(dir);
   } else if (process.platform === "linux") {
     await assertNoLinuxAcl(dir);
@@ -93,23 +106,46 @@ async function assertNoDarwinAcl(dir: string): Promise<void> {
 }
 
 /**
+ * Classifies a single `getfacl --omit-header` output line as a
+ * non-owner ACL grant. Base entries (`user::rwx`, `group::rwx`,
+ * `other::rwx`) carry an EMPTY qualifier between the two colons and
+ * are not grants — every POSIX-permissioned file has them. Named
+ * entries (`user:alice:r-x`, `group:staff:r-x`) carry a non-empty
+ * qualifier and ARE grants. `mask::` bounds effective permissions for
+ * named entries; it is not itself a grant and is ignored. Extracted as
+ * a pure function so the classifier has unit coverage even on
+ * platforms (darwin) that never execute the getfacl call path.
+ */
+export function isNonOwnerAclLine(line: string): boolean {
+  return /^(user|group):[^:]+:/.test(line);
+}
+
+/**
  * POSIX-ACL grants surface in the group-class bits of st_mode, so the
  * 0700 check above already covers it. If getfacl is present, verify no
- * non-owner entries as an additional best-effort layer; if absent,
- * skip — this is documented best-effort, not the primary boundary.
+ * non-owner entries as an additional best-effort layer. Absence of the
+ * binary (ENOENT) is a documented best-effort skip; any other failure
+ * (permission denied, unexpected exit) is NOT silently swallowed — it
+ * surfaces as a typed error rather than disabling the layer.
  */
 async function assertNoLinuxAcl(dir: string): Promise<void> {
   const GETFACL = "/usr/bin/getfacl";
   let stdout: string;
   try {
     ({ stdout } = await execFileAsync(GETFACL, ["--omit-header", dir]));
-  } catch {
-    return; // getfacl unavailable — best-effort layer, silently skipped
+  } catch (err) {
+    if (isEnoent(err)) return; // getfacl not installed — best-effort layer, skipped
+    throw new StateDirError(
+      "EXTENDED_ACL",
+      `state directory ACL check failed (getfacl): ${dir}: ${String(err)}`,
+    );
   }
-  const nonOwnerEntry = stdout
-    .split("\n")
-    .some((line) => /^(user:.+|group:.+|mask::)/.test(line) && !line.startsWith("mask::"));
+  const nonOwnerEntry = stdout.split("\n").some(isNonOwnerAclLine);
   if (nonOwnerEntry) {
     throw new StateDirError("EXTENDED_ACL", `state directory has a POSIX ACL grant: ${dir}`);
   }
+}
+
+function isEnoent(err: unknown): boolean {
+  return typeof err === "object" && err !== null && "code" in err && err.code === "ENOENT";
 }

@@ -4,7 +4,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { assertStateDir } from "./state-dir.js";
+import { assertStateDir, isNonOwnerAclLine } from "./state-dir.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -40,6 +40,22 @@ describe("assertStateDir (design §3.2 — state-directory boundary)", () => {
     await expect(assertStateDir(link, "connect")).rejects.toThrow();
   });
 
+  it("rejects a symlinked directory in bind mode (validate-before-strip)", async () => {
+    // CRITICAL fix regression test: chmod -N follows symlinks without
+    // -h, so bind mode must reject the symlink BEFORE ever invoking
+    // chmod against it. If ordering regresses, this either strips ACLs
+    // off `real` (the symlink target) before rejecting, or — worse —
+    // silently succeeds.
+    const parent = newTempParent();
+    const real = join(parent, "real");
+    const link = join(parent, "link");
+    await execFileAsync("/bin/mkdir", [real]);
+    await execFileAsync("/bin/chmod", ["700", real]);
+    symlinkSync(real, link);
+
+    await expect(assertStateDir(link, "bind")).rejects.toThrow();
+  });
+
   it("rejects a directory with mode 0755", async () => {
     const parent = newTempParent();
     const target = join(parent, "loose");
@@ -67,6 +83,29 @@ describe("assertStateDir (design §3.2 — state-directory boundary)", () => {
     // not a false negative: real enforcement is the plain uid !== uid
     // comparison in assertStateDir, exercised implicitly by every other
     // test (own uid must match to pass).
+  });
+
+  describe("isNonOwnerAclLine (linux getfacl classifier — pure function, any platform)", () => {
+    it("does not flag base owner/group/other entries (empty qualifier)", () => {
+      expect(isNonOwnerAclLine("user::rwx")).toBe(false);
+      expect(isNonOwnerAclLine("group::---")).toBe(false);
+      expect(isNonOwnerAclLine("other::---")).toBe(false);
+    });
+
+    it("flags named user/group grants (non-empty qualifier)", () => {
+      expect(isNonOwnerAclLine("user:alice:r-x")).toBe(true);
+      expect(isNonOwnerAclLine("group:staff:r-x")).toBe(true);
+    });
+
+    it("does not flag the mask entry", () => {
+      expect(isNonOwnerAclLine("mask::r-x")).toBe(false);
+    });
+
+    it("does not flag unrelated or blank lines", () => {
+      expect(isNonOwnerAclLine("")).toBe(false);
+      expect(isNonOwnerAclLine("# file: /some/dir")).toBe(false);
+      expect(isNonOwnerAclLine("flags: -R-")).toBe(false);
+    });
   });
 
   if (process.platform === "darwin") {
