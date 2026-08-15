@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { CONCURRENCY_CAP, daemonPaths, ExecutionQueue, QUEUE_CAPACITY } from "./conduitd.js";
+import {
+  CONCURRENCY_CAP,
+  DRAIN_DEADLINE_MS,
+  daemonPaths,
+  ExecutionQueue,
+  QUEUE_CAPACITY,
+} from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
 
@@ -494,6 +500,146 @@ describe("conduitd lifecycle", () => {
       // reach it by method name (§3.3).
       client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
       expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a second handshake cannot widen an established capability",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      expect(await handshake(client, "serve")).toMatchObject({ kind: "handshake.ok" });
+
+      // Refused: administrative verb, outside `serve`.
+      client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
+      expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+
+      // `handshake` is in EVERY capability set, so re-handshaking is the
+      // obvious escalation route: claim `approvals`, then retry the verb.
+      client.send({ kind: "handshake", protocol: 1, capability: "approvals" });
+      expect(await client.next()).toMatchObject({
+        kind: "error",
+        code: "invalid",
+        message: "capability already negotiated on this connection",
+      });
+
+      // The escalated request is still refused — the connection is still
+      // `serve`, not `approvals`.
+      client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
+      expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "reports internal failures without leaking the cause to the client",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "approvals");
+
+      // A resume against an unknown execution drives the store/manager
+      // failure path. Whatever it reports, the client must not receive
+      // filesystem paths or key-source context.
+      client.send({ kind: "approvals.resume", executionId: "nope", decision: "approve" });
+      const reply = (await client.next()) as { kind: string; code?: string; message?: string };
+      if (reply.kind === "error" && reply.code === "internal") {
+        expect(reply.message).toBe(
+          "internal daemon error; see the daemon log for the cause (correlation id below)",
+        );
+        expect(reply.message).not.toContain(stateDir);
+        expect(reply.message).not.toContain(".db");
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "refuses unimplemented source RPCs distinguishably from malformed ones",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "add-mcp");
+
+      // Well-formed and permitted for this capability, but not built:
+      // "unimplemented", never "invalid".
+      client.send({ kind: "source.revalidate", namespace: "ns" });
+      expect(await client.next()).toMatchObject({ kind: "error", code: "unimplemented" });
+
+      // A genuinely malformed request still reads "invalid", so the two
+      // remain distinguishable.
+      client.send({ kind: "source.revalidate", namespace: 5 });
+      expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+    },
+    TIMEOUT,
+  );
+
+  it("exits within the drain deadline even with a request stalled in a non-sandbox layer", async () => {
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    // The helper stalls one in-flight request forever, simulating a
+    // block in the store/upstream layer that §16's budgets do not bound.
+    const daemon = spawnDaemon(stateDir, ["--stall-execute"]);
+    await daemon.waitForLine("listening");
+
+    const client = await connectClient(paths.socket);
+    await handshake(client, "serve");
+    client.send({ kind: "execute", code: "1+1", deadlineMs: 60_000 });
+    await daemon.waitForLine("stalling execute");
+
+    const startedAt = Date.now();
+    daemon.child.kill("SIGTERM");
+    expect(await daemon.waitForExit()).toBe(0);
+    const elapsed = Date.now() - startedAt;
+
+    // Bounded: it must not wait on the stalled request forever, and it
+    // must still release its locks and remove its endpoint on the way.
+    expect(elapsed).toBeLessThan(DRAIN_DEADLINE_MS + 20_000);
+    expect(daemon.lines.join("\n")).toContain("Drain deadline reached");
+    expect(existsSync(paths.socket)).toBe(false);
+
+    // The lifecycle lock is free — a successor can start, which is the
+    // property an unbounded drain would have destroyed.
+    const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+    expect(lifecycle).not.toBeNull();
+    if (lifecycle) locks.push(lifecycle);
+  }, 120_000);
+
+  it(
+    "an interrupted startup leaves no bound socket and releases its locks",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // Stalls inside the sweep — after both locks are held, before bind.
+      const daemon = spawnDaemon(stateDir, ["--stall-sweep"]);
+      await daemon.waitForLine("stalling sweep");
+
+      daemon.child.kill("SIGTERM");
+      expect(await daemon.waitForExit()).toBe(0);
+
+      // Startup was interrupted before bind, so no endpoint exists...
+      expect(existsSync(paths.socket)).toBe(false);
+      // ...and both locks were released through the same path a running
+      // daemon uses, rather than being abandoned by a default-signal death.
+      const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+      expect(lifecycle).not.toBeNull();
+      if (lifecycle) locks.push(lifecycle);
+      const maintenance = await acquireExclusive(paths.maintenanceLockDb);
+      expect(maintenance).not.toBeNull();
+      if (maintenance) locks.push(maintenance);
     },
     TIMEOUT,
   );

@@ -28,7 +28,13 @@ import { join } from "node:path";
 import { type ConduitStore, InMemoryCatalog } from "@conduithq/sdk";
 import { createApprovalRuntime } from "../runtime.js";
 import { openStoreFromEnv } from "../store-open.js";
-import { encodeFrame, FrameDecoder } from "./frames.js";
+import {
+  DepthExceeded,
+  encodeFrame,
+  FrameDecoder,
+  FrameTooLarge,
+  MalformedFrame,
+} from "./frames.js";
 import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
 import {
   CAPABILITIES,
@@ -49,6 +55,20 @@ import { assertStateDir } from "./state-dir.js";
  */
 export const CONCURRENCY_CAP = 4;
 export const QUEUE_CAPACITY = 16;
+
+/**
+ * How long DRAINING waits for accepted work before abandoning it.
+ *
+ * Normative-local (chosen here, not by the design): the design says
+ * draining "finishes everything", which is correct as intent but
+ * unbounded in practice — §16's budgets bound the sandbox, yet a request
+ * blocked in the store or an upstream layer is outside them. Since the
+ * daemon holds the lifecycle lock until it exits, an unbounded drain is
+ * an unbounded outage: every restart exits "already running" and rotation
+ * can never take maintenance. Bounding it trades one abandoned response
+ * (which §5 already models as `outcome unknown`) for a guaranteed exit.
+ */
+export const DRAIN_DEADLINE_MS = 30_000;
 
 export interface DaemonPaths {
   stateDir: string;
@@ -89,6 +109,13 @@ export interface RunDaemonOptions {
   sweep?: CrashTerminalSweep;
   /** Structured lifecycle lines; default stderr. */
   log?: (line: string) => void;
+  /**
+   * Builds the execution runtime per unit of work (M6). Defaults to
+   * `createApprovalRuntime`; overridable so a test can substitute a
+   * collaborator that stalls in a layer §16's budgets do not bound,
+   * without the daemon under test being anything other than the real one.
+   */
+  createRuntime?: typeof createApprovalRuntime;
 }
 
 /** Exit codes are part of the client contract (§3.5 decision table). */
@@ -285,6 +312,18 @@ function send(socket: Socket, msg: RpcResponse): void {
 }
 
 /**
+ * What an `internal` error tells the client. Store and sandbox failures
+ * carry absolute filesystem paths, key-source context, and upstream
+ * detail (§5: "stable error codes, redacted cause"; §11 forbids secret
+ * material in any daemon-visible line). The client gets a fixed string
+ * plus its correlation id; the operator gets the real cause in the
+ * daemon's own log, where the §3.2 directory boundary already restricts
+ * who can read it.
+ */
+const INTERNAL_ERROR_MESSAGE =
+  "internal daemon error; see the daemon log for the cause (correlation id below)";
+
+/**
  * Runs the daemon, resolving only once it has fully stopped. The two
  * refusal paths throw `DaemonExit` rather than calling `process.exit`
  * directly, so the exit code stays a property of the protocol and the
@@ -294,6 +333,75 @@ export async function runDaemon(opts: RunDaemonOptions): Promise<void> {
   const log = opts.log ?? ((line: string) => console.error(line));
   const paths = daemonPaths(opts.stateDir);
 
+  // Signals are armed BEFORE the first blocking startup step. Registering
+  // them only once serving begins leaves a window — lock acquisition,
+  // store open, sweep, bind — where SIGTERM takes Node's default
+  // disposition: the process dies without unwinding, `finally` never
+  // runs, and a freshly-bound socket is left behind. Arming here means an
+  // interrupted startup exits through the same release path as a running
+  // daemon, with the drain simply having nothing to do.
+  const stopSignal = new StopSignal();
+  process.once("SIGTERM", stopSignal.request);
+  process.once("SIGINT", stopSignal.request);
+
+  // A registered signal handler does NOT keep Node's event loop alive.
+  // Before the listener binds, startup can be waiting only on promises
+  // (a lock acquire, a store open, the sweep) — and if one of those never
+  // settles, Node sees no pending work, exits at "unsettled top-level
+  // await", and the handler never runs: locks abandoned, `finally`
+  // skipped. This handle holds the loop open across the whole startup
+  // window so a signal is always delivered to the code above rather than
+  // to Node's default disposition. The listener keeps it alive afterwards.
+  const keepAlive = setInterval(() => {}, 1 << 30);
+
+  try {
+    return await startDaemon(opts, paths, log, stopSignal);
+  } finally {
+    clearInterval(keepAlive);
+    process.removeListener("SIGTERM", stopSignal.request);
+    process.removeListener("SIGINT", stopSignal.request);
+  }
+}
+
+/**
+ * A stop request that can arrive before anything is listening for it.
+ * A signal during startup must not be lost — it is recorded and observed
+ * at the next checkpoint — and must not be delivered twice.
+ */
+class StopSignal {
+  private requested = false;
+  // Every pending waiter, not just the latest: startup races the signal
+  // at more than one checkpoint, and a single-slot field would silently
+  // strand whichever waiter registered first.
+  private readonly waiters = new Set<() => void>();
+
+  /** Bound so it can be registered and removed as a listener directly. */
+  readonly request = (): void => {
+    if (this.requested) return;
+    this.requested = true;
+    for (const notify of this.waiters) notify();
+    this.waiters.clear();
+  };
+
+  get isRequested(): boolean {
+    return this.requested;
+  }
+
+  /** Resolves immediately if a stop was already requested. */
+  wait(): Promise<void> {
+    if (this.requested) return Promise.resolve();
+    return new Promise<void>((resolve) => {
+      this.waiters.add(resolve);
+    });
+  }
+}
+
+async function startDaemon(
+  opts: RunDaemonOptions,
+  paths: DaemonPaths,
+  log: (line: string) => void,
+  stopSignal: StopSignal,
+): Promise<void> {
   // 1. State-directory boundary (§3.2). The different-UID boundary is
   //    enforced here, one level above the socket: a different-uid process
   //    cannot traverse a 0700 directory, so it never reaches the pathname.
@@ -329,7 +437,22 @@ export async function runDaemon(opts: RunDaemonOptions): Promise<void> {
     //    served. Both locks are held, so no other daemon can be touching
     //    the same rows, and the endpoint is not yet bound.
     if (opts.sweep !== undefined) {
-      await opts.sweep(store);
+      // Raced against the stop signal: a sweep that blocks (a wedged
+      // store call) would otherwise make the whole startup
+      // uninterruptible, and SIGTERM would fall through to Node's default
+      // disposition — killing the process without releasing either lock.
+      // Losing the race abandons the sweep, which is safe: it is
+      // idempotent by construction (it only moves dead-daemon rows to a
+      // terminal state) and the next startup runs it again.
+      await Promise.race([opts.sweep(store), stopSignal.wait()]);
+    }
+
+    // A stop that arrived during startup is honored here, before the
+    // endpoint exists — so an interrupted start never leaves a bound
+    // socket behind, and the locks still release through `finally`.
+    if (stopSignal.isRequested) {
+      log("stopped before bind");
+      return;
     }
 
     // 6. Validate and remove any pre-existing endpoint (we hold the
@@ -342,6 +465,8 @@ export async function runDaemon(opts: RunDaemonOptions): Promise<void> {
       allowPrivateEgress: env.allowPrivateEgress,
       dbPath: env.dbPath,
       log,
+      stopSignal,
+      createRuntime: opts.createRuntime ?? createApprovalRuntime,
     });
   } finally {
     // §3.5 step 4: maintenance first, lifecycle last. Lifecycle release
@@ -372,10 +497,12 @@ interface ServeOptions {
   allowPrivateEgress: boolean;
   dbPath: string;
   log: (line: string) => void;
+  stopSignal: StopSignal;
+  createRuntime: typeof createApprovalRuntime;
 }
 
 async function serve(opts: ServeOptions): Promise<void> {
-  const { paths, store, allowPrivateEgress, dbPath, log } = opts;
+  const { paths, store, allowPrivateEgress, dbPath, log, stopSignal, createRuntime } = opts;
   let draining = false;
   const queue = new ExecutionQueue();
   const connections = new Set<ConnectionContext>();
@@ -428,11 +555,27 @@ async function serve(opts: ServeOptions): Promise<void> {
       try {
         messages = decoder.push(chunk);
       } catch (err) {
+        // Framing failures are protocol-level and describe only the
+        // client's own bytes (size cap, nesting cap, malformed JSON), so
+        // echoing those specific messages tells the client how to fix
+        // its request without revealing daemon state. Anything else is
+        // unexpected and gets the generic message.
+        const protocolFault =
+          err instanceof FrameTooLarge ||
+          err instanceof DepthExceeded ||
+          err instanceof MalformedFrame;
+        if (!protocolFault) {
+          log(
+            `[conduitd] Frame decode failed: unexpected fault. Context: {cause: ${
+              err instanceof Error ? (err.stack ?? err.message) : String(err)
+            }}`,
+          );
+        }
         send(socket, {
           kind: "error",
           requestId: "",
           code: "invalid",
-          message: err instanceof Error ? err.message : String(err),
+          message: protocolFault ? (err as Error).message : INTERNAL_ERROR_MESSAGE,
         });
         socket.destroy();
         return;
@@ -503,11 +646,18 @@ async function serve(opts: ServeOptions): Promise<void> {
     try {
       await handleRequest(ctx, request, requestId);
     } catch (err) {
+      // Detail daemon-side, generic message to the client — the cause is
+      // correlated by requestId rather than copied onto the wire.
+      log(
+        `[conduitd] Request failed: ${request.kind}. Context: {requestId: ${requestId}, cause: ${
+          err instanceof Error ? (err.stack ?? err.message) : String(err)
+        }}`,
+      );
       send(ctx.socket, {
         kind: "error",
         requestId,
         code: "internal",
-        message: err instanceof Error ? err.message : String(err),
+        message: INTERNAL_ERROR_MESSAGE,
       });
     }
   }
@@ -517,6 +667,22 @@ async function serve(opts: ServeOptions): Promise<void> {
     request: Extract<RpcRequest, { kind: "handshake" }>,
     requestId: string,
   ): void {
+    // A connection's capability is assigned EXACTLY ONCE. `handshake` is a
+    // member of every capability set (§3.3), so without this guard a
+    // client refused an out-of-set request could simply re-handshake as a
+    // wider role and retry it — the authorization check below would then
+    // pass. Capability is a property of the connection, not a mutable
+    // per-request field; a client wanting a different one opens a new
+    // connection.
+    if (ctx.capability !== null) {
+      send(ctx.socket, {
+        kind: "error",
+        requestId,
+        code: "invalid",
+        message: "capability already negotiated on this connection",
+      });
+      return;
+    }
     // A client carrying its own CONDUIT_DB is refused rather than served
     // against a database it did not choose. Silently ignoring the value
     // would hide the mismatch at exactly the moment it matters (§9.3
@@ -552,7 +718,7 @@ async function serve(opts: ServeOptions): Promise<void> {
       case "execute": {
         const admission = queue.submit(async () => {
           // M6: a fresh runtime per unit of work — never cached.
-          const { manager } = await createApprovalRuntime({ store, allowPrivateEgress, log });
+          const { manager } = await createRuntime({ store, allowPrivateEgress, log });
           // deadlineMs bounded ADMISSION, not execution: §16's wall-clock
           // budget stays with the manager's own limits.
           const outcome = await manager.start(request.code);
@@ -619,18 +785,22 @@ async function serve(opts: ServeOptions): Promise<void> {
         return;
       }
       case "approvals.resume": {
-        const { manager } = await createApprovalRuntime({ store, allowPrivateEgress, log });
+        const { manager } = await createRuntime({ store, allowPrivateEgress, log });
         const outcome = await manager.resume(request.executionId, { kind: request.decision });
         send(ctx.socket, { kind: "result", requestId, payload: outcome });
         return;
       }
       case "source.provision":
       case "source.revalidate": {
+        // Well-formed and permitted for `add-mcp`, but §3.3.1's
+        // credential-handling design is not built here. `unimplemented`
+        // rather than `invalid` so a client can tell "not yet" from
+        // "you sent something wrong" and does not retry or reformat.
         send(ctx.socket, {
           kind: "error",
           requestId,
-          code: "invalid",
-          message: `"${request.kind}" is not served by this daemon build`,
+          code: "unimplemented",
+          message: `"${request.kind}" arrives with the client-conversion work; use direct store access until then`,
         });
         return;
       }
@@ -643,47 +813,61 @@ async function serve(opts: ServeOptions): Promise<void> {
   // accepted, then remove the endpoint under the device+inode check.
   // Draining is not cancellable — a daemon that has begun draining
   // completes its exit.
-  await new Promise<void>((resolve) => {
-    let stopping = false;
-    const stop = () => {
-      if (stopping) return;
-      stopping = true;
-      draining = true;
-      log("draining");
+  await stopSignal.wait();
+  draining = true;
+  log("draining");
 
-      void (async () => {
-        // Stop accepting new connections. `server.close` does NOT resolve
-        // until every already-open connection is gone, so the idle ones
-        // are ended first — otherwise a client that connected and simply
-        // sat there would hold the daemon in DRAINING forever. Sockets
-        // with work in flight are left alone here and ended below, once
-        // their responses have been written.
-        const closed = new Promise<void>((done) => server.close(() => done()));
-        for (const ctx of connections) {
-          if (ctx.inFlight.size === 0) ctx.socket.end();
-        }
+  // Stop accepting new connections. `server.close` does NOT resolve until
+  // every already-open connection is gone, so the idle ones are ended
+  // first — otherwise a client that connected and simply sat there would
+  // hold the daemon in DRAINING forever. Sockets with work in flight are
+  // left alone here and ended below, once their responses are written.
+  const closed = new Promise<void>((done) => server.close(() => done()));
+  for (const ctx of connections) {
+    if (ctx.inFlight.size === 0) ctx.socket.end();
+  }
 
-        // Let accepted work finish. Queue entries still waiting for a
-        // slot are legitimate accepted work — they drain rather than
-        // being dropped, so nothing a client was told "accepted" is
-        // stranded.
-        while (!queue.isIdle) {
-          await new Promise((tick) => setTimeout(tick, 5));
-        }
-        for (const ctx of connections) {
-          await Promise.allSettled([...ctx.inFlight]);
-          ctx.socket.end();
-        }
-        await closed;
+  // Finishing accepted work is best-effort under a deadline, not an
+  // unbounded wait. §16's budgets bound the sandbox, but a request
+  // blocked in the store or an upstream layer is outside them — and an
+  // unbounded drain holds the lifecycle lock forever, which is strictly
+  // worse than abandoning one response: every restart would exit
+  // "already running" and rotation could never acquire maintenance.
+  // Exiting releases both locks and lets the next daemon serve.
+  const deadline = Date.now() + DRAIN_DEADLINE_MS;
+  while (!queue.isIdle && Date.now() < deadline) {
+    await new Promise((tick) => setTimeout(tick, 5));
+  }
+  for (const ctx of connections) {
+    const remaining = deadline - Date.now();
+    if (remaining > 0 && ctx.inFlight.size > 0) {
+      await Promise.race([
+        Promise.allSettled([...ctx.inFlight]),
+        new Promise((expire) => setTimeout(expire, remaining)),
+      ]);
+    }
+    ctx.socket.end();
+  }
 
-        unlinkIfStillOurs(paths.socket, bound, log);
-        log("stopped");
-        resolve();
-      })();
-    };
-    process.once("SIGTERM", stop);
-    process.once("SIGINT", stop);
-  });
+  const abandonedActive = queue.activeCount;
+  const abandonedQueued = queue.depth;
+  if (abandonedActive > 0 || abandonedQueued > 0) {
+    // Named explicitly: a client whose request was abandoned sees a
+    // closed connection, which §5 already defines as `outcome unknown`
+    // — never a silent success.
+    log(
+      `[conduitd] Drain deadline reached: abandoning work. Context: {deadlineMs: ${DRAIN_DEADLINE_MS}, active: ${abandonedActive}, queued: ${abandonedQueued}}`,
+    );
+  }
+
+  // Destroy anything still open so the listener close can complete —
+  // otherwise the wait below reintroduces the unbounded hang this
+  // deadline exists to prevent.
+  for (const ctx of connections) ctx.socket.destroy();
+  await closed;
+
+  unlinkIfStillOurs(paths.socket, bound, log);
+  log("stopped");
 }
 
 /**

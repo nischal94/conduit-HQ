@@ -25,6 +25,7 @@ import { writeFileSync } from "node:fs";
 // Explicit .ts extensions: run directly via `process.execPath` under
 // Node's native TypeScript support, never compiled by tsup, so Node's ESM
 // resolver needs the literal on-disk extension.
+import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
 
 const [, , stateDir, ...rest] = process.argv;
@@ -36,18 +37,54 @@ if (!stateDir) {
 
 const markerFlag = rest.indexOf("--sweep-marker");
 const sweepMarker = markerFlag === -1 ? undefined : rest[markerFlag + 1];
+const stallSweep = rest.includes("--stall-sweep");
+const stallExecute = rest.includes("--stall-execute");
+
+/** Never settles — the caller is expected to be killed, not to wait. */
+function forever(): Promise<never> {
+  return new Promise<never>(() => {});
+}
 
 const sweep: CrashTerminalSweep | undefined =
-  sweepMarker === undefined
-    ? undefined
-    : async () => {
-        writeFileSync(sweepMarker, "swept");
+  stallSweep || sweepMarker !== undefined
+    ? async () => {
+        if (sweepMarker !== undefined) writeFileSync(sweepMarker, "swept");
+        if (stallSweep) {
+          // Blocks startup after both locks are held and before bind —
+          // the window where a signal must still unwind cleanly.
+          console.log("stalling sweep");
+          await forever();
+        }
+      }
+    : undefined;
+
+/**
+ * Stalls one execution inside the store/manager layer, which §16's
+ * sandbox budgets do not bound — the case a bounded drain exists for.
+ * Supplied through the daemon's own `createRuntime` seam, so the daemon
+ * under test is the real one with only this collaborator replaced.
+ */
+const createRuntime = stallExecute
+  ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+      const built = await createApprovalRuntime(runtimeOpts);
+      return {
+        ...built,
+        manager: {
+          ...built.manager,
+          start: () => {
+            console.log("stalling execute");
+            return forever();
+          },
+        },
       };
+    }
+  : undefined;
 
 try {
   await runDaemon({
     stateDir,
     ...(sweep !== undefined ? { sweep } : {}),
+    ...(createRuntime !== undefined ? { createRuntime } : {}),
     // stdout, not stderr: the parent reads these as the readiness
     // protocol, and mixing them with Node's own stderr noise would make
     // the line-oriented wait fragile.

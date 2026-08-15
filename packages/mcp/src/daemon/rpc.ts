@@ -58,7 +58,21 @@ export type RpcResponse =
   | {
       kind: "error";
       requestId: string;
-      code: "busy" | "rotation-in-progress" | "refused-custom-db" | "invalid" | "internal";
+      /**
+       * `unimplemented` is distinct from `invalid` on purpose: `invalid`
+       * means the client sent something malformed and should fix it,
+       * while `unimplemented` means the request was well-formed and the
+       * capability simply does not exist yet in this build. A client
+       * cannot tell those apart from a single code, and retrying or
+       * reformatting is the wrong response to the second.
+       */
+      code:
+        | "busy"
+        | "rotation-in-progress"
+        | "refused-custom-db"
+        | "invalid"
+        | "unimplemented"
+        | "internal";
       message: string;
     }
   | { kind: "outcome-unknown"; requestId: string };

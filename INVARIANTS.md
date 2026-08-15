@@ -97,6 +97,7 @@ promise the product makes but does not yet enforce.
 | §17 — a signal-stopped daemon drains without stranding work: it exits 0, releases both locks and removes its endpoint, and a successor started against the same state directory reads back the same durable approval state | `packages/mcp/src/daemon/conduitd.test.ts` ("INVARIANT §17: a signal-stopped daemon exits with no paused work stranded") | ✅ pinned |
 | §17 / §9.3 — the daemon is default-paths-only: a client whose env sets `CONDUIT_DB` gets the typed `refused-custom-db` handshake refusal instead of being served against a database it did not choose | `packages/mcp/src/daemon/conduitd.test.ts` ("INVARIANT §17: a client whose env sets CONDUIT_DB is refused at handshake") | ✅ pinned |
 | §17 — the crash-terminal sweep runs at its fixed point in the startup order: after both locks are held and before the endpoint is bound, so no client can observe a half-swept database | `packages/mcp/src/daemon/conduitd.test.ts` ("INVARIANT §17: the crash-terminal sweep runs before the endpoint is bound") | ✅ pinned |
+| §17 / §3.3 — a connection's capability is negotiated exactly once: since `handshake` is a member of every capability set, a second handshake claiming a wider role is refused and the previously-denied request stays denied (no re-handshake privilege escalation) | `packages/mcp/src/daemon/conduitd.test.ts` ("INVARIANT §17: a second handshake cannot widen an established capability") | ✅ pinned |
 
 ---
 
