@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 4 — three adversarial passes; pass-3 refinements applied
+**Status:** design, revision 5 — four adversarial passes; pass-4 residuals fixed
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -143,8 +143,22 @@ therefore let that client smuggle security config into the daemon,
 defeating §9.3's default-only decision. So:
 
 - The auto-starting client spawns the daemon with an **allowlisted,
-  constructed environment**: `PATH` and platform essentials only. Every
-  `CONDUIT_*` variable is stripped.
+  constructed environment** of explicitly enumerated platform variables
+  with daemon-derived values. Every `CONDUIT_*` variable is stripped —
+  and **`PATH` is fixed to a daemon-owned constant** (platform system
+  paths), never reused from the client: an inherited `PATH` would let
+  the client influence executable resolution in the long-lived daemon
+  and its future subprocesses.
+- **The daemon executable is resolved to an absolute trusted path by the
+  client before spawn** (the client's own installation directory — it is
+  running the same package), never looked up through `PATH`.
+- **The child's working directory is set explicitly** to the state
+  directory, never inherited — an inherited cwd would silently anchor
+  any relative path the daemon, sandbox, or an upstream session ever
+  resolves.
+- **Stdio and file-descriptor inheritance is explicitly configured**:
+  stdin closed, stdout/stderr to the daemon's own log destination, no
+  other descriptors inherited from the client.
 - The daemon derives its state directory from the **authenticated OS
   UID** (`os.userInfo().homedir`-equivalent resolved from the uid, not
   the inherited `HOME` string).
@@ -154,9 +168,24 @@ defeating §9.3's default-only decision. So:
   *override* path (`CONDUIT_MASTER_KEY`) remains supported only for a
   daemon an operator starts BY HAND with that env set; it never
   transfers through auto-start.
-- Required tests: hostile client values for `HOME`, `CONDUIT_MASTER_KEY`,
-  `CONDUIT_DB`, and the private-egress flag must all be inert through
-  auto-start.
+- Required tests: hostile client values for `HOME`, `PATH`, cwd,
+  `CONDUIT_MASTER_KEY`, `CONDUIT_DB`, and the private-egress flag must
+  all be inert through auto-start; executable resolution must not
+  consult the client's `PATH`.
+
+**Lock descriptors never survive into daemon children.** The daemon
+spawns its own subprocesses (sandbox tooling, upstream helpers). If a
+lifecycle or maintenance lock descriptor is inherited across `exec`, a
+long-lived or hostile child retains the lock after the daemon exits —
+the socket refuses while the kernel still reports a daemon-like lock
+state, and rotation is wedged indefinitely. Therefore both lock
+descriptors are opened **close-on-exec** and never passed to children;
+the chosen locking primitive's fork/exec semantics must be verified on
+both platforms (BSD `flock` locks travel with the open file description
+— the close-on-exec flag is what severs them at `exec`). Required
+real-process test: start a daemon child that outlives its daemon, kill
+the daemon, prove both locks become immediately acquirable while the
+child still runs.
 
 ### 3.2 Transport: Unix domain socket
 
@@ -894,3 +923,17 @@ confirmed complete; 3 category-(c) refinements, all fixed in revision 4:**
    and be discarded → READY preface gate: no operation bytes until the
    daemon confirms RUNNING-state acceptance; a READY connection blocks
    drain; a missing READY is treated as a refused connect (§3.5).
+
+**Fourth pass (2026-08-15): NOT CONVERGED — READY gate and lock ordering
+confirmed complete; 2 residual breaks, fixed in revision 5:**
+
+1. The spawn boundary stripped `CONDUIT_*` but left `PATH`, executable
+   resolution, cwd, and fd inheritance client-controlled → daemon-owned
+   fixed `PATH`, absolute pre-resolved executable, explicit cwd = state
+   dir, explicit stdio/fd configuration, hostile-`PATH`/cwd tests
+   (§3.1).
+2. Lock descriptors could be inherited by daemon children across `exec`,
+   letting a long-lived child wedge rotation after daemon death → both
+   locks opened close-on-exec, never passed to children; fork/exec
+   semantics of the primitive verified per platform; orphan-child
+   real-process test (§3.1).
