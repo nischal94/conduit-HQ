@@ -179,10 +179,13 @@ below; act where triggers fire. Remember: serve runs from dist — REBUILD
   ledger). Each lane takes the full load-bearing gauntlet; HUMAN-NAMED
   merges.
 - **NEXT SESSION: build Lane A via superpowers:subagent-driven-development
-  in a FRESH session** (project rule). Kickoff: check out
-  `docs/daemon-ownership-design`, cut `feat/daemon-core` from origin/main
-  (design+plan ride Lane A's PR, the PR #41 precedent), run SDD over the
-  plan task-by-task. Global constraints live in the plan header. Do NOT
+  in a FRESH session** (project rule). Kickoff: `git fetch origin`, then
+  check out the EXISTING local branch `feat/daemon-core` — already cut
+  at the tip of `docs/daemon-ownership-design` (`d834a0a`), so the design
+  + plan ride Lane A's PR (the PR #41 precedent). Do NOT re-cut it, and
+  NOT from origin/main (that would exclude the design/plan docs — a
+  prior HANDOFF revision said origin/main in error). Run SDD over the
+  plan task-by-task; global constraints live in the plan header. Do NOT
   redesign or re-run either review arc.
 
 LEARNINGS #21 applies: the branch is invisible to the git tripwire —
