@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 6 — codex-converged (5 passes) + platform eng review applied; pass 6 pending on the lock-primitive change
+**Status:** design, revision 7 — pass-6 specification breaks fixed; pass 7 pending
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -138,8 +138,16 @@ owns:
 ONE process sharing ONE QuickJS module, and §16's budgets are
 per-execution — nothing bounds the daemon. The daemon caps concurrent
 executions (v1 default: 4; a constant, not config) and queues the rest
-with a deadline-bounded wait, refusing with a typed "daemon busy" error
-past the queue's own bound. Known coupling, stated honestly: a sandbox
+in a queue that is bounded in BOTH dimensions — a deadline per entry
+AND a hard global capacity constant (v1: 16). A deadline alone is not a
+size bound: at a high enough arrival rate, requests accumulate faster
+than deadlines expire, and queued frames/connections grow without
+limit. Queue-full → immediate typed "daemon busy" refusal. Entries are
+removed on deadline expiry AND on client disconnect. During a §16
+module recovery, dispatch suspends but the four active slots are
+retained, so the recovery wave cannot admit extra concurrency. Required
+tests: sustained overload, expiry cleanup, disconnect cleanup, recovery
+wave. Known coupling, stated honestly: a sandbox
 overflow triggers the §16 module recovery, and during that window every
 client's executions stall behind the rebuild — the recovery tests put
 worst-case waves at ~16s. That is the cost of one shared module; it was
@@ -194,11 +202,14 @@ the socket refuses while the kernel still reports a daemon-like lock
 state, and rotation is wedged indefinitely. Therefore both lock
 descriptors are opened **close-on-exec** and never passed to children;
 the chosen locking primitive's fork/exec semantics must be verified on
-both platforms (BSD `flock` locks travel with the open file description
-— the close-on-exec flag is what severs them at `exec`). Required
-real-process test: start a daemon child that outlives its daemon, kill
-the daemon, prove both locks become immediately acquirable while the
-child still runs.
+both platforms. The primitive is SQLite's POSIX record locks (fcntl),
+not BSD `flock`: fcntl locks are per-process and notoriously released
+when the process closes ANY descriptor on the file — SQLite manages its
+descriptors internally to survive that footgun, and opens them
+close-on-exec. Both properties are pinned by the named lock-db tests
+(§3.5), never trusted from this paragraph. Required real-process test:
+start a daemon child that outlives its daemon, kill the daemon, prove
+both locks become immediately acquirable while the child still runs.
 
 ### 3.2 Transport: Unix domain socket
 
@@ -241,9 +252,14 @@ doc said mode 0600 "replaces a bearer-token scheme." That is wrong twice:
 
 **Threat-model scope, stated explicitly rather than left implied:**
 
-- *Different UID* — IN scope, must fail closed: 0700 state directory,
-  peer-UID verification on accept, client-side verification that the
-  socket is owned by the expected UID.
+- *Different UID* — IN scope, must fail closed: lstat-verified 0700
+  state directory (the enforcement mechanism, above) plus client-side
+  verification that the socket is owned by the expected UID. On macOS
+  the `st_mode` check is NOT sufficient alone: an extended ACL can grant
+  another user directory-search rights invisible to the mode bits, so
+  the directory check REJECTS any extended ACL on the state directory
+  (verified per-platform by test; Linux POSIX-ACL leakage is checked the
+  same way).
 - *Same UID* — OUT of scope for v1, and this is a documented limit, not
   an oversight. A same-UID attacker can already read the 0600 master key
   and the database directly; the socket is not the weak link. Solving it
@@ -450,11 +466,34 @@ journal gives true shared/exclusive fcntl ranges):
 
 - **Hold EXCLUSIVE** = `BEGIN EXCLUSIVE` on a dedicated connection, held
   open for the holder's lifetime.
-- **Hold SHARED** = an open read transaction (`BEGIN` + one `SELECT`),
-  held open — rollback-journal SQLite blocks any EXCLUSIVE while a
-  SHARED reader lives.
-- **Non-blocking probe** = attempt with `busy_timeout=0`; `SQLITE_BUSY`
-  is the held signal.
+- **Hold SHARED** = an open read transaction held open — and the
+  transaction MUST actually read the database: `BEGIN` is deferred and
+  acquires nothing, and `SELECT 1` need not touch the file. The
+  canonical hold is `BEGIN` + `SELECT count(*) FROM sqlite_schema`,
+  which forces the database SHARED lock. Rollback-journal SQLite then
+  blocks any EXCLUSIVE while that reader lives.
+- **Probe modes (normative — an EXCLUSIVE probe cannot distinguish
+  holders, so detection ALWAYS probes SHARED):**
+
+  | question | probe | result meaning |
+  |---|---|---|
+  | is rotation running? | attempt SHARED hold on maintenance, `busy_timeout=0` | BUSY = rotation (only an EXCLUSIVE holder blocks a reader); success = no rotation — roll back immediately |
+  | is a daemon alive/starting? | attempt SHARED hold on lifecycle | BUSY = daemon holds it; success = none — roll back immediately |
+  | acquire (rotation, or daemon lifecycle) | `BEGIN EXCLUSIVE`, `busy_timeout=0` | BUSY = refuse per the decision table |
+
+  Every successful probe is rolled back and its connection closed at
+  once; probes never linger as accidental holders.
+- **libsql-client behavior is pinned by test, not assumed.** The pattern
+  requires a dedicated file-URL client whose transaction handle pins one
+  physical connection, with `journal_mode=DELETE` and `busy_timeout=0`
+  applied on that same connection. Pooling, lazy connect, transaction
+  expiry, or client GC would silently invalidate it. Named real-process
+  tests, mandatory in the plan:
+  `lock-db-shared-blocks-exclusive-through-libsql`,
+  `lock-db-probe-distinguishes-shared-and-exclusive`,
+  `lock-db-transaction-remains-held-until-explicit-close`,
+  `lock-db-sibling-connection-close-does-not-release-lock`,
+  `lock-db-releases-after-sigkill-with-orphan-child-alive`.
 - Locks are fcntl-backed, so the kernel releases them on process death —
   crash-safe with no cleanup protocol.
 - SQLite internally works around the POSIX close-drops-locks footgun and
@@ -783,7 +822,8 @@ the prefix follows that number instead.
 - `key rotate` refuses with a true process answer when the daemon is live
 - a source added via one client is visible to another with no restart
   (the hot-reload precondition)
-- the daemon exits after idle timeout with no paused work stranded
+- a signal-stopped daemon exits with no paused work stranded (idle-exit
+  deferred to step 7)
 - a paused approval created before daemon exit is resumable after restart
 - secrets never enter the `conduit serve` process (§9.2, extending the
   existing credential-boundary test to the new process split)
@@ -791,8 +831,9 @@ the prefix follows that number instead.
 **Security and lifecycle tests the process split introduces** (real
 processes, not mocks):
 
-- a client running as a different UID is refused (peer-UID check, both
-  directions)
+- a different-UID process cannot reach the socket (0700 directory
+  traversal denied on both platforms); an extended ACL on the state
+  directory is rejected at bind and at connect
 - a symlinked / wrong-owner / mode-wider-than-0700 state directory is
   refused
 - a pre-created socket cannot be used to impersonate the daemon
@@ -800,7 +841,7 @@ processes, not mocks):
   guard)
 - a stale pidfile whose PID now belongs to another process changes
   nothing (pidfile is non-authoritative)
-- a client arriving exactly at the idle-timer boundary, and one that
+- a client arriving during signal-triggered listener closure, and one that
   connects but does not write
 - response backpressure during shutdown drain
 - rotation racing auto-start (both orders)
@@ -845,7 +886,7 @@ versus stop and ask.
 **May improvise:** wire encoding (JSON-RPC over the socket is the obvious
 choice given the MCP SDK is already a dependency, but not mandated —
 the §3.3 contract requirements are mandatory regardless); internal module
-layout; the exact idle timeout value; log line wording.
+layout; the queue-capacity constant's exact value; log line wording.
 
 **Stop and ask:**
 
@@ -1017,6 +1058,23 @@ dissolves the §9.4 console conflict and shrinks drain to
 shutdown-on-signal (§3.5). Test additions for the plan: multi-process
 harness task, concurrency-under-load, daemon log destination, one real
 stdio-client E2E. Lock-primitive change confirmed by codex pass 6 below.
+
+**Sixth pass (2026-08-16, on the rev-6 platform changes): NOT
+CONVERGED — 5 specification breaks, all fixed in revision 7.** The lock
+idea, directory posture, cap, and idle-exit deferral were each confirmed
+viable; the breaks were completions: (1) a SHARED hold must actually
+read the db (`SELECT count(*) FROM sqlite_schema`, since deferred
+`BEGIN`/`SELECT 1` acquire nothing) and probe modes are now normative —
+detection always probes SHARED, because an EXCLUSIVE probe cannot
+distinguish holders; (2) libsql client behavior (connection pinning,
+per-connection pragmas) pinned by five named real-process tests;
+(3) macOS extended ACLs can grant traversal invisible to `st_mode` →
+the state-directory check rejects any extended ACL; stale normative
+peer-UID text removed from §3.2/§7; (4) the queue gains a hard capacity
+constant (16) — a deadline alone is not a size bound — with
+expiry/disconnect removal and recovery-wave dispatch suspension;
+(5) stale idle-exit requirements removed from §7/§8 (BSD-`flock`
+wording also corrected to POSIX record locks).
 
 **Fifth pass (2026-08-15): CONVERGED.** Both pass-4 fixes verified
 correct and complete; no new in-scope breaks; zero category-(c) findings.
