@@ -1850,3 +1850,44 @@ third-party advisory non-applicable. Structural fixes retire future
 alerts; denylist fixes accumulate them. The triage note records residual
 exposure honestly (whatever the MCP SDK does with these at runtime) —
 the point is that the boundary's own guarantee was verified, not assumed.
+
+## 2026-08-15 (later) — Daemon-ownership design: 5-pass convergence arc
+
+### 1. The reviews found different error classes — run both instruments
+
+The design went through an adversarial codex arc AND an independent
+claim-verification agent. They overlapped on exactly one finding (the
+credential-forwarding path) and otherwise partitioned cleanly: codex
+found the races and trust-boundary gaps (unlink split-brain, rotation
+race, spawn-env smuggling, lock-fd inheritance); the verifier found the
+false factual claims (a wrong entry-point table, a misattributed spec
+quote, a reworded MUST presented as a quotation). Neither instrument
+would have caught the other's class. A design review that runs only the
+adversarial pass ships with confident false citations; one that runs
+only fact-checking ships with correct citations and a split-brain race.
+
+### 2. Fix-the-finding creates the next finding — budget for the arc
+
+9 → 5 → 3 → 2 → 0 over five passes, mirroring step 1's arc. Every fix
+wave created new attack surface out of its own machinery: the daemon
+answer created the IPC boundary; the credential fix created the
+forwarding oracle; the lock fix created the fd-inheritance wedge; the
+spawn fix left PATH/cwd ambient channels. None of these were denylist
+loops — each was a distinct root cause in newly-introduced structure,
+which is exactly the convergence rule's "fix and re-run" branch, not its
+"change the shape" branch. Plan for 3-5 passes on any design that
+introduces a new process or trust boundary; a single pass plus fixes is
+an unreviewed design.
+
+### 3. An empty output file is not a failed run — check process liveness
+
+Three consecutive codex "failures" were one failure: reading the output
+file before the run finished. The notification fires when the shell
+wrapper exits, not when the detached process writes stdout; codex writes
+stdout ONCE at the end of a 4-7 minute run. Two invented diagnoses
+(skill-file wandering, an interactive-mode config flag) were both wrong
+and each consumed a full relaunch. The tell that should have stopped it:
+`pgrep -f "codex exec"` — alive means wait, not diagnose. Codified in
+~/.claude/rules/codex-one-path.md (liveness check, wait-on-process
+pattern, 1400s budget for design reviews, inline-the-document for
+document reviews).
