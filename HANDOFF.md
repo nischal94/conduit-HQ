@@ -155,19 +155,38 @@ PR → Tier-2 both mechanics + /security-review + codex correctness pass +
 below; act where triggers fire. Remember: serve runs from dist — REBUILD
 (`pnpm -r build`) after every merge until §17 step 7.
 
-**DESIGN CONVERGED 2026-08-15 — branch `docs/daemon-ownership-design`
-(pushed, no PR yet; LEARNINGS #25-27 ride the branch).** The design doc
-`docs/superpowers/specs/2026-08-15-daemon-ownership-design.md` is at
-revision 5, CONVERGED after a 5-pass codex arc (9 → 5 → 3 → 2 → 0) plus
-an independent claim-verification pass; the full trail is in the doc's
-§10. Decision: one daemon owns the store; narrow capability-scoped RPCs
-over a UDS (never a remote ConduitStore; no credential-returning RPC);
-two-lock protocol (maintenance shared/exclusive + lifecycle) with
-kernel-enforced stop-first for rotation; constructed spawn environment;
-READY-gated connections; default-paths-only v1. AWAITING: human review
-of the spec, then `superpowers:writing-plans`, then the build via SDD in
-a fresh session. LEARNINGS #21 applies: the branch is invisible to the
-git tripwire — pair with `gh pr list`.
+**DESIGN + PLAN COMPLETE 2026-08-16 — branch `docs/daemon-ownership-design`
+(pushed, no PR yet; LEARNINGS entries ride the branch).**
+
+- **Design:** `docs/superpowers/specs/2026-08-15-daemon-ownership-design.md`
+  revision 8, CONVERGED across TWO arcs — codex passes 1-5 on the design
+  logic (9→5→3→2→0), then a platform eng review (`plan-eng-review`, at the
+  human's direction) that found Node stdlib has neither `flock(2)` nor
+  `SO_PEERCRED` — both load-bearing — then codex passes 6-8 on the fixes
+  (5→1→0). Full trail in the doc's §10. Final shape: one daemon owns the
+  store; capability-scoped RPCs over a UDS; locks = SQLite lock databases
+  (fcntl-backed via @libsql/client, normative hold/probe modes);
+  different-UID boundary = lstat-verified 0700 state dir with ACL
+  rejection; constructed spawn env incl. fixed PATH/cwd/fds; READY-gated
+  connections; cap 4 / queue 16 (normative); idle-exit DEFERRED to step 7
+  (dissolved the console conflict); crash sweep = status UPDATE, no
+  schema change.
+- **Plan:** `docs/superpowers/plans/2026-08-16-daemon-ownership.md` —
+  10 TDD tasks, TWO PRs: Lane A `feat/daemon-core` (locks with the five
+  named libsql tests → state-dir → framing/RPC → conduitd runtime →
+  sweep/spawn/client), Lane B `feat/daemon-clients` (serve, approvals,
+  add-mcp anti-oracle, key/doctor under the maintenance lock, docs +
+  ledger). Each lane takes the full load-bearing gauntlet; HUMAN-NAMED
+  merges.
+- **NEXT SESSION: build Lane A via superpowers:subagent-driven-development
+  in a FRESH session** (project rule). Kickoff: check out
+  `docs/daemon-ownership-design`, cut `feat/daemon-core` from origin/main
+  (design+plan ride Lane A's PR, the PR #41 precedent), run SDD over the
+  plan task-by-task. Global constraints live in the plan header. Do NOT
+  redesign or re-run either review arc.
+
+LEARNINGS #21 applies: the branch is invisible to the git tripwire —
+pair with `gh pr list`.
 
 Original exploration findings below (still accurate; kept for context):
 
