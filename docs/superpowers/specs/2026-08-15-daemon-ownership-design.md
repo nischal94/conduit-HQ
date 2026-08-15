@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 8 — pass-7 residual fixed; pass 8 pending
+**Status:** design, revision 8 — CONVERGED (codex passes 1-5 on the design, platform eng review, codex passes 6-8 on the platform changes)
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -1081,7 +1081,7 @@ wording also corrected to POSIX record locks).
 complete; ONE residual category-(c)** — §8's may-improvise list
 contradicted §3.1's normative queue capacity. Fixed in revision 8 by
 pinning both constants (cap 4, queue 16) as normative, exactly as the
-pass prescribed. Eighth pass below confirms.
+pass prescribed. Eighth pass (2026-08-16): fix verified, nothing new introduced — **CONVERGED**. Full arc: design logic 9→5→3→2→0 (passes 1-5); platform changes 5→1→0 (passes 6-8).
 
 **Fifth pass (2026-08-15): CONVERGED.** Both pass-4 fixes verified
 correct and complete; no new in-scope breaks; zero category-(c) findings.
