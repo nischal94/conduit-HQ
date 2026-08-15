@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 7 — pass-6 specification breaks fixed; pass 7 pending
+**Status:** design, revision 8 — pass-7 residual fixed; pass 8 pending
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -886,7 +886,8 @@ versus stop and ask.
 **May improvise:** wire encoding (JSON-RPC over the socket is the obvious
 choice given the MCP SDK is already a dependency, but not mandated —
 the §3.3 contract requirements are mandatory regardless); internal module
-layout; the queue-capacity constant's exact value; log line wording.
+layout; log line wording. (The concurrency cap of 4 and queue capacity
+of 16 are NORMATIVE constants from §3.1, not implementation freedoms.)
 
 **Stop and ask:**
 
@@ -1075,6 +1076,12 @@ constant (16) — a deadline alone is not a size bound — with
 expiry/disconnect removal and recovery-wave dispatch suspension;
 (5) stale idle-exit requirements removed from §7/§8 (BSD-`flock`
 wording also corrected to POSIX record locks).
+
+**Seventh pass (2026-08-16): all five pass-6 fixes verified correct and
+complete; ONE residual category-(c)** — §8's may-improvise list
+contradicted §3.1's normative queue capacity. Fixed in revision 8 by
+pinning both constants (cap 4, queue 16) as normative, exactly as the
+pass prescribed. Eighth pass below confirms.
 
 **Fifth pass (2026-08-15): CONVERGED.** Both pass-4 fixes verified
 correct and complete; no new in-scope breaks; zero category-(c) findings.
