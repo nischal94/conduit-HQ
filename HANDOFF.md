@@ -121,6 +121,39 @@ PR → Tier-2 both mechanics + /security-review + codex correctness pass +
 below; act where triggers fire. Remember: serve runs from dist — REBUILD
 (`pnpm -r build`) after every merge until §17 step 7.
 
+**Brainstorm OPENED 2026-08-15 — exploration done, NOTHING decided, no
+branch/PR/code.** Findings established (skip re-deriving these):
+
+- **There is no owning process today.** Every entry point opens its own
+  libsql client against the same `~/.conduit/conduit.db`:
+  `runStdioServer` (`conduit serve`), `conduit-mcp --doctor`, `add-mcp`,
+  `approvals`, and `key rotate` all route through
+  `openStoreFromEnv`/`openStoreClientFromEnv` (`packages/mcp/src/store-open.ts`).
+  SQLite file locking is the only coordinator. `conduit serve`
+  (`packages/cli/src/commands/serve.ts`) is a one-line adapter, so the
+  ownership question lives entirely in `packages/mcp`.
+- **The per-call catalog rehydration is a no-owner workaround.**
+  `createApprovalRuntime` (`packages/mcp/src/runtime.ts`) hydrates a fresh
+  catalog snapshot per unit of work — its own comment records this as the
+  M6 fix for stale-connection visibility. Step 3's hot-reload is what
+  should replace it; a long-lived owner is the precondition.
+- **Step 1 named the process-detection limit verbatim** (key-lifecycle
+  design §`conduit key rotate`): the write-lock probe is "writer exclusion
+  DURING the transaction — best-effort detection, not process detection".
+  That is why `rotate` can only say "stop running conduit processes
+  first". A db-owning daemon is what makes real detection possible.
+- **Spec §17 offers a genuine fork** (conduitspec.md, "Durable background
+  service"): one daemon owns the store and stdio `/mcp` becomes a thin
+  local client of it, **OR** "an explicitly safe shared-store contract".
+  This fork is UNRESOLVED and is the open question put to the human.
+  Second open question: whether daemon lifecycle (on-demand auto-start,
+  surviving client exits) is in THIS step or deferred to step 7 —
+  relevant input: spec §574 already says `call`, `resume`, `tools …`
+  "auto-start the local daemon if needed".
+
+Resume by putting those two questions to the human; do not pick a fork
+unilaterally.
+
 ### KICKOFF PROMPT for the next session
 
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
