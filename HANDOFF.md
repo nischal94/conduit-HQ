@@ -23,7 +23,70 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-03 (REPO IS PUBLIC: PR #42 merged, flip executed same session; next: §17 v1 step 2 daemon ownership)
+## Current handoff — updated 2026-08-16 (§17 v1 step 2 daemon ownership: design rev 8 CONVERGED + 10-task plan COMMITTED; next: BUILD Lane A via SDD in a fresh session)
+
+### Where things stand
+
+- **Repo state:** public, Apache-2.0, branch protection ON (5 checks,
+  strict; enforce_admins=false so scripts/push-docs works). Branches:
+  `main`, `docs/daemon-ownership-design` (remote), plus LOCAL-ONLY
+  `feat/daemon-core` (already cut at the design branch's tip `d834a0a`,
+  zero commits of its own). No open PRs. Serve runs from dist — REBUILD
+  (`pnpm -r build`) after every merge until §17 step 7.
+- **Design:** `docs/superpowers/specs/2026-08-15-daemon-ownership-design.md`
+  revision 8, CONVERGED across two review arcs — codex passes 1–5 on the
+  design logic (9→5→3→2→0), a platform eng review (found Node stdlib has
+  neither flock(2) nor SO_PEERCRED; both load-bearing, both re-designed
+  onto shipped machinery), codex passes 6–8 on the fixes (5→1→0). Full
+  trail in the doc's §10. Shape: one daemon owns the store;
+  capability-scoped RPCs over a UDS; SQLite lock databases as the kernel
+  locks; lstat-verified 0700 state dir; constructed spawn env; READY
+  gate; cap 4 / queue 16; idle-exit deferred to step 7; crash sweep is a
+  status UPDATE (no schema change).
+- **Plan:** `docs/superpowers/plans/2026-08-16-daemon-ownership.md` —
+  10 TDD tasks, TWO PRs: Lane A `feat/daemon-core` (locks → state-dir →
+  framing/RPC → conduitd runtime → sweep/spawn/client), Lane B
+  `feat/daemon-clients` (serve, approvals, add-mcp anti-oracle,
+  key/doctor, docs+ledger). Both docs live on
+  `docs/daemon-ownership-design`.
+- **Dependabot: 8 open alerts, parked, NOT a blocker** — all transitive
+  via `@modelcontextprotocol/sdk@1.29.0`; verified they do not reach the
+  §9.3 egress guard. Full triage note in the superseded section below
+  ("OPEN — Dependabot triage"). No routine mechanism surfaces these;
+  expect drift between deliberate sweeps.
+- Remaining human leisure item (carried): reserve the `conduithq` npm org.
+
+### NEXT SESSION — build Lane A (plan Tasks 1–5) via SDD
+
+`git fetch origin`, check out the EXISTING local branch `feat/daemon-core`
+(do NOT re-cut it, and NOT from origin/main — that would exclude the
+design/plan docs, which ride Lane A's PR per the PR #41 precedent). Run
+superpowers:subagent-driven-development over the plan task-by-task: fresh
+implementer per task → vitest in the FOREGROUND → two-verdict review →
+ledger `.superpowers/sdd/progress-daemon-core.md`. Global constraints
+live in the plan header and are binding (zero new deps; NO schema
+changes; normative constants; real spawned-process lock tests). Do NOT
+redesign or re-run either review arc. After Task 5: whole-branch review →
+push → open the Lane A PR with a Deviations section → full load-bearing
+gauntlet → HUMAN-NAMED merge. Environment quirks: commits need
+sandbox-disabled Bash (pre-commit runs the sdk suite), never
+--no-verify; npx/pnpm-exec blocked by the sfw guard — use
+`packages/<p>/node_modules/.bin/*` directly; the agent never installs.
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: daemon-ownership design rev 8 is CONVERGED and the 10-task
+> plan is committed, both on `docs/daemon-ownership-design`; the working
+> branch `feat/daemon-core` already exists at that branch's tip. Do NOT
+> redesign, re-review, or re-cut the branch.** BUILD Lane A (plan Tasks
+> 1–5) via superpowers:subagent-driven-development per the NEXT SESSION
+> section above. The agent never merges.
+
+---
+
+## Superseded handoff — updated 2026-08-03 (REPO PUBLIC: PR #42 merged + flip executed; its NEXT [daemon ownership] was designed+planned 2026-08-15/16 by the section above; its human steps 1–6 are ALL DONE except the npm org)
 
 **FLIP COMPLETE (2026-08-03, same session, human-executed):** the human read
 the audit (independently re-verified by the agent: identities, paths,
