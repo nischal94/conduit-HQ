@@ -1,6 +1,6 @@
 # Daemon ownership — §17 v1 surface-product step 2
 
-**Status:** design, revision 5 — CONVERGED after a 5-pass codex arc (9 → 5 → 3 → 2 → 0)
+**Status:** design, revision 6 — codex-converged (5 passes) + platform eng review applied; pass 6 pending on the lock-primitive change
 (see §10). No code.
 **Date:** 2026-08-15
 **Spec anchor:** §17 "⭑ v1 Surface Product", build sequence step (2) "decide
@@ -134,6 +134,19 @@ owns:
   step 3's hot-reload builds on)
 - the upstream MCP session scope
 
+**Concurrency cap (eng-review T3).** N clients now drive executions in
+ONE process sharing ONE QuickJS module, and §16's budgets are
+per-execution — nothing bounds the daemon. The daemon caps concurrent
+executions (v1 default: 4; a constant, not config) and queues the rest
+with a deadline-bounded wait, refusing with a typed "daemon busy" error
+past the queue's own bound. Known coupling, stated honestly: a sandbox
+overflow triggers the §16 module recovery, and during that window every
+client's executions stall behind the rebuild — the recovery tests put
+worst-case waves at ~16s. That is the cost of one shared module; it was
+per-process before and is per-daemon now. The cap keeps the blast radius
+bounded; removing the shared-module coupling is explicitly step-7+
+territory, not this step.
+
 **The spawn boundary — the daemon's environment is constructed, never
 inherited.** A spawned child ordinarily inherits the client's entire
 environment — including `CONDUIT_MASTER_KEY`, `CONDUIT_DB`,
@@ -204,9 +217,22 @@ doc said mode 0600 "replaces a bearer-token scheme." That is wrong twice:
 
 1. **Portability.** Linux honors pathname-socket permissions; POSIX does
    not guarantee it, and portable code is warned not to rely on socket
-   file mode alone. Peer identity must be checked explicitly —
-   `getpeereid()` (macOS) / `SO_PEERCRED` (Linux) — and verified on the
-   daemon side for every accepted connection, failing closed.
+   file mode alone.
+
+   **Enforcement mechanism (eng-review T2):** Node stdlib exposes no
+   `getpeereid()`/`SO_PEERCRED` on `net.Socket`, and a native addon is
+   off the table under the supply-chain rules. The different-UID boundary
+   is therefore enforced at the **state directory**: mode 0700,
+   owner-verified by `lstat` before every bind and connect. A
+   different-UID process cannot traverse a 0700 directory on macOS or
+   Linux, so it can never reach the socket pathname at all — kernel
+   enforcement one level up, on a primitive whose semantics ARE
+   guaranteed. The socket file itself is additionally 0600
+   (defense-in-depth on Linux, where it is honored). If a maintained
+   zero-dependency peer-credential mechanism becomes available in a
+   future Node release, adopt it; until then per-connection peer
+   verification is a DOCUMENTED v1 LIMIT layered under the directory
+   boundary, not a silent assumption.
 2. **Same-UID processes are indistinguishable.** Mode 0600 cannot
    separate two processes running as the same user, and most of the
    stated threat model ("other local processes may be hostile") is
@@ -413,6 +439,35 @@ lock must carry that distinction structurally.
 | **maintenance** | SHARED, for its lifetime | EXCLUSIVE | mutual exclusion between normal runtime and offline maintenance |
 | **lifecycle** | EXCLUSIVE, for its lifetime | — | singleton enforcement among daemons |
 
+**Lock primitive (eng-review T1): SQLite lock databases, not `flock`.**
+Node ≥20 stdlib has no `flock(2)` and no `fcntl` lock API, and the
+supply-chain rules forbid a casual native dep. The kernel lock we already
+ship is SQLite's own POSIX advisory locking, via `@libsql/client`. Each
+lock is a dedicated, empty, single-purpose database file in the state
+directory (`conduitd-lifecycle.lock.db`, `conduitd-maintenance.lock.db`),
+forced to `journal_mode=DELETE` (WAL changes lock semantics; rollback
+journal gives true shared/exclusive fcntl ranges):
+
+- **Hold EXCLUSIVE** = `BEGIN EXCLUSIVE` on a dedicated connection, held
+  open for the holder's lifetime.
+- **Hold SHARED** = an open read transaction (`BEGIN` + one `SELECT`),
+  held open — rollback-journal SQLite blocks any EXCLUSIVE while a
+  SHARED reader lives.
+- **Non-blocking probe** = attempt with `busy_timeout=0`; `SQLITE_BUSY`
+  is the held signal.
+- Locks are fcntl-backed, so the kernel releases them on process death —
+  crash-safe with no cleanup protocol.
+- SQLite internally works around the POSIX close-drops-locks footgun and
+  opens its fds close-on-exec — precisely the two hand-rolled-fcntl traps
+  this choice avoids. The plan must still pin both properties with the
+  orphan-child test rather than trusting this paragraph.
+- Step 1 already verified the underlying behavior empirically ("a held
+  `transaction("write")` = `BEGIN IMMEDIATE` refuses a second writer with
+  SQLITE_BUSY").
+
+The lock-db files carry no data; their contents are never read. They are
+kernel lock handles with a `.db` extension.
+
 **The total acquisition protocol** (order is normative — two separate
 locks cannot be observed atomically, so coherence comes from ordering
 plus re-probing, not from a snapshot):
@@ -463,11 +518,20 @@ A pidfile may exist as **diagnostic metadata only** (for error messages:
 which process, since when). A PID plus `kill(pid, 0)` is not proof of
 liveness — PIDs are reused — so no control flow may branch on it.
 
-**Idle exit — PROVISIONALLY yes, but see the console conflict below.**
-The daemon exits after a period with no connected clients and no
-in-flight requests. A pending paused approval does not keep it alive — it
-is durable data, and the next client to ask auto-starts a daemon that
-reads it back.
+**Idle exit — DEFERRED to step 7 (eng-review T4, reversing the
+provisional yes).** In this step the daemon runs until stopped: operator
+signal (`SIGTERM`/`SIGINT`) or a future `conduit daemon stop`. The
+eng review's reasoning: the DRAINING complexity, the READY gate's
+hardest race, and the §9.4 browser-console conflict all existed *only to
+serve idle-exit* — and idle-exit was itself provisional. Deferring it
+makes step 2 smaller and strictly safer, and step 7 (service lifecycle)
+is idle-exit's natural home alongside supervision. The liveness
+analysis below is KEPT because it establishes that exiting is *safe*
+whenever it happens — which shutdown-on-signal still needs.
+
+A pending paused approval does not keep the daemon alive — it is durable
+data, and the next client to ask auto-starts a daemon that reads it
+back.
 
 The evidence that supports this, stated at its true scope: **nothing
 expires on a timer.** Zero `setTimeout`/`setInterval` in
@@ -501,7 +565,9 @@ drain complete.
 Daemon states: `RUNNING → DRAINING → STOPPED`.
 
 - `RUNNING`: listener open, requests served.
-- `DRAINING`: idle timeout fired. Close the listener, re-check
+- `DRAINING`: stop signal received (idle-exit deferred to step 7 — the
+  only triggers in this step are operator signal or explicit stop).
+  Close the listener, re-check
   accepted/in-flight/queued work, finish everything, remove the socket
   under the §3.2 device+inode check, then release the locks —
   maintenance first, lifecycle last. Draining is not cancellable; a
@@ -546,16 +612,14 @@ serve it):
   the exclusive maintenance lock is distinguishable by mode (§ two-lock
   table above).
 
-**Unresolved conflict — idle-exit vs. the console (step 3).** A browser
-cannot launch a local binary. Once the typed HTTP API and console exist,
-a bookmarked console URL fails after idle exit unless an MCP/CLI client
-happens to restart the daemon. An idle HTTP connection or polling loop is
-not a reliable lifecycle mechanism. This must be resolved BEFORE step 3
-ships, by one of: disabling idle exit once the control API exists; moving
-service supervision (step 7) ahead of the console; or providing a native
-launcher that starts the daemon before opening the browser. §17 calls for
-a *"durable background service"*, and an idle-exiting daemon is in
-tension with that phrase. Recorded as §9 open item 4.
+**The browser-console conflict is RESOLVED by the deferral.** A browser
+cannot launch a local binary, so idle-exit would have made a bookmarked
+console URL fail after timeout — the conflict recorded in earlier
+revisions. With idle-exit deferred, the daemon is durable until stopped,
+which is exactly §17's *"durable background service."* When step 7
+introduces idle-exit (if it still wants it), it owns this conflict with
+full context: supervision exists by then, so the daemon can be
+launchd/systemd-woken rather than client-woken.
 
 **Crash recovery.** A stale socket (daemon killed, machine rebooted) must
 not wedge the system — but **a client must never unlink it.** A failed
@@ -822,8 +886,8 @@ layout; the exact idle timeout value; log line wording.
      opening the store (file existence, permissions, key-file shape).
    The current direct, potentially-mutating path outside any lock is
    retired in the same PR that introduces the daemon.
-2. Idle timeout value — proposed 15 minutes, trivially tunable, and
-   subordinate to item 4.
+2. ~~Idle timeout value~~ — RESOLVED by deferral: no idle-exit in this
+   step (§3.5, eng-review T4).
 3. **Daemon identity and config — DECIDED: option (a), default-only
    v1.** The daemon serves exactly the default pair
    (`~/.conduit/conduit.db` + key file), mirroring rotation's own
@@ -842,10 +906,10 @@ layout; the exact idle timeout value; log line wording.
      non-secret security settings; clients print them on mismatch.
    This removes the "first client silently sets global egress policy"
    hole by construction rather than by validation.
-4. **Idle-exit vs. the browser console (§3.5).** Must be resolved before
-   step 3 ships. A browser cannot auto-start the daemon. (Out-of-scope
-   for step 2 by the documented provisional-idle-exit decision; the
-   conflict is recorded so step 3 cannot claim surprise.)
+4. ~~Idle-exit vs. the browser console~~ — RESOLVED by the idle-exit
+   deferral (§3.5): the daemon is durable until stopped, so the console
+   always finds it. Step 7 re-inherits the conflict only if it
+   reintroduces idle-exit, with supervision available by then.
 5. **Steps 3 and 4 must land as one externally-reachable increment.** The
    spec already says the §16 floor ships in the same increment as the
    console. A mutating loopback HTTP API must never bind between the two.
@@ -937,6 +1001,22 @@ confirmed complete; 2 residual breaks, fixed in revision 5:**
    locks opened close-on-exec, never passed to children; fork/exec
    semantics of the primitive verified per platform; orphan-child
    real-process test (§3.1).
+
+**Engineering review (2026-08-16, `plan-eng-review`, platform-focused):**
+the codex arc reviewed the design as logic; this pass reviewed it against
+the Node runtime and found two buildability landmines the arc structurally
+could not see — **Node ≥20 stdlib has neither `flock(2)` nor
+`SO_PEERCRED`/`getpeereid`**, and both were load-bearing. Resolutions,
+applied in revision 6: T1 locks re-expressed over SQLite lock databases
+(fcntl-backed, crash-safe, already shipped via `@libsql/client`; §3.5);
+T2 different-UID enforcement moved to the lstat-verified 0700 state
+directory, per-connection peer verification demoted to a documented v1
+limit (§3.2); T3 daemon concurrency cap added (§3.1); T4 idle-exit
+DEFERRED to step 7 — reversing the pass-2..5 provisional yes — which
+dissolves the §9.4 console conflict and shrinks drain to
+shutdown-on-signal (§3.5). Test additions for the plan: multi-process
+harness task, concurrency-under-load, daemon log destination, one real
+stdio-client E2E. Lock-primitive change confirmed by codex pass 6 below.
 
 **Fifth pass (2026-08-15): CONVERGED.** Both pass-4 fixes verified
 correct and complete; no new in-scope breaks; zero category-(c) findings.
