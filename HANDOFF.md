@@ -1774,7 +1774,7 @@ merge instruction).
 
 ## Previous handoff (2026-07-10, superseded but quirks still valid)
 
-## Current handoff — written 2026-07-10 (§11 Trace redaction MERGED — PHASE 0 COMPLETE; next MVP step = /mcp server, stdio)
+## Superseded handoff — written 2026-07-10 (§11 Trace redaction MERGED — PHASE 0 COMPLETE; its NEXT [/mcp stdio server] was built long since; header renamed 2026-08-16, content untouched)
 
 ### Where things stand
 
