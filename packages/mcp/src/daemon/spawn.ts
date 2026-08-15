@@ -20,7 +20,7 @@
  * it — a daemon an operator starts BY HAND never passes through here.
  */
 import { spawn } from "node:child_process";
-import { closeSync, openSync } from "node:fs";
+import { closeSync, mkdirSync, openSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -79,6 +79,16 @@ export function daemonSpawnEnv(): NodeJS.ProcessEnv {
  * outcome, not a race to prevent.
  */
 export function spawnDaemon(stateDir: string): void {
+  // On a fresh install the state directory does not exist yet, and the
+  // log below is opened INSIDE it — so the directory has to exist before
+  // the very first daemon can be started. `recursive: true` makes this
+  // idempotent for every subsequent spawn. This creates the directory
+  // but validates nothing: the boundary check is the daemon's, run over
+  // this same path by `ensureStateDir` as its first act, and a
+  // 0700-mode create that loses a race to a hostile directory is caught
+  // there rather than trusted here.
+  mkdirSync(stateDir, { recursive: true, mode: 0o700 });
+
   // Opened by the CLIENT rather than letting the child create it: the
   // child must inherit descriptors that are already pointed at the log,
   // so nothing it writes can reach the client's own stdout/stderr — a
@@ -93,11 +103,15 @@ export function spawnDaemon(stateDir: string): void {
       // session ever resolves.
       cwd: stateDir,
       // The allowlist. `PATH` is the daemon-owned constant; every
-      // `CONDUIT_*` variable is absent, and so is `HOME` — the daemon
-      // resolves its state directory from the authenticated OS uid
-      // (`os.userInfo()`), not from an inherited `HOME` string, so
-      // omitting it is what makes a hostile `HOME` inert rather than
-      // merely unused.
+      // `CONDUIT_*` variable is absent, and so is `HOME`. The daemon
+      // resolves its state directory through `os.homedir()` (`env.ts`:
+      // `join(homedir(), ".conduit")`), and on POSIX `homedir()` returns
+      // `$HOME` when it is set and falls back to the passwd entry for
+      // the real uid when it is not. Omitting `HOME` from this env is
+      // therefore precisely what forces that fallback — the uid the
+      // kernel authenticated, not a string the client chose. A hostile
+      // `HOME` is inert because it is absent, not because `homedir()`
+      // ignores it.
       env: daemonSpawnEnv(),
       // stdin closed; stdout and stderr to the daemon's own log. No other
       // descriptor is inherited — in particular no lock-db descriptor,

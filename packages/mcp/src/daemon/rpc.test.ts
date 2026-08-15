@@ -68,6 +68,27 @@ describe("decodeRequest", () => {
     expect(() => decodeRequest({ kind: "source.revalidate", namespace: 5 })).toThrow();
   });
 
+  it("rejects degenerate execute.deadlineMs values that are still typeof number", () => {
+    // Each corrupts the admission bound in its own way, and each would
+    // pass a bare `typeof v === "number"` check: NaN makes every expiry
+    // comparison false so the entry NEVER expires, a negative deadline
+    // expires it before it can be dispatched, and Infinity is precisely
+    // the unbounded queue entry the capacity cap exists to prevent.
+    for (const deadlineMs of [
+      Number.NaN,
+      -1,
+      -0.5,
+      Number.POSITIVE_INFINITY,
+      Number.NEGATIVE_INFINITY,
+    ]) {
+      expect(() => decodeRequest({ kind: "execute", code: "1+1", deadlineMs })).toThrow();
+    }
+    // Zero remains legal — "do not queue me at all" is a coherent bound.
+    expect(decodeRequest({ kind: "execute", code: "1+1", deadlineMs: 0 })).toMatchObject({
+      deadlineMs: 0,
+    });
+  });
+
   it("rejects the anti-oracle shape: source.revalidate carrying a url field", () => {
     expect(() =>
       decodeRequest({ kind: "source.revalidate", namespace: "ns", url: "https://evil.example" }),

@@ -15,6 +15,8 @@
  * The lock-db files carry no data; their contents are never read. They
  * are kernel lock handles with a `.db` extension.
  */
+import { existsSync } from "node:fs";
+import { dirname } from "node:path";
 import { type Client, createClient, LibsqlError } from "@libsql/client";
 
 export interface HeldLock {
@@ -96,10 +98,50 @@ export async function acquireShared(lockDbPath: string): Promise<HeldLock | null
  * blocks a would-be EXCLUSIVE acquire) from "an EXCLUSIVE holder exists"
  * — only a SHARED probe (which coexists with other SHARED holders but is
  * blocked by an EXCLUSIVE holder) tells the two apart.
+ *
+ * A lock db whose PARENT DIRECTORY does not exist reads "free", which is
+ * the truthful answer rather than a swallowed error: on a fresh install
+ * the state directory has not been created yet, and a lock file nobody
+ * can open is a lock nobody can be holding. Probing is deliberately
+ * read-only about the filesystem — it never creates the directory, so a
+ * client asking "is anyone there?" cannot mutate the state directory it
+ * is only inspecting (§3.2: creation is the daemon's prerogative).
+ * Only the missing-directory errno is treated this way; every other
+ * open failure still throws.
  */
 export async function probeShared(lockDbPath: string): Promise<"free" | "busy"> {
-  const held = await acquireShared(lockDbPath);
+  let held: HeldLock | null;
+  try {
+    held = await acquireShared(lockDbPath);
+  } catch (err) {
+    if (isMissingDirectory(err, lockDbPath)) return "free";
+    throw err;
+  }
   if (!held) return "busy";
   await held.release();
   return "free";
+}
+
+/**
+ * True when the failure is "this lock db could not be opened because its
+ * directory isn't there".
+ *
+ * The shape is awkward, and deliberately not trusted. libsql surfaces
+ * this as a PLAIN `Error` — not a `LibsqlError`, and with an empty
+ * `code` — whose message embeds the raw SQLite result code (`14` is
+ * `SQLITE_CANTOPEN`). There is no typed field to branch on, so the
+ * message is only a HINT here, never the decision.
+ *
+ * The decision is made against the filesystem: this returns true only
+ * when the lock db's parent directory genuinely does not exist. That
+ * matters because `SQLITE_CANTOPEN` also covers permission denials and
+ * I/O faults, and reading either as "free" would let a client spawn a
+ * daemon against a state directory it cannot actually use. Checking the
+ * directory directly makes the answer true or false for a reason that
+ * does not depend on libsql's error prose staying stable.
+ */
+function isMissingDirectory(err: unknown, lockDbPath: string): boolean {
+  if ((err as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return true;
+  if (!(err instanceof Error) || !err.message.includes("ConnectionFailed")) return false;
+  return !existsSync(dirname(lockDbPath));
 }

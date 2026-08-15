@@ -27,13 +27,15 @@
  * close the listener: it only frees the name, letting a second daemon
  * bind and produce two owners of one database.
  */
+
 import { connect, type Socket } from "node:net";
-import { daemonPaths } from "./conduitd.js";
+import { join } from "node:path";
+import { type DaemonPaths, daemonPaths } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { probeShared } from "./locks.js";
 import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
-import { spawnDaemon } from "./spawn.js";
-import { assertStateDir } from "./state-dir.js";
+import { DAEMON_LOG, spawnDaemon } from "./spawn.js";
+import { assertStateDir, StateDirError } from "./state-dir.js";
 
 export interface DaemonRequestOptions {
   stateDir: string;
@@ -106,7 +108,25 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
   // daemon's prerogative), but it must refuse to hand a request to a
   // socket sitting in a directory whose ownership or mode would let
   // another uid reach it.
-  await assertStateDir(opts.stateDir, "connect");
+  //
+  // A directory that does not exist yet is the one case that is NOT a
+  // boundary violation: on a fresh install nothing has created
+  // `~/.conduit`, and "absent" IS decision-table row 4 — a lock nobody
+  // can open is a lock nobody holds, so there is no daemon and no
+  // rotation. Any OTHER code still refuses: a directory that exists and
+  // is unsafe is a boundary break, not a fresh install.
+  //
+  // The client never creates the directory itself — that stays the
+  // daemon's prerogative. It simply proceeds into the loop, where both
+  // probes read "free" against a missing directory (a lock nobody can
+  // open is a lock nobody holds), lands on row 4, and spawns; the
+  // daemon's own `ensureStateDir` then creates it under the same
+  // mkdir-then-assert boundary that governs every other start.
+  try {
+    await assertStateDir(opts.stateDir, "connect");
+  } catch (err) {
+    if (!(err instanceof StateDirError) || err.code !== "NOT_FOUND") throw err;
+  }
 
   let spawned = false;
 
@@ -133,28 +153,38 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
       // Row 2/3 — a daemon holds lifecycle: it is running, starting, or
       // draining. Try to connect; only a connect that reaches READY is a
       // healthy daemon.
-      const socket = await tryConnect(paths.socket);
-      if (socket !== null) {
-        const ready = await awaitReady(socket, remaining(expiry));
-        if (ready.ready) {
-          // Past this point the request bytes go out and the retryable
-          // zone ends. The READY gate's decoder and any frames it already
-          // read past READY travel into the exchange — see `awaitReady`
-          // for why starting a fresh decoder here would be a bug.
-          return await exchange(socket, opts.role, opts.request, expiry, ready);
-        }
-        // Connected but no READY — accepted-or-queued during DRAINING.
-        // Identical to a refused connect, and crucially NOTHING was
-        // written, so the next attempt is still a first attempt.
-        socket.destroy();
+      let socket = await tryConnect(paths.socket, remaining(expiry));
+      if (socket === null) {
+        // Row 3 — starting or draining, and the two are indistinguishable
+        // from out here. So the wait watches for EITHER outcome rather
+        // than only one: a DRAINING daemon ends by releasing the
+        // lifecycle lock, but a STARTING one holds it the whole time and
+        // resolves by BINDING — the lock is taken before the store opens
+        // and the sweep runs, so a perfectly healthy daemon sits in that
+        // window with the socket not yet there. Waiting only for release
+        // would burn the entire deadline against a daemon that came up
+        // fine seconds earlier.
+        socket = await waitForStartOrRelease(paths, expiry);
+        // Still nothing — the lock released (drain finished, or the
+        // daemon died) or time ran out. RE-PROBE FROM THE TOP rather
+        // than assuming which: rotation may have taken maintenance in
+        // the meantime, so the loop re-runs row 1 instead of falling
+        // through to spawn.
+        if (socket === null) continue;
       }
 
-      // Row 3 — starting or draining. One bounded wait for lifecycle
-      // release, then RE-PROBE FROM THE TOP rather than assuming the
-      // reason it released. Rotation may have taken maintenance in the
-      // meantime, which is why the loop re-runs row 1 rather than
-      // falling through to spawn.
-      await waitForLifecycleRelease(paths.lifecycleLockDb, expiry);
+      const ready = await awaitReady(socket, remaining(expiry));
+      if (ready.ready) {
+        // Past this point the request bytes go out and the retryable
+        // zone ends. The READY gate's decoder and any frames it already
+        // read past READY travel into the exchange — see `awaitReady`
+        // for why starting a fresh decoder here would be a bug.
+        return await exchange(socket, opts.role, opts.request, expiry, ready);
+      }
+      // Connected but no READY — accepted-or-queued during DRAINING.
+      // Identical to a refused connect, and crucially NOTHING was
+      // written, so the next attempt is still a first attempt.
+      socket.destroy();
       continue;
     }
 
@@ -174,9 +204,14 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
     await waitForLifecycleHeld(paths.lifecycleLockDb, expiry);
   }
 
+  // Names the daemon's own log: this is the terminal failure, and the
+  // cause is never on the wire (the daemon that would have reported it
+  // is the thing that could not be reached). Without the path, "no
+  // daemon could be started" is a dead end — with it, the next step is
+  // to read why the child exited.
   throw new DaemonUnavailable(
     "unavailable",
-    `[conduit] Daemon unavailable: no daemon could be reached or started within the deadline. Context: {stateDir: ${opts.stateDir}, deadlineMs: ${opts.deadlineMs}}`,
+    `[conduit] Daemon unavailable: no daemon could be reached or started within the deadline. Context: {stateDir: ${opts.stateDir}, deadlineMs: ${opts.deadlineMs}} — see ${join(opts.stateDir, DAEMON_LOG)} for why the daemon exited`,
   );
 }
 
@@ -189,18 +224,26 @@ function remaining(expiry: number): number {
  * is information, not an error, and it explicitly does NOT license
  * removing the socket (§3.2) — hence no unlink anywhere in this module.
  */
-function tryConnect(socketPath: string): Promise<Socket | null> {
+function tryConnect(socketPath: string, timeoutMs: number): Promise<Socket | null> {
   return new Promise((resolve) => {
     const socket = connect(socketPath);
-    const onError = (): void => {
-      socket.destroy();
-      resolve(null);
-    };
-    socket.once("error", onError);
-    socket.once("connect", () => {
+    let settled = false;
+    const finish = (result: Socket | null): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
       socket.removeListener("error", onError);
-      resolve(socket);
-    });
+      if (result === null) socket.destroy();
+      resolve(result);
+    };
+    // A connect that neither succeeds nor errors is possible: a full
+    // listen backlog leaves the SYN unanswered, so without this the
+    // attempt outlives the caller's whole budget waiting on a socket
+    // that will never report either way.
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    const onError = (): void => finish(null);
+    socket.once("error", onError);
+    socket.once("connect", () => finish(socket));
   });
 }
 
@@ -410,12 +453,33 @@ function createReader(socket: Socket, decoder: FrameDecoder, alreadyRead: unknow
   };
 }
 
-/** Polls until the lifecycle lock is free, or the deadline passes. */
-async function waitForLifecycleRelease(lockDb: string, expiry: number): Promise<void> {
+/**
+ * Waits out a daemon that holds the lifecycle lock, resolving on
+ * whichever of the two possible outcomes happens first:
+ *
+ * - a **connected socket**, meaning a STARTING daemon finished binding.
+ *   The caller carries it straight into the READY gate; reconnecting
+ *   would only race the same window again.
+ * - **null**, meaning the lock went free (a DRAINING daemon exited, or
+ *   the holder died) or the deadline passed. The caller re-probes from
+ *   the top of the decision table.
+ *
+ * Both are polled on the same tick because the client cannot tell
+ * STARTING from DRAINING from outside: they present identically (lock
+ * held, no socket), and they resolve in opposite directions. Watching
+ * only for release would make a healthy start cost the full deadline;
+ * watching only for the socket would hang on a daemon that is leaving.
+ */
+async function waitForStartOrRelease(paths: DaemonPaths, expiry: number): Promise<Socket | null> {
   while (Date.now() < expiry) {
-    if ((await probeShared(lockDb)) === "free") return;
     await sleep(Math.min(LIFECYCLE_WAIT_POLL_MS, remaining(expiry)));
+
+    const socket = await tryConnect(paths.socket, remaining(expiry));
+    if (socket !== null) return socket;
+
+    if ((await probeShared(paths.lifecycleLockDb)) === "free") return null;
   }
+  return null;
 }
 
 /** Polls until a spawned daemon has TAKEN the lifecycle lock. */

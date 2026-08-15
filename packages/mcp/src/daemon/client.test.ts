@@ -174,6 +174,64 @@ describe("daemonRequest — the §3.5 decision table", () => {
   );
 
   it(
+    "INVARIANT §17: a client auto-starts against a state directory that does not exist yet",
+    async () => {
+      // A fresh install: nothing has created `~/.conduit`. The client
+      // must read this as decision-table row 4 (a lock nobody can open
+      // is a lock nobody holds) and spawn, rather than dying on a raw
+      // ENOENT out of the boundary check.
+      const parent = newStateDir();
+      const stateDir = join(parent, "nested", "conduit");
+      expect(existsSync(stateDir)).toBe(false);
+      // The probes read "free" against the missing directory rather than
+      // throwing — the property that lets the loop reach row 4 at all.
+      expect(await probeShared(daemonPaths(stateDir).lifecycleLockDb)).toBe("free");
+
+      const response = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 45_000,
+        spawn: testSpawn(),
+      });
+
+      expect(response.kind).toBe("result");
+      expect(existsSync(daemonPaths(stateDir).socket)).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a client connects as soon as a STARTING daemon binds, without waiting out its deadline",
+    async () => {
+      const stateDir = newStateDir();
+      // A healthy daemon that holds the lifecycle lock for a while
+      // before binding — the real window where the store opens and the
+      // sweep runs. The client sees "lock held, nothing to connect to",
+      // which is indistinguishable from DRAINING from outside.
+      const delayMs = 4_000;
+
+      const startedAt = Date.now();
+      const response = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "anything" },
+        // Far larger than the bind delay: if the wait only watched for
+        // lifecycle RELEASE, it would burn this entire budget against a
+        // daemon that came up fine seconds earlier.
+        deadlineMs: 45_000,
+        spawn: testSpawn(["--delay-bind-ms", String(delayMs)]),
+      });
+      const elapsed = Date.now() - startedAt;
+
+      expect(response.kind).toBe("result");
+      // Connected on the socket appearing, not on the deadline expiring.
+      expect(elapsed).toBeLessThan(30_000);
+    },
+    TIMEOUT,
+  );
+
+  it(
     "INVARIANT §17: a client fails fast during rotation and never spawns a daemon",
     async () => {
       const stateDir = newStateDir();

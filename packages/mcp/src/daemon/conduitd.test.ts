@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,6 +11,7 @@ import {
   daemonPaths,
   ExecutionQueue,
   QUEUE_CAPACITY,
+  RESUME_ADMISSION_DEADLINE_MS,
 } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
@@ -541,24 +542,31 @@ describe("conduitd lifecycle", () => {
     async () => {
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
-      const daemon = spawnDaemon(stateDir);
+      // A genuinely FAILING manager, not an unknown execution id: a
+      // resume against an unknown id loses `claimForResume` and returns
+      // a `conflict` RESULT, never an error — so the original version of
+      // this test drove no failure path at all. Its assertions were
+      // wrapped in `if (reply.code === "internal")`, which was false
+      // every run, so the whole §9.2 hygiene check silently passed on a
+      // successful reply. The unconditional shape below is what caught it.
+      const daemon = spawnDaemon(stateDir, ["--throw-execute"]);
       await daemon.waitForLine("listening");
 
       const client = await connectClient(paths.socket);
-      await handshake(client, "approvals");
+      await handshake(client, "serve");
 
-      // A resume against an unknown execution drives the store/manager
-      // failure path. Whatever it reports, the client must not receive
-      // filesystem paths or key-source context.
-      client.send({ kind: "approvals.resume", executionId: "nope", decision: "approve" });
+      // Drives a real store/manager rejection. The client must receive
+      // the fixed string only — never filesystem paths or key-source
+      // context (§9.2, §11).
+      client.send({ kind: "execute", code: "1+1", deadlineMs: 60_000 });
       const reply = (await client.next()) as { kind: string; code?: string; message?: string };
-      if (reply.kind === "error" && reply.code === "internal") {
-        expect(reply.message).toBe(
-          "internal daemon error; see the daemon log for the cause (correlation id below)",
-        );
-        expect(reply.message).not.toContain(stateDir);
-        expect(reply.message).not.toContain(".db");
-      }
+      expect(reply).toMatchObject({
+        kind: "error",
+        code: "internal",
+        message: "internal daemon error; see the daemon log for the cause (correlation id below)",
+      });
+      expect(reply.message).not.toContain(stateDir);
+      expect(reply.message).not.toContain(".db");
     },
     TIMEOUT,
   );
@@ -643,6 +651,115 @@ describe("conduitd lifecycle", () => {
     },
     TIMEOUT,
   );
+
+  it(
+    "INVARIANT §17: a rejecting execution is a typed error, never a dead daemon",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // manager.start rejects from inside the queue's run closure, which
+      // is invoked as `void dispatch(entry)` — an unhandled rejection
+      // there terminates the process under Node's default disposition,
+      // so one client's store fault would kill every other client's
+      // daemon.
+      const daemon = spawnDaemon(stateDir, ["--throw-execute"]);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({ kind: "execute", code: "1+1", deadlineMs: 60_000 });
+
+      expect(await client.next()).toMatchObject({ kind: "error", code: "internal" });
+
+      // The daemon is still up and still serving: a second request on a
+      // fresh connection is answered normally.
+      expect(daemon.child.exitCode).toBeNull();
+      const second = await connectClient(paths.socket);
+      await handshake(second, "serve");
+      second.send({ kind: "search", query: "anything" });
+      expect(await second.next()).toMatchObject({ kind: "result" });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a result too large for one IPC frame is a typed error, never a dead daemon",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // Not a hostile input: the sandbox's default maxOutputBytes EQUALS
+      // FRAME_CAP, so an ordinary maximum-size result plus its envelope
+      // necessarily overflows the frame. encodeFrame throws inside the
+      // queue closure, with the same fatal consequence as above.
+      const daemon = spawnDaemon(stateDir, ["--huge-execute"]);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({ kind: "execute", code: "1+1", deadlineMs: 60_000 });
+
+      const reply = (await client.next()) as { kind: string; message?: string };
+      expect(reply).toMatchObject({ kind: "error" });
+      // Honest about the actual cause — the client can act on "return
+      // less data" where "internal daemon error" would strand it.
+      expect(reply.message).toContain("too large for the IPC frame");
+
+      expect(daemon.child.exitCode).toBeNull();
+      const second = await connectClient(paths.socket);
+      await handshake(second, "serve");
+      second.send({ kind: "search", query: "anything" });
+      expect(await second.next()).toMatchObject({ kind: "result" });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: the daemon starts against a state directory that does not exist yet",
+    async () => {
+      // A fresh install: nothing has created `~/.conduit`. Refusing here
+      // made first run a dead end (raw ENOENT out of the lstat).
+      const parent = newStateDir();
+      const stateDir = join(parent, "nested", "conduit");
+      const paths = daemonPaths(stateDir);
+
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      // Created at 0700 and then validated by the same boundary check
+      // that governs a directory it found — mkdir-then-assert.
+      expect(statSync(stateDir).mode & 0o777).toBe(0o700);
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({ kind: "search", query: "anything" });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+    },
+    TIMEOUT,
+  );
+
+  it("INVARIANT §17: an idle READY connection can still complete a request issued during drain grace", async () => {
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const daemon = spawnDaemon(stateDir);
+    await daemon.waitForLine("listening");
+
+    // READY granted, then deliberately idle — no request in flight at
+    // the moment drain begins.
+    const client = await connectClient(paths.socket);
+    await handshake(client, "serve");
+
+    daemon.child.kill("SIGTERM");
+    await daemon.waitForLine("draining");
+
+    // §3.5: a connection that has received READY counts as active
+    // work. Before the D6 ruling this socket was ended at drain start
+    // and this request went nowhere.
+    client.send({ kind: "search", query: "anything" });
+    expect(await client.next()).toMatchObject({ kind: "result" });
+
+    // The grace window is still BOUNDED — the daemon exits on its own.
+    expect(await daemon.waitForExit()).toBe(0);
+  }, 120_000);
 
   it(
     "refuses any request sent before the handshake",
@@ -760,6 +877,30 @@ describe("ExecutionQueue admission", () => {
     expect(ran).toBe(false);
 
     for (const b of blockers) b.release();
+  });
+
+  it("resume shares the SAME queue as execute — concurrent resumes queue rather than exceeding the cap", () => {
+    // Resume re-enters sandbox execution (it drives a paused execution's
+    // replay), so it is admitted through the same queue as execute.
+    // Before the fix it bypassed admission entirely and N concurrent
+    // resumes ran unbounded in the one process the cap protects.
+    const queue = new ExecutionQueue();
+
+    // Fill every slot with "execute" work...
+    const executes = Array.from({ length: CONCURRENCY_CAP }, () => blocker());
+    for (const b of executes) queue.submit(b.run, 60_000);
+    expect(queue.activeCount).toBe(CONCURRENCY_CAP);
+
+    // ...then submit resumes. They QUEUE behind the cap rather than
+    // adding themselves to the active set.
+    const resumes = Array.from({ length: 3 }, () => blocker());
+    for (const b of resumes) {
+      expect(queue.submit(b.run, RESUME_ADMISSION_DEADLINE_MS).outcome).toBe("accepted");
+    }
+    expect(queue.activeCount).toBe(CONCURRENCY_CAP);
+    expect(queue.depth).toBe(3);
+
+    for (const b of [...executes, ...resumes]) b.release();
   });
 
   it("sustained overload never exceeds the queue capacity", () => {

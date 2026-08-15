@@ -1,7 +1,7 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it } from "vitest";
@@ -200,5 +200,21 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
 
     holder.kill("SIGKILL");
     await waitForExclusiveFree(db);
+  });
+
+  it("probeShared: a lock db whose directory does not exist reads free, and is not created", async () => {
+    // The fresh-install case. A lock file nobody can open is a lock
+    // nobody holds, so "free" is the truthful answer rather than a
+    // swallowed error — it is what lets the client reach decision-table
+    // row 4 and spawn instead of dying on a raw open failure.
+    const missing = join(newLockDbPath(), "..", "absent-dir", "lc.lock.db");
+    expect(existsSync(dirname(missing))).toBe(false);
+
+    expect(await probeShared(missing)).toBe("free");
+
+    // Probing is read-only about the filesystem: a client asking "is
+    // anyone there?" must not create the state directory it is only
+    // inspecting (§3.2 — creation is the daemon's prerogative).
+    expect(existsSync(dirname(missing))).toBe(false);
   });
 });

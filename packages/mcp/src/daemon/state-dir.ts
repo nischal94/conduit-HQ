@@ -15,7 +15,8 @@
  * by absolute path — never a PATH lookup.
  */
 import { execFile } from "node:child_process";
-import { lstat } from "node:fs/promises";
+import type { Stats } from "node:fs";
+import { lstat, mkdir } from "node:fs/promises";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -23,6 +24,7 @@ const execFileAsync = promisify(execFile);
 export type StateDirMode = "bind" | "connect";
 
 export type StateDirErrorCode =
+  | "NOT_FOUND"
   | "SYMLINK"
   | "NOT_DIRECTORY"
   | "WRONG_OWNER"
@@ -61,7 +63,23 @@ const REQUIRED_MODE = 0o700;
  * this without re-reading that reasoning.
  */
 export async function assertStateDir(dir: string, mode: StateDirMode): Promise<void> {
-  const stat = await lstat(dir);
+  let stat: Stats;
+  try {
+    stat = await lstat(dir);
+  } catch (err) {
+    // A missing state directory is a NAMED condition, not a raw errno
+    // escaping the boundary. On a fresh install nothing has created
+    // `~/.conduit` yet, and every caller needs to branch on it: the
+    // daemon creates the directory and re-asserts, the client treats it
+    // as "no daemon, no rotation" and spawns one. A bare ENOENT
+    // `Error` forces both to string-match an errno to tell "not there
+    // yet" from "there and unsafe" — the two outcomes with opposite
+    // correct responses.
+    if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+      throw new StateDirError("NOT_FOUND", `state directory does not exist: ${dir}`);
+    }
+    throw err;
+  }
 
   if (stat.isSymbolicLink()) {
     throw new StateDirError("SYMLINK", `state directory is a symlink: ${dir}`);
@@ -91,6 +109,27 @@ export async function assertStateDir(dir: string, mode: StateDirMode): Promise<v
   } else if (process.platform === "linux") {
     await assertNoLinuxAcl(dir);
   }
+}
+
+/**
+ * Creates the state directory if it is absent, then runs the FULL bind
+ * validation over it. The order is the whole point: `mkdir` is
+ * best-effort and its own mode argument is not trusted (umask masks it,
+ * and an attacker may have won the race to create the path first), so
+ * nothing is assumed from a successful create — `assertStateDir` still
+ * proves ownership, mode, symlink-freedom and ACL-freedom afterwards,
+ * exactly as it would for a directory that already existed. Creating
+ * without re-asserting would turn the §3.2 boundary into a first-run
+ * exemption.
+ *
+ * `recursive: true` also makes the create idempotent, so two daemons
+ * racing a fresh install both proceed to validation rather than one
+ * failing EEXIST; the lifecycle lock, not this call, is what makes them
+ * a singleton.
+ */
+export async function ensureStateDir(dir: string): Promise<void> {
+  await mkdir(dir, { recursive: true, mode: REQUIRED_MODE });
+  await assertStateDir(dir, "bind");
 }
 
 async function stripDarwinAcl(dir: string): Promise<void> {

@@ -31,6 +31,7 @@ import { openStoreFromEnv } from "../store-open.js";
 import {
   DepthExceeded,
   encodeFrame,
+  FRAME_CAP,
   FrameDecoder,
   FrameTooLarge,
   MalformedFrame,
@@ -43,7 +44,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from "./rpc.js";
-import { assertStateDir } from "./state-dir.js";
+import { ensureStateDir } from "./state-dir.js";
 
 /**
  * Normative constants (§3.1), not configuration. N clients now drive
@@ -55,6 +56,17 @@ import { assertStateDir } from "./state-dir.js";
  */
 export const CONCURRENCY_CAP = 4;
 export const QUEUE_CAPACITY = 16;
+
+/**
+ * Admission deadline for `approvals.resume`, which — unlike `execute` —
+ * carries no client-supplied `deadlineMs` in its §3.3 request shape.
+ *
+ * Resume goes through the same queue as execute (it re-enters sandbox
+ * execution), so it needs an admission bound like every other entry: an
+ * entry that never expires is precisely the unbounded queue growth the
+ * capacity cap exists to prevent. Normative-local, chosen here.
+ */
+export const RESUME_ADMISSION_DEADLINE_MS = 60_000;
 
 /**
  * How long DRAINING waits for accepted work before abandoning it.
@@ -298,6 +310,12 @@ export class ExecutionQueue {
 interface ConnectionContext {
   socket: Socket;
   capability: Capability | null;
+  /**
+   * Whether this connection was sent READY. §3.5 counts a READY-granted
+   * connection as active work, so drain leaves it open through the grace
+   * window rather than cutting it at drain start — see the drain block.
+   */
+  readyGranted: boolean;
   /** In-flight request promises; drain waits on all of them. */
   inFlight: Set<Promise<unknown>>;
   /** Abandon hooks for this connection's still-queued entries. */
@@ -405,7 +423,13 @@ async function startDaemon(
   // 1. State-directory boundary (§3.2). The different-UID boundary is
   //    enforced here, one level above the socket: a different-uid process
   //    cannot traverse a 0700 directory, so it never reaches the pathname.
-  await assertStateDir(paths.stateDir, "bind");
+  //    The daemon CREATES the directory when absent (0700) and then runs
+  //    the full validation over it either way — on a fresh install
+  //    nothing has made `~/.conduit` yet, and refusing to start there
+  //    would make first run a dead end. Creation is not a shortcut past
+  //    the boundary: mkdir-then-assert proves the same properties for a
+  //    directory it just created as for one it found.
+  await ensureStateDir(paths.stateDir);
 
   // 2. Lifecycle EXCLUSIVE — singleton enforcement among daemons.
   const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
@@ -444,6 +468,16 @@ async function startDaemon(
       // Losing the race abandons the sweep, which is safe: it is
       // idempotent by construction (it only moves dead-daemon rows to a
       // terminal state) and the next startup runs it again.
+      //
+      // Abandoning it does NOT cancel it — the sweep's own store writes
+      // may still be in flight after this race resolves. That straggler
+      // is tolerable only because losing this race means a stop was
+      // requested, so the process is about to exit through `finally`
+      // (both locks released, no endpoint ever bound) and no client can
+      // observe the partially-swept state. If this race is ever reused
+      // somewhere the process KEEPS RUNNING afterwards, the straggler
+      // becomes a concurrent writer against a store the daemon has
+      // resumed serving, and it would need real cancellation.
       await Promise.race([opts.sweep(store), stopSignal.wait()]);
     }
 
@@ -543,6 +577,7 @@ async function serve(opts: ServeOptions): Promise<void> {
     const ctx: ConnectionContext = {
       socket,
       capability: null,
+      readyGranted: false,
       inFlight: new Set(),
       queued: new Set(),
       requestCounter: { n: 0 },
@@ -606,6 +641,7 @@ async function serve(opts: ServeOptions): Promise<void> {
     // READY (or split across chunks) survives regardless. Anything added
     // here that writes unprompted must keep that decoder-handoff intact.
     send(socket, { kind: "ready" });
+    ctx.readyGranted = true;
   }
 
   async function dispatch(ctx: ConnectionContext, msg: unknown): Promise<void> {
@@ -715,6 +751,123 @@ async function serve(opts: ServeOptions): Promise<void> {
     return catalog;
   }
 
+  /**
+   * Runs one unit of sandbox work and writes its reply, converting EVERY
+   * failure into a typed error frame rather than a rejected promise.
+   *
+   * This exists because the queue's run closure is invoked as
+   * `void this.dispatch(entry)` and `dispatch` awaits `entry.run()` with
+   * only a `finally` — nothing catches. A rejection there is an unhandled
+   * rejection, which under Node's default disposition terminates the
+   * whole daemon: one client's failing execution would take down every
+   * other client's long-lived process. Mirroring `dispatch`'s own outer
+   * handler (log with the correlation id, send the fixed internal
+   * message) keeps the failure scoped to the request that caused it.
+   *
+   * The oversize case is handled separately and honestly. The sandbox's
+   * default `maxOutputBytes` (§16) EQUALS `FRAME_CAP`, so an ordinary,
+   * entirely legal result envelope — the payload plus its `kind`,
+   * `requestId` and JSON overhead — can exceed the frame cap. That is not
+   * an internal fault and must not read as one: the client is told its
+   * result did not fit the IPC frame, which is actionable (return less),
+   * where "internal daemon error" would not be.
+   */
+  async function runGuarded(
+    ctx: ConnectionContext,
+    requestId: string,
+    work: () => Promise<unknown>,
+  ): Promise<void> {
+    let payload: unknown;
+    try {
+      payload = await work();
+    } catch (err) {
+      log(
+        `[conduitd] Queued request failed: execute. Context: {requestId: ${requestId}, cause: ${
+          err instanceof Error ? (err.stack ?? err.message) : String(err)
+        }}`,
+      );
+      send(ctx.socket, {
+        kind: "error",
+        requestId,
+        code: "internal",
+        message: INTERNAL_ERROR_MESSAGE,
+      });
+      return;
+    }
+    sendResult(ctx, requestId, payload);
+  }
+
+  /**
+   * Writes a `result`, degrading to a typed error when the encoded frame
+   * would exceed `FRAME_CAP`. Encoding happens inside `send`, so without
+   * this the throw escapes into whatever called it — on the queue path,
+   * into an unhandled rejection.
+   */
+  function sendResult(ctx: ConnectionContext, requestId: string, payload: unknown): void {
+    try {
+      send(ctx.socket, { kind: "result", requestId, payload });
+    } catch (err) {
+      if (!(err instanceof FrameTooLarge)) throw err;
+      log(
+        `[conduitd] Result too large for one IPC frame. Context: {requestId: ${requestId}, cap: ${FRAME_CAP}}`,
+      );
+      send(ctx.socket, {
+        kind: "error",
+        requestId,
+        code: "invalid",
+        message: `the result was too large for the IPC frame (cap ${FRAME_CAP} bytes); return less data`,
+      });
+    }
+  }
+
+  /**
+   * Submits one unit of sandbox work to the admission queue and owns the
+   * whole §3.1 admission contract around it: the `busy` refusal, the
+   * per-connection abandon bookkeeping, and the expiry reply.
+   *
+   * Both `execute` and `approvals.resume` go through here. A resume
+   * re-enters sandbox execution exactly as `execute` does — it drives a
+   * paused execution's replay — so admitting it outside the queue would
+   * let N concurrent resumes run unbounded past the cap the queue exists
+   * to enforce, in the same process, against the same store.
+   */
+  async function submitSandboxWork(
+    ctx: ConnectionContext,
+    requestId: string,
+    deadlineMs: number,
+    work: () => Promise<unknown>,
+  ): Promise<void> {
+    const admission = queue.submit(async () => {
+      await runGuarded(ctx, requestId, work);
+    }, deadlineMs);
+
+    if (admission.outcome === "busy") {
+      send(ctx.socket, {
+        kind: "error",
+        requestId,
+        code: "busy",
+        message: `daemon busy: ${QUEUE_CAPACITY} requests queued behind ${CONCURRENCY_CAP} active`,
+      });
+      log(`queue depth=${queue.depth} max=${queue.maxObservedDepth} refused=busy`);
+      return;
+    }
+
+    ctx.queued.add(admission.abandon);
+    log(`queue depth=${queue.depth} max=${queue.maxObservedDepth} active=${queue.activeCount}`);
+    const settled = await admission.done;
+    ctx.queued.delete(admission.abandon);
+    if (settled === "expired") {
+      // Nothing ran, so this is not an ambiguous outcome — the request
+      // was never admitted and may be retried as a first attempt.
+      send(ctx.socket, {
+        kind: "error",
+        requestId,
+        code: "busy",
+        message: "queue deadline expired before a slot became available",
+      });
+    }
+  }
+
   async function handleRequest(
     ctx: ConnectionContext,
     request: RpcRequest,
@@ -722,41 +875,13 @@ async function serve(opts: ServeOptions): Promise<void> {
   ): Promise<void> {
     switch (request.kind) {
       case "execute": {
-        const admission = queue.submit(async () => {
+        // deadlineMs bounds ADMISSION, not execution: §16's wall-clock
+        // budget stays with the manager's own limits.
+        await submitSandboxWork(ctx, requestId, request.deadlineMs, async () => {
           // M6: a fresh runtime per unit of work — never cached.
           const { manager } = await createRuntime({ store, allowPrivateEgress, log });
-          // deadlineMs bounded ADMISSION, not execution: §16's wall-clock
-          // budget stays with the manager's own limits.
-          const outcome = await manager.start(request.code);
-          send(ctx.socket, { kind: "result", requestId, payload: outcome });
-        }, request.deadlineMs);
-
-        if (admission.outcome === "busy") {
-          send(ctx.socket, {
-            kind: "error",
-            requestId,
-            code: "busy",
-            message: `daemon busy: ${QUEUE_CAPACITY} requests queued behind ${CONCURRENCY_CAP} active`,
-          });
-          log(`queue depth=${queue.depth} max=${queue.maxObservedDepth} refused=busy`);
-          return;
-        }
-
-        ctx.queued.add(admission.abandon);
-        log(`queue depth=${queue.depth} max=${queue.maxObservedDepth} active=${queue.activeCount}`);
-        const settled = await admission.done;
-        ctx.queued.delete(admission.abandon);
-        if (settled === "expired") {
-          // Nothing ran, so this is not an ambiguous outcome — the
-          // request was never admitted and may be retried as a first
-          // attempt.
-          send(ctx.socket, {
-            kind: "error",
-            requestId,
-            code: "busy",
-            message: "queue deadline expired before a slot became available",
-          });
-        }
+          return await manager.start(request.code);
+        });
         return;
       }
       case "search": {
@@ -791,9 +916,20 @@ async function serve(opts: ServeOptions): Promise<void> {
         return;
       }
       case "approvals.resume": {
-        const { manager } = await createRuntime({ store, allowPrivateEgress, log });
-        const outcome = await manager.resume(request.executionId, { kind: request.decision });
-        send(ctx.socket, { kind: "result", requestId, payload: outcome });
+        // Through the SAME queue as execute: a resume drives a paused
+        // execution's replay, which is sandbox execution by another name.
+        // Admitting it outside the queue would let N concurrent resumes
+        // run past the cap in the one process the cap exists to protect.
+        //
+        // `approvals.resume` carries no client-supplied deadline (§3.3's
+        // request shape), so the admission bound is the daemon's own
+        // constant rather than a client-chosen one — deliberately NOT
+        // unbounded, since an entry that never expires is exactly the
+        // unbounded queue growth §3.1 rejects.
+        await submitSandboxWork(ctx, requestId, RESUME_ADMISSION_DEADLINE_MS, async () => {
+          const { manager } = await createRuntime({ store, allowPrivateEgress, log });
+          return await manager.resume(request.executionId, { kind: request.decision });
+        });
         return;
       }
       case "source.provision":
@@ -823,14 +959,26 @@ async function serve(opts: ServeOptions): Promise<void> {
   draining = true;
   log("draining");
 
-  // Stop accepting new connections. `server.close` does NOT resolve until
-  // every already-open connection is gone, so the idle ones are ended
-  // first — otherwise a client that connected and simply sat there would
-  // hold the daemon in DRAINING forever. Sockets with work in flight are
-  // left alone here and ended below, once their responses are written.
+  // Stop accepting new connections. `server.close` does NOT resolve
+  // until every already-open connection is gone, so idle connections
+  // must eventually be ended — otherwise a client that connected and sat
+  // there would hold the daemon in DRAINING forever.
+  //
+  // But "eventually" is the drain deadline, not drain start. §3.5 is
+  // explicit that a connection which has received READY counts as active
+  // work: the client was told the daemon was serving, and it may be
+  // mid-decision about a request it is entitled to still issue. Cutting
+  // it at drain start breaks that promise for a connection that did
+  // nothing wrong. So a READY-granted connection — idle or not — is left
+  // open through the grace window below and ended only when the deadline
+  // expires, which is the residual this bound trades for a guaranteed
+  // exit (Deviation D6).
+  //
+  // A connection that never received READY was never promised anything
+  // and is ended immediately.
   const closed = new Promise<void>((done) => server.close(() => done()));
   for (const ctx of connections) {
-    if (ctx.inFlight.size === 0) ctx.socket.end();
+    if (!ctx.readyGranted) ctx.socket.end();
   }
 
   // Finishing accepted work is best-effort under a deadline, not an
@@ -840,10 +988,27 @@ async function serve(opts: ServeOptions): Promise<void> {
   // worse than abandoning one response: every restart would exit
   // "already running" and rotation could never acquire maintenance.
   // Exiting releases both locks and lets the next daemon serve.
+  // The grace window. It runs to the deadline whenever a READY-granted
+  // connection is still open, rather than exiting the moment the queue
+  // first reads idle: an idle queue does NOT mean the connection is
+  // finished, only that it has not issued its next request yet, and that
+  // request is one §3.5 entitles it to make. Exiting early would end the
+  // connection between two requests it was promised it could send.
+  //
+  // Once every READY connection has closed on its own, there is nothing
+  // left to wait for and the loop stops immediately — the common case
+  // (well-behaved clients disconnecting on SIGTERM) still exits fast.
   const deadline = Date.now() + DRAIN_DEADLINE_MS;
-  while (!queue.isIdle && Date.now() < deadline) {
+  while (Date.now() < deadline) {
+    const liveReady = [...connections].some((ctx) => ctx.readyGranted && !ctx.socket.destroyed);
+    if (queue.isIdle && !liveReady) break;
     await new Promise((tick) => setTimeout(tick, 5));
   }
+
+  // Deadline reached (or nothing left): finish whatever responses are
+  // still writable, then end every remaining connection. This is where
+  // the surviving idle READY connections are finally cut — the recorded
+  // residual of the D6 ruling.
   for (const ctx of connections) {
     const remaining = deadline - Date.now();
     if (remaining > 0 && ctx.inFlight.size > 0) {

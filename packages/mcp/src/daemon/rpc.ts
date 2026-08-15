@@ -144,8 +144,16 @@ export function decodeRequest(v: unknown): RpcRequest {
       if (!isString(v.code)) {
         throw new InvalidRpcRequest("execute.code must be a string");
       }
-      if (typeof v.deadlineMs !== "number") {
-        throw new InvalidRpcRequest("execute.deadlineMs must be a number");
+      // Finite and non-negative, not merely "a number". `NaN`, `-1` and
+      // `Infinity` are all typeof "number" and each corrupts the
+      // admission bound differently: NaN makes every expiry comparison
+      // false so the entry NEVER expires, a negative deadline expires it
+      // before it is ever dispatched, and Infinity is an unbounded queue
+      // entry — the exact thing the capacity cap exists to prevent.
+      if (typeof v.deadlineMs !== "number" || !Number.isFinite(v.deadlineMs) || v.deadlineMs < 0) {
+        throw new InvalidRpcRequest(
+          "execute.deadlineMs must be a finite, non-negative number of milliseconds",
+        );
       }
       return { kind: "execute", code: v.code, deadlineMs: v.deadlineMs };
     }
