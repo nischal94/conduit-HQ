@@ -1,5 +1,5 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, rmSync, statSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -9,6 +9,8 @@ import {
   CONCURRENCY_CAP,
   DRAIN_DEADLINE_MS,
   daemonPaths,
+  EXIT_ALREADY_RUNNING,
+  EXIT_ROTATION_IN_PROGRESS,
   ExecutionQueue,
   QUEUE_CAPACITY,
   RESUME_ADMISSION_DEADLINE_MS,
@@ -251,6 +253,16 @@ function connectClient(socketPath: string): Promise<Client> {
   });
 }
 
+/** Polls a synchronous condition to true, or throws at the deadline. */
+async function waitFor(check: () => boolean, timeoutMs = TIMEOUT): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (check()) return;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  throw new Error("timed out waiting for a condition");
+}
+
 async function handshake(client: Client, capability = "serve"): Promise<unknown> {
   expect(await client.next()).toEqual({ kind: "ready" });
   client.send({ kind: "handshake", protocol: 1, capability });
@@ -301,7 +313,10 @@ describe("conduitd lifecycle", () => {
       // A second daemon fails to take over: it refuses on the lifecycle
       // lock and must leave the live endpoint alone.
       const intruder = spawnDaemon(stateDir);
-      expect(await intruder.waitForExit()).not.toBe(0);
+      // The exact code, not merely "non-zero": exit codes are part of
+      // the §3.5 client contract, so 3 is the assertion — a refusal that
+      // started exiting 1 would still pass a not-zero check.
+      expect(await intruder.waitForExit()).toBe(EXIT_ALREADY_RUNNING);
       expect(existsSync(paths.socket)).toBe(true);
 
       // The live daemon still serves on that same endpoint.
@@ -347,7 +362,9 @@ describe("conduitd lifecycle", () => {
       if (rotation) locks.push(rotation);
 
       const blocked = spawnDaemon(stateDir);
-      expect(await blocked.waitForExit()).not.toBe(0);
+      // Exit 4 specifically — a client distinguishes "rotation" from
+      // "already running" by the code, so the numeric contract is pinned.
+      expect(await blocked.waitForExit()).toBe(EXIT_ROTATION_IN_PROGRESS);
       expect(blocked.lines.join("\n")).toContain("rotation in progress");
 
       // Lifecycle was released on the way out — provable by taking it.
@@ -563,7 +580,8 @@ describe("conduitd lifecycle", () => {
       expect(reply).toMatchObject({
         kind: "error",
         code: "internal",
-        message: "internal daemon error; see the daemon log for the cause (correlation id below)",
+        message:
+          "internal daemon error; see the daemon log for the cause, correlated by this error's requestId",
       });
       expect(reply.message).not.toContain(stateDir);
       expect(reply.message).not.toContain(".db");
@@ -624,6 +642,70 @@ describe("conduitd lifecycle", () => {
     const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
     expect(lifecycle).not.toBeNull();
     if (lifecycle) locks.push(lifecycle);
+  }, 120_000);
+
+  it(
+    "refuses to start when a REGULAR FILE occupies the socket path, and leaves the file alone",
+    async () => {
+      // `clearStaleEndpoint` removes a stale SOCKET, but an entry that is
+      // not a socket is something the daemon does not own and must not
+      // delete — unlinking it would make the daemon a deletion primitive
+      // against an arbitrary file that happens to sit at the path.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      writeFileSync(paths.socket, "not a socket", { mode: 0o600 });
+
+      const daemon = spawnDaemon(stateDir);
+      expect(await daemon.waitForExit()).not.toBe(0);
+
+      // Still there, untouched.
+      expect(existsSync(paths.socket)).toBe(true);
+      expect(readFileSync(paths.socket, "utf8")).toBe("not a socket");
+    },
+    TIMEOUT,
+  );
+
+  it("INVARIANT §17: approvals.resume is admitted through the SAME queue as execute — through the real dispatch path", async () => {
+    // The queue-level test above drives a bare ExecutionQueue, which
+    // proves the queue behaves but NOT that the daemon actually routes
+    // resume through it — `submitSandboxWork` was the unpinned wiring.
+    // This drives a real daemon end-to-end: fill every slot with
+    // executes, then send a resume on a second connection and assert it
+    // never reaches the manager while the cap is full.
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const daemon = spawnDaemon(stateDir, ["--stall-sandbox"]);
+    await daemon.waitForLine("listening");
+
+    // Fill the concurrency cap with stalled executes. Each needs its
+    // own connection only insofar as it needs its own request; one
+    // `serve` connection can carry them all.
+    const executor = await connectClient(paths.socket);
+    await handshake(executor, "serve");
+    for (let i = 0; i < CONCURRENCY_CAP; i++) {
+      executor.send({ kind: "execute", code: `${i}`, deadlineMs: 60_000 });
+    }
+    // Wait until all four are genuinely dispatched and stalled.
+    await waitFor(
+      () => daemon.lines.filter((l) => l.includes("stalling execute")).length >= CONCURRENCY_CAP,
+    );
+
+    // Now a resume, on an `approvals` connection (§3.3 capability row).
+    const approver = await connectClient(paths.socket);
+    await handshake(approver, "approvals");
+    approver.send({ kind: "approvals.resume", executionId: "exec_x", decision: "approve" });
+
+    // The daemon logs queue depth on every admission, so a depth>0 line
+    // is positive evidence the resume was ADMITTED TO THE QUEUE rather
+    // than dispatched or refused.
+    await daemon.waitForLine("depth=1");
+
+    // And it must not have run: the cap is full, so the manager's
+    // resume path is never reached while the executes hold every slot.
+    expect(daemon.lines.join("\n")).not.toContain("stalling resume");
+
+    daemon.child.kill("SIGTERM");
+    await daemon.waitForExit();
   }, 120_000);
 
   it(
@@ -901,6 +983,38 @@ describe("ExecutionQueue admission", () => {
     expect(queue.depth).toBe(3);
 
     for (const b of [...executes, ...resumes]) b.release();
+  });
+
+  it("an entry settles exactly once — the first verdict wins even when two paths reach it", async () => {
+    // "expired" vs "ran" is a correctness claim, and before the one-shot
+    // guard it rode entirely on the queue/active split keeping those
+    // paths disjoint — a property of the control flow, not of the entry.
+    // Here abandon and expiry both reach the same entry; whichever lands
+    // first is the verdict, and the second call must not re-resolve it.
+    let now = 1_000;
+    const queue = new ExecutionQueue(CONCURRENCY_CAP, QUEUE_CAPACITY, () => now);
+    const blockers = Array.from({ length: CONCURRENCY_CAP }, () => blocker());
+    for (const b of blockers) queue.submit(b.run, 60_000);
+
+    let ran = false;
+    const queued = queue.submit(async () => {
+      ran = true;
+    }, 5_000);
+    if (queued.outcome !== "accepted") throw new Error("expected acceptance");
+
+    // First verdict: abandoned (removes it from the queue and settles).
+    queued.abandon();
+    // Now push past its deadline and force a sweep. The entry is already
+    // gone, but a second settle on the same entry would be the bug —
+    // and abandon() itself is called again for good measure.
+    now += 5_001;
+    queued.abandon();
+    queue.submit(blocker().run, 60_000);
+
+    expect(await queued.done).toBe("abandoned");
+    expect(ran).toBe(false);
+
+    for (const b of blockers) b.release();
   });
 
   it("sustained overload never exceeds the queue capacity", () => {

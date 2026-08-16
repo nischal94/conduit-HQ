@@ -1,9 +1,9 @@
 /**
  * Typed RPC vocabulary for the daemon UDS protocol (design §3.3). Every
- * request and response is schema-validated by hand — CLAUDE.md's
- * zero-new-dependencies rule for `packages/mcp` rules out zod/ajv, so
- * `decodeRequest` is an explicit, field-by-field decoder rather than a
- * generic schema runtime.
+ * request and response is schema-validated by hand — "zero new
+ * dependencies" is this plan's Global Constraint, which rules out
+ * zod/ajv, so `decodeRequest` is an explicit, field-by-field decoder
+ * rather than a generic schema runtime.
  *
  * The capability table (§3.3) is the daemon's authorization boundary:
  * each connected client is scoped to exactly one of `serve`, `approvals`,

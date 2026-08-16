@@ -20,10 +20,21 @@ const HELPER = fileURLToPath(new URL("./helpers/hold-lock.ts", import.meta.url))
 let dir: string | undefined;
 const children: ChildProcess[] = [];
 
-afterEach(() => {
-  for (const child of children) {
-    if (!child.killed) child.kill("SIGKILL");
-  }
+afterEach(async () => {
+  // Reaped to ACTUAL exit before the directory is removed, matching the
+  // other suites. A killed-but-not-yet-exited holder still has the lock
+  // db open, so removing the directory underneath it leaves its handles
+  // to leak into the next test's acquisition.
+  await Promise.all(
+    children.map((child) => {
+      // `exitCode === null` also covers a signal-terminated child (whose
+      // code is null and whose `signalCode` is set), so both are checked
+      // before deciding anything is still alive.
+      if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+      if (!child.killed) child.kill("SIGKILL");
+      return new Promise<void>((resolve) => child.once("exit", () => resolve()));
+    }),
+  );
   children.length = 0;
   if (dir) {
     rmSync(dir, { recursive: true, force: true });
@@ -216,5 +227,27 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
     // anyone there?" must not create the state directory it is only
     // inspecting (§3.2 — creation is the daemon's prerogative).
     expect(existsSync(dirname(missing))).toBe(false);
+  });
+
+  it("release() is idempotent — a second call is a no-op, not a ROLLBACK on a closed client", async () => {
+    // Release lands in `finally` blocks and shutdown paths that can
+    // plausibly run twice. Without the guard the second call issues
+    // ROLLBACK on an already-closed client, which rejects with a
+    // confusing libsql error from a caller that did nothing wrong — and
+    // in a `finally` that would mask whatever real failure was being
+    // unwound at the time.
+    const db = newLockDbPath();
+    const held = await acquireExclusive(db);
+    expect(held).not.toBeNull();
+    if (!held) throw new Error("expected the lock");
+
+    await held.release();
+    // The lock is genuinely released, not merely marked so.
+    const second = await acquireExclusive(db);
+    expect(second).not.toBeNull();
+    if (second) await second.release();
+
+    // The double release resolves rather than throwing.
+    await expect(held.release()).resolves.toBeUndefined();
   });
 });

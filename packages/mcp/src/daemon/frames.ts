@@ -39,6 +39,20 @@ export class DepthExceeded extends Error {
   }
 }
 
+/**
+ * Thrown by a `push` on a decoder that already threw. Distinct from the
+ * framing errors: those describe the peer's bytes, while this one says
+ * the decoder was reused after its stream had already desynchronized —
+ * a caller-side bug, since the correct response to any decode fault is
+ * to tear the connection down.
+ */
+export class DecoderPoisoned extends Error {
+  constructor() {
+    super("frame decoder was reused after a decode failure; the stream is desynchronized");
+    this.name = "DecoderPoisoned";
+  }
+}
+
 export class MalformedFrame extends Error {
   constructor(message: string) {
     super(message);
@@ -57,9 +71,16 @@ export function encodeFrame(msg: unknown): Buffer {
 }
 
 /**
- * Depth of a parsed JSON value: a scalar (string/number/boolean/null) is
- * depth 0; each array/object nesting level adds 1. An empty array/object
- * counts as depth 1 (a container level exists even with no children).
+ * Bounds the depth of the DEEPEST VALUE in a parsed JSON tree. `depth` is
+ * the level of the value being examined: the top-level value is 0, and
+ * each array element or object property is one level below its container.
+ * A scalar at the top level is therefore depth 0.
+ *
+ * A container's own level is only counted through its CHILDREN — an empty
+ * array or object contributes nothing beyond the level it already sits
+ * at, because the recursion that would add a level has nothing to
+ * descend into. So `[]` at the top level checks depth 0, while `[[]]`
+ * checks the inner array at depth 1.
  */
 function checkDepth(value: unknown, depth: number): void {
   if (depth > DEPTH_CAP) {
@@ -80,10 +101,20 @@ function checkDepth(value: unknown, depth: number): void {
  * mid-frame) and returns every fully-decoded message the chunk
  * completed. Internal buffering state persists across calls.
  *
- * Error behavior: a thrown error reflects a specific malformed/oversized
- * frame. Any bytes already consumed toward the frame that caused the
- * error are dropped; subsequent, independent `push` calls with
- * well-formed frames continue to work normally.
+ * Error behavior: **a throw desynchronizes the stream permanently, and
+ * the connection must be torn down.** This decoder does not recover, and
+ * cannot: on `FrameTooLarge` the oversized body's bytes were never
+ * consumed, so whatever arrives next is read as a length prefix at an
+ * arbitrary offset into that body — every subsequent "frame" is garbage
+ * derived from an attacker- or bug-chosen byte stream. A throw also
+ * discards any messages decoded EARLIER in the same `push` call, since
+ * the return value never reaches the caller; those messages are gone even
+ * though they were well-formed.
+ *
+ * The decoder therefore POISONS itself on any throw: a later `push`
+ * throws immediately rather than returning plausible-looking nonsense.
+ * Both callers (`conduitd.ts` and `client.ts`) already destroy the socket
+ * on a decode fault, which is the correct and only disposition.
  *
  * Memory bound: this class answers "how much memory can a hostile local
  * process force this decoder to hold?" `buf` only ever retains bytes
@@ -110,8 +141,23 @@ export class FrameDecoder {
   // has been read and validated against FRAME_CAP. null = no header
   // parsed yet for the frame currently being assembled.
   private pendingBodyLen: number | null = null;
+  // Set by the first throw and never cleared: past that point the byte
+  // stream's frame boundaries are unknowable (see the class doc).
+  private dead = false;
 
   push(chunk: Buffer): unknown[] {
+    if (this.dead) {
+      throw new DecoderPoisoned();
+    }
+    try {
+      return this.decode(chunk);
+    } catch (err) {
+      this.dead = true;
+      throw err;
+    }
+  }
+
+  private decode(chunk: Buffer): unknown[] {
     // Always copy into a fresh buffer — never alias the caller's chunk.
     // `Buffer.concat` always allocates, even for a single-element array,
     // so this holds whether or not there's residual state to merge with.

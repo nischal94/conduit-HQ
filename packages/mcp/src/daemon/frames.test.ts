@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   DEPTH_CAP,
+  DecoderPoisoned,
   DepthExceeded,
   encodeFrame,
   FRAME_CAP,
@@ -143,19 +144,35 @@ describe("encodeFrame / FrameDecoder round-trip", () => {
     expect(() => decoder.push(frame)).toThrow(MalformedFrame);
   });
 
-  it("decoder can continue accepting frames after a MalformedFrame error on a prior push, using a fresh push", () => {
-    // A push that throws should not corrupt the decoder for future,
-    // independent, non-overlapping pushes (new well-formed frame).
+  it("a decoder that threw is POISONED — reuse throws rather than returning plausible nonsense", () => {
+    // The decoder used to document recovery across independent pushes.
+    // That contract was false for FrameTooLarge: the oversized body's
+    // bytes are never consumed, so the next push reads a length prefix
+    // at an arbitrary offset inside it and every subsequent "frame" is
+    // garbage derived from attacker- or bug-chosen bytes. Rather than
+    // recover selectively, any throw poisons the decoder — both callers
+    // already tear the connection down, which is the only correct
+    // disposition once the stream has desynchronized.
     const badBody = Buffer.from("{not json", "utf8");
     const badHeader = Buffer.alloc(4);
     badHeader.writeUInt32BE(badBody.length, 0);
-    const badFrame = Buffer.concat([badHeader, badBody]);
 
     const decoder = new FrameDecoder();
-    expect(() => decoder.push(badFrame)).toThrow(MalformedFrame);
+    expect(() => decoder.push(Buffer.concat([badHeader, badBody]))).toThrow(MalformedFrame);
 
-    const goodMsg = { kind: "handshake", protocol: 1 };
-    const goodFrame = encodeFrame(goodMsg);
-    expect(decoder.push(goodFrame)).toEqual([goodMsg]);
+    // A perfectly well-formed frame is still refused: the decoder cannot
+    // know where this stream's frame boundaries are any more.
+    expect(() => decoder.push(encodeFrame({ kind: "handshake", protocol: 1 }))).toThrow(
+      DecoderPoisoned,
+    );
+  });
+
+  it("an oversized frame poisons the decoder too — the desync case the old doc got wrong", () => {
+    const header = Buffer.alloc(4);
+    header.writeUInt32BE(FRAME_CAP + 1, 0);
+
+    const decoder = new FrameDecoder();
+    expect(() => decoder.push(header)).toThrow(FrameTooLarge);
+    expect(() => decoder.push(encodeFrame({ kind: "ready" }))).toThrow(DecoderPoisoned);
   });
 });

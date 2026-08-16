@@ -103,6 +103,24 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
   const spawnChild = opts.spawn ?? spawnDaemon;
   const expiry = Date.now() + opts.deadlineMs;
 
+  // Encoded BEFORE anything connects, so an oversized request is refused
+  // here — in the fully retryable zone, where the client can prove no
+  // daemon saw it — rather than throwing from the write inside
+  // `exchange`, where the same failure would be indistinguishable from a
+  // request that had already gone out. A request too large to frame can
+  // never succeed, and it should never reach the ambiguous zone to fail.
+  const requestFrame = encodeFrame(opts.request);
+
+  // The last connect errno that was NOT part of the decision table (see
+  // `tryConnect`). Remembered rather than thrown so a transient fault
+  // cannot abort a bounded wait, and surfaced in the terminal message so
+  // the operator is not told "no daemon could be reached" when the real
+  // answer was EACCES.
+  let lastConnectError: string | undefined;
+  const noteErrno = (code: string): void => {
+    lastConnectError = code;
+  };
+
   // The client-side half of the §3.2 boundary. `connect` mode verifies
   // only — a client never mutates the state directory (that is the
   // daemon's prerogative), but it must refuse to hand a request to a
@@ -153,7 +171,7 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
       // Row 2/3 — a daemon holds lifecycle: it is running, starting, or
       // draining. Try to connect; only a connect that reaches READY is a
       // healthy daemon.
-      let socket = await tryConnect(paths.socket, remaining(expiry));
+      let socket = await tryConnect(paths.socket, remaining(expiry), noteErrno);
       if (socket === null) {
         // Row 3 — starting or draining, and the two are indistinguishable
         // from out here. So the wait watches for EITHER outcome rather
@@ -164,7 +182,7 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
         // window with the socket not yet there. Waiting only for release
         // would burn the entire deadline against a daemon that came up
         // fine seconds earlier.
-        socket = await waitForStartOrRelease(paths, expiry);
+        socket = await waitForStartOrRelease(paths, expiry, noteErrno);
         // Still nothing — the lock released (drain finished, or the
         // daemon died) or time ran out. RE-PROBE FROM THE TOP rather
         // than assuming which: rotation may have taken maintenance in
@@ -179,7 +197,7 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
         // zone ends. The READY gate's decoder and any frames it already
         // read past READY travel into the exchange — see `awaitReady`
         // for why starting a fresh decoder here would be a bug.
-        return await exchange(socket, opts.role, opts.request, expiry, ready);
+        return await exchange(socket, opts.role, expiry, ready, requestFrame);
       }
       // Connected but no READY — accepted-or-queued during DRAINING.
       // Identical to a refused connect, and crucially NOTHING was
@@ -211,7 +229,9 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
   // to read why the child exited.
   throw new DaemonUnavailable(
     "unavailable",
-    `[conduit] Daemon unavailable: no daemon could be reached or started within the deadline. Context: {stateDir: ${opts.stateDir}, deadlineMs: ${opts.deadlineMs}} — see ${join(opts.stateDir, DAEMON_LOG)} for why the daemon exited`,
+    `[conduit] Daemon unavailable: no daemon could be reached or started within the deadline. Context: {stateDir: ${opts.stateDir}, deadlineMs: ${opts.deadlineMs}${
+      lastConnectError !== undefined ? `, last connect error: ${lastConnectError}` : ""
+    }} — see ${join(opts.stateDir, DAEMON_LOG)} for why the daemon exited`,
   );
 }
 
@@ -223,8 +243,26 @@ function remaining(expiry: number): number {
  * Connects, or resolves null if the endpoint refuses/is absent. A refusal
  * is information, not an error, and it explicitly does NOT license
  * removing the socket (§3.2) — hence no unlink anywhere in this module.
+ *
+ * The errno is CLASSIFIED rather than discarded. `ECONNREFUSED`/`ENOENT`
+ * are the decision table's own inputs — "nobody is listening at this
+ * name" — and mean exactly what a null return means. Every other errno
+ * (`EACCES` on a socket this uid may not open, `ENOTSOCK` on a path that
+ * is not a socket, `EMFILE` when the CLIENT is out of descriptors) is a
+ * different problem wearing the same clothes, and reading it as "starting
+ * or draining" sends the client into a wait loop that will never resolve,
+ * ending in a terminal message that names none of it.
+ *
+ * It is reported, never thrown: the wait path calls this repeatedly and a
+ * transient `EMFILE` must not abort a bounded wait that would otherwise
+ * succeed. The last such errno is remembered and surfaces in the terminal
+ * `DaemonUnavailable` message.
  */
-function tryConnect(socketPath: string, timeoutMs: number): Promise<Socket | null> {
+function tryConnect(
+  socketPath: string,
+  timeoutMs: number,
+  onErrno?: (code: string) => void,
+): Promise<Socket | null> {
   return new Promise((resolve) => {
     const socket = connect(socketPath);
     let settled = false;
@@ -241,25 +279,25 @@ function tryConnect(socketPath: string, timeoutMs: number): Promise<Socket | nul
     // attempt outlives the caller's whole budget waiting on a socket
     // that will never report either way.
     const timer = setTimeout(() => finish(null), timeoutMs);
-    const onError = (): void => finish(null);
+    const onError = (err: NodeJS.ErrnoException): void => {
+      const code = err.code;
+      if (code !== undefined && code !== "ECONNREFUSED" && code !== "ENOENT") {
+        onErrno?.(code);
+      }
+      finish(null);
+    };
     socket.once("error", onError);
     socket.once("connect", () => finish(socket));
   });
 }
 
 /**
- * The outcome of the READY gate. On success it carries the decoder state
- * forward — see `awaitReady` for why that is mandatory rather than tidy.
+ * The outcome of the READY gate. On success it carries a live `Reader`
+ * already bound to the connection's decoder state — the decoder itself
+ * never escapes, so "recreate it for the next phase" is not an
+ * expressible mistake.
  */
-type ReadyResult =
-  | { ready: false }
-  | {
-      ready: true;
-      /** The SAME decoder that consumed the READY frame. */
-      decoder: FrameDecoder;
-      /** Frames that arrived in the READY chunk, after the READY frame. */
-      pending: unknown[];
-    };
+type ReadyResult = { ready: false } | { ready: true; reader: Reader };
 
 /**
  * Waits for the daemon's READY preface. Resolves `{ready: false}` if the
@@ -267,16 +305,20 @@ type ReadyResult =
  * daemon never accepted this connection while RUNNING. No bytes are
  * written here; that is the entire point of the gate.
  *
- * **The decoder is handed to the caller, never discarded.** A UDS
- * delivers arbitrary chunk boundaries, so bytes following READY can
- * arrive coalesced into the same chunk — and a frame can also be split
- * across chunks, leaving a partial body buffered inside this decoder.
- * Constructing a fresh decoder for the next phase would silently drop
- * both: the already-decoded frames, and the partial-frame bytes this one
- * still holds. That loss would surface as a response that never arrives,
- * i.e. a spurious `outcome-unknown` on a request the daemon actually
- * answered — the single worst failure this module can produce, since it
- * is indistinguishable from a genuine ambiguity.
+ * **The decoder never leaves this function.** A UDS delivers arbitrary
+ * chunk boundaries, so bytes following READY can arrive coalesced into
+ * the same chunk — and a frame can also be split across chunks, leaving a
+ * partial body buffered inside the decoder. Starting a fresh decoder for
+ * the next phase would silently drop both: the already-decoded frames,
+ * and the partial-frame bytes. That loss would surface as a response that
+ * never arrives — a spurious `outcome-unknown` on a request the daemon
+ * actually answered, which is the worst failure this module can produce
+ * because it is indistinguishable from a genuine ambiguity.
+ *
+ * Rather than documenting that as a contract the caller must honor, the
+ * `Reader` is constructed HERE, over that same decoder and the frames
+ * that arrived after READY. The caller receives something it can only
+ * read from; recreating the decoder is not an operation it has.
  *
  * Today the daemon writes nothing between READY and the handshake
  * response, so neither case can fire in practice. That is a property of
@@ -299,15 +341,29 @@ function awaitReady(socket: Socket, timeoutMs: number): Promise<ReadyResult> {
       let messages: unknown[];
       try {
         messages = decoder.push(chunk);
-      } catch {
+      } catch (err) {
+        // Nothing has been written yet, so this stays a non-ready
+        // outcome and the caller retries as a first attempt. But the
+        // fault is REPORTED rather than swallowed: "the daemon sent
+        // bytes we could not parse" and "the connection dropped" have
+        // the same shape from here and completely different causes, and
+        // only one of them means something is wrong with the daemon.
+        process.stderr.write(
+          `[conduit] Daemon sent an undecodable frame before READY; treating the connection as unusable. Context: {cause: ${
+            err instanceof Error ? err.message : String(err)
+          }}\n`,
+        );
         finish({ ready: false });
         return;
       }
       const at = messages.findIndex((msg) => isKind(msg, "ready"));
       if (at !== -1) {
         // Everything after READY in this same chunk belongs to the next
-        // phase and travels with the decoder rather than being dropped.
-        finish({ ready: true, decoder, pending: messages.slice(at + 1) });
+        // phase and is handed to the reader rather than dropped.
+        finish({
+          ready: true,
+          reader: createReader(socket, decoder, messages.slice(at + 1)),
+        });
       }
     };
     socket.on("data", onData);
@@ -330,13 +386,13 @@ function awaitReady(socket: Socket, timeoutMs: number): Promise<ReadyResult> {
 async function exchange(
   socket: Socket,
   role: keyof typeof CAPABILITIES,
-  request: RpcRequest,
   expiry: number,
   ready: Extract<ReadyResult, { ready: true }>,
+  requestFrame: Buffer,
 ): Promise<RpcResponse> {
-  // Continues the READY gate's decoder rather than starting a new one, so
-  // no byte the daemon has already sent can be lost at the phase boundary.
-  const reader = createReader(socket, ready.decoder, ready.pending);
+  // The reader was built by the READY gate over the decoder that consumed
+  // READY, so no byte the daemon already sent is lost at this boundary.
+  const { reader } = ready;
   try {
     // The client's own CONDUIT_DB, when set, is declared rather than
     // hidden: the daemon refuses it with `refused-custom-db` (§9.3 item
@@ -353,14 +409,17 @@ async function exchange(
     );
 
     const handshake = await reader.next(remaining(expiry));
-    if (handshake === null) return unknownOutcome(null);
-    if (isKind(handshake, "error")) return handshake as RpcResponse;
-    if (!isKind(handshake, "handshake.ok")) return unknownOutcome(handshake);
+    if (handshake === null) return unknownOutcome(null, reader.decodeFault());
+    if (isKind(handshake, "error")) return decodeResponseOrUnknown(handshake);
+    if (!isKind(handshake, "handshake.ok")) return unknownOutcome(handshake, reader.decodeFault());
 
-    socket.write(encodeFrame(request));
+    // Encoded BEFORE the connection was ever made (see `daemonRequest`),
+    // so an oversized request has already been refused client-side and
+    // cannot reach this write.
+    socket.write(requestFrame);
     const response = await reader.next(remaining(expiry));
-    if (response === null) return unknownOutcome(null);
-    return response as RpcResponse;
+    if (response === null) return unknownOutcome(null, reader.decodeFault());
+    return decodeResponseOrUnknown(response);
   } finally {
     reader.dispose();
     socket.destroy();
@@ -368,36 +427,109 @@ async function exchange(
 }
 
 /**
+ * Validates a frame the daemon sent as an `RpcResponse`, degrading to
+ * `outcome-unknown` when it is not one.
+ *
+ * A blind `as RpcResponse` admits ANY frame the daemon happens to send —
+ * an unknown kind, a `result` with no `requestId` — and hands it to the
+ * caller as a well-typed value it will then destructure. Post-write there
+ * is no retryable answer available (§5), so a frame that fails validation
+ * is a protocol fault reported as the ambiguity it genuinely is, with the
+ * fault attached so an operator can tell it from a dropped connection.
+ */
+function decodeResponseOrUnknown(frame: unknown): RpcResponse {
+  const decoded = decodeResponse(frame);
+  if (decoded !== null) return decoded;
+  return unknownOutcome(
+    frame,
+    `daemon sent a frame that is not a valid response: ${JSON.stringify(frame)?.slice(0, 200)}`,
+  );
+}
+
+/**
  * Synthesizes the §5 `outcome unknown` verdict client-side. There is no
  * wire message for it — the daemon that would have sent one is gone —
  * so the id is taken from whatever partial response arrived, and falls
  * back to the sentinel when nothing did. See UNCORRELATED.
+ *
+ * `detail`, when present, records WHY the outcome is unknown: a decode
+ * fault reads identically to a dropped connection from the caller's side,
+ * and only one of the two means the daemon is misbehaving. The field is
+ * client-local — it is never encoded onto the wire, so adding it does not
+ * touch the §3.3 response vocabulary.
  */
-function unknownOutcome(partial: unknown): RpcResponse {
+function unknownOutcome(partial: unknown, detail?: string): RpcResponse {
   const requestId =
     typeof partial === "object" &&
     partial !== null &&
     typeof (partial as { requestId?: unknown }).requestId === "string"
       ? (partial as { requestId: string }).requestId
       : UNCORRELATED;
-  return { kind: "outcome-unknown", requestId };
+  const outcome: RpcResponse = { kind: "outcome-unknown", requestId };
+  if (detail !== undefined) {
+    (outcome as { detail?: string }).detail = detail;
+  }
+  return outcome;
+}
+
+/**
+ * Validates a daemon frame as an `RpcResponse`, returning null when it is
+ * not one. Hand-written like `decodeRequest` but lighter: this checks the
+ * kind is one the protocol defines and that the fields the client
+ * actually reads are present and correctly typed. The client is not the
+ * authorization boundary the daemon's decoder is — it validates to avoid
+ * handing the caller a lie, not to defend itself from its own daemon.
+ */
+function decodeResponse(frame: unknown): RpcResponse | null {
+  if (typeof frame !== "object" || frame === null) return null;
+  const f = frame as Record<string, unknown>;
+  const hasId = typeof f.requestId === "string";
+  switch (f.kind) {
+    case "ready":
+      return frame as RpcResponse;
+    case "handshake.ok":
+      return f.protocol === 1 &&
+        typeof f.dbPath === "string" &&
+        typeof f.allowPrivateEgress === "boolean"
+        ? (frame as RpcResponse)
+        : null;
+    case "result":
+      return hasId && "payload" in f ? (frame as RpcResponse) : null;
+    case "error":
+      return hasId && typeof f.code === "string" && typeof f.message === "string"
+        ? (frame as RpcResponse)
+        : null;
+    case "outcome-unknown":
+      return hasId ? (frame as RpcResponse) : null;
+    default:
+      return null;
+  }
 }
 
 interface Reader {
   /** Next decoded frame, or null if the connection closed / time ran out. */
   next(timeoutMs: number): Promise<unknown | null>;
+  /**
+   * The decode fault that ended this stream, if one did. Distinguishes
+   * "the daemon sent bytes we could not parse" from "the connection was
+   * lost" — both surface as a null `next()`, and only the first indicates
+   * something wrong with the daemon rather than with the transport.
+   */
+  decodeFault(): string | undefined;
   dispose(): void;
 }
 
 /**
  * `decoder` and `alreadyRead` come from the READY gate: the decoder may
  * hold a partially-received frame, and `alreadyRead` holds frames that
- * arrived coalesced with READY. Both must be adopted, never recreated.
+ * arrived coalesced with READY. Constructed only there, so neither can be
+ * recreated at a phase boundary.
  */
 function createReader(socket: Socket, decoder: FrameDecoder, alreadyRead: unknown[]): Reader {
   const buffered: unknown[] = [...alreadyRead];
   let waiter: ((msg: unknown | null) => void) | null = null;
   let closed = false;
+  let fault: string | undefined;
 
   const deliver = (msg: unknown | null): void => {
     if (waiter) {
@@ -413,7 +545,13 @@ function createReader(socket: Socket, decoder: FrameDecoder, alreadyRead: unknow
     let messages: unknown[];
     try {
       messages = decoder.push(chunk);
-    } catch {
+    } catch (err) {
+      // Captured, not swallowed. This is post-write, so the outcome is
+      // ambiguous either way — but "the daemon sent unparseable bytes"
+      // and "the connection was lost" have different causes and different
+      // fixes, and the caller can only tell them apart if the fault
+      // survives to the synthesized outcome.
+      fault = `frame decode failed: ${err instanceof Error ? err.message : String(err)}`;
       closed = true;
       deliver(null);
       return;
@@ -445,6 +583,9 @@ function createReader(socket: Socket, decoder: FrameDecoder, alreadyRead: unknow
         };
       });
     },
+    decodeFault(): string | undefined {
+      return fault;
+    },
     dispose(): void {
       socket.removeListener("data", onData);
       socket.removeListener("close", onEnd);
@@ -470,11 +611,15 @@ function createReader(socket: Socket, decoder: FrameDecoder, alreadyRead: unknow
  * only for release would make a healthy start cost the full deadline;
  * watching only for the socket would hang on a daemon that is leaving.
  */
-async function waitForStartOrRelease(paths: DaemonPaths, expiry: number): Promise<Socket | null> {
+async function waitForStartOrRelease(
+  paths: DaemonPaths,
+  expiry: number,
+  onErrno?: (code: string) => void,
+): Promise<Socket | null> {
   while (Date.now() < expiry) {
     await sleep(Math.min(LIFECYCLE_WAIT_POLL_MS, remaining(expiry)));
 
-    const socket = await tryConnect(paths.socket, remaining(expiry));
+    const socket = await tryConnect(paths.socket, remaining(expiry), onErrno);
     if (socket !== null) return socket;
 
     if ((await probeShared(paths.lifecycleLockDb)) === "free") return null;

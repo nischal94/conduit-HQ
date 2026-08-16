@@ -41,6 +41,14 @@ const markerFlag = rest.indexOf("--sweep-marker");
 const sweepMarker = markerFlag === -1 ? undefined : rest[markerFlag + 1];
 const stallSweep = rest.includes("--stall-sweep");
 const stallExecute = rest.includes("--stall-execute");
+/**
+ * Stalls BOTH `start` and `resume` inside the manager layer, so one
+ * daemon can have its concurrency cap filled by executes and then be
+ * handed an `approvals.resume` that must queue behind them. Distinct from
+ * --stall-execute, which only stalls start and so cannot exercise the
+ * resume dispatch path at all.
+ */
+const stallSandbox = rest.includes("--stall-sandbox");
 const stallRunning = rest.includes("--stall-running");
 /** manager.start rejects — the store-fault path that must not kill the daemon. */
 const throwExecute = rest.includes("--throw-execute");
@@ -95,83 +103,104 @@ const sweep: CrashTerminalSweep | undefined = realSweep
  * Supplied through the daemon's own `createRuntime` seam, so the daemon
  * under test is the real one with only this collaborator replaced.
  */
-const createRuntime = throwExecute
+const createRuntime = stallSandbox
   ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
       const built = await createApprovalRuntime(runtimeOpts);
       return {
         ...built,
         manager: {
           ...built.manager,
-          // Rejects the way a store fault would. Reached from INSIDE the
-          // queue's run closure, which is invoked as `void dispatch(...)`
-          // — so before the fix this became an unhandled rejection and
-          // took the whole daemon down with it.
           start: () => {
-            console.log("throwing execute");
-            return Promise.reject(new Error("simulated store fault"));
+            console.log("stalling execute");
+            return forever();
+          },
+          resume: () => {
+            // Only ever reached if the resume was DISPATCHED. With the
+            // cap already full it must instead sit in the queue, so the
+            // absence of this line is the assertion.
+            console.log("stalling resume");
+            return forever();
           },
         },
       };
     }
-  : hugeExecute
+  : throwExecute
     ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
         const built = await createApprovalRuntime(runtimeOpts);
         return {
           ...built,
           manager: {
             ...built.manager,
-            // A perfectly legal result that simply does not fit one
-            // frame. The sandbox's default maxOutputBytes EQUALS
-            // FRAME_CAP, so the envelope around a max-size payload
-            // necessarily overflows — no hostile input required.
-            start: async () => {
-              console.log("huge execute");
-              return { oversize: "x".repeat(FRAME_CAP) } as never;
+            // Rejects the way a store fault would. Reached from INSIDE the
+            // queue's run closure, which is invoked as `void dispatch(...)`
+            // — so before the fix this became an unhandled rejection and
+            // took the whole daemon down with it.
+            start: () => {
+              console.log("throwing execute");
+              return Promise.reject(new Error("simulated store fault"));
             },
           },
         };
       }
-    : stallExecute
+    : hugeExecute
       ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
           const built = await createApprovalRuntime(runtimeOpts);
           return {
             ...built,
             manager: {
               ...built.manager,
-              start: () => {
-                console.log("stalling execute");
-                return forever();
+              // A perfectly legal result that simply does not fit one
+              // frame. The sandbox's default maxOutputBytes EQUALS
+              // FRAME_CAP, so the envelope around a max-size payload
+              // necessarily overflows — no hostile input required.
+              start: async () => {
+                console.log("huge execute");
+                return { oversize: "x".repeat(FRAME_CAP) } as never;
               },
             },
           };
         }
-      : stallRunning
+      : stallExecute
         ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
             const built = await createApprovalRuntime(runtimeOpts);
             return {
               ...built,
               manager: {
                 ...built.manager,
-                // Unlike --stall-execute, this PERSISTS the execution row
-                // first and stalls afterwards, leaving the row durably
-                // `running` — the state a SIGKILLed daemon actually strands,
-                // and the precondition the crash-terminal sweep recovers.
-                // Stalling before the write would leave nothing to sweep.
-                start: async (code: string) => {
-                  await runtimeOpts.store.executions.put({
-                    id: `exec_stalled_${Date.now()}`,
-                    code,
-                    status: "running",
-                    seeds: { now: Date.now(), random: 0.5 },
-                    startedAt: Date.now(),
-                  });
-                  console.log("stalling running");
+                start: () => {
+                  console.log("stalling execute");
                   return forever();
                 },
               },
             };
           }
-        : undefined;
+        : stallRunning
+          ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+              const built = await createApprovalRuntime(runtimeOpts);
+              return {
+                ...built,
+                manager: {
+                  ...built.manager,
+                  // Unlike --stall-execute, this PERSISTS the execution row
+                  // first and stalls afterwards, leaving the row durably
+                  // `running` — the state a SIGKILLed daemon actually strands,
+                  // and the precondition the crash-terminal sweep recovers.
+                  // Stalling before the write would leave nothing to sweep.
+                  start: async (code: string) => {
+                    await runtimeOpts.store.executions.put({
+                      id: `exec_stalled_${Date.now()}`,
+                      code,
+                      status: "running",
+                      seeds: { now: Date.now(), random: 0.5 },
+                      startedAt: Date.now(),
+                    });
+                    console.log("stalling running");
+                    return forever();
+                  },
+                },
+              };
+            }
+          : undefined;
 
 try {
   await runDaemon({

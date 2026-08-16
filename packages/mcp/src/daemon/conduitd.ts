@@ -41,6 +41,7 @@ import {
   CAPABILITIES,
   type Capability,
   decodeRequest,
+  InvalidRpcRequest,
   type RpcRequest,
   type RpcResponse,
 } from "./rpc.js";
@@ -242,10 +243,25 @@ export class ExecutionQueue {
       return { outcome: "busy" };
     }
 
-    let settle: (outcome: QueueOutcome) => void = () => {};
+    let resolveDone: (outcome: QueueOutcome) => void = () => {};
     const done = new Promise<QueueOutcome>((resolve) => {
-      settle = resolve;
+      resolveDone = resolve;
     });
+    // One-shot at CONSTRUCTION, so the first verdict wins no matter which
+    // path settles the entry. An entry can plausibly be reached twice —
+    // expiry sweeping a queued entry that dispatch is concurrently
+    // draining, or abandon racing either — and today "expired" vs "ran"
+    // stays correct only because the queue/active split happens to make
+    // those paths disjoint. That is a property of the current control
+    // flow, not of the type, and a later refactor could silently flip a
+    // settled verdict. Guarding here makes the one-shot a property of the
+    // entry itself; a second call is a no-op rather than a re-resolve.
+    let settled = false;
+    const settle = (outcome: QueueOutcome): void => {
+      if (settled) return;
+      settled = true;
+      resolveDone(outcome);
+    };
     const entry: QueueEntry = { run, expiresAt: this.now() + deadlineMs, settle };
 
     if (this.active < this.cap) {
@@ -324,8 +340,24 @@ interface ConnectionContext {
   requestCounter: { n: number };
 }
 
-function send(socket: Socket, msg: RpcResponse): void {
-  if (socket.destroyed) return;
+/**
+ * Writes one response frame, dropping it if the peer is already gone.
+ *
+ * A drop is logged rather than silent: the client sees only a closed
+ * connection (§5's `outcome unknown`), so the daemon log is the ONLY
+ * place the distinction between "we never produced a reply" and "we
+ * produced one the client was no longer there to receive" can be
+ * recovered. The correlation id is what makes that line joinable to the
+ * request that produced it.
+ */
+function send(socket: Socket, msg: RpcResponse, log?: (line: string) => void): void {
+  if (socket.destroyed) {
+    const requestId = "requestId" in msg ? msg.requestId : "n/a";
+    log?.(
+      `[conduitd] Response dropped: client socket already destroyed. Context: {requestId: ${requestId}, kind: ${msg.kind}}`,
+    );
+    return;
+  }
   socket.write(encodeFrame(msg));
 }
 
@@ -339,7 +371,7 @@ function send(socket: Socket, msg: RpcResponse): void {
  * who can read it.
  */
 const INTERNAL_ERROR_MESSAGE =
-  "internal daemon error; see the daemon log for the cause (correlation id below)";
+  "internal daemon error; see the daemon log for the cause, correlated by this error's requestId";
 
 /**
  * Runs the daemon, resolving only once it has fully stopped. The two
@@ -479,6 +511,14 @@ async function startDaemon(
       // becomes a concurrent writer against a store the daemon has
       // resumed serving, and it would need real cancellation.
       await Promise.race([opts.sweep(store), stopSignal.wait()]);
+      // Which side won is invisible from the outside — both leave the
+      // process exiting through `finally` — so the abandoned case is
+      // named explicitly. Otherwise an operator seeing rows still
+      // `running` after a start has no way to tell "the sweep ran and
+      // these are new" from "the sweep never finished".
+      if (stopSignal.isRequested) {
+        log("sweep abandoned mid-flight; rows remain for next startup");
+      }
     }
 
     // A stop that arrived during startup is honored here, before the
@@ -550,6 +590,22 @@ async function serve(opts: ServeOptions): Promise<void> {
     });
   });
 
+  // The bind-phase `error` listener above is removed once listen
+  // succeeds, which would leave the server with NO error listener for the
+  // rest of its life. A post-listen fault (accept-time EMFILE/ENFILE, or
+  // any listener-level error) would then be an uncaught 'error' event:
+  // the process dies where it stands, bypassing the entire drain path —
+  // no unlink under the device+inode check, no maintenance-then-lifecycle
+  // release ordering, no "draining"/"stopped" lines. Routing it into the
+  // stop signal makes a server fault exit through exactly the same path
+  // as SIGTERM, which is the only exit this daemon is designed to have.
+  server.on("error", (err: NodeJS.ErrnoException) => {
+    log(
+      `[conduitd] Listener error after bind — draining. Context: {code: ${err.code ?? "unknown"}, cause: ${err.message}}`,
+    );
+    stopSignal.request();
+  });
+
   // The endpoint we bound, by identity rather than by name — shutdown
   // compares against this so it can never unlink a successor's socket.
   const bound = statSync(paths.socket);
@@ -606,12 +662,16 @@ async function serve(opts: ServeOptions): Promise<void> {
             }}`,
           );
         }
-        send(socket, {
-          kind: "error",
-          requestId: "",
-          code: "invalid",
-          message: protocolFault ? (err as Error).message : INTERNAL_ERROR_MESSAGE,
-        });
+        send(
+          socket,
+          {
+            kind: "error",
+            requestId: "",
+            code: "invalid",
+            message: protocolFault ? (err as Error).message : INTERNAL_ERROR_MESSAGE,
+          },
+          log,
+        );
         socket.destroy();
         return;
       }
@@ -630,7 +690,16 @@ async function serve(opts: ServeOptions): Promise<void> {
       ctx.queued.clear();
       connections.delete(ctx);
     });
-    socket.on("error", () => {
+    socket.on("error", (err: NodeJS.ErrnoException) => {
+      // Logged, not swallowed: a mid-response EPIPE/ECONNRESET is the
+      // daemon-side evidence that a reply did not land, and without a
+      // line here it is invisible from inside the daemon — the client
+      // just sees a closed connection and the operator has nothing to
+      // join against. Destroying remains the right disposition; only
+      // the silence was wrong.
+      log(
+        `[conduitd] Connection error. Context: {code: ${err.code ?? "unknown"}, cause: ${err.message}}`,
+      );
       socket.destroy();
     });
 
@@ -640,7 +709,7 @@ async function serve(opts: ServeOptions): Promise<void> {
     // READY-gate decoder into the next phase, so a frame coalesced with
     // READY (or split across chunks) survives regardless. Anything added
     // here that writes unprompted must keep that decoder-handoff intact.
-    send(socket, { kind: "ready" });
+    send(socket, { kind: "ready" }, log);
     ctx.readyGranted = true;
   }
 
@@ -650,12 +719,30 @@ async function serve(opts: ServeOptions): Promise<void> {
     try {
       request = decodeRequest(msg);
     } catch (err) {
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "invalid",
-        message: err instanceof Error ? err.message : String(err),
-      });
+      // Mirrors the frame-decode split above. `InvalidRpcRequest` is a
+      // verdict about the CLIENT'S OWN bytes, so echoing it tells the
+      // client how to fix its request and reveals nothing about daemon
+      // state. Anything else reaching here is an unexpected fault inside
+      // the decoder — its message could carry internal detail, so it is
+      // logged daemon-side and the client gets the fixed string.
+      const invalidRequest = err instanceof InvalidRpcRequest;
+      if (!invalidRequest) {
+        log(
+          `[conduitd] Request decode failed: unexpected fault. Context: {requestId: ${requestId}, cause: ${
+            err instanceof Error ? (err.stack ?? err.message) : String(err)
+          }}`,
+        );
+      }
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "invalid",
+          message: invalidRequest ? (err as Error).message : INTERNAL_ERROR_MESSAGE,
+        },
+        log,
+      );
       return;
     }
 
@@ -665,23 +752,31 @@ async function serve(opts: ServeOptions): Promise<void> {
     }
 
     if (ctx.capability === null) {
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "invalid",
-        message: "handshake required before any other request",
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "invalid",
+          message: "handshake required before any other request",
+        },
+        log,
+      );
       return;
     }
     // The capability set is the authorization boundary (§3.3): a request
     // outside the client's declared set is refused before any other work.
     if (!CAPABILITIES[ctx.capability].has(request.kind)) {
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "invalid",
-        message: `capability "${ctx.capability}" does not permit "${request.kind}"`,
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "invalid",
+          message: `capability "${ctx.capability}" does not permit "${request.kind}"`,
+        },
+        log,
+      );
       return;
     }
 
@@ -695,12 +790,16 @@ async function serve(opts: ServeOptions): Promise<void> {
           err instanceof Error ? (err.stack ?? err.message) : String(err)
         }}`,
       );
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "internal",
-        message: INTERNAL_ERROR_MESSAGE,
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "internal",
+          message: INTERNAL_ERROR_MESSAGE,
+        },
+        log,
+      );
     }
   }
 
@@ -717,12 +816,16 @@ async function serve(opts: ServeOptions): Promise<void> {
     // per-request field; a client wanting a different one opens a new
     // connection.
     if (ctx.capability !== null) {
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "invalid",
-        message: "capability already negotiated on this connection",
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "invalid",
+          message: "capability already negotiated on this connection",
+        },
+        log,
+      );
       return;
     }
     // A client carrying its own CONDUIT_DB is refused rather than served
@@ -731,17 +834,21 @@ async function serve(opts: ServeOptions): Promise<void> {
     // item 3: custom-path installs keep direct access and forgo daemon
     // features in v1).
     if (request.dbPath !== undefined) {
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "refused-custom-db",
-        message: "custom db paths bypass the daemon in v1; unset CONDUIT_DB to use it",
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "refused-custom-db",
+          message: "custom db paths bypass the daemon in v1; unset CONDUIT_DB to use it",
+        },
+        log,
+      );
       ctx.socket.end();
       return;
     }
     ctx.capability = request.capability;
-    send(ctx.socket, { kind: "handshake.ok", protocol: 1, dbPath, allowPrivateEgress });
+    send(ctx.socket, { kind: "handshake.ok", protocol: 1, dbPath, allowPrivateEgress }, log);
   }
 
   /** Fresh catalog snapshot per call (M6) — never cached across requests. */
@@ -775,6 +882,7 @@ async function serve(opts: ServeOptions): Promise<void> {
   async function runGuarded(
     ctx: ConnectionContext,
     requestId: string,
+    kind: RpcRequest["kind"],
     work: () => Promise<unknown>,
   ): Promise<void> {
     let payload: unknown;
@@ -782,16 +890,20 @@ async function serve(opts: ServeOptions): Promise<void> {
       payload = await work();
     } catch (err) {
       log(
-        `[conduitd] Queued request failed: execute. Context: {requestId: ${requestId}, cause: ${
+        `[conduitd] Queued request failed: ${kind}. Context: {requestId: ${requestId}, cause: ${
           err instanceof Error ? (err.stack ?? err.message) : String(err)
         }}`,
       );
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "internal",
-        message: INTERNAL_ERROR_MESSAGE,
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "internal",
+          message: INTERNAL_ERROR_MESSAGE,
+        },
+        log,
+      );
       return;
     }
     sendResult(ctx, requestId, payload);
@@ -805,18 +917,22 @@ async function serve(opts: ServeOptions): Promise<void> {
    */
   function sendResult(ctx: ConnectionContext, requestId: string, payload: unknown): void {
     try {
-      send(ctx.socket, { kind: "result", requestId, payload });
+      send(ctx.socket, { kind: "result", requestId, payload }, log);
     } catch (err) {
       if (!(err instanceof FrameTooLarge)) throw err;
       log(
         `[conduitd] Result too large for one IPC frame. Context: {requestId: ${requestId}, cap: ${FRAME_CAP}}`,
       );
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "invalid",
-        message: `the result was too large for the IPC frame (cap ${FRAME_CAP} bytes); return less data`,
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "invalid",
+          message: `the result was too large for the IPC frame (cap ${FRAME_CAP} bytes); return less data`,
+        },
+        log,
+      );
     }
   }
 
@@ -834,20 +950,25 @@ async function serve(opts: ServeOptions): Promise<void> {
   async function submitSandboxWork(
     ctx: ConnectionContext,
     requestId: string,
+    kind: RpcRequest["kind"],
     deadlineMs: number,
     work: () => Promise<unknown>,
   ): Promise<void> {
     const admission = queue.submit(async () => {
-      await runGuarded(ctx, requestId, work);
+      await runGuarded(ctx, requestId, kind, work);
     }, deadlineMs);
 
     if (admission.outcome === "busy") {
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "busy",
-        message: `daemon busy: ${QUEUE_CAPACITY} requests queued behind ${CONCURRENCY_CAP} active`,
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "busy",
+          message: `daemon busy: ${QUEUE_CAPACITY} requests queued behind ${CONCURRENCY_CAP} active`,
+        },
+        log,
+      );
       log(`queue depth=${queue.depth} max=${queue.maxObservedDepth} refused=busy`);
       return;
     }
@@ -859,12 +980,16 @@ async function serve(opts: ServeOptions): Promise<void> {
     if (settled === "expired") {
       // Nothing ran, so this is not an ambiguous outcome — the request
       // was never admitted and may be retried as a first attempt.
-      send(ctx.socket, {
-        kind: "error",
-        requestId,
-        code: "busy",
-        message: "queue deadline expired before a slot became available",
-      });
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "busy",
+          message: "queue deadline expired before a slot became available",
+        },
+        log,
+      );
     }
   }
 
@@ -877,7 +1002,7 @@ async function serve(opts: ServeOptions): Promise<void> {
       case "execute": {
         // deadlineMs bounds ADMISSION, not execution: §16's wall-clock
         // budget stays with the manager's own limits.
-        await submitSandboxWork(ctx, requestId, request.deadlineMs, async () => {
+        await submitSandboxWork(ctx, requestId, request.kind, request.deadlineMs, async () => {
           // M6: a fresh runtime per unit of work — never cached.
           const { manager } = await createRuntime({ store, allowPrivateEgress, log });
           return await manager.start(request.code);
@@ -886,33 +1011,45 @@ async function serve(opts: ServeOptions): Promise<void> {
       }
       case "search": {
         const catalog = await snapshotCatalog();
-        send(ctx.socket, {
-          kind: "result",
-          requestId,
-          payload: catalog.search({ query: request.query }),
-        });
+        send(
+          ctx.socket,
+          {
+            kind: "result",
+            requestId,
+            payload: catalog.search({ query: request.query }),
+          },
+          log,
+        );
         return;
       }
       case "describe": {
         const catalog = await snapshotCatalog();
-        send(ctx.socket, {
-          kind: "result",
-          requestId,
-          payload: catalog.describe(request.toolName) ?? null,
-        });
+        send(
+          ctx.socket,
+          {
+            kind: "result",
+            requestId,
+            payload: catalog.describe(request.toolName) ?? null,
+          },
+          log,
+        );
         return;
       }
       case "approvals.list": {
         const paused = await store.executions.listPaused();
-        send(ctx.socket, {
-          kind: "result",
-          requestId,
-          payload: paused.map((execution) => ({
-            executionId: execution.id,
-            startedAt: execution.startedAt,
-            pausedOn: execution.pausedOn ?? null,
-          })),
-        });
+        send(
+          ctx.socket,
+          {
+            kind: "result",
+            requestId,
+            payload: paused.map((execution) => ({
+              executionId: execution.id,
+              startedAt: execution.startedAt,
+              pausedOn: execution.pausedOn ?? null,
+            })),
+          },
+          log,
+        );
         return;
       }
       case "approvals.resume": {
@@ -926,10 +1063,16 @@ async function serve(opts: ServeOptions): Promise<void> {
         // constant rather than a client-chosen one — deliberately NOT
         // unbounded, since an entry that never expires is exactly the
         // unbounded queue growth §3.1 rejects.
-        await submitSandboxWork(ctx, requestId, RESUME_ADMISSION_DEADLINE_MS, async () => {
-          const { manager } = await createRuntime({ store, allowPrivateEgress, log });
-          return await manager.resume(request.executionId, { kind: request.decision });
-        });
+        await submitSandboxWork(
+          ctx,
+          requestId,
+          request.kind,
+          RESUME_ADMISSION_DEADLINE_MS,
+          async () => {
+            const { manager } = await createRuntime({ store, allowPrivateEgress, log });
+            return await manager.resume(request.executionId, { kind: request.decision });
+          },
+        );
         return;
       }
       case "source.provision":
@@ -938,12 +1081,16 @@ async function serve(opts: ServeOptions): Promise<void> {
         // credential-handling design is not built here. `unimplemented`
         // rather than `invalid` so a client can tell "not yet" from
         // "you sent something wrong" and does not retry or reformat.
-        send(ctx.socket, {
-          kind: "error",
-          requestId,
-          code: "unimplemented",
-          message: `"${request.kind}" arrives with the client-conversion work; use direct store access until then`,
-        });
+        send(
+          ctx.socket,
+          {
+            kind: "error",
+            requestId,
+            code: "unimplemented",
+            message: `"${request.kind}" arrives with the client-conversion work; use direct store access until then`,
+          },
+          log,
+        );
         return;
       }
       case "handshake":
@@ -971,8 +1118,10 @@ async function serve(opts: ServeOptions): Promise<void> {
   // it at drain start breaks that promise for a connection that did
   // nothing wrong. So a READY-granted connection — idle or not — is left
   // open through the grace window below and ended only when the deadline
-  // expires, which is the residual this bound trades for a guaranteed
-  // exit (Deviation D6).
+  // expires. That cut is the deliberate residual: the grace window was
+  // ruled bounded rather than unbounded because holding the lifecycle
+  // lock forever is a worse failure than ending one idle connection, so
+  // a still-open READY connection at the deadline is severed on purpose.
   //
   // A connection that never received READY was never promised anything
   // and is ended immediately.
@@ -1007,8 +1156,8 @@ async function serve(opts: ServeOptions): Promise<void> {
 
   // Deadline reached (or nothing left): finish whatever responses are
   // still writable, then end every remaining connection. This is where
-  // the surviving idle READY connections are finally cut — the recorded
-  // residual of the D6 ruling.
+  // the surviving idle READY connections are finally cut — the residual
+  // the bounded grace window accepts in exchange for a guaranteed exit.
   for (const ctx of connections) {
     const remaining = deadline - Date.now();
     if (remaining > 0 && ctx.inFlight.size > 0) {
@@ -1056,7 +1205,19 @@ function unlinkIfStillOurs(socketPath: string, bound: Stats, log: (line: string)
     }
     unlinkSync(socketPath);
   } catch (err) {
-    if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+    const code = (err as NodeJS.ErrnoException).code;
+    if (code === "ENOENT") return;
+    // Logged rather than rethrown. This runs at the very END of `serve`,
+    // after the drain completed and immediately before the locks release
+    // — so a throw here converts a clean shutdown into a crash exit that
+    // `bin.ts` reports as an unexpected failure (it special-cases only
+    // `DaemonExit`). The leftover entry is not dangerous: the next
+    // daemon's `clearStaleEndpoint` validates and removes it under the
+    // lifecycle lock before binding, which is exactly the path that
+    // exists for an endpoint a predecessor failed to clean up.
+    log(
+      `[conduitd] Endpoint unlink failed — leaving it for the successor to clear. Context: {path: ${socketPath}, code: ${code ?? "unknown"}}`,
+    );
   }
 }
 

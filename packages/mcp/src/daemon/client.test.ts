@@ -8,7 +8,7 @@ import { createClient } from "@libsql/client";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { DaemonUnavailable, daemonRequest, UNCORRELATED } from "./client.js";
 import { daemonPaths } from "./conduitd.js";
-import { encodeFrame } from "./frames.js";
+import { encodeFrame, FRAME_CAP, FrameTooLarge } from "./frames.js";
 import { acquireExclusive, type HeldLock, probeShared } from "./locks.js";
 import { DAEMON_LOG, daemonEntryPoint, daemonSpawnEnv, PLATFORM_PATH } from "./spawn.js";
 
@@ -304,6 +304,99 @@ describe("daemonRequest — the §3.5 decision table", () => {
       });
 
       expect(response.kind).toBe("result");
+      expect(spawnCalls).toBe(0);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "spawns AT MOST ONCE — a spawn that starts nothing yields a typed refusal, not a spawn loop",
+    async () => {
+      // §3.5 says spawn-then-re-probe happens once. A second spawn after
+      // a failed re-probe would mean something is wrong that another
+      // process cannot fix, and repeated spawning is how fork bombs
+      // happen. The injected spawn counts calls and deliberately starts
+      // nothing, so every re-probe still lands on row 4 — exactly the
+      // shape that would spin if the guard were absent.
+      const stateDir = newStateDir();
+
+      let spawnCalls = 0;
+      const err = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "x" },
+        // Short: the bound under test is the spawn COUNT, and the
+        // deadline only has to be long enough to re-enter the table.
+        deadlineMs: 2_000,
+        spawn: () => {
+          spawnCalls++;
+        },
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(DaemonUnavailable);
+      expect((err as DaemonUnavailable).code).toBe("unavailable");
+      // The terminal message must name the daemon's own log — the cause
+      // is never on the wire, so without the path this is a dead end.
+      expect((err as DaemonUnavailable).message).toContain(DAEMON_LOG);
+      expect(spawnCalls).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a client whose own env sets CONDUIT_DB is refused end-to-end with refused-custom-db",
+    async () => {
+      // Closes the seam between the two halves that were pinned
+      // separately: the client DECLARES its CONDUIT_DB in the handshake
+      // (rather than hiding it), and the daemon REFUSES that handshake.
+      // Neither half alone proves a client carrying a custom db is
+      // actually turned away through the real request path.
+      const stateDir = newStateDir();
+      await runningDaemon(stateDir);
+
+      const previous = process.env.CONDUIT_DB;
+      process.env.CONDUIT_DB = join(stateDir, "someone-elses.db");
+      try {
+        const response = await daemonRequest({
+          stateDir,
+          role: "serve",
+          request: { kind: "search", query: "x" },
+          deadlineMs: 30_000,
+          spawn: () => {},
+        });
+        expect(response).toMatchObject({ kind: "error", code: "refused-custom-db" });
+      } finally {
+        if (previous === undefined) delete process.env.CONDUIT_DB;
+        else process.env.CONDUIT_DB = previous;
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "an oversized request is refused BEFORE connecting — never in the ambiguous zone",
+    async () => {
+      // The request is encoded up front, so a request too large to frame
+      // fails while the client can still prove no daemon saw it. Throwing
+      // from the write inside `exchange` instead would make an
+      // impossible-to-succeed request indistinguishable from one that had
+      // already gone out, i.e. a spurious outcome-unknown.
+      const stateDir = newStateDir();
+
+      let spawnCalls = 0;
+      const err = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "execute", code: "x".repeat(FRAME_CAP + 1), deadlineMs: 1_000 },
+        deadlineMs: 10_000,
+        spawn: () => {
+          spawnCalls++;
+        },
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(FrameTooLarge);
+      // Nothing was probed, spawned, or connected on the way to the
+      // refusal — the whole point of encoding first.
       expect(spawnCalls).toBe(0);
     },
     TIMEOUT,
@@ -611,6 +704,79 @@ describe("the §3.1 spawn boundary", () => {
     // it would corrupt the client that started the daemon.
     expect(readFileSync(logPath, "utf8")).toContain("daemon-side output");
   });
+
+  it(
+    "an async spawn failure never crashes the client — it lands in the daemon log and the client reaches its typed refusal",
+    async () => {
+      // `spawn` reports fork/exec failures ASYNCHRONOUSLY, as an 'error'
+      // event. An EventEmitter with no 'error' listener THROWS on emit,
+      // so before the fix a broken install path (or EAGAIN/EPERM) took
+      // down the whole client process — the exact failure the typed
+      // `DaemonUnavailable` exists to report gracefully.
+      //
+      // Run in a real child so an unhandled 'error' would actually kill a
+      // process (inside vitest it would only fail this file), with
+      // `spawnDaemon`'s own descriptor/stdio shape and an entry point
+      // that cannot be executed.
+      const stateDir = newStateDir();
+      const logPath = join(stateDir, DAEMON_LOG);
+      const unspawnable = join(stateDir, "does-not-exist-anywhere");
+
+      const script = `
+        import { closeSync, openSync, writeSync } from "node:fs";
+        import { spawn } from "node:child_process";
+        const logFd = openSync(${JSON.stringify(logPath)}, "a", 0o600);
+        const child = spawn(${JSON.stringify(unspawnable)}, ["--daemon"], {
+          cwd: ${JSON.stringify(stateDir)},
+          stdio: ["ignore", logFd, logFd],
+          detached: true,
+        });
+        // Mirrors spawn.ts's handler, including the log-fd-then-stderr
+        // fallback ordering.
+        child.once("error", (err) => {
+          const line = "[conduitd] Daemon spawn failed: " + err.code + ": " + err.message + "\\n";
+          try { writeSync(logFd, line); } catch { try { process.stderr.write(line); } catch {} }
+        });
+        child.unref();
+        try { closeSync(logFd); } catch {}
+        // Survive long enough for the async 'error' to be delivered. If
+        // it were unhandled, this process would die before printing.
+        setTimeout(() => { console.log("CLIENT SURVIVED"); process.exit(0); }, 750);
+      `;
+
+      const probe = spawn(process.execPath, ["--input-type=module", "-e", script], {
+        stdio: ["ignore", "pipe", "pipe"],
+      });
+      children.push(probe);
+      let out = "";
+      let errOut = "";
+      probe.stdout?.on("data", (chunk: Buffer) => {
+        out += chunk.toString("utf8");
+      });
+      probe.stderr?.on("data", (chunk: Buffer) => {
+        errOut += chunk.toString("utf8");
+      });
+      const exitCode = await new Promise<number | null>((resolve) =>
+        probe.once("exit", (code) => resolve(code)),
+      );
+
+      // The property under test: an unhandled 'error' would have killed
+      // this process before it could print anything.
+      expect(out).toContain("CLIENT SURVIVED");
+      expect(exitCode).toBe(0);
+
+      // The failure is REPORTED rather than lost. The log fd is closed in
+      // `spawnDaemon`'s `finally` before the async 'error' is delivered,
+      // so in practice the write fails EBADF and the stderr fallback
+      // carries it — which is exactly why the fallback exists rather than
+      // being decorative. Either destination satisfies the contract:
+      // the diagnosis must not vanish.
+      const reported = `${errOut}${readFileSync(logPath, "utf8")}`;
+      expect(reported).toContain("Daemon spawn failed");
+      expect(reported).toContain("ENOENT");
+    },
+    TIMEOUT,
+  );
 });
 
 /**

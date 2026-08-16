@@ -132,13 +132,35 @@ export async function ensureStateDir(dir: string): Promise<void> {
   await assertStateDir(dir, "bind");
 }
 
+/**
+ * Typed like the linux getfacl path: an exec failure here is a failure of
+ * the ACL layer itself, and surfacing it as a raw `ExecFileException`
+ * would let a caller that catches `StateDirError` (the type this module
+ * documents as its failure mode) miss it entirely and treat an unchecked
+ * directory as validated.
+ */
 async function stripDarwinAcl(dir: string): Promise<void> {
-  await execFileAsync("/bin/chmod", ["-N", dir]);
+  try {
+    await execFileAsync("/bin/chmod", ["-N", dir]);
+  } catch (err) {
+    throw new StateDirError(
+      "EXTENDED_ACL",
+      `state directory ACL strip failed (chmod -N): ${dir}: ${String(err)}`,
+    );
+  }
 }
 
 /** Any `/bin/ls -lde` output line matching /^ \d+: / is an ACL entry. */
 async function assertNoDarwinAcl(dir: string): Promise<void> {
-  const { stdout } = await execFileAsync("/bin/ls", ["-lde", dir]);
+  let stdout: string;
+  try {
+    ({ stdout } = await execFileAsync("/bin/ls", ["-lde", dir]));
+  } catch (err) {
+    throw new StateDirError(
+      "EXTENDED_ACL",
+      `state directory ACL check failed (ls -lde): ${dir}: ${String(err)}`,
+    );
+  }
   if (/^ \d+: /m.test(stdout)) {
     throw new StateDirError("EXTENDED_ACL", `state directory has an extended ACL: ${dir}`);
   }

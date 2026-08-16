@@ -83,6 +83,45 @@ describe("sweepOrphanedExecutions", () => {
     expect(await sweepOrphanedExecutions(store)).toBe(0);
   });
 
+  it("terminalizes a running row whose JSON is CORRUPT, along with its valid siblings", async () => {
+    // The crash that stranded these rows is exactly the kind of event
+    // that can leave one of them half-written. The sweep is documented
+    // as needing no PARSED Execution — it reuses the store's guarded
+    // `WHERE status='running'` terminalizer — and this pins that: a row
+    // whose seeds/code JSON cannot be parsed must still reach a terminal
+    // state, and must not abort the sweep of the rows around it.
+    const client = createClient({ url: ":memory:" });
+    const store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(Buffer.alloc(32, 7)),
+    });
+
+    // Valid siblings on either side of the corrupt row, so an abort
+    // anywhere in the loop is visible.
+    await seed(store, [
+      { id: "exec_valid_a", status: "running" },
+      { id: "exec_valid_b", status: "running" },
+    ]);
+    // Raw insert, bypassing the store's own encoding: `seeds` is not
+    // JSON at all and `code` is a truncated fragment.
+    await client.execute(
+      `INSERT INTO executions (id, code, status, seeds, started_at)
+       VALUES ('exec_corrupt', '{"unterminated', 'running', 'not-json-at-all', 1000)`,
+    );
+
+    expect(await sweepOrphanedExecutions(store)).toBe(3);
+
+    // Every one of them, corrupt included, is terminal afterwards.
+    for (const id of ["exec_valid_a", "exec_valid_b", "exec_corrupt"]) {
+      const row = await client.execute({
+        sql: "SELECT status, ended_at FROM executions WHERE id = ?",
+        args: [id],
+      });
+      expect(row.rows[0]?.status).toBe("failed");
+      expect(row.rows[0]?.ended_at).not.toBeNull();
+    }
+  });
+
   it("returns 0 and writes nothing on a clean database", async () => {
     const store = await newStore();
     await seed(store, [{ id: "exec_done", status: "completed" }]);

@@ -13,14 +13,18 @@
  * of "strip CONDUIT_*" would silently pass every variable someone adds
  * later, and the failure would be invisible.
  *
- * Note that this composes with the daemon's own defense (task 4, D2):
- * `daemonPaths` derives the database from the state directory rather than
- * from env, and the handshake refuses a client carrying `CONDUIT_DB`. This
+ * Note that this composes with the daemon's own defense, which was ruled
+ * to be a SEPARATE layer rather than a substitute for this one: the
+ * daemon must hold the database boundary on its own, because a daemon an
+ * operator starts by hand never passes through this spawn path at all.
+ * Concretely, `daemonPaths` derives the database from the state directory
+ * rather than from env, and the handshake refuses a client carrying
+ * `CONDUIT_DB`. This
  * module is the outer layer of that same guarantee, not a substitute for
  * it — a daemon an operator starts BY HAND never passes through here.
  */
 import { spawn } from "node:child_process";
-import { closeSync, mkdirSync, openSync } from "node:fs";
+import { closeSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -121,6 +125,32 @@ export function spawnDaemon(stateDir: string): void {
       // service (§17), not a child of whichever client happened to start
       // it first.
       detached: true,
+    });
+    // A spawn failure is asynchronous: `spawn` returns a ChildProcess
+    // before the fork/exec is known to have worked, and a broken entry
+    // point, EAGAIN, or EPERM arrives later as an 'error' event. Without
+    // a listener that event is an unhandled 'error' on an EventEmitter,
+    // which throws and takes the CLIENT process down — a failed
+    // auto-start would kill the MCP client rather than degrading to the
+    // typed `DaemonUnavailable` the client is designed to report.
+    //
+    // The line goes to the log fd the client already opened, because
+    // that is the file `DaemonUnavailable` tells the operator to read.
+    // The fd is closed in the `finally` below, so by the time a late
+    // event fires it is usually gone; stderr is the fallback so the
+    // diagnosis is never silently lost. Writing must never itself throw
+    // here — this handler exists to PREVENT a crash.
+    child.once("error", (err: NodeJS.ErrnoException) => {
+      const line = `[conduitd] Daemon spawn failed: ${err.code ?? "unknown"}: ${err.message}. Context: {stateDir: ${stateDir}, entryPoint: ${daemonEntryPoint()}}\n`;
+      try {
+        writeSync(logFd, line);
+      } catch {
+        try {
+          process.stderr.write(line);
+        } catch {
+          /* nothing left to report through; the client still survives */
+        }
+      }
     });
     // Without this the client's event loop stays alive until the daemon
     // exits — which, the daemon being durable until stopped, is forever.

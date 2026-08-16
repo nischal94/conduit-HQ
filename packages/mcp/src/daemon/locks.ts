@@ -20,7 +20,35 @@ import { dirname } from "node:path";
 import { type Client, createClient, LibsqlError } from "@libsql/client";
 
 export interface HeldLock {
+  /**
+   * Releases the hold. Idempotent: a second call is a no-op that
+   * resolves. Release lands in `finally` blocks and shutdown paths that
+   * can plausibly run twice, and without the guard the second call
+   * issues `ROLLBACK` on an already-closed client — surfacing as a
+   * confusing libsql error from a caller that did nothing wrong, and
+   * masking whatever real failure was being unwound at the time.
+   */
   release(): Promise<void>;
+}
+
+/**
+ * Wraps a held client's release in a one-shot guard. Shared by both
+ * acquisitions so the idempotence is a property of every `HeldLock`
+ * this module hands out, not of each construction site remembering it.
+ */
+function heldLock(client: Client): HeldLock {
+  let released = false;
+  return {
+    async release() {
+      if (released) return;
+      released = true;
+      try {
+        await client.execute("ROLLBACK");
+      } finally {
+        client.close();
+      }
+    },
+  };
 }
 
 function isBusy(err: unknown): boolean {
@@ -52,15 +80,7 @@ export async function acquireExclusive(lockDbPath: string): Promise<HeldLock | n
     if (isBusy(err)) return null;
     throw err;
   }
-  return {
-    async release() {
-      try {
-        await client.execute("ROLLBACK");
-      } finally {
-        client.close();
-      }
-    },
-  };
+  return heldLock(client);
 }
 
 /**
@@ -80,15 +100,7 @@ export async function acquireShared(lockDbPath: string): Promise<HeldLock | null
     if (isBusy(err)) return null;
     throw err;
   }
-  return {
-    async release() {
-      try {
-        await client.execute("ROLLBACK");
-      } finally {
-        client.close();
-      }
-    },
-  };
+  return heldLock(client);
 }
 
 /**
