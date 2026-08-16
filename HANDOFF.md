@@ -16,6 +16,14 @@ If they differ, work happened after this handoff was written — it is
 stale by exactly the commits between them. Reconstruct state from
 `git log` over that range, rewrite this file FIRST, then start the task.
 A session that ends abnormally can't lie here; git tells on it.
+
+**Rewrite self-check (added 2026-08-16 — the DONE criterion; run after any
+rewrite, then STOP checking):** (1) tripwire passes; (2) exactly ONE
+`## Current handoff` header and it is the first section a reader meets;
+(3) every branch/PR/file the current section names exists as stated;
+(4) the kickoff is executable verbatim against the real repo state.
+All four green = done — further findings in superseded sections are
+archive cosmetics, out of scope by definition. Do not rescan.
 **Known blind spot (LEARNINGS #21): the tripwire only sees main.** Work
 that lives on an unmerged PR branch leaves main untouched and the
 tripwire silent. Always pair it with `gh pr list --state all --limit 5`
@@ -23,7 +31,136 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-03 (REPO IS PUBLIC: PR #42 merged, flip executed same session; next: §17 v1 step 2 daemon ownership)
+## Current handoff — updated 2026-08-16 late (Lane A BUILT: PR #46 open, SDD + whole-branch review converged; next: load-bearing gauntlet on PR #46 → human quiz + merge)
+
+### Where things stand
+
+- **Lane A is BUILT and PR #46 is OPEN** (`feat/daemon-core` → main,
+  12 build commits on top of the design branch's docs, head at the
+  whole-branch fix wave). Full SDD run 2026-08-16: 5 tasks, fresh
+  implementer + task review + scoped re-review per fix round (every
+  task took exactly one fix round), then a whole-branch review → one
+  fix wave → re-review: converged, no open Critical/Important. Suites
+  at head: **mcp 147/147, sdk 444/444, cli 105/105**, tsc+biome clean,
+  20+ INVARIANT §17 rows. Ledger (per-task history, rulings, parked
+  items): `.superpowers/sdd/2026-08-16-daemon-ownership/progress.md`
+  (git-ignored, kept). Deviations D1–D6 + rulings are consolidated in
+  the PR #46 body.
+- **Notable in-branch catches** (all fixed + re-reviewed): bind-mode
+  ACL strip ordered before symlink validation; capability re-handshake
+  privilege escalation; daemon crash on an ordinary 1 MiB result
+  (sandbox output cap == frame cap) via unhandled rejection; a vacuous
+  §9.2 hygiene test that asserted against a successful reply.
+- **Known pre-existing flake (needs its own task, NOT Lane A's):**
+  conduitd's "exactly one daemon survives a concurrent auto-start race"
+  test intermittently has BOTH daemons exit "already running" —
+  reproduces on unmodified baseline, rarer on the branch; exit-code
+  analysis says spawn-timing artifact, not a lock defect. Separately,
+  the branch's first commit widened the quickjs overflow-stress test
+  timeout 30s→90s (pre-existing full-suite-load flake that blocked ALL
+  commits via the pre-commit hook).
+- **Dependabot drift: push banner now reports 9 open alerts** (2 high /
+  6 moderate / 1 low) vs the 8 parked on 2026-08-15 — one new advisory
+  since the triage. Still parked, NOT a blocker.
+
+### NEXT — the load-bearing gauntlet on PR #46, then human merge
+
+Lane A touches product code + the security boundary → full gauntlet:
+(1) `/pr-review-toolkit:review-pr all parallel`; (2) post-PR
+`code-review` mechanic; (3) `/security-review` (+ aikido if connected);
+(4) raw `codex exec` correctness pass per
+`~/.claude/rules/codex-one-path.md` (the design convergence does NOT
+cover this code); (5) `/explain-diff` explainer + quiz linked on the
+PR. Findings: fix in-branch → scoped re-verify; adjudications go in the
+ledger. CI green. Then the HUMAN passes the quiz fully and NAMES the
+merge — the agent never merges. Post-merge: branch sweep, `pnpm -r
+build`, then Lane B (plan Tasks 6–10) via SDD in a fresh session from
+merged main. Carry into Lane B: the auto-start race flake task; a
+wiring test for resume→submitSandboxWork (currently pinned only by
+reading); split conduitd's connection handling early (file is ~900
+lines); the `listRunningIds` rename question when Lane B settles the
+seam's public surface; oversize-result error-code taxonomy if clients
+need to branch on it.
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: Lane A (daemon core) is BUILT — PR #46 open, SDD +
+> whole-branch review converged, suites green. Do NOT re-run SDD or the
+> whole-branch review.** If the gauntlet hasn't run: run it per the NEXT
+> section, fix findings in-branch, then hand to the human for quiz +
+> named merge. If PR #46 is merged: post-merge sweep, rebuild dists,
+> then Lane B (Tasks 6–10) via SDD from merged main. The agent never
+> merges.
+
+---
+
+## Superseded handoff — updated 2026-08-16 (design+plan converged; its NEXT [build Lane A] was completed the same day by the section above)
+
+### Where things stand
+
+- **Repo state:** public, Apache-2.0, branch protection ON (5 checks,
+  strict; enforce_admins=false so scripts/push-docs works). Branches:
+  `main`, `docs/daemon-ownership-design` (remote), No open PRs, no other
+  local branches (a leftover `feat/daemon-core` from a killed sub-agent
+  was verified commit-free and deleted 2026-08-16). Serve runs from dist — REBUILD
+  (`pnpm -r build`) after every merge until §17 step 7.
+- **Design:** `docs/superpowers/specs/2026-08-15-daemon-ownership-design.md`
+  revision 8, CONVERGED across two review arcs — codex passes 1–5 on the
+  design logic (9→5→3→2→0), a platform eng review (found Node stdlib has
+  neither flock(2) nor SO_PEERCRED; both load-bearing, both re-designed
+  onto shipped machinery), codex passes 6–8 on the fixes (5→1→0). Full
+  trail in the doc's §10. Shape: one daemon owns the store;
+  capability-scoped RPCs over a UDS; SQLite lock databases as the kernel
+  locks; lstat-verified 0700 state dir; constructed spawn env; READY
+  gate; cap 4 / queue 16; idle-exit deferred to step 7; crash sweep is a
+  status UPDATE (no schema change).
+- **Plan:** `docs/superpowers/plans/2026-08-16-daemon-ownership.md` —
+  10 TDD tasks, TWO PRs: Lane A `feat/daemon-core` (locks → state-dir →
+  framing/RPC → conduitd runtime → sweep/spawn/client), Lane B
+  `feat/daemon-clients` (serve, approvals, add-mcp anti-oracle,
+  key/doctor, docs+ledger). Both docs live on
+  `docs/daemon-ownership-design`.
+- **Dependabot: 8 open alerts, parked, NOT a blocker** — all transitive
+  via `@modelcontextprotocol/sdk@1.29.0`; verified they do not reach the
+  §9.3 egress guard. Full triage note in the superseded section below
+  ("OPEN — Dependabot triage"). No routine mechanism surfaces these;
+  expect drift between deliberate sweeps.
+- Remaining human leisure item (carried): reserve the `conduithq` npm org.
+
+### NEXT SESSION — build Lane A (plan Tasks 1–5) via SDD
+
+`git fetch origin`, then cut the working branch from the DESIGN branch —
+`git checkout -b feat/daemon-core origin/docs/daemon-ownership-design` —
+NOT from origin/main (main lacks the design/plan docs, which ride Lane
+A's PR per the PR #41 precedent). Run
+superpowers:subagent-driven-development over the plan task-by-task: fresh
+implementer per task → vitest in the FOREGROUND → two-verdict review →
+ledger `.superpowers/sdd/progress-daemon-core.md`. Global constraints
+live in the plan header and are binding (zero new deps; NO schema
+changes; normative constants; real spawned-process lock tests). Do NOT
+redesign or re-run either review arc. After Task 5: whole-branch review →
+push → open the Lane A PR with a Deviations section → full load-bearing
+gauntlet → HUMAN-NAMED merge. Environment quirks: commits need
+sandbox-disabled Bash (pre-commit runs the sdk suite), never
+--no-verify; npx/pnpm-exec blocked by the sfw guard — use
+`packages/<p>/node_modules/.bin/*` directly; the agent never installs.
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: daemon-ownership design rev 8 is CONVERGED and the 10-task
+> plan is committed, both on `docs/daemon-ownership-design`. Cut
+> `feat/daemon-core` from THAT branch (not main). Do NOT redesign or
+> re-review.** BUILD Lane A (plan Tasks
+> 1–5) via superpowers:subagent-driven-development per the NEXT SESSION
+> section above. The agent never merges.
+
+---
+
+## Superseded handoff — updated 2026-08-03 (REPO PUBLIC: PR #42 merged + flip executed; its NEXT [daemon ownership] was designed+planned 2026-08-15/16 by the section above; its human steps 1–6 are ALL DONE except the npm org)
 
 **FLIP COMPLETE (2026-08-03, same session, human-executed):** the human read
 the audit (independently re-verified by the agent: identities, paths,
@@ -155,8 +292,43 @@ PR → Tier-2 both mechanics + /security-review + codex correctness pass +
 below; act where triggers fire. Remember: serve runs from dist — REBUILD
 (`pnpm -r build`) after every merge until §17 step 7.
 
-**Brainstorm OPENED 2026-08-15 — exploration done, NOTHING decided, no
-branch/PR/code.** Findings established (skip re-deriving these):
+**DESIGN + PLAN COMPLETE 2026-08-16 — branch `docs/daemon-ownership-design`
+(pushed, no PR yet; LEARNINGS entries ride the branch).**
+
+- **Design:** `docs/superpowers/specs/2026-08-15-daemon-ownership-design.md`
+  revision 8, CONVERGED across TWO arcs — codex passes 1-5 on the design
+  logic (9→5→3→2→0), then a platform eng review (`plan-eng-review`, at the
+  human's direction) that found Node stdlib has neither `flock(2)` nor
+  `SO_PEERCRED` — both load-bearing — then codex passes 6-8 on the fixes
+  (5→1→0). Full trail in the doc's §10. Final shape: one daemon owns the
+  store; capability-scoped RPCs over a UDS; locks = SQLite lock databases
+  (fcntl-backed via @libsql/client, normative hold/probe modes);
+  different-UID boundary = lstat-verified 0700 state dir with ACL
+  rejection; constructed spawn env incl. fixed PATH/cwd/fds; READY-gated
+  connections; cap 4 / queue 16 (normative); idle-exit DEFERRED to step 7
+  (dissolved the console conflict); crash sweep = status UPDATE, no
+  schema change.
+- **Plan:** `docs/superpowers/plans/2026-08-16-daemon-ownership.md` —
+  10 TDD tasks, TWO PRs: Lane A `feat/daemon-core` (locks with the five
+  named libsql tests → state-dir → framing/RPC → conduitd runtime →
+  sweep/spawn/client), Lane B `feat/daemon-clients` (serve, approvals,
+  add-mcp anti-oracle, key/doctor under the maintenance lock, docs +
+  ledger). Each lane takes the full load-bearing gauntlet; HUMAN-NAMED
+  merges.
+- **NEXT SESSION: build Lane A via superpowers:subagent-driven-development
+  in a FRESH session** (project rule). Kickoff: `git fetch origin`, then
+  check out the EXISTING local branch `feat/daemon-core` — already cut
+  at the tip of `docs/daemon-ownership-design` (`d834a0a`), so the design
+  + plan ride Lane A's PR (the PR #41 precedent). Do NOT re-cut it, and
+  NOT from origin/main (that would exclude the design/plan docs — a
+  prior HANDOFF revision said origin/main in error). Run SDD over the
+  plan task-by-task; global constraints live in the plan header. Do NOT
+  redesign or re-run either review arc.
+
+LEARNINGS #21 applies: the branch is invisible to the git tripwire —
+pair with `gh pr list`.
+
+Original exploration findings below (still accurate; kept for context):
 
 - **There is no owning process today.** Every entry point opens its own
   libsql client against the same `~/.conduit/conduit.db`:
@@ -1676,7 +1848,7 @@ merge instruction).
 
 ## Previous handoff (2026-07-10, superseded but quirks still valid)
 
-## Current handoff — written 2026-07-10 (§11 Trace redaction MERGED — PHASE 0 COMPLETE; next MVP step = /mcp server, stdio)
+## Superseded handoff — written 2026-07-10 (§11 Trace redaction MERGED — PHASE 0 COMPLETE; its NEXT [/mcp stdio server] was built long since; header renamed 2026-08-16, content untouched)
 
 ### Where things stand
 
