@@ -1967,3 +1967,31 @@ because subagents (correctly) cannot pop stashes and the controller's
 own attempt was denied. When a subagent must snapshot work, prefer
 committing to a temp branch or copying files to the workspace over
 `git stash` — stashes strand work behind a human gate.
+
+## 2026-08-18 — Merge-day addendum (PRs #46/#47)
+
+### 1. "CI green" was assumed for 12 hours while CI never ran
+
+Three stacked causes hid it: the audit gate red on ALL of main since
+08-15 (advisories age into the registry db on their own schedule — a
+gate can turn red with zero repo changes); a test harness spawning an
+esbuild bin shim that exists locally (pnpm exposes transitive bins) but
+not under CI's --ignore-scripts layout; and a CONFLICTING PR silently
+suspends pull_request runs — GitHub can't build the merge ref, so
+nothing fires and nothing says why. Check `gh pr checks` + mergeable
+state EARLY in a PR's life, not at the end.
+
+### 2. Review your own lockfile PRs like hostile code
+
+The override `>=3.3.18` resolved nanoid to 6.0.1 — three majors outside
+postcss's ^3.3.x range, ESM-only, engines >=22 — and every suite plus
+CI passed anyway. Only the line-by-line lockfile read caught it. Order
+override ranges with an upper bound (`>=X <next-major`) and verify the
+RESOLVED version in the lockfile diff, not the range you wrote.
+
+### 3. gh is config-blind in sandboxed background tasks
+
+Background/monitor shells deny ~/.config/gh/hosts.yml, so every gh call
+silently fails; foreground gh (sandbox-disabled) works. Monitors that
+watch GitHub must poll unauthenticated via curl (public repo) or hand
+the check back to the foreground.

@@ -31,7 +31,66 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-17 (Lane A GAUNTLET COMPLETE on PR #46, codex CONVERGED; next: HUMAN passes the quiz + names the merge, then Lane B)
+## Current handoff — updated 2026-08-18 (Lane A MERGED: PR #46 squash → main `2fe55ff`, sweep DONE; next: Lane B [plan Tasks 6–10] via SDD in a fresh session)
+
+**MERGE + SWEEP (2026-08-18, human passed the quiz and named the
+merge):** PR #46 squash → main `2fe55ff` (trailer-free verified). The
+final stretch after the gauntlet had three extra acts, all resolved:
+(1) CI turned out never to have run on the finished branch — the audit
+gate had been red on ALL of main since 2026-08-15 (two HIGH transitive
+advisories aged into the registry db), the daemon test harness spawned
+an esbuild bin shim that doesn't exist under CI's --ignore-scripts
+layout (fixed: bundle in-process via the declared tsup dep, `c5d0340`),
+and the PR had gone CONFLICTING on HANDOFF.md which silently stops
+pull_request runs. (2) **PR #47** (human-named merge → `09ee448`) fixed
+the audit gate with scoped pnpm-workspace overrides — ip-address
+≥10.3.1, nanoid ≥3.3.18 <4; the thorough lockfile review caught the
+first head resolving nanoid to 6.0.1 (three majors out of postcss's
+range) before merge. (3) The HANDOFF conflict was resolved with a
+tree-proof merge (post-merge tree = branch tree + exactly main's two
+override files). Post-merge sweep DONE: branches = main only (design
+branch content verified on main before deletion), dists rebuilt,
+real-db canary open exit 0. Dependabot: 5 alerts left (4 moderate /
+1 low) — the pins cleared both highs. Explainer quiz passed by the
+human pre-merge. Serve still runs from dist — REBUILD after every
+merge until §17 step 7.
+
+### NEXT SESSION — build Lane B (plan Tasks 6–10) via SDD
+
+Fresh session from merged main: cut `feat/daemon-clients` from
+origin/main, run superpowers:subagent-driven-development over
+`docs/superpowers/plans/2026-08-16-daemon-ownership.md` Tasks 6–10
+(serve → approvals → add-mcp anti-oracle → key/doctor under the
+maintenance lock → docs+ledger closeout). Global constraints in the
+plan header remain binding. Full load-bearing gauntlet on the PR;
+HUMAN-NAMED merge. Carry into Lane B (from the Lane A ledger +
+reviews): fresh-dir auto-start flake / spawn-once retry policy (one
+decision covers both — the parked codex P2); split conduitd's
+connection handling early (~1,300 lines); `listRunningIds` rename
+question when the seam's public surface settles; oversize-result
+error-code taxonomy if clients need to branch; §9.2 hygiene test's
+decorative redaction assertions; retire the pnpm override pins when
+@modelcontextprotocol/sdk ships patched transitives naturally.
+Environment quirks: commits need sandbox-disabled Bash, never
+--no-verify; npx/pnpm-exec blocked — use packages/<p>/node_modules/
+.bin/* directly; the agent never installs (lockfile changes = human
+runs pnpm install); gh in BACKGROUND tasks can't read its config —
+poll GitHub unauthenticated via curl in monitors.
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: Lane A (daemon core) is MERGED (PR #46 → main `2fe55ff`),
+> sweep done, dists rebuilt, canary verified. Do NOT re-review Lane A.**
+> NEXT: build Lane B (plan Tasks 6–10) via
+> superpowers:subagent-driven-development — cut `feat/daemon-clients`
+> from origin/main, follow the plan + the carry list in the NEXT
+> section. Full gauntlet on the PR; the agent never merges.
+
+---
+
+## Superseded handoff — updated 2026-08-17 (Lane A gauntlet complete; its NEXT [quiz + merge] was completed 2026-08-18 by the section above)
 
 ### Where things stand
 
