@@ -3,7 +3,6 @@ import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync 
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   CONCURRENCY_CAP,
@@ -16,6 +15,7 @@ import {
   RESUME_ADMISSION_DEADLINE_MS,
 } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
+import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
 import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
 
 /**
@@ -33,53 +33,20 @@ import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
 const TIMEOUT = 60_000;
 
 /**
- * The daemon is spawned as a real child, which means Node loads it
- * directly — and Node's strip-only TypeScript mode cannot resolve the
- * `.js` specifiers product code correctly uses for its tsup build. So the
- * helper and everything it imports are bundled once, with the esbuild
- * already present for the package build (no new dependency), into a temp
- * `.mjs` that Node runs natively.
- *
- * Bundling rather than loosening the product's import style keeps
- * `conduitd.ts` idiomatic with the rest of `packages/mcp`; the test
- * harness absorbs the mismatch instead of the shipped code.
+ * The spawnable helper is bundled once per file; see
+ * `helpers/bundle.ts` for why the harness bundles at all and how esbuild
+ * is reached.
  */
-const HELPER_SRC = fileURLToPath(new URL("./helpers/run-daemon.ts", import.meta.url));
 let HELPER = "";
-let bundleDir: string | undefined;
+let bundle: HelperBundle | undefined;
 
 beforeAll(async () => {
-  // Emitted inside the package, not a temp dir: dependencies are left
-  // external, so the bundle must sit somewhere `node_modules` resolution
-  // still reaches @conduithq/sdk and @libsql/client.
-  bundleDir = mkdtempSync(fileURLToPath(new URL("../../.daemon-test-", import.meta.url)));
-  HELPER = join(bundleDir, "run-daemon.mjs");
-  const esbuild = fileURLToPath(new URL("../../node_modules/.bin/esbuild", import.meta.url));
-  await new Promise<void>((resolve, reject) => {
-    const proc = spawn(
-      esbuild,
-      [
-        HELPER_SRC,
-        "--bundle",
-        "--platform=node",
-        "--format=esm",
-        // Leave real dependencies external — only first-party TypeScript
-        // needs rewriting, and bundling native/WASM-backed deps would
-        // change the runtime under test.
-        "--packages=external",
-        `--outfile=${HELPER}`,
-      ],
-      { stdio: ["ignore", "inherit", "inherit"] },
-    );
-    proc.once("error", reject);
-    proc.once("exit", (code) =>
-      code === 0 ? resolve() : reject(new Error(`esbuild failed with code ${code}`)),
-    );
-  });
+  bundle = await bundleDaemonHelper();
+  HELPER = bundle.helper;
 }, TIMEOUT);
 
 afterAll(() => {
-  if (bundleDir) rmSync(bundleDir, { recursive: true, force: true });
+  bundle?.cleanup();
 });
 
 let dir: string | undefined;

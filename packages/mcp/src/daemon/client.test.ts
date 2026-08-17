@@ -3,12 +3,12 @@ import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } fr
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { fileURLToPath } from "node:url";
 import { createClient } from "@libsql/client";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { DaemonUnavailable, daemonRequest, UNCORRELATED } from "./client.js";
 import { daemonPaths } from "./conduitd.js";
 import { encodeFrame, FRAME_CAP, FrameTooLarge } from "./frames.js";
+import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
 import { acquireExclusive, type HeldLock, probeShared } from "./locks.js";
 import { DAEMON_LOG, daemonEntryPoint, daemonSpawnEnv, PLATFORM_PATH } from "./spawn.js";
 
@@ -23,40 +23,17 @@ import { DAEMON_LOG, daemonEntryPoint, daemonSpawnEnv, PLATFORM_PATH } from "./s
 
 const TIMEOUT = 60_000;
 
-// Same bundling approach as conduitd.test.ts: the helper is run directly
-// by Node, whose strip-only TypeScript mode cannot resolve the `.js`
-// specifiers product code uses, so it is bundled once with the esbuild
-// already present for the package build.
-const HELPER_SRC = fileURLToPath(new URL("./helpers/run-daemon.ts", import.meta.url));
+// Same bundling approach as conduitd.test.ts; see `helpers/bundle.ts`.
 let HELPER = "";
-let bundleDir: string | undefined;
+let bundle: HelperBundle | undefined;
 
 beforeAll(async () => {
-  bundleDir = mkdtempSync(fileURLToPath(new URL("../../.client-test-", import.meta.url)));
-  HELPER = join(bundleDir, "run-daemon.mjs");
-  const esbuild = fileURLToPath(new URL("../../node_modules/.bin/esbuild", import.meta.url));
-  await new Promise<void>((resolve, reject) => {
-    const proc = spawn(
-      esbuild,
-      [
-        HELPER_SRC,
-        "--bundle",
-        "--platform=node",
-        "--format=esm",
-        "--packages=external",
-        `--outfile=${HELPER}`,
-      ],
-      { stdio: ["ignore", "inherit", "inherit"] },
-    );
-    proc.once("error", reject);
-    proc.once("exit", (code) =>
-      code === 0 ? resolve() : reject(new Error(`esbuild failed with code ${code}`)),
-    );
-  });
+  bundle = await bundleDaemonHelper();
+  HELPER = bundle.helper;
 }, TIMEOUT);
 
 afterAll(() => {
-  if (bundleDir) rmSync(bundleDir, { recursive: true, force: true });
+  bundle?.cleanup();
 });
 
 let dir: string | undefined;
