@@ -1065,7 +1065,9 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
       const { stderr } = await execFileAsync("node", [binPath, "--doctor", "--offline"], {
         env,
       }).catch((e: { stderr: string }) => e);
-      expect(stderr).toMatch(/Held by daemon \(pid \d+\) since /);
+      // Hedged, not asserted: the row can outlive a SIGKILLed holder, so
+      // it is rendered as a lead rather than a verdict.
+      expect(stderr).toMatch(/Last acquired by daemon \(pid \d+\) at .* \(may be stale\)/);
       // And it names the way forward — ask the live daemon instead.
       expect(stderr).toMatch(/--doctor/);
     } finally {
@@ -1156,6 +1158,12 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
       expect(stderr).toMatch(/ok: daemon reachable/);
       // The seeded source count came from the daemon, over the socket.
       expect(stderr).toMatch(/ok: 1 source\(s\) in catalog/);
+      // The two diagnostics the retired implementation printed, now taken
+      // from the handshake rather than a private store open (§9 item 3).
+      // The egress line matters most: on a live install it is reportable
+      // by NO other mode, since `--offline` refuses while a daemon runs.
+      expect(stderr).toMatch(/ok: daemon owns the database at .*conduit\.db/);
+      expect(stderr).toMatch(/egress opt-in: off \(fail-closed default\)/);
     } finally {
       rmSync(home, { recursive: true, force: true });
     }

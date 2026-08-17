@@ -480,7 +480,10 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
     expect(err).toMatch(/maintenance lock is held/i);
     // The §3.4 diagnostic metadata: the refusal names WHO holds it, so the
     // operator is not sent hunting. A SHARED holder does not block the read.
-    expect(err).toMatch(/Held by daemon \(pid \d+\) since /);
+    // Hedged rather than asserted: the row survives a SIGKILLed holder, so
+    // it is offered as a lead ("may be stale"), never as a verdict that
+    // would send the operator after an already-departed pid.
+    expect(err).toMatch(/Last acquired by daemon \(pid \d+\) at .* \(may be stale\)/);
     // Non-blocking: a fail-fast refusal, never a wait-then-take. Well under
     // EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS (1000), which only lifecycle uses.
     expect(elapsed).toBeLessThan(2000);
@@ -525,9 +528,59 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
 
     expect(result.exitCode).toBe(1);
     expect(io.err.join("\n")).toMatch(/maintenance lock is held/i);
-    expect(io.err.join("\n")).toMatch(/Held by daemon \(pid \d+\)/);
+    expect(io.err.join("\n")).toMatch(/Last acquired by daemon \(pid \d+\)/);
     expect(existsSync(join(dir, "master-key"))).toBe(false); // no key minted
   }, 60_000);
+
+  it("INVARIANT §17 / §3.4: fresh install — generate works when the state directory does not exist yet", async () => {
+    // THE REGRESSION THIS PINS: the maintenance acquisition runs BEFORE
+    // generate's own mkdir, and `acquireExclusive` throws raw libsql
+    // SQLITE_CANTOPEN (`ConnectionFailed(… : 14)`) on a directory that is
+    // not there. That broke the DOCUMENTED FIRST ONBOARDING STEP — the one
+    // command guaranteed to run before `~/.conduit` exists. Every other
+    // fixture in this file uses mkdtempSync, which always creates the
+    // directory, which is exactly why nothing caught it.
+    //
+    // Nothing can hold a lock inside a directory that does not exist, so
+    // the absence is proof of exclusivity and generate proceeds.
+    const fresh = join(dir, "not-created-yet");
+    expect(existsSync(fresh)).toBe(false);
+
+    const io = makeIo();
+    const result = await runKey(["generate"], { env: {}, conduitDir: fresh, ...io });
+
+    expect(result.exitCode).toBe(0);
+    const all = [...io.out, ...io.err].join("\n");
+    expect(all).not.toMatch(/ConnectionFailed|SQLITE_CANTOPEN/);
+
+    // The key was really minted, and the directory created 0700.
+    const keyPath = join(fresh, "master-key");
+    expect(statSync(keyPath).mode & 0o777).toBe(0o600);
+    expect(statSync(fresh).mode & 0o777).toBe(0o700);
+    expect(Buffer.from(readFileSync(keyPath, "utf8").trim(), "base64")).toHaveLength(32);
+    expect(all).not.toContain(readFileSync(keyPath, "utf8").trim()); // key never printed
+  });
+
+  it("INVARIANT §17 / §3.4: fresh install — rotate fails on its OWN terms, never a raw lock error", async () => {
+    // The other half of the missing-directory reading. A dirless install
+    // has no key to rotate, so rotate must reach its own typed refusal
+    // rather than dying inside the lock acquisition — a lock error would
+    // tell the operator nothing about what is actually wrong.
+    const fresh = join(dir, "also-not-created");
+    expect(existsSync(fresh)).toBe(false);
+
+    const io = makeIo();
+    const result = await runKey(["rotate"], { env: {}, conduitDir: fresh, ...io });
+
+    expect(result.exitCode).toBe(1);
+    const err = io.err.join("\n");
+    expect(err).not.toMatch(/ConnectionFailed|SQLITE_CANTOPEN/);
+    // Its own diagnosis: preflight cannot resolve a key that isn't there.
+    expect(err).toMatch(/\[ConduitKey\] rotate preflight failed/);
+    expect(err).toMatch(/Missing master key/);
+    // And it created nothing on the way to refusing.
+    expect(existsSync(fresh)).toBe(false);
+  });
 
   it("rotate succeeds normally once no daemon holds the lock, and releases it afterwards", async () => {
     // The lock must not be a one-way door: a plain rotate on a quiet

@@ -22,7 +22,9 @@ export {
  */
 export {
   acquireExclusive,
+  acquireExclusiveIfPresent,
   describeHolder,
+  type ExclusiveAcquisition,
   type HeldLock,
   type LockHolder,
   readLockHolder,

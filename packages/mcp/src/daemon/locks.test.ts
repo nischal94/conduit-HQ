@@ -5,7 +5,14 @@ import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it } from "vitest";
-import { acquireExclusive, acquireShared, probeShared } from "./locks.js";
+import {
+  acquireExclusive,
+  acquireExclusiveIfPresent,
+  acquireShared,
+  describeHolder,
+  probeShared,
+  readLockHolder,
+} from "./locks.js";
 
 /**
  * Real-process lock tests (design §3.5, normative — no in-memory fakes):
@@ -249,6 +256,78 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
     // anyone there?" must not create the state directory it is only
     // inspecting (§3.2 — creation is the daemon's prerogative).
     expect(existsSync(dirname(missing))).toBe(false);
+  });
+
+  it("INVARIANT §17 / §3.4: the holder row is CLEARED on release — a refusal never names a departed process", async () => {
+    // THE BUG THIS PINS: the row was stamped pre-BEGIN and never cleared,
+    // so after an orderly release it lingered. A later refusal caused by a
+    // DIFFERENT, role-less holder would then flatly assert "held by
+    // conduit key rotate (pid N)" — naming a process that had already
+    // exited. That is materially worse than naming nobody: it sends the
+    // operator to kill a pid that is already gone.
+    const db = newLockDbPath();
+
+    // A SHARED hold, because that is the readable case and the one
+    // production depends on: the daemon holds maintenance SHARED, and a
+    // refused `key rotate` reads the row past it. (An EXCLUSIVE holder
+    // blocks every reader, so its own row is unreadable while it lives —
+    // inherent to the primitive, which is why the prose hedges.)
+    const held = await acquireShared(db, { role: "daemon" });
+    expect(held).not.toBeNull();
+    expect(await readLockHolder(db)).toMatchObject({ role: "daemon" });
+
+    await held?.release();
+    // Cleared on the way out — nothing to misattribute.
+    expect(await readLockHolder(db)).toBeNull();
+
+    // The scenario that made it dangerous: a role-less holder now owns the
+    // lock for real. The refusal must not name the departed rotate.
+    const { child: anonymous } = await spawnHolder("exclusive", db);
+    expect(await acquireExclusive(db)).toBeNull(); // genuinely busy
+    expect(describeHolder(await readLockHolder(db))).toBe("");
+
+    anonymous.kill("SIGKILL");
+    await waitForExclusiveFree(db);
+  });
+
+  it("a surviving holder row is rendered HEDGED — diagnosis, not authority", async () => {
+    // A SIGKILLed holder cannot clear its row, so the residue is inherent.
+    // What the code owes the operator is honest framing: the row is a
+    // lead, never a verdict.
+    const db = newLockDbPath();
+    const held = await acquireShared(db, { role: "daemon" });
+    const rendered = describeHolder(await readLockHolder(db));
+    await held?.release();
+
+    expect(rendered).toMatch(/Last acquired by daemon \(pid \d+\)/);
+    expect(rendered).toMatch(/may be stale/);
+    // Never the unqualified assertion it used to make.
+    expect(rendered).not.toMatch(/Held by/);
+  });
+
+  it("acquireExclusiveIfPresent: a missing state directory reads `no-state-dir`, and is not created", async () => {
+    // The shared missing-directory reading — one policy for the key
+    // subcommands and the offline doctor, rather than each inventing its
+    // own. `acquireExclusive` alone THROWS raw SQLITE_CANTOPEN here.
+    const missing = join(newLockDbPath(), "..", "absent-dir", "m.lock.db");
+    expect(existsSync(dirname(missing))).toBe(false);
+
+    await expect(acquireExclusive(missing)).rejects.toThrow(); // the raw behavior
+    expect(await acquireExclusiveIfPresent(missing)).toEqual({ outcome: "no-state-dir" });
+
+    // Inspecting must never provision the directory (§3.2).
+    expect(existsSync(dirname(missing))).toBe(false);
+  });
+
+  it("acquireExclusiveIfPresent: distinguishes acquired from busy on a directory that exists", async () => {
+    const db = newLockDbPath();
+    const first = await acquireExclusiveIfPresent(db, { role: "daemon" });
+    expect(first.outcome).toBe("acquired");
+
+    const second = await acquireExclusiveIfPresent(db);
+    expect(second).toEqual({ outcome: "busy" });
+
+    if (first.outcome === "acquired") await first.lock.release();
   });
 
   it("release() is idempotent — a second call is a no-op, not a ROLLBACK on a closed client", async () => {

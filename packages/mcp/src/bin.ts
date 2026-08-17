@@ -4,7 +4,7 @@ import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
 import { DaemonUnavailable, daemonRequest } from "./daemon/client.js";
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
-import { acquireExclusive, describeHolder, readLockHolder } from "./daemon/locks.js";
+import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { DEFAULT_CONDUIT_DIR, DEFAULT_KEY_FILE, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
@@ -59,8 +59,17 @@ Flags: --version · --help · --daemon (run the store-owning daemon; stop with
  */
 async function doctor(): Promise<number> {
   try {
+    // Captured from the handshake, which is where the daemon reports its
+    // effective non-secret configuration (§9 item 3). The egress setting
+    // in particular is reportable by NO other means on a live install —
+    // `--offline` refuses while a daemon runs — and it is among the most
+    // likely things an operator is actually debugging.
+    let daemonConfig: { dbPath: string; allowPrivateEgress: boolean } | undefined;
     const response = await daemonRequest({
       stateDir: DEFAULT_CONDUIT_DIR,
+      onHandshake: (info) => {
+        daemonConfig = info;
+      },
       // `serve` is the agent-facing read role, and `catalog.listing` is
       // one of its D-B1 reads. Doctor deliberately does NOT get a
       // capability of its own: a new row would be a wider authorization
@@ -92,6 +101,12 @@ async function doctor(): Promise<number> {
     const payload = response.payload as { connections?: unknown[]; sourceCount?: number };
     const sourceCount = payload.sourceCount ?? 0;
     console.error("ok: daemon reachable (handshake accepted)");
+    if (daemonConfig !== undefined) {
+      console.error(`ok: daemon owns the database at ${daemonConfig.dbPath}`);
+      console.error(
+        `egress opt-in: ${daemonConfig.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`,
+      );
+    }
     console.error(
       `ok: ${sourceCount} source(s) in catalog${sourceCount === 0 ? " — onboard one with `conduit add-mcp`" : ""}`,
     );
@@ -140,13 +155,16 @@ async function doctorOffline(): Promise<number> {
   // `~/.conduit` is the daemon's prerogative (§3.2), and a read-only
   // diagnostic that provisions the very state it claims to be inspecting
   // would be the mutation this mode exists to avoid.
-  const stateDirExists = existsSync(DEFAULT_CONDUIT_DIR);
-  const lock = stateDirExists
-    ? await acquireExclusive(paths.maintenanceLockDb, { role: MAINTENANCE_ROLE_DOCTOR })
-    : null;
-  // Only a directory that EXISTS can have a holder — the fresh-install
-  // null above is "nothing to lock", not "someone else has it".
-  if (stateDirExists && lock === null) {
+  // One reading of "the state directory isn't there", shared with the two
+  // `key` subcommands: nothing can hold a lock in a directory that does
+  // not exist, so `no-state-dir` proceeds to report on the fresh install
+  // rather than refusing. The directory is never created to take the lock
+  // — creation is the daemon's prerogative (§3.2), and a read-only
+  // diagnostic must not provision the state it claims to inspect.
+  const acquisition = await acquireExclusiveIfPresent(paths.maintenanceLockDb, {
+    role: MAINTENANCE_ROLE_DOCTOR,
+  });
+  if (acquisition.outcome === "busy") {
     const holder = describeHolder(await readLockHolder(paths.maintenanceLockDb));
     console.error(
       "offline diagnosis refused: the maintenance lock is held, so a daemon is running or a key " +
@@ -203,7 +221,7 @@ async function doctorOffline(): Promise<number> {
     );
     return keyOk ? 0 : 1;
   } finally {
-    await lock?.release();
+    if (acquisition.outcome === "acquired") await acquisition.lock.release();
   }
 }
 

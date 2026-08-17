@@ -45,6 +45,22 @@ export interface DaemonRequestOptions {
   deadlineMs: number;
   /** Injectable for tests; production spawns the real daemon. */
   spawn?: (stateDir: string) => void;
+  /**
+   * Observes the daemon's `handshake.ok` when one is received.
+   *
+   * The handshake carries the daemon's effective, non-secret configuration
+   * — §9 item 3: "the handshake reports protocol version, db path, and
+   * effective non-secret security settings; clients print them on
+   * mismatch". Every other caller only needs the RESPONSE, so the
+   * handshake stays consumed inside `exchange`; `--doctor` is the one
+   * caller whose entire job is reporting that configuration, and this
+   * seam lets it read what arrived without changing the return type or
+   * the ambiguity semantics for anyone else.
+   *
+   * Read-only by construction: the callback cannot alter the exchange,
+   * and it fires at most once per attempt.
+   */
+  onHandshake?: (info: { dbPath: string; allowPrivateEgress: boolean }) => void;
 }
 
 /**
@@ -197,7 +213,7 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
         // zone ends. The READY gate's decoder and any frames it already
         // read past READY travel into the exchange — see `awaitReady`
         // for why starting a fresh decoder here would be a bug.
-        return await exchange(socket, opts.role, expiry, ready, requestFrame);
+        return await exchange(socket, opts.role, expiry, ready, requestFrame, opts.onHandshake);
       }
       // Connected but no READY — accepted-or-queued during DRAINING.
       // Identical to a refused connect, and crucially NOTHING was
@@ -389,6 +405,7 @@ async function exchange(
   expiry: number,
   ready: Extract<ReadyResult, { ready: true }>,
   requestFrame: Buffer,
+  onHandshake?: DaemonRequestOptions["onHandshake"],
 ): Promise<RpcResponse> {
   // The reader was built by the READY gate over the decoder that consumed
   // READY, so no byte the daemon already sent is lost at this boundary.
@@ -412,6 +429,16 @@ async function exchange(
     if (handshake === null) return unknownOutcome(null, reader.decodeFault());
     if (isKind(handshake, "error")) return decodeResponseOrUnknown(handshake);
     if (!isKind(handshake, "handshake.ok")) return unknownOutcome(handshake, reader.decodeFault());
+
+    // Surfaced through the validating decoder rather than the raw frame,
+    // so an observer can never be handed a malformed handshake's fields.
+    const validated = decodeResponse(handshake);
+    if (validated !== null && validated.kind === "handshake.ok") {
+      onHandshake?.({
+        dbPath: validated.dbPath,
+        allowPrivateEgress: validated.allowPrivateEgress,
+      });
+    }
 
     // Encoded BEFORE the connection was ever made (see `daemonRequest`),
     // so an oversized request has already been refused client-side and

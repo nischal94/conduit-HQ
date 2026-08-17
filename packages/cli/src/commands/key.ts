@@ -12,12 +12,12 @@ import {
 } from "node:fs";
 import { join } from "node:path";
 import {
-  acquireExclusive,
+  acquireExclusiveIfPresent,
   DEFAULT_CONDUIT_DIR,
   daemonPaths,
   describeHolder,
+  type ExclusiveAcquisition,
   ensureDbFile,
-  type HeldLock,
   MAINTENANCE_ROLE_GENERATE,
   MAINTENANCE_ROLE_ROTATE,
   openStoreClientFromEnv,
@@ -98,12 +98,29 @@ async function underMaintenance(
   verb: string,
   run: (deps: KeyDeps) => Promise<KeyResult>,
 ): Promise<KeyResult> {
-  const held = await acquireMaintenance(deps, role, verb);
-  if (held === null) return { exitCode: 1 };
+  const acquisition = await acquireMaintenance(deps, role, verb);
+  if (acquisition.outcome === "busy") return { exitCode: 1 };
+
+  // `no-state-dir`: the state directory does not exist yet, so nothing can
+  // be holding a lock inside it and the subcommand PROCEEDS unlocked. This
+  // is the fresh-install path — `generate` is the documented first
+  // onboarding step and creates the directory itself moments later, so
+  // refusing here (or throwing a raw libsql open error) would break the
+  // very first command a new user runs. `rotate` also proceeds, and then
+  // fails on its OWN terms — a keyless install has nothing to rotate,
+  // which is a far better diagnosis than a lock error.
+  //
+  // Proceeding unlocked is not a hole: a directory that does not exist
+  // holds no db for a daemon to own, so there is no second writer to
+  // exclude. The window between this check and the mkdir is the same one
+  // `generate`'s own `link()`-based publication already resolves — it
+  // never overwrites, so a racing generate loses on EEXIST rather than
+  // clobbering a key.
+  const lock = acquisition.outcome === "acquired" ? acquisition.lock : null;
   try {
     return await run(deps);
   } finally {
-    await held.release();
+    await lock?.release();
   }
 }
 
@@ -135,19 +152,20 @@ async function acquireMaintenance(
   deps: KeyDeps,
   role: string,
   verb: string,
-): Promise<HeldLock | null> {
+): Promise<ExclusiveAcquisition> {
   const lockDb = daemonPaths(deps.conduitDir).maintenanceLockDb;
-  const held = await acquireExclusive(lockDb, { role });
-  if (held !== null) return held;
+  const acquisition = await acquireExclusiveIfPresent(lockDb, { role });
+  if (acquisition.outcome !== "busy") return acquisition;
   // Read the holder only AFTER the kernel has already refused us — the
-  // row is a companion to that verdict, never a substitute for it.
+  // row is a companion to that verdict, never a substitute for it, and it
+  // is rendered hedged because it can name a departed process.
   const holder = describeHolder(await readLockHolder(lockDb));
   deps.stderr(
     `[ConduitKey] ${verb} refused: another process owns ~/.conduit — the maintenance lock is held.` +
       `${holder} ${verb} is stop-first: stop every conduit process and MCP client (the daemon exits on ` +
       "SIGTERM), then re-run. Nothing was read or written.\n",
   );
-  return null;
+  return acquisition;
 }
 
 /** fsync a directory so a just-created/renamed entry survives a host crash. THROWS on failure — each caller decides whether to degrade (generate/post-promote: warn) or abort (pre-tx staging: refuse). */

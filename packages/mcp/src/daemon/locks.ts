@@ -41,7 +41,7 @@ export interface HeldLock {
  * acquisitions so the idempotence is a property of every `HeldLock`
  * this module hands out, not of each construction site remembering it.
  */
-function heldLock(client: Client): HeldLock {
+function heldLock(client: Client, stamped: boolean): HeldLock {
   let released = false;
   return {
     async release() {
@@ -49,6 +49,21 @@ function heldLock(client: Client): HeldLock {
       released = true;
       try {
         await client.execute("ROLLBACK");
+        // Clear the diagnostic row on the way out, so a LATER refusal
+        // cannot name this now-departed process as the current holder.
+        // Runs AFTER the ROLLBACK that ends the hold, which is when the
+        // row becomes writable again on this connection.
+        //
+        // `clearHolder` swallows its own faults: a release must never
+        // fail on account of diagnostics, and wrapping the ROLLBACK in
+        // that same tolerance would hide a genuine release failure.
+        //
+        // Best-effort, and incompletely so on purpose: a SIGKILLed
+        // holder never runs this and leaves its row behind. That residue
+        // is inherent — the kernel drops the lock without giving anyone
+        // a chance to tidy up — and is why the refusal prose hedges
+        // ("may be stale") rather than asserting.
+        if (stamped) await clearHolder(client);
       } finally {
         client.close();
       }
@@ -124,6 +139,17 @@ async function stampHolder(client: Client, role: string): Promise<void> {
 }
 
 /**
+ * Removes this connection's holder row. Best-effort: see `heldLock`.
+ */
+async function clearHolder(client: Client): Promise<void> {
+  try {
+    await client.execute("DELETE FROM lock_holder WHERE id = 1");
+  } catch {
+    // Intentionally silent — diagnostics never fail a release.
+  }
+}
+
+/**
  * Reads the holder row, or null when there is nothing legible to report.
  *
  * Null covers every "we cannot say who" case with one answer, because the
@@ -153,10 +179,21 @@ export async function readLockHolder(lockDbPath: string): Promise<LockHolder | n
   }
 }
 
-/** Renders a holder as a clause for an error message, or "" when unknown. */
+/**
+ * Renders a holder as a clause for an error message, or "" when unknown.
+ *
+ * Deliberately hedged — "last acquired by", never "held by". The row is
+ * cleared on an orderly release, but a SIGKILLed holder leaves its row
+ * behind while the kernel drops its lock, so the process named here can be
+ * dead while a DIFFERENT, role-less acquirer holds the lock for real.
+ * Asserting a specific culprit in that case would be worse than saying
+ * nothing: it sends the operator to kill a pid that is already gone and
+ * leaves them puzzled when the lock stays busy. The wording makes the row
+ * what it actually is — a lead, not a verdict.
+ */
 export function describeHolder(holder: LockHolder | null): string {
   if (holder === null) return "";
-  return ` Held by ${holder.role} (pid ${holder.pid}) since ${holder.since}.`;
+  return ` Last acquired by ${holder.role} (pid ${holder.pid}) at ${holder.since} (may be stale).`;
 }
 
 function openLockClient(lockDbPath: string): Client {
@@ -229,7 +266,7 @@ export async function acquireExclusive(
     if (isBusy(err)) return null;
     throw err;
   }
-  return heldLock(client);
+  return heldLock(client, opts?.role !== undefined);
 }
 
 /**
@@ -253,7 +290,7 @@ export async function acquireShared(
     if (isBusy(err)) return null;
     throw err;
   }
-  return heldLock(client);
+  return heldLock(client, opts?.role !== undefined);
 }
 
 /**
@@ -285,6 +322,53 @@ export async function probeShared(lockDbPath: string): Promise<"free" | "busy"> 
   if (!held) return "busy";
   await held.release();
   return "free";
+}
+
+/**
+ * The three-way answer an acquirer needs on a state directory that may not
+ * exist yet — `probeShared`'s missing-directory reading, applied to an
+ * EXCLUSIVE acquisition.
+ *
+ * `acquireExclusive` alone cannot express this: it returns null for BUSY and
+ * THROWS the raw libsql `SQLITE_CANTOPEN` when the directory is absent, so
+ * every caller on a fresh install would surface
+ * `ConnectionFailed("… : 14")` instead of doing something sensible. That is
+ * a real regression on the documented first onboarding step, since
+ * `conduit key generate` is precisely the command run before `~/.conduit`
+ * exists.
+ *
+ * `"no-state-dir"` is a distinct answer rather than a silent success because
+ * the two callers want opposite things from it:
+ *
+ * - `key generate` PROCEEDS — it creates the directory itself moments later,
+ *   and nothing can hold a lock in a directory that does not exist, so the
+ *   absence is proof of exclusivity rather than an obstacle to it.
+ * - `key rotate` and the offline doctor fall through to their OWN typed
+ *   refusals (a keyless install has nothing to rotate, and nothing to
+ *   diagnose), which are far better diagnoses than a lock error.
+ *
+ * The directory is never CREATED here. Creation is the daemon's prerogative
+ * (§3.2), and an acquirer that provisioned the state directory as a side
+ * effect of asking "is anyone holding this?" would be mutating the very
+ * thing it is inspecting — the property `probeShared` already guarantees.
+ */
+export type ExclusiveAcquisition =
+  | { outcome: "acquired"; lock: HeldLock }
+  | { outcome: "busy" }
+  | { outcome: "no-state-dir" };
+
+export async function acquireExclusiveIfPresent(
+  lockDbPath: string,
+  opts?: { busyTimeoutMs?: number; role?: string },
+): Promise<ExclusiveAcquisition> {
+  let lock: HeldLock | null;
+  try {
+    lock = await acquireExclusive(lockDbPath, opts);
+  } catch (err) {
+    if (isMissingDirectory(err, lockDbPath)) return { outcome: "no-state-dir" };
+    throw err;
+  }
+  return lock === null ? { outcome: "busy" } : { outcome: "acquired", lock };
 }
 
 /**
