@@ -18,7 +18,12 @@
  */
 import type { Socket } from "node:net";
 import { type ConduitStore, InMemoryCatalog } from "@conduithq/sdk";
-import { buildCatalogListing, executionToCheckPayload, outcomeToPayload } from "../payloads.js";
+import {
+  buildCatalogListing,
+  executionToCheckPayload,
+  outcomeToPayload,
+  resumeToPayload,
+} from "../payloads.js";
 import type { createApprovalRuntime } from "../runtime.js";
 import {
   DepthExceeded,
@@ -668,7 +673,14 @@ async function handleRequest(
         RESUME_ADMISSION_DEADLINE_MS,
         async () => {
           const { manager } = await createRuntime({ store, allowPrivateEgress, log });
-          return await manager.resume(request.executionId, { kind: request.decision });
+          // Projected like every other answer (`ResumePayload`): the raw
+          // `ResumeOutcome` carries the paused call's ARGUMENTS in
+          // `pending.input`, and the projection also pins `decisionApplied`
+          // as a deliberate wire field rather than an incidental one — the
+          // CLI's verb reporting is unimplementable without it.
+          return resumeToPayload(
+            await manager.resume(request.executionId, { kind: request.decision }),
+          );
         },
         deps,
       );

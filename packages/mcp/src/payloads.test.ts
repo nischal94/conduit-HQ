@@ -6,6 +6,7 @@ import {
   executionToCheckPayload,
   extendExecuteDefinition,
   outcomeToPayload,
+  resumeToPayload,
 } from "./payloads.js";
 
 const seeds = { now: 1, random: 0.5 };
@@ -64,6 +65,88 @@ describe("outcomeToPayload (execute)", () => {
     const p = outcomeToPayload({ status: "conflict", executionId: "e4" });
     expect(p.status).toBe("conflict");
     expect(p.message).toMatch(/check_execution/);
+  });
+});
+
+describe("resumeToPayload (approvals.resume)", () => {
+  it("INVARIANT §17 / §3.3: the resume projection carries decisionApplied — the verb-truth axis the CLI keys on", () => {
+    // `decisionApplied` is host-side truth about whether the operator's
+    // staged decision was CONSUMED (sdk D6), and it is the ONLY field the
+    // CLI may key its verb reporting on: outcome error NAMES are
+    // guest-reachable and therefore spoofable in both directions. If the
+    // wire shape dropped it, the daemon path could not honor the PR #40
+    // contract at all.
+    const applied = resumeToPayload({
+      status: "failed",
+      executionId: "e_denied",
+      error: { name: "ConduitPolicyBlocked", message: "policy denied the execution" },
+      decisionApplied: true,
+    });
+    expect(applied.decisionApplied).toBe(true);
+    expect(applied.status).toBe("failed");
+
+    const notApplied = resumeToPayload({
+      status: "failed",
+      executionId: "e_spoof",
+      error: { name: "ConduitPolicyBlocked", message: "guest-forged name" },
+      decisionApplied: false,
+    });
+    expect(notApplied.decisionApplied).toBe(false);
+  });
+
+  it("is a PROJECTION over ExecutePayload, not the raw ResumeOutcome: the failed arm carries the vetted error envelope", () => {
+    // Same discipline as every other D-B1 answer: the raw outcome's
+    // `SandboxError` and `PendingApproval` shapes come straight off the
+    // pipeline (`pending.input` carries the CALL ARGUMENTS), and only the
+    // vetted view crosses the socket.
+    const p = resumeToPayload({
+      status: "failed",
+      executionId: "e1",
+      error: { name: "SomeError", message: "boom" },
+      decisionApplied: false,
+    });
+    expect(p.error).toEqual({ code: "SomeError", message: "boom", retryable: false });
+  });
+
+  it("the paused arm projects the pending VIEW and drops the raw pausedOn input", () => {
+    const p = resumeToPayload({
+      status: "paused",
+      executionId: "e2",
+      pending: {
+        callId: "c1",
+        toolName: "github.push",
+        input: { token: "should-never-cross-the-socket" },
+        reason: "review",
+        expiresAt: 9,
+      },
+      decisionApplied: true,
+    });
+    expect(p.pending).toEqual({ toolName: "github.push", reason: "review", expiresAt: 9 });
+    // The projection is what the socket carries; the call arguments the
+    // agent passed are not part of the approvals answer.
+    expect(JSON.stringify(p)).not.toContain("should-never-cross-the-socket");
+  });
+
+  it("carries every outcome status the verb-truth branches need", () => {
+    expect(
+      resumeToPayload({ status: "conflict", executionId: "e3", decisionApplied: false }).status,
+    ).toBe("conflict");
+    expect(
+      resumeToPayload({
+        status: "expired",
+        executionId: "e4",
+        pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 1 },
+        decisionApplied: false,
+      }).status,
+    ).toBe("expired");
+    expect(
+      resumeToPayload({
+        status: "completed",
+        executionId: "e5",
+        value: { ok: true },
+        decisionApplied: true,
+      }),
+    ).toMatchObject({ status: "completed", result: { ok: true }, decisionApplied: true });
   });
 });
 

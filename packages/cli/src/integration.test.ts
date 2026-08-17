@@ -528,48 +528,41 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
 
 describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop through conduit serve", () => {
   /**
-   * Its own state directory, because this suite mixes the two access
-   * models that Task 6 left temporarily side by side:
+   * Its own state directory, so this suite's `require_approval` policy
+   * override does not disturb the shared one.
    *
-   * - `conduit serve` reaches the database ONLY through the daemon.
-   * - `conduit approvals` still opens the store DIRECTLY — converting it
-   *   is Task 7's job, not Task 6's.
-   *
-   * Those cannot both be live against one database without recreating the
-   * dual-ownership §17 exists to eliminate, so the daemon is stopped
-   * before the approvals commands run and a fresh one is started after —
-   * the same stop-first posture `key rotate` takes (§3.4). This is an
-   * INTERIM shape: once Task 7 lands, `approvals` becomes a daemon client
-   * and the stop/restart dance disappears.
+   * Since Task 7 BOTH clients reach the database only through the daemon:
+   * `conduit serve` over the `serve` capability row, `conduit approvals`
+   * over the `approvals` row. The daemon is the single owner throughout,
+   * which is why the commands below run against a LIVE daemon with no
+   * stop/restart dance — Task 6's interim shape, now deleted.
    */
   const approvalsStateDir = mkdtempSync(join(tmpdir(), "conduit-cli-it-appr-"));
   chmodSync(approvalsStateDir, 0o700);
   const approvalsDbPath = join(approvalsStateDir, "conduit.db");
 
+  /**
+   * Runs `conduit approvals` against this suite's daemon.
+   *
+   * `--state-dir` rather than `CONDUIT_DB`: the state directory is what
+   * selects the daemon (and therefore the database), and a client whose
+   * env sets `CONDUIT_DB` is refused outright at handshake (§9.3 item 3).
+   * The env is `serveEnv()` for exactly that reason.
+   */
   async function runApprovals(
     args: string[],
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     try {
-      const { stdout, stderr } = await execFileAsync("node", [cliBinPath, "approvals", ...args], {
-        env: { ...process.env, ...baseEnv(), CONDUIT_DB: approvalsDbPath },
-      });
+      const { stdout, stderr } = await execFileAsync(
+        "node",
+        [cliBinPath, "approvals", ...args, "--state-dir", approvalsStateDir],
+        { env: { ...process.env, ...serveEnv() } },
+      );
       return { stdout, stderr, exitCode: 0 };
     } catch (error) {
       const err = error as { stdout?: string; stderr?: string; code?: number };
       return { stdout: err.stdout ?? "", stderr: err.stderr ?? "", exitCode: err.code ?? 1 };
     }
-  }
-
-  /**
-   * Stops ONLY this suite's daemon, so a direct opener is alone against
-   * `approvalsDbPath`. Scoped to a single child rather than the shared
-   * `daemons` registry — killing the suite-wide daemon here would break
-   * every other case.
-   */
-  async function stopDaemon(child: ChildProcess): Promise<void> {
-    if (child.exitCode !== null) return;
-    child.kill("SIGKILL");
-    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
   }
 
   beforeAll(async () => {
@@ -613,8 +606,14 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     client.close();
   }, 30_000);
 
-  it("workflow: execute pauses on require_approval → approvals list shows it → approvals approve resumes it to completion", async () => {
-    const first = await startDaemonAt(approvalsStateDir);
+  it("INVARIANT §17: a write made through ONE daemon client is visible to ANOTHER with no restart — approvals resumes, the live serve session sees it", async () => {
+    // The whole loop against ONE live daemon, with THREE separate client
+    // processes talking to it concurrently: a `serve` client (capability
+    // `serve`), two `approvals` clients (capability `approvals`), and the
+    // same `serve` client again afterwards. Before Task 7 this test could
+    // not exist — `approvals` opened the database directly, so the daemon
+    // had to be stopped first, and "no restart" was unobservable.
+    await startDaemonAt(approvalsStateDir);
     const client = await spawnClient(serveEnv(), approvalsStateDir);
     const paused = await client.callTool({
       name: "execute",
@@ -627,12 +626,8 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     expect(pausedPayload.status).toBe("paused");
     const { executionId } = pausedPayload;
 
-    // Stop the daemon before the direct-store approvals commands run — see
-    // the suite docblock for why the two access models cannot overlap yet.
-    await stopDaemon(first);
-
-    // `approvals list` (a SEPARATE spawned process) shows the paused
-    // execution, read from the same durable state the daemon left behind.
+    // A SEPARATE spawned process, against the LIVE daemon — no stop, no
+    // second opener. It sees the pause the serve client just produced.
     const listResult = await runApprovals(["list", "--json"]);
     expect(listResult.exitCode).toBe(0);
     const rows = JSON.parse(listResult.stdout) as Array<{ executionId: string; tool: string }>;
@@ -640,29 +635,49 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
       true,
     );
 
-    // `approvals approve` (another separate spawned process) resumes it.
+    // `approvals approve` (another separate process) resumes it — a WRITE
+    // through the approvals capability row, driven inside the daemon.
     const approveResult = await runApprovals(["approve", executionId]);
     expect(approveResult.exitCode).toBe(0);
     expect(approveResult.stdout.trim()).toBe("completed");
     expect(upstream.upstreamCalls.some((c) => c.name === "delete_repo")).toBe(true);
 
-    // `approvals list` is now empty — the resumed execution is no longer
-    // paused. Read while the daemon is still stopped, so this is the last
-    // of the direct-store reads.
+    // The queue is empty again, read through the same live daemon.
     const listAfter = await runApprovals(["list", "--json"]);
     const rowsAfter = JSON.parse(listAfter.stdout) as Array<{ executionId: string }>;
     expect(rowsAfter.some((r) => r.executionId === executionId)).toBe(false);
 
-    // A NEW daemon and a NEW serve session confirm the persisted result:
-    // the approval was granted by a process that this session never saw,
-    // and it is visible because the state is durable rather than in-memory.
-    await startDaemonAt(approvalsStateDir);
-    const poller = await spawnClient(serveEnv(), approvalsStateDir);
-    const checked = await poller.callTool({
+    // THE INVARIANT: the ORIGINAL serve session — never restarted, never
+    // reconnected — sees the approval that a different client applied.
+    // It holds because the daemon is the only writer and the serve process
+    // caches nothing: every read is a fresh RPC.
+    const checked = await client.callTool({
       name: "check_execution",
       arguments: { executionId },
     });
     const checkedPayload = textPayload(checked) as { status: string };
     expect(checkedPayload.status).toBe("completed");
+  }, 60_000);
+
+  it("a resume the daemon refuses reaches the operator as a typed non-zero answer, not a crash", async () => {
+    // The daemon-side refusal path through a REAL spawned CLI process: an
+    // execution id that was never paused produces a genuine `conflict`
+    // from `manager.resume` inside the daemon, projected onto the wire and
+    // reported here with the verb-truth exit code. Pre-conversion this
+    // branch was only ever driven in-process against a local store.
+    //
+    // NOTE ON AUTO-START: there is deliberately no case here for
+    // "approvals starts a daemon when none is running against THIS state
+    // directory". `spawnDaemon` passes only `--daemon` and a constructed
+    // env with no HOME, so an auto-started daemon always derives the
+    // DEFAULT state directory (§3.1: the daemon resolves its own state
+    // dir; a client may never smuggle one in). Auto-start is therefore
+    // real for production's default path — pinned in
+    // `daemon/client.test.ts` — but unreachable for a `--state-dir` test
+    // fixture by design, not by omission.
+    const denied = await runApprovals(["deny", "exec_never_existed"]);
+    expect(denied.exitCode).toBe(1);
+    expect(denied.stdout.trim()).toBe("conflict");
+    expect(denied.stderr).toMatch(/not in a resumable \(paused\) state/);
   }, 60_000);
 });

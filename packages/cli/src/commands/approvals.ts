@@ -1,38 +1,44 @@
-import { createApprovalRuntime, openStoreFromEnv, type ResolvedEnv } from "@conduithq/mcp";
 import {
-  type ConduitStore,
-  type Execution,
-  logSandboxDiagnosticsTo,
-  type ResumeOutcome,
-} from "@conduithq/sdk";
+  DaemonUnavailable,
+  DEFAULT_CONDUIT_DIR,
+  daemonRequest,
+  deadlineForRequest,
+  type ResumePayload,
+  type RpcRequest,
+  type RpcResponse,
+} from "@conduithq/mcp";
+import type { PendingApproval } from "@conduithq/sdk";
 
 /**
  * `conduit approvals list|approve|deny` — the human approval queue (design
- * §2.3). `list` reads `store.executions.listPaused()` and computes the
- * expiry label at DISPLAY time from the stored `pausedOn.expiresAt` — it
- * NEVER writes. `approve`/`deny` build a FRESH `ApprovalRuntime` per call
- * (M6 fresh-catalog rule — see runtime.ts's doc comment) and drive
- * `manager.resume`, printing the resulting outcome status.
+ * §2.3), driven through the DAEMON since Task 7 (§17).
  *
- * Injectable deps mirror add-mcp.ts's DI convention: production defaults to
- * the real store/runtime; tests substitute a runtime factory to pin
- * individual outcome branches in isolation (real-path coverage also drives
- * an actual manager, including a genuine double-approve `conflict`).
+ * **This command opens no database.** Before the conversion it called
+ * `openStoreFromEnv` directly, which was survivable only while nothing else
+ * held the db. Task 6 removed that condition: every `conduit serve`
+ * auto-starts a daemon, so a direct open here became a SECOND owner of
+ * `~/.conduit/conduit.db` automatically rather than only when an operator
+ * opted in — the dual ownership §17 exists to eliminate. Both operations now
+ * travel the capability-scoped `approvals` RPC set (`approvals.list`,
+ * `approvals.resume`), and auto-start lives inside `daemonRequest`, so "no
+ * daemon yet" is an ordinary first call rather than a failure.
+ *
+ * `list` still NEVER writes: it renders the daemon's paused-row projection
+ * and computes the expiry label at DISPLAY time. `approve`/`deny` drive
+ * `manager.resume` inside the daemon — including the M6 fresh-runtime rule,
+ * which now holds daemon-side where the store lives.
+ *
+ * The single injectable dep is the daemon call itself (the DI seam that
+ * replaced `openStore`/`createRuntime`): tests drive the whole command
+ * against a fake daemon with no sockets, exactly as `runStdioServer`'s
+ * tests do for `serve`.
  */
 
+export type ApprovalsDaemonCall = (request: RpcRequest) => Promise<RpcResponse>;
+
 export interface ApprovalsDeps {
-  /** Defaults to `openStoreFromEnv`; injectable so tests can pre-open a store. */
-  openStore: (env?: NodeJS.ProcessEnv) => Promise<{ env: ResolvedEnv; store: ConduitStore }>;
-  /** Defaults to `createApprovalRuntime`; injectable so tests can pin
-   * individual outcome branches in isolation. Deliberately NOT
-   * given a `log` option here — the seam's own default (console.error) is
-   * what production wiring exercises. */
-  createRuntime: (opts: { store: ConduitStore; allowPrivateEgress: boolean }) => Promise<{
-    manager: {
-      resume: (id: string, decision: { kind: "approve" | "deny" }) => Promise<ResumeOutcome>;
-    };
-  }>;
-  env: NodeJS.ProcessEnv;
+  /** Every read and every resume goes through here, capability `approvals`. */
+  daemon: ApprovalsDaemonCall;
   now: () => number;
   stdout: (line: string) => void;
   stderr: (line: string) => void;
@@ -42,14 +48,114 @@ export interface ApprovalsResult {
   exitCode: number;
 }
 
-const PROD_DEPS: ApprovalsDeps = {
-  openStore: openStoreFromEnv,
-  createRuntime: createApprovalRuntime,
-  env: process.env,
-  now: () => Date.now(),
-  stdout: (line) => process.stdout.write(line),
-  stderr: (line) => process.stderr.write(line),
-};
+/**
+ * Production deps for one invocation.
+ *
+ * `stateDir` is a CODE-level parameter threaded from the (undocumented)
+ * `--state-dir` flag and never read from the environment — the same posture
+ * `serve` takes, and for the same reason: the state directory selects which
+ * daemon, and therefore which database, this command decides against.
+ */
+function prodDeps(stateDir: string): ApprovalsDeps {
+  return {
+    daemon: (request) =>
+      daemonRequest({
+        stateDir,
+        role: "approvals",
+        request,
+        // Per-kind, via the shared table: a resume is queued and then RUNS,
+        // so it carries the derived resume budget rather than a read's.
+        deadlineMs: deadlineForRequest(request),
+      }),
+    now: () => Date.now(),
+    stdout: (line) => process.stdout.write(line),
+    stderr: (line) => process.stderr.write(line),
+  };
+}
+
+/**
+ * The daemon's `approvals.list` projection — the rows `connection.ts` sends.
+ * Structurally narrower than a stored `Execution`: three fields, and
+ * `pausedOn` explicitly nullable because the daemon projects it that way.
+ */
+interface PausedRowWire {
+  executionId: string;
+  startedAt: number;
+  pausedOn: PendingApproval | null;
+}
+
+/**
+ * One daemon round trip, reduced to either a payload or an operator-facing
+ * refusal. Every non-`result` answer is a REFUSAL rather than an empty
+ * success, which matters most for `list`: rendering "no paused executions"
+ * for a queue the daemon never reported would tell an operator that nothing
+ * awaits them, which is the one wrong answer this command must never give.
+ */
+type Answer = { ok: true; payload: unknown } | { ok: false; line: string; exitCode: number };
+
+function describeResponse(response: RpcResponse, verb: string): Answer {
+  if (response.kind === "result") return { ok: true, payload: response.payload };
+  if (response.kind === "outcome-unknown") {
+    // §5's ambiguity, and the one answer whose mishandling is dangerous in
+    // BOTH directions. The connection died after the request bytes went
+    // out, so the resume may have driven the execution and may not have.
+    // Reporting the verb as landed would be the same false positive the
+    // decisionApplied contract exists to kill; retrying could apply a
+    // second decision to an execution that already consumed one. So: no
+    // verb line, a non-zero exit, and a lookup instruction.
+    return {
+      ok: false,
+      exitCode: 1,
+      line:
+        `[conduit approvals] The outcome of this ${verb} is UNKNOWN: the daemon connection was ` +
+        `lost after the request was sent, so it may or may not have been applied ` +
+        `(requestId ${response.requestId}). Do NOT retry it — run "conduit approvals list" to ` +
+        `see whether the execution is still awaiting a decision.\n`,
+    };
+  }
+  if (response.kind === "error") {
+    // The daemon's own typed refusal. Its message is client-safe by
+    // construction (`connection.ts` sends a fixed string for `internal`),
+    // and it is strictly more useful than a generic line: `busy` and
+    // `rotation-in-progress` each name a different next step.
+    return {
+      ok: false,
+      exitCode: 1,
+      line: `[conduit approvals] ${verb} refused by the daemon (${response.code}): ${response.message}\n`,
+    };
+  }
+  // `ready`/`handshake.ok` are prefaces the client already consumed.
+  return {
+    ok: false,
+    exitCode: 1,
+    line: `[conduit approvals] ${verb} failed: protocol desync (unexpected ${response.kind} frame).\n`,
+  };
+}
+
+/**
+ * Calls the daemon, folding a thrown `DaemonUnavailable` into the same
+ * Answer shape. That error is NOT dressed up: it already carries the state
+ * directory, the deadline, and the daemon log path that explains why a
+ * child exited — everything the operator needs to act, and this is an
+ * operator-facing command, so unlike the agent-facing `serve` seam there is
+ * nothing here to redact it from.
+ */
+async function ask(deps: ApprovalsDeps, request: RpcRequest, verb: string): Promise<Answer> {
+  try {
+    return describeResponse(await deps.daemon(request), verb);
+  } catch (error) {
+    return {
+      ok: false,
+      exitCode: 1,
+      line:
+        error instanceof DaemonUnavailable
+          ? `${error.message}\n`
+          : `[conduit approvals] ${verb} could not reach the Conduit daemon: ${
+              error instanceof Error ? error.message : String(error)
+            }\n`,
+    };
+  }
+}
 
 interface PausedRow {
   executionId: string;
@@ -59,20 +165,20 @@ interface PausedRow {
   expired: boolean;
 }
 
-function toPausedRow(execution: Execution, now: number): PausedRow {
-  const pausedOn = execution.pausedOn;
-  if (pausedOn === undefined) {
-    // Defensive — listPaused only returns status:"paused" rows, which always
-    // carry pausedOn (manager.ts invariant). A row without it is corrupt
-    // state; surface it rather than silently drop the row.
+function toPausedRow(row: PausedRowWire, now: number): PausedRow {
+  const pausedOn = row.pausedOn;
+  if (pausedOn === null || pausedOn === undefined) {
+    // Defensive — the daemon projects only status:"paused" rows, which
+    // always carry pausedOn (manager.ts invariant). A row without it is
+    // corrupt state; surface it rather than silently drop the row.
     throw new Error(
-      `[conduit approvals] listPaused returned a paused row with no pausedOn. Context: { executionId: ${execution.id} }`,
+      `[conduit approvals] the daemon returned a paused row with no pausedOn. Context: { executionId: ${row.executionId} }`,
     );
   }
   return {
-    executionId: execution.id,
+    executionId: row.executionId,
     tool: pausedOn.toolName,
-    waitingSince: execution.startedAt,
+    waitingSince: row.startedAt,
     expiresAt: pausedOn.expiresAt,
     expired: pausedOn.expiresAt < now,
   };
@@ -120,10 +226,13 @@ export async function runList(
   args: { json: boolean },
   deps: ApprovalsDeps,
 ): Promise<ApprovalsResult> {
-  const { store } = await deps.openStore(deps.env);
-  const paused = await store.executions.listPaused();
+  const answer = await ask(deps, { kind: "approvals.list" }, "list");
+  if (!answer.ok) {
+    deps.stderr(answer.line);
+    return { exitCode: answer.exitCode };
+  }
   const now = deps.now();
-  const rows = paused.map((execution) => toPausedRow(execution, now));
+  const rows = (answer.payload as PausedRowWire[]).map((row) => toPausedRow(row, now));
 
   if (args.json) {
     deps.stdout(
@@ -152,16 +261,25 @@ const EXPIRED_LINE =
  * one source of truth for the wording, whichever branch reports it (the
  * applied-deny informational line and the generic paused arm).
  */
-function pausedAgainGuidance(pending: { toolName: string; reason: string }): string {
-  return (
-    `paused again on a new approval: ${pending.toolName} (${pending.reason}). ` +
-    `Run "conduit approvals list" to see the queue and decide again.`
-  );
+function pausedAgainGuidance(pending: { toolName: string; reason: string } | undefined): string {
+  // `pending` is optional on the wire projection (`ExecutePayload`) even
+  // though the daemon always fills it for a paused arm. The fallback keeps
+  // the ACTIONABLE half of the guidance — the queue command — rather than
+  // printing "undefined (undefined)" at an operator, since the projection's
+  // optionality is a type fact this command does not get to assume away.
+  return pending === undefined
+    ? 'paused again on a new approval. Run "conduit approvals list" to see the queue and decide again.'
+    : `paused again on a new approval: ${pending.toolName} (${pending.reason}). ` +
+        `Run "conduit approvals list" to see the queue and decide again.`;
 }
 
-/** One rendering of a SandboxError for operator-facing lines. */
-function formatSandboxError(error: { name: string; message: string }): string {
-  return `${error.name}: ${error.message}`;
+/**
+ * One rendering of the projected error envelope for operator-facing lines.
+ * `code` carries what the raw `SandboxError.name` used to, so the operator
+ * text is unchanged across the daemon conversion.
+ */
+function formatOutcomeError(error: { code: string; message: string } | undefined): string {
+  return error === undefined ? "an unreported error" : `${error.code}: ${error.message}`;
 }
 
 export async function runDecide(
@@ -174,10 +292,14 @@ export async function runDecide(
     return { exitCode: 1 };
   }
 
-  const { env, store } = await deps.openStore(deps.env);
-  // M6: fresh runtime per invocation — never cached across calls.
-  const runtime = await deps.createRuntime({ store, allowPrivateEgress: env.allowPrivateEgress });
-  const outcome = await runtime.manager.resume(executionId, { kind });
+  // The daemon drives the resume — including the M6 fresh-runtime-per-call
+  // rule, which now holds on the side that owns the store.
+  const answer = await ask(deps, { kind: "approvals.resume", executionId, decision: kind }, kind);
+  if (!answer.ok) {
+    deps.stderr(answer.line);
+    return { exitCode: answer.exitCode };
+  }
+  const outcome = answer.payload as ResumePayload;
 
   // Deny verb-truth: the exit code and the "denied" line report the OPERATOR'S
   // VERB, and the verb's success is `decisionApplied` — the manager's host-side
@@ -199,7 +321,7 @@ export async function runDecide(
     } else {
       const driveOutcome =
         outcome.status === "failed"
-          ? `failed (${formatSandboxError(outcome.error)})`
+          ? `failed (${formatOutcomeError(outcome.error)})`
           : outcome.status;
       deps.stderr(
         `[conduit approvals] The deny was applied; the execution then settled as ${driveOutcome}.\n`,
@@ -223,7 +345,7 @@ export async function runDecide(
   }
   if (outcome.status === "conflict" || outcome.status === "failed") {
     if (outcome.status === "failed") {
-      deps.stderr(`[conduit approvals] ${kind} failed: ${formatSandboxError(outcome.error)}\n`);
+      deps.stderr(`[conduit approvals] ${kind} failed: ${formatOutcomeError(outcome.error)}\n`);
     } else {
       deps.stderr(
         `[conduit approvals] ${kind}: execution ${executionId} was not in a resumable (paused) state.\n`,
@@ -251,26 +373,33 @@ export async function runDecide(
   return { exitCode: 0 };
 }
 
+export interface ApprovalsOptions {
+  /** Defaults to the uid-derived `DEFAULT_CONDUIT_DIR` (design §3.1). */
+  stateDir?: string;
+}
+
 /** Production entrypoint wired into the CLI dispatch (bin.ts). */
-export async function approvals(argv: string[]): Promise<number> {
-  // Route sandbox module-recovery diagnostics to this command's stderr, ONCE
-  // (the sink is process-global; this is the CLI process's entry point). A
-  // resumed execution can itself overflow, so the operator sees the recovery.
-  logSandboxDiagnosticsTo((line) => PROD_DEPS.stderr(line));
+export async function approvals(argv: string[], opts: ApprovalsOptions = {}): Promise<number> {
+  // NOTE: sandbox module-recovery diagnostics are registered by the DAEMON
+  // (`conduitd.ts`), not here — the same move `server.ts` made in D-B1.
+  // Since Task 7 this process runs no sandbox at all: a resumed execution
+  // replays inside the daemon, so a sink installed here could never fire,
+  // and leaving one would imply this process still executes guest code.
+  const deps = prodDeps(opts.stateDir ?? DEFAULT_CONDUIT_DIR);
   const [sub, ...rest] = argv;
   switch (sub) {
     case "list": {
       const json = rest.includes("--json");
-      const result = await runList({ json }, PROD_DEPS);
+      const result = await runList({ json }, deps);
       return result.exitCode;
     }
     case "approve":
     case "deny": {
-      const result = await runDecide(sub, rest[0], PROD_DEPS);
+      const result = await runDecide(sub, rest[0], deps);
       return result.exitCode;
     }
     default: {
-      PROD_DEPS.stderr(
+      deps.stderr(
         `[conduit approvals] Unknown subcommand: ${sub ?? "(none)"}. Usage: conduit approvals list|approve|deny [<execution-id>]\n`,
       );
       return 1;

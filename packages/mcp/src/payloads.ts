@@ -5,6 +5,7 @@ import type {
   ExecutionOutcome,
   JsonSchema,
   PendingApproval,
+  ResumeOutcome,
 } from "@conduithq/sdk";
 
 /** Shared agent-visible error envelope (design M8). */
@@ -29,6 +30,31 @@ export interface ExecutePayload {
   pending?: PendingView;
   message?: string;
 }
+
+/**
+ * The `approvals.resume` projection — `ExecutePayload` plus the one field
+ * the operator-facing verb contract cannot be honored without.
+ *
+ * **Why `decisionApplied` is on the wire.** `conduit approvals` reports the
+ * OPERATOR'S VERB, and the verb's success is whether the staged decision was
+ * consumed by the pending call — host-side truth the invoker records (sdk
+ * D6). It is deliberately NOT derivable from anything else here: an applied
+ * deny can present as `completed` (the guest caught the block) and an
+ * unapplied one as `failed` with a guest-forged `ConduitPolicyBlocked` name,
+ * so a client keying on status or error name gets the answer wrong in both
+ * directions. Dropping the field would silently degrade the daemon path to
+ * exactly the name-matching PR #40 removed.
+ *
+ * **Why it is still a projection, not the raw `ResumeOutcome`.** The raw
+ * outcome carries `SandboxError` and `PendingApproval` straight off the
+ * pipeline, and `PendingApproval.input` is the paused call's ARGUMENTS.
+ * Widening the RESPONSE of an existing kind with one boolean is not a
+ * capability widening — `approvals` could already call `approvals.resume`
+ * and already learned the drive's fate — but shipping the raw row would be
+ * a shape regression against the §3.3 rule that the socket carries service
+ * operations, never database access. Nothing here is credential-bearing.
+ */
+export type ResumePayload = ExecutePayload & { decisionApplied: boolean };
 
 /** Independent of ExecutePayload — check adds "running"/"not_found" states. */
 export interface CheckPayloadBody {
@@ -171,6 +197,18 @@ export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
     case "conflict":
       return { status: "conflict", executionId: outcome.executionId, message: CONFLICT_MESSAGE };
   }
+}
+
+/**
+ * Projects a `ResumeOutcome` for the `approvals.resume` response.
+ *
+ * Reuses `outcomeToPayload` for the drive-outcome half rather than
+ * re-deriving it, so the two answers can never disagree about how a given
+ * status presents, and attaches the independent `decisionApplied` axis. See
+ * `ResumePayload` for why that field is on the wire.
+ */
+export function resumeToPayload(outcome: ResumeOutcome): ResumePayload {
+  return { ...outcomeToPayload(outcome), decisionApplied: outcome.decisionApplied };
 }
 
 export function executionToCheckPayload(

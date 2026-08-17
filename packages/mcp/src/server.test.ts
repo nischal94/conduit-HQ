@@ -11,6 +11,7 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { beforeEach, describe, expect, it } from "vitest";
+import { RESUME_ADMISSION_DEADLINE_MS } from "./daemon/connection.js";
 import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
 import { buildCatalogListing, executionToCheckPayload, outcomeToPayload } from "./payloads.js";
 import { createApprovalRuntime } from "./runtime.js";
@@ -21,6 +22,7 @@ import {
   EXECUTE_ADMISSION_DEADLINE_MS,
   EXECUTE_CLIENT_DEADLINE_MS,
   READ_DEADLINE_MS,
+  RESUME_CLIENT_DEADLINE_MS,
 } from "./server.js";
 
 /**
@@ -439,6 +441,34 @@ describe("createConduitMcpServer", () => {
     // execute-sized budget would make a wedged daemon hang a tools/list
     // for minutes.
     expect(READ_DEADLINE_MS).toBeLessThan(EXECUTE_CLIENT_DEADLINE_MS);
+  });
+
+  it("INVARIANT §17 / §5: `approvals.resume` carries a RUN-sized budget, not a read's — the same ordering constraint as execute", () => {
+    // A resume is not a read. `connection.ts` admits it through the SAME
+    // ExecutionQueue as execute (so it may wait out
+    // RESUME_ADMISSION_DEADLINE_MS) and then it DRIVES a paused
+    // execution's replay, bounded by §16's wall clock. Handing it
+    // READ_DEADLINE_MS would abandon an approve that is merely queued
+    // behind the concurrency cap and report §5 ambiguity — telling an
+    // operator their decision may or may not have landed on an execution
+    // that would have completed normally seconds later.
+    const worstLegalResumeAnswer =
+      RESUME_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs;
+    expect(RESUME_CLIENT_DEADLINE_MS).toBeGreaterThan(worstLegalResumeAnswer);
+
+    // Wired, not merely declared.
+    expect(
+      deadlineForRequest({
+        kind: "approvals.resume",
+        executionId: "e",
+        decision: "approve",
+      }),
+    ).toBe(RESUME_CLIENT_DEADLINE_MS);
+    expect(RESUME_CLIENT_DEADLINE_MS).toBeGreaterThan(READ_DEADLINE_MS);
+
+    // `approvals.list` IS a read — answered outside the queue, like the
+    // D-B1 reads — so it keeps the short budget.
+    expect(deadlineForRequest({ kind: "approvals.list" })).toBe(READ_DEADLINE_MS);
   });
 
   it("execute forwards requestKey to the daemon only when the agent supplied one", async () => {

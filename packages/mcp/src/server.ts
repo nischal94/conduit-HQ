@@ -7,6 +7,7 @@ import {
   McpError,
   type Tool as McpToolDefinition,
 } from "@modelcontextprotocol/sdk/types.js";
+import { RESUME_ADMISSION_DEADLINE_MS } from "./daemon/connection.js";
 import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
 import {
   type CatalogListing,
@@ -118,9 +119,32 @@ export const EXECUTE_CLIENT_DEADLINE_MS =
  */
 export const READ_DEADLINE_MS = 30_000;
 
+/**
+ * The client budget for `approvals.resume` (Task 7).
+ *
+ * Derived by THE SAME ordering constraint documented above, because a
+ * resume is subject to the same two server-side bounds: `connection.ts`
+ * admits it through the identical `ExecutionQueue` (so it may wait out
+ * `RESUME_ADMISSION_DEADLINE_MS`) and then it drives a paused execution's
+ * replay, which is sandbox execution bounded by §16's wall clock. A resume
+ * is therefore NOT a read and must never carry `READ_DEADLINE_MS`: an
+ * approve that merely queues behind the concurrency cap would be abandoned
+ * client-side and reported as §5 ambiguity, telling the operator their
+ * decision may or may not have landed on an execution that was going to
+ * complete normally seconds later.
+ *
+ * The admission constant is imported from the daemon rather than
+ * re-declared, so the two cannot drift apart silently — the whole point of
+ * the constraint is that the client outlasts the daemon's own bound.
+ */
+export const RESUME_CLIENT_DEADLINE_MS =
+  RESUME_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs + 30_000;
+
 /** The per-kind client budget. See the ordering constraint above. */
 export function deadlineForRequest(request: RpcRequest): number {
-  return request.kind === "execute" ? EXECUTE_CLIENT_DEADLINE_MS : READ_DEADLINE_MS;
+  if (request.kind === "execute") return EXECUTE_CLIENT_DEADLINE_MS;
+  if (request.kind === "approvals.resume") return RESUME_CLIENT_DEADLINE_MS;
+  return READ_DEADLINE_MS;
 }
 
 /**
