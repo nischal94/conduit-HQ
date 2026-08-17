@@ -1,5 +1,5 @@
-import { execFile } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -10,18 +10,39 @@ import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { bundleDaemonHelper, type HelperBundle } from "./daemon/helpers/bundle.js";
 
 /**
- * Ring-2 integration suite (task 10): drives the REAL COMPILED bin
- * (`dist/bin.js`) over real stdio child processes — the only ring that
+ * Ring-2 integration suite: drives the REAL stdio server over real child
+ * processes against a REAL daemon on a REAL Unix socket — the only ring that
  * proves stdout purity, cross-process approval, and client-timeout survival,
  * none of which the ring-1 InMemoryTransport suite (server.test.ts) can
- * exercise. Each `it` spawns its own bin (or two, for the approval case) so
- * failures stay isolated; the shared fixtures below (db path, key, upstream
- * server) are set up once in beforeAll and reused across cases.
+ * exercise. Each `it` spawns its own serve process so failures stay isolated;
+ * the shared fixtures below (state dir, key, upstream server, daemon) are set
+ * up once in beforeAll and reused across cases.
  *
- * NOT safe for `.concurrent`: cases mutate the shared `src_gh` source row
- * (policy flips, the slow-upstream repoint) and must run sequentially.
+ * Since Task 6 the topology is two processes deep — agent → serve → daemon →
+ * db — and the pieces that moved are worth stating, because they are what the
+ * cases now have to arrange:
+ *
+ * - The **state directory**, not `CONDUIT_DB`, is the unit of isolation: the
+ *   daemon derives its db path from it, and a client that sets `CONDUIT_DB`
+ *   is refused at handshake (§9.3 item 3).
+ * - The **daemon is started by hand** (design §3.1's supported override
+ *   path), because auto-start deliberately strips every `CONDUIT_*` and
+ *   `HOME` — a test must not weaken that boundary to redirect it.
+ * - The **egress opt-in belongs to the daemon**: it runs the sandbox and
+ *   makes the upstream calls, so the fail-closed case starts a daemon
+ *   without it rather than unsetting a client variable that is never read.
+ * - **Direct store writes** (policy seeding, the slow-upstream repoint) are
+ *   only legitimate when no daemon owns that database — hence the per-case
+ *   state directories and the stop-first sequence in the approval case.
+ *
+ * `dist/bin.js` is still exercised directly by the flag/doctor cases below,
+ * which are the paths that do not go through a daemon.
+ *
+ * NOT safe for `.concurrent`: cases mutate shared rows and must run
+ * sequentially.
  */
 
 const execFileAsync = promisify(execFile);
@@ -141,14 +162,112 @@ function startMcpServer(delayMs = 0): Promise<{
 }
 
 const scratch = mkdtempSync(join(tmpdir(), "conduit-mcp-it-"));
-const dbPath = join(scratch, "it.db");
+/**
+ * The daemon's state directory — 0700, as `assertStateDir(bind)` requires.
+ *
+ * Since Task 6 the serve process opens no database: the DAEMON does, and it
+ * derives every path from its state directory (`daemonPaths`), so the db
+ * lives at `<stateDir>/conduit.db` rather than at a `CONDUIT_DB` of the
+ * test's choosing. A client-supplied `CONDUIT_DB` is now refused at
+ * handshake by design (§9.3 item 3), which is exactly why this suite
+ * supplies the state directory instead — the one supported way to point a
+ * daemon somewhere else is to start it BY HAND, which is what it does.
+ */
+const stateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-state-"));
+chmodSync(stateDir, 0o700);
+const dbPath = join(stateDir, "conduit.db");
 const masterKey = SecretBox.generateKeyBytes();
 const masterKeyB64 = Buffer.from(masterKey).toString("base64");
 const binPath = join(process.cwd(), "dist", "bin.js");
 
-/** Seeds one source/integration/connection/secret + tools, in-process. */
-async function seedStore(policy: "allow" | "require_approval"): Promise<void> {
-  const client = createClient({ url: `file:${dbPath}` });
+let bundle: HelperBundle | undefined;
+
+/**
+ * Starts the daemon by hand against `stateDir` and waits for "listening".
+ *
+ * Spawned with `CONDUIT_MASTER_KEY` set — design §3.1 supports the env
+ * override precisely for a daemon an operator starts by hand, and never
+ * through auto-start (`spawnDaemon` strips every `CONDUIT_*`). A test
+ * daemon is that operator.
+ */
+function startDaemonAt(
+  dir: string,
+  opts: { allowPrivateEgress?: boolean } = {},
+): Promise<ChildProcess> {
+  if (bundle === undefined) throw new Error("[integration.test] helper bundle not built");
+  return startDaemonWith(bundle.helper, dir, opts);
+}
+
+function startDaemonWith(
+  helper: string,
+  dir: string,
+  opts: { allowPrivateEgress?: boolean } = {},
+): Promise<ChildProcess> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [helper, dir], {
+      stdio: ["ignore", "pipe", "inherit"],
+      // The egress opt-in belongs to the DAEMON now, not to the client:
+      // it runs the sandbox and makes every upstream call, and §9.3's
+      // default-only decision means a client's flag never transfers. The
+      // loopback fixture upstream is a private address, so without this
+      // every tool call in the suite is correctly refused. Set here, on a
+      // daemon started BY HAND, which is the supported path (§3.1).
+      env: daemonEnv(opts.allowPrivateEgress !== false),
+    });
+    const timer = setTimeout(() => reject(new Error("daemon did not report listening")), 30_000);
+    let buf = "";
+    child.stdout?.on("data", (chunk: Buffer) => {
+      buf += chunk.toString("utf8");
+      if (buf.includes("listening")) {
+        clearTimeout(timer);
+        resolve(child);
+      }
+    });
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`daemon exited early with code ${code}. Output: ${buf}`));
+    });
+    daemons.push(child);
+  });
+}
+
+/** Every daemon this suite starts, killed in afterAll. */
+const daemons: ChildProcess[] = [];
+
+/**
+ * The environment a hand-started test daemon runs under.
+ *
+ * When `allowPrivateEgress` is false the variable is DELETED rather than
+ * merely left unset: the ambient environment that runs the test suite may
+ * itself export it, and inheriting it there would silently turn the
+ * fail-closed case into a fail-open one that still passes for the wrong
+ * reason.
+ */
+function daemonEnv(allowPrivateEgress: boolean): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env, CONDUIT_MASTER_KEY: masterKeyB64 };
+  if (allowPrivateEgress) {
+    env.CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS = "1";
+  } else {
+    delete env.CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS;
+  }
+  return env;
+}
+
+/** Seeds one source/integration/connection/secret + tools into the suite's db. */
+function seedStore(policy: "allow" | "require_approval"): Promise<void> {
+  return seedStoreAt(dbPath, policy);
+}
+
+/**
+ * Seeds a database directly, in-process.
+ *
+ * Only ever called while NO daemon owns that path — before the daemon
+ * starts, or between the stop and restart of one. A direct open beside a
+ * live daemon would be exactly the second writer §17 exists to eliminate.
+ */
+async function seedStoreAt(targetDb: string, policy: "allow" | "require_approval"): Promise<void> {
+  const client = createClient({ url: `file:${targetDb}` });
   const store = await openSqliteStore({
     client,
     secretBox: await SecretBox.fromKeyBytes(masterKey),
@@ -192,11 +311,19 @@ let mcpLocation: string;
 const clients: Client[] = [];
 const transports: StdioClientTransport[] = [];
 
-/** Spawns a fresh bin + connected Client; tracked for teardown. */
-async function spawnClient(env: Record<string, string>): Promise<Client> {
+/**
+ * Spawns a fresh serve process + connected Client; tracked for teardown.
+ *
+ * Runs the REAL `runStdioServer` in a REAL child over REAL stdio (the
+ * `run-serve` fixture is a three-line wrapper that passes the state
+ * directory and nothing else), so everything this ring exists to prove —
+ * stdout purity, cross-process approval, client-timeout survival — is
+ * still proven against genuine processes and a genuine socket.
+ */
+async function spawnClient(env: Record<string, string>, dir = stateDir): Promise<Client> {
   const transport = new StdioClientTransport({
     command: "node",
-    args: [binPath],
+    args: [serveHelper(), dir],
     env,
     stderr: "pipe",
   });
@@ -205,6 +332,11 @@ async function spawnClient(env: Record<string, string>): Promise<Client> {
   await client.connect(transport);
   clients.push(client);
   return client;
+}
+
+function serveHelper(): string {
+  if (bundle === undefined) throw new Error("[integration.test] helper bundle not built");
+  return bundle.serve;
 }
 
 function textPayload(res: Awaited<ReturnType<Client["callTool"]>>): unknown {
@@ -233,8 +365,22 @@ function drainStderr(transport: StdioClientTransport): Promise<string> {
   });
 }
 
+/**
+ * The environment a SERVE process runs under.
+ *
+ * Deliberately carries NO `CONDUIT_DB`: since Task 6 a client whose env
+ * sets it is refused at handshake with `refused-custom-db` (§9.3 item 3),
+ * so a test still exporting it would be testing the refusal path by
+ * accident. The database is the daemon's, reached through its state
+ * directory. `PATH` is inherited so the spawned `node` resolves.
+ *
+ * `CONDUIT_MASTER_KEY` stays only because it is inert here — the serve
+ * process no longer opens a store, and it never transfers to the daemon
+ * (`spawnDaemon` strips every `CONDUIT_*`). Keeping it proves that
+ * inertness rather than assuming it.
+ */
 const baseEnv = (): Record<string, string> => ({
-  CONDUIT_DB: dbPath,
+  ...(process.env as Record<string, string>),
   CONDUIT_MASTER_KEY: masterKeyB64,
   CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
 });
@@ -242,8 +388,14 @@ const baseEnv = (): Record<string, string> => ({
 beforeAll(async () => {
   upstream = await startMcpServer();
   mcpLocation = `http://127.0.0.1:${upstream.port}/mcp`;
+  // Seed BEFORE the daemon starts: it opens the db at startup and is then
+  // its sole owner, so the fixture rows must already be there.
   await seedStore("allow");
-}, 30_000);
+  bundle = await bundleDaemonHelper();
+  // The one daemon every serve process in this suite talks to; tracked in
+  // `daemons` and killed in afterAll like every other.
+  await startDaemonWith(bundle.helper, stateDir);
+}, 120_000);
 
 afterEach(async () => {
   for (const client of clients.splice(0)) {
@@ -259,10 +411,18 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  // SIGKILL, not SIGTERM: a clean drain waits out the grace window for any
+  // connection that saw READY, and teardown does not need to exercise that
+  // path — the drain tests own it.
+  for (const child of daemons) {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }
+  bundle?.cleanup();
   await new Promise<void>((resolve) => {
     upstream.server.close(() => resolve());
   });
   rmSync(scratch, { recursive: true, force: true });
+  rmSync(stateDir, { recursive: true, force: true });
 });
 
 describe("ring-2: spawned bin integration", () => {
@@ -301,17 +461,23 @@ describe("ring-2: spawned bin integration", () => {
   });
 
   it("INVARIANT M8: stdout purity — every stdout byte the client transport did NOT consume is protocol-framed", async () => {
-    // A bin against a FRESH, UNSEEDED db (its own temp CONDUIT_DB) with the
-    // egress opt-in set: startup writes BOTH diagnostics the brief names —
-    // the egress WARNING and the empty-catalog "0 sources" hint (bin.ts) —
-    // and both MUST land on stderr only. A corrupted stdout kills the whole
-    // JSON-RPC session, so the full protocol conversation below succeeding
-    // is itself the stdout-purity proof.
-    const emptyDbPath = join(scratch, "empty-purity.db"); // cleaned with scratch in afterAll
+    // A serve process against a FRESH, UNSEEDED daemon (its own empty state
+    // directory) with the egress opt-in set: startup writes BOTH
+    // diagnostics the brief names — the egress WARNING and the
+    // empty-catalog "0 sources" hint — and both MUST land on stderr only.
+    // A corrupted stdout kills the whole JSON-RPC session, so the full
+    // protocol conversation below succeeding is itself the purity proof.
+    //
+    // Its own daemon, not the shared one: the hint fires on an EMPTY
+    // catalog, and the suite's daemon is seeded. The state directory is
+    // the unit of isolation now that the db path derives from it.
+    const emptyStateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-purity-"));
+    chmodSync(emptyStateDir, 0o700);
+    await startDaemonAt(emptyStateDir); // tracked in `daemons`, killed in afterAll
     const transport = new StdioClientTransport({
       command: "node",
-      args: [binPath],
-      env: { ...baseEnv(), CONDUIT_DB: emptyDbPath },
+      args: [serveHelper(), emptyStateDir],
+      env: baseEnv(),
       stderr: "pipe",
     });
     transports.push(transport);
@@ -345,43 +511,68 @@ describe("ring-2: spawned bin integration", () => {
   });
 
   it("pause → approve from a SEPARATE child process → poll sees the persisted result", async () => {
-    await seedStore("require_approval");
-    try {
-      const client = await spawnClient(baseEnv());
-      const paused = await client.callTool({
-        name: "execute",
-        arguments: {
-          code: 'return await tools.github.delete_repo({ repo: "site" });',
-          requestKey: "rk-approve-1",
-        },
-      });
-      const pausedPayload = textPayload(paused) as {
-        status: string;
-        executionId: string;
-        pending: { toolName: string };
-      };
-      expect(pausedPayload.status).toBe("paused");
-      expect(pausedPayload.pending.toolName).toBe("github.delete_repo");
-      const { executionId } = pausedPayload;
+    // Its own state directory and its own daemon, for two reasons that are
+    // both consequences of Task 6:
+    //
+    // 1. The `require_approval` policy is seeded by a DIRECT store write,
+    //    which is only legitimate while no daemon owns that database — so
+    //    the seeding happens before this daemon starts.
+    // 2. `approve-demo.mjs` still opens the store directly (the approvals
+    //    path is Task 7's conversion, not this one). Running it beside a
+    //    live daemon would be the very second-writer situation §17 exists
+    //    to eliminate, so the daemon is STOPPED first and restarted after —
+    //    the same stop-first posture `key rotate` takes (§3.4).
+    //
+    // The property under test is unchanged and still real: an approval
+    // granted by a different process is visible to a serve session that
+    // never saw it happen, because the state is durable rather than
+    // in-memory.
+    const approvalStateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-approve-"));
+    chmodSync(approvalStateDir, 0o700);
+    const approvalDb = join(approvalStateDir, "conduit.db");
+    await seedStoreAt(approvalDb, "require_approval");
 
-      // Separate one-shot child process approver (Task 9's script) — NOT the
-      // same bin process that is still running and holding the MCP session.
-      await execFileAsync("node", ["../../scripts/approve-demo.mjs", executionId], {
-        cwd: process.cwd(),
-        env: { ...process.env, ...baseEnv() },
-      });
+    const first = await startDaemonAt(approvalStateDir);
+    const client = await spawnClient(baseEnv(), approvalStateDir);
+    const paused = await client.callTool({
+      name: "execute",
+      arguments: {
+        code: 'return await tools.github.delete_repo({ repo: "site" });',
+        requestKey: "rk-approve-1",
+      },
+    });
+    const pausedPayload = textPayload(paused) as {
+      status: string;
+      executionId: string;
+      pending: { toolName: string };
+    };
+    expect(pausedPayload.status).toBe("paused");
+    expect(pausedPayload.pending.toolName).toBe("github.delete_repo");
+    const { executionId } = pausedPayload;
 
-      const checked = await client.callTool({
-        name: "check_execution",
-        arguments: { executionId },
-      });
-      const checkedPayload = textPayload(checked) as { status: string; result: unknown };
-      expect(checkedPayload.status).toBe("completed");
-      expect(checkedPayload.result).toEqual(ISSUES_RESULT);
-    } finally {
-      await seedStore("allow");
-    }
-  });
+    // Stop the daemon so the direct-access approver is the ONLY opener.
+    first.kill("SIGKILL");
+    await new Promise<void>((resolve) => first.once("exit", () => resolve()));
+
+    // Separate one-shot child process approver — never the process that
+    // ran the execution.
+    await execFileAsync("node", ["../../scripts/approve-demo.mjs", executionId], {
+      cwd: process.cwd(),
+      env: { ...process.env, ...baseEnv(), CONDUIT_DB: approvalDb },
+    });
+
+    // A NEW daemon over the same durable state, and a new serve session:
+    // the approval must be visible to a process that did not witness it.
+    await startDaemonAt(approvalStateDir);
+    const poller = await spawnClient(baseEnv(), approvalStateDir);
+    const checked = await poller.callTool({
+      name: "check_execution",
+      arguments: { executionId },
+    });
+    const checkedPayload = textPayload(checked) as { status: string; result: unknown };
+    expect(checkedPayload.status).toBe("completed");
+    expect(checkedPayload.result).toEqual(ISSUES_RESULT);
+  }, 60_000);
 
   it("client timeout on a slow call: server survives; the row settles; requestKey recovers it", async () => {
     const slow = await startMcpServer(3_000);
@@ -483,10 +674,19 @@ describe("ring-2: spawned bin integration", () => {
     expect(seenRepos).toEqual(expect.arrayContaining(["one", "two"]));
   });
 
-  it("egress fail-closed: WITHOUT the opt-in env, the loopback call fails and the agent-visible error hints at the operator override WITHOUT naming the env var", async () => {
-    const env = baseEnv();
-    delete (env as Record<string, string | undefined>).CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS;
-    const client = await spawnClient(env as Record<string, string>);
+  it("egress fail-closed: WITHOUT the opt-in on the DAEMON, the loopback call fails and the agent-visible error hints at the operator override WITHOUT naming the env var", async () => {
+    // The opt-in is the DAEMON's property now: it runs the sandbox and
+    // makes the upstream call, and §9.3 default-only means a client's own
+    // env never transfers. So fail-closed is exercised by starting a
+    // daemon WITHOUT it — deleting the variable from the client's
+    // environment (what this test used to do) would now prove nothing,
+    // since the client's value was never consulted in the first place.
+    const closedStateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-closed-"));
+    chmodSync(closedStateDir, 0o700);
+    await seedStoreAt(join(closedStateDir, "conduit.db"), "allow");
+    await startDaemonAt(closedStateDir, { allowPrivateEgress: false });
+
+    const client = await spawnClient(baseEnv(), closedStateDir);
     const res = await client.callTool({
       name: "execute",
       arguments: { code: 'return await tools.github.list_issues({ owner: "a", repo: "b" });' },
@@ -556,23 +756,45 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     });
   });
 
-  it("no flag + missing CONDUIT_MASTER_KEY: startup fails fast, exits 1 with a stderr diagnostic", async () => {
+  it("no flag + an unreachable daemon: startup fails, exits 1, and the diagnostic names the daemon log", async () => {
+    // BEHAVIOR CHANGE, recorded deliberately (Task 6 / D-B1). This case
+    // used to assert "Missing master key" from the serve process itself.
+    // The serve process no longer resolves a key or opens a store — the
+    // DAEMON does — so a missing key is now a daemon startup failure that
+    // the client observes as an unreachable daemon.
+    //
+    // Design §5 anticipated exactly this and set the contract accordingly:
+    // "An earlier revision promised byte-identical startup errors. That is
+    // the wrong contract once auto-start introduces readiness,
+    // child-process, and IPC failure layers. The contract is instead:
+    // stable error codes, redacted cause, actionable operator guidance."
+    //
+    // So what is pinned here is the ACTIONABLE part: a non-zero exit, and
+    // a message that points at the daemon's own log — the only place the
+    // real cause (the missing key) can be read. The key-resolution
+    // diagnostic itself is still pinned verbatim, on the paths that still
+    // own it: the two `--doctor` cases above.
     const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nohome-"));
+    const isolatedStateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nokey-"));
+    chmodSync(isolatedStateDir, 0o700);
     try {
-      const env: Record<string, string | undefined> = {
-        ...process.env,
-        ...baseEnv(),
-        HOME: emptyHome,
-      };
+      const env: Record<string, string | undefined> = { ...process.env, HOME: emptyHome };
       delete env.CONDUIT_MASTER_KEY;
-      await expect(execFileAsync("node", [binPath], { env })).rejects.toMatchObject({
+      delete env.CONDUIT_DB;
+      // The serve fixture rather than `binPath`: a state directory the test
+      // owns is the only way to exercise auto-start without racing the
+      // real `~/.conduit` daemon on the developer's machine.
+      await expect(
+        execFileAsync("node", [serveHelper(), isolatedStateDir], { env, timeout: 60_000 }),
+      ).rejects.toMatchObject({
         code: 1,
-        stderr: expect.stringMatching(/Missing master key/),
+        stderr: expect.stringMatching(/Daemon unavailable/),
       });
     } finally {
       rmSync(emptyHome, { recursive: true, force: true });
+      rmSync(isolatedStateDir, { recursive: true, force: true });
     }
-  });
+  }, 90_000);
 
   it("--doctor resolves the default ~/.conduit/master-key path end-to-end with no CONDUIT_MASTER_KEY set", async () => {
     // Proves the headline default-path resolution: a valid 0600 key file at

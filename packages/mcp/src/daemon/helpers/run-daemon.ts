@@ -57,6 +57,18 @@ const hugeExecute = rest.includes("--huge-execute");
 /** Delays the bind so a client sees a healthy STARTING daemon. */
 const delayBindFlag = rest.indexOf("--delay-bind-ms");
 const delayBindMs = delayBindFlag === -1 ? 0 : Number(rest[delayBindFlag + 1] ?? 0);
+/**
+ * Seeds one source/integration/connection/secret so `catalog.listing` has
+ * something to project. Written through the sweep seam because that is the
+ * one hook that runs with the daemon's OWN store, after both locks are held
+ * and before the endpoint is bound — so the rows are durably in place
+ * before any client can connect, with no second opener involved.
+ *
+ * The seeded connection deliberately carries a `credentialRef` pointing at
+ * a real stored secret: the §3.3.1 assertion is that neither ever reaches
+ * the wire, which is vacuous unless they actually exist.
+ */
+const seedCatalog = rest.includes("--seed-catalog");
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
@@ -71,31 +83,53 @@ function forever(): Promise<never> {
  */
 const realSweep = rest.includes("--sweep-on-start");
 
-const sweep: CrashTerminalSweep | undefined = realSweep
+const sweep: CrashTerminalSweep | undefined = seedCatalog
   ? async (store) => {
-      await sweepOrphanedExecutions(store, (line) => {
-        console.log(line);
+      await store.sources.upsert({
+        id: "src_gh",
+        type: "mcp",
+        namespace: "github",
+        location: "http://127.0.0.1:1/mcp",
       });
+      await store.integrations.upsert({
+        id: "int_gh",
+        sourceId: "src_gh",
+        namespace: "github",
+      });
+      await store.connections.upsert({
+        id: "conn_gh",
+        integrationId: "int_gh",
+        prefix: "github.acme.prod",
+        credentialRef: "cred_gh",
+      });
+      await store.secrets.put("cred_gh", "Bearer ghp_seeded_secret_do_not_leak");
+      console.log("seeded catalog");
     }
-  : stallSweep || sweepMarker !== undefined || delayBindMs > 0
-    ? async () => {
-        if (sweepMarker !== undefined) writeFileSync(sweepMarker, "swept");
-        if (delayBindMs > 0) {
-          // Holds startup in the window a real daemon occupies while the
-          // store opens and the sweep runs: lifecycle lock HELD, socket
-          // not yet bound. A client probing here sees "busy" with nothing
-          // to connect to — the healthy STARTING state.
-          console.log("delaying bind");
-          await new Promise((resolve) => setTimeout(resolve, delayBindMs));
-        }
-        if (stallSweep) {
-          // Blocks startup after both locks are held and before bind —
-          // the window where a signal must still unwind cleanly.
-          console.log("stalling sweep");
-          await forever();
-        }
+  : realSweep
+    ? async (store) => {
+        await sweepOrphanedExecutions(store, (line) => {
+          console.log(line);
+        });
       }
-    : undefined;
+    : stallSweep || sweepMarker !== undefined || delayBindMs > 0
+      ? async () => {
+          if (sweepMarker !== undefined) writeFileSync(sweepMarker, "swept");
+          if (delayBindMs > 0) {
+            // Holds startup in the window a real daemon occupies while the
+            // store opens and the sweep runs: lifecycle lock HELD, socket
+            // not yet bound. A client probing here sees "busy" with nothing
+            // to connect to — the healthy STARTING state.
+            console.log("delaying bind");
+            await new Promise((resolve) => setTimeout(resolve, delayBindMs));
+          }
+          if (stallSweep) {
+            // Blocks startup after both locks are held and before bind —
+            // the window where a signal must still unwind cleanly.
+            console.log("stalling sweep");
+            await forever();
+          }
+        }
+      : undefined;
 
 /**
  * Stalls one execution inside the store/manager layer, which §16's
@@ -153,9 +187,19 @@ const createRuntime = stallSandbox
               // frame. The sandbox's default maxOutputBytes EQUALS
               // FRAME_CAP, so the envelope around a max-size payload
               // necessarily overflows — no hostile input required.
+              //
+              // Returns a real `completed` ExecutionOutcome rather than a
+              // bare object: since D-B1 the daemon projects the outcome
+              // through `outcomeToPayload` BEFORE framing, and a shape
+              // with no `status` projects to `undefined` — which frames
+              // small and would make this test pass while pinning nothing.
               start: async () => {
                 console.log("huge execute");
-                return { oversize: "x".repeat(FRAME_CAP) } as never;
+                return {
+                  status: "completed",
+                  executionId: "exec_huge",
+                  value: { oversize: "x".repeat(FRAME_CAP) },
+                } as never;
               },
             },
           };

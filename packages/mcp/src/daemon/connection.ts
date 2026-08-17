@@ -18,6 +18,7 @@
  */
 import type { Socket } from "node:net";
 import { type ConduitStore, InMemoryCatalog } from "@conduithq/sdk";
+import { buildCatalogListing, executionToCheckPayload, outcomeToPayload } from "../payloads.js";
 import type { createApprovalRuntime } from "../runtime.js";
 import {
   DepthExceeded,
@@ -553,10 +554,57 @@ async function handleRequest(
         async () => {
           // M6: a fresh runtime per unit of work — never cached.
           const { manager } = await createRuntime({ store, allowPrivateEgress, log });
-          return await manager.start(request.code);
+          // requestKey is forwarded only when the client sent one — the
+          // manager persists it BEFORE the sandbox runs, which is what
+          // makes a reissue return `conflict` rather than starting a
+          // second run against side effects that already landed (§M1).
+          // Projected daemon-side, like every other D-B1 response: the
+          // raw `ExecutionOutcome` carries `pending.reason`/`error` shapes
+          // straight off the pipeline, and the §M8 agent-facing envelope
+          // (`ExecutePayload`) is the vetted view of them. Projecting here
+          // keeps one wire contract and one place where agent-visible
+          // wording is decided.
+          return outcomeToPayload(
+            await manager.start(
+              request.code,
+              request.requestKey !== undefined ? { requestKey: request.requestKey } : undefined,
+            ),
+          );
         },
         deps,
       );
+      return;
+    }
+    /**
+     * D-B1 reads. All three answer with a projection computed here, so
+     * no repository row shape ever reaches an agent-facing client.
+     *
+     * They are answered OUTSIDE the ExecutionQueue, unlike `execute` and
+     * `approvals.resume`. That is deliberate: the queue exists to bound
+     * concurrent SANDBOX execution (§3.1 — N clients driving one QuickJS
+     * module), and these are bounded store reads that touch neither the
+     * sandbox nor an upstream. Routing them through the cap would let a
+     * `tools/list` sit behind four long-running executions, turning a
+     * metadata read into a stall — while adding nothing, since a read
+     * cannot exhaust the resource the cap protects. `approvals.list`,
+     * the existing read of the same character, is handled the same way.
+     */
+    case "execution.get": {
+      // The §M1 CheckPayload projection, computed on the DAEMON's clock
+      // (controller ruling): `paused`-past-TTL presents as `expired`, and
+      // that comparison belongs to the process that owns the row rather
+      // than to whichever client happens to ask.
+      const execution = await store.executions.get(request.executionId);
+      sendResult(ctx, requestId, executionToCheckPayload(execution, Date.now()), log);
+      return;
+    }
+    case "execution.getByRequestKey": {
+      const execution = await store.executions.getByRequestKey(request.requestKey);
+      sendResult(ctx, requestId, executionToCheckPayload(execution, Date.now()), log);
+      return;
+    }
+    case "catalog.listing": {
+      sendResult(ctx, requestId, await buildCatalogListing(store, log), log);
       return;
     }
     case "search": {

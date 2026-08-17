@@ -431,6 +431,205 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
+    "routes sandbox module-recovery diagnostics to the DAEMON's log — and leaks no guest code",
+    async () => {
+      // Moved here from server.test.ts by D-B1: the sandbox now runs
+      // daemon-side, so `runDaemon` owns the process-global recovery sink.
+      // A real overflow through a real daemon, then a benign call that
+      // rebuilds — the events must reach the daemon's own log in the
+      // "[sandbox]" format, carrying NO guest code or values.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({
+        kind: "execute",
+        code: "let x = { secretMarker: 1 }; for (let i=0;i<20000;i++) x={n:x}; return x;",
+        deadlineMs: 60_000,
+      });
+      await client.next();
+      client.send({ kind: "execute", code: "return 1;", deadlineMs: 60_000 });
+      await client.next();
+
+      await waitFor(() => daemon.lines.some((l) => l.includes("sandbox.module.recovery.ok")));
+      const diag = daemon.lines.filter((l) => l.includes("[sandbox] "));
+      expect(diag.some((l) => l.includes("sandbox.module.poisoned"))).toBe(true);
+      expect(diag.some((l) => l.includes("sandbox.module.recovery.ok"))).toBe(true);
+      // §11: no diagnostic line carries guest code or guest values.
+      for (const line of diag) {
+        expect(line).not.toContain("secretMarker");
+        expect(line).not.toContain('"n"');
+      }
+
+      // Close before signalling: a READY-granted connection counts as
+      // active work, so the D6 drain grace would otherwise hold this
+      // daemon for the full DRAIN_DEADLINE_MS with nothing left to do.
+      client.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * D-B1 (controller-ruled): the three read-only kinds `serve` gained so the
+   * stdio server could stop opening the database itself. Driven against a
+   * REAL spawned daemon over the real socket, because what needs pinning is
+   * the whole path — capability check, dispatch, projection — not the
+   * projection functions alone (`server.test.ts` covers those in ring 1).
+   */
+  it(
+    "INVARIANT §17 / §3.3: the D-B1 reads answer with PROJECTIONS carrying no credential material",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--seed-catalog"]);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      client.send({ kind: "catalog.listing" });
+      const listing = (await client.next()) as {
+        kind: string;
+        payload: { connections: { prefix: string; label: string }[]; sourceCount: number };
+      };
+      expect(listing.kind).toBe("result");
+      // The advertisement view: the seeded connection is listed by prefix
+      // and namespace label, and the source count drives the startup hint.
+      expect(listing.payload.connections).toEqual([
+        { prefix: "github.acme.prod", label: "github tools" },
+      ]);
+      expect(listing.payload.sourceCount).toBe(1);
+
+      // §3.3.1, pinned on the WIRE rather than by reading the code: the
+      // connection row this projection derives from carries a
+      // `credentialRef`, and no field of it — nor the secret it points at —
+      // may appear in any byte the daemon sent. A future refactor that
+      // spreads the row instead of naming two fields fails here.
+      const wire = JSON.stringify(listing.payload);
+      expect(wire).not.toContain("credentialRef");
+      expect(wire).not.toContain("cred_gh");
+      expect(wire).not.toContain("secret");
+      expect(Object.keys(listing.payload.connections[0] ?? {}).sort()).toEqual(["label", "prefix"]);
+
+      // An unknown execution is `not_found`, never an error frame — "no
+      // such row" is a legitimate answer to a lookup, and collapsing it
+      // into a failure would make an agent retry a question already
+      // answered.
+      client.send({ kind: "execution.get", executionId: "exec_does_not_exist" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "not_found" },
+      });
+      client.send({ kind: "execution.getByRequestKey", requestKey: "rk-nope" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "not_found" },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: execute.requestKey round-trips — the same key returns conflict, never a second run",
+    async () => {
+      // §M1's duplicate suppression, end to end through the daemon. The
+      // key is persisted BEFORE the sandbox runs, so a reissue after a
+      // lost response must be refused as a `conflict` rather than started
+      // again — a replayed execution can duplicate upstream side effects
+      // that already landed.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      client.send({
+        kind: "execute",
+        code: "return 41 + 1;",
+        deadlineMs: 60_000,
+        requestKey: "rk-1",
+      });
+      const first = (await client.next()) as {
+        kind: string;
+        payload: { status: string; executionId: string; result: unknown };
+      };
+      expect(first.kind).toBe("result");
+      expect(first.payload.status).toBe("completed");
+      expect(first.payload.result).toBe(42);
+
+      // Same key again: refused as a conflict, and the SAME execution is
+      // then recoverable by that key — which is the whole point of the
+      // field (recover, don't re-run).
+      client.send({
+        kind: "execute",
+        code: "return 41 + 1;",
+        deadlineMs: 60_000,
+        requestKey: "rk-1",
+      });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "conflict" },
+      });
+
+      client.send({ kind: "execution.getByRequestKey", requestKey: "rk-1" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "completed", executionId: first.payload.executionId, result: 42 },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17 / §3.3: the D-B1 reads are denied to every capability except serve",
+    async () => {
+      // The ruling widened `serve` ALONE. An administrative client must not
+      // acquire an execution lookup as a side effect of that widening.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      for (const capability of ["approvals", "add-mcp"]) {
+        const client = await connectClient(paths.socket);
+        await handshake(client, capability);
+        for (const request of [
+          { kind: "catalog.listing" },
+          { kind: "execution.get", executionId: "exec_x" },
+          { kind: "execution.getByRequestKey", requestKey: "rk-x" },
+        ]) {
+          client.send(request);
+          expect(await client.next()).toMatchObject({
+            kind: "error",
+            code: "invalid",
+            message: expect.stringContaining(`does not permit "${request.kind}"`),
+          });
+        }
+        client.socket.destroy(); // see the drain-grace note above
+      }
+
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
     "INVARIANT §17: a client whose env sets CONDUIT_DB is refused at handshake",
     async () => {
       const stateDir = newStateDir();

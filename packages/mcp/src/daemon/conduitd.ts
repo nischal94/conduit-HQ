@@ -25,7 +25,7 @@
 import { type Stats, statSync, unlinkSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
-import type { ConduitStore } from "@conduithq/sdk";
+import { type ConduitStore, logSandboxDiagnosticsTo } from "@conduithq/sdk";
 import { createApprovalRuntime } from "../runtime.js";
 import { openStoreFromEnv } from "../store-open.js";
 import {
@@ -378,6 +378,15 @@ export class ExecutionQueue {
 export async function runDaemon(opts: RunDaemonOptions): Promise<void> {
   const log = opts.log ?? ((line: string) => console.error(line));
   const paths = daemonPaths(opts.stateDir);
+
+  // Route sandbox module-recovery diagnostics (gate-two DoS fix) to the
+  // daemon's log — ONCE, at startup. The sink is process-global (the
+  // shared QuickJS module is too), and since D-B1 the daemon is the only
+  // process that RUNS a sandbox: `createConduitMcpServer` registered this
+  // while it owned the execution runtime, but a serve process that
+  // executes nothing would never fire it. Registering here keeps §16
+  // recovery observable instead of silently losing it in the move.
+  logSandboxDiagnosticsTo(log);
 
   // Signals are armed BEFORE the first blocking startup step. Registering
   // them only once serving begins leaves a window — lock acquisition,

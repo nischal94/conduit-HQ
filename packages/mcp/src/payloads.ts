@@ -1,4 +1,5 @@
 import type {
+  ConduitStore,
   ExecuteToolDefinition,
   Execution,
   ExecutionOutcome,
@@ -39,6 +40,32 @@ export interface CheckPayloadBody {
   message?: string;
 }
 export type CheckPayload = { status: "not_found" } | CheckPayloadBody;
+
+/**
+ * The `catalog.listing` projection (D-B1): everything the stdio server
+ * needs to build `tools/list` and its startup diagnostics, and nothing
+ * else.
+ *
+ * Deliberately a PROJECTION rather than the repository rows it derives
+ * from. `store.connections.list()` returns rows carrying `credentialRef`,
+ * and putting that shape on the socket would hand an agent-facing client
+ * a handle to stored credential material — precisely the §3.3.1 failure
+ * mode the capability split exists to prevent. Here the daemon decides
+ * what is advertisable and sends only that: an addressing prefix and a
+ * human label.
+ */
+export interface CatalogListing {
+  connections: ConnectionListingView[];
+  /** Drives the "0 sources — onboard one" startup hint; a count, never the rows. */
+  sourceCount: number;
+}
+
+export interface ConnectionListingView {
+  /** Addressing prefix, e.g. `github.acme.prod`. */
+  prefix: string;
+  /** Human label, e.g. `github tools`. */
+  label: string;
+}
 
 /** ~4 chars/token heuristic, same shape as the sdk's estimateTokens. */
 export function estimateDefinitionTokens(definition: unknown): number {
@@ -191,4 +218,51 @@ export function executionToCheckPayload(
 
 export function toTextResult(payload: unknown): { content: [{ type: "text"; text: string }] } {
   return { content: [{ type: "text", text: JSON.stringify(payload) }] };
+}
+
+/**
+ * Builds the `catalog.listing` projection from a live store. Runs
+ * DAEMON-SIDE (D-B1) — it moved here from `server.ts` when the stdio
+ * server stopped holding a store of its own, and this is now the only
+ * place the connection rows are read.
+ *
+ * One line per namespace by construction — §18 v1: single connection per
+ * namespace; the invoker FAILS CLOSED on multi-connection integrations, so
+ * an integration with >1 connection is deliberately NOT advertised ("every
+ * advertised connection is selectable" — design M6). Ambiguous namespaces
+ * get one log line so the operator knows why they're absent; that line now
+ * lands in the daemon's log rather than the serve process's stderr, which
+ * is where the store it describes actually lives.
+ */
+export async function buildCatalogListing(
+  store: ConduitStore,
+  log: (line: string) => void,
+): Promise<CatalogListing> {
+  const [connections, integrations, sources] = await Promise.all([
+    store.connections.list(),
+    store.integrations.list(),
+    store.sources.list(),
+  ]);
+  const namespaceById = new Map(integrations.map((i) => [i.id, i.namespace]));
+  const byIntegration = new Map<string, typeof connections>();
+  for (const c of connections) {
+    byIntegration.set(c.integrationId, [...(byIntegration.get(c.integrationId) ?? []), c]);
+  }
+  const listed: ConnectionListingView[] = [];
+  for (const [integrationId, group] of byIntegration) {
+    const namespace = namespaceById.get(integrationId) ?? "unknown";
+    const only = group[0];
+    if (group.length === 1 && only !== undefined) {
+      // ONLY prefix and label cross the socket. `only` also carries
+      // `credentialRef`; spreading the row here instead of naming two
+      // fields is how a credential handle would reach an agent-facing
+      // client, so the field list is the boundary and stays explicit.
+      listed.push({ prefix: only.prefix, label: `${namespace} tools` });
+    } else {
+      log(
+        `[ConduitMcp] namespace ${namespace} has ${group.length} connections — v1 addressing is single-connection per namespace (§18); not advertised.`,
+      );
+    }
+  }
+  return { connections: listed, sourceCount: sources.length };
 }

@@ -60,8 +60,24 @@ async function main(): Promise<void> {
     return;
   }
   if (arg === "--daemon") {
+    // `--state-dir <path>` runs the daemon against a non-default state
+    // directory. This is the OPERATOR-BY-HAND path design §3.1 already
+    // sanctions (the same posture as `CONDUIT_MASTER_KEY`), and it is an
+    // argument rather than an environment variable on purpose: auto-start
+    // constructs the child's environment from an allowlist and strips
+    // every `CONDUIT_*`, so an env-based override would be both ignored
+    // there and, if honored, exactly the client-chosen redirection §9.3
+    // removes. A client can never reach this — only a person running the
+    // command can.
+    const at = process.argv.indexOf("--state-dir");
+    const override = at === -1 ? undefined : process.argv[at + 1];
+    if (at !== -1 && (override === undefined || override.startsWith("--"))) {
+      console.error("[conduitd] --state-dir requires a path argument");
+      process.exitCode = 1;
+      return;
+    }
     try {
-      await runDaemon({ stateDir: DEFAULT_CONDUIT_DIR, sweep: sweepDaemonStore });
+      await runDaemon({ stateDir: override ?? DEFAULT_CONDUIT_DIR, sweep: sweepDaemonStore });
     } catch (error) {
       // The two refusal paths carry their own exit codes (§3.5's client
       // decision table) — a client branches on the code, not on prose.

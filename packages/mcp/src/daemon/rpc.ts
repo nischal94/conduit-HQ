@@ -43,9 +43,56 @@ export type RpcRequest =
        */
       dbPath?: string;
     }
-  | { kind: "execute"; code: string; deadlineMs: number }
+  | {
+      kind: "execute";
+      code: string;
+      deadlineMs: number;
+      /**
+       * The §M1 correlation key, persisted BEFORE the sandbox runs so a
+       * lost response can be recovered via `execution.getByRequestKey`
+       * rather than re-executed. Optional because it is
+       * agent-supplied — but load-bearing when present: it is what makes
+       * a reissued `execute` return `conflict` instead of starting a
+       * second run against the same upstream side effects.
+       */
+      requestKey?: string;
+    }
   | { kind: "search"; query: string }
   | { kind: "describe"; toolName: string }
+  /**
+   * D-B1 (controller-ruled, 2026-08-18): three read-only kinds the
+   * agent-facing `serve` process genuinely performs today and could not
+   * perform through the original §3.3 row.
+   *
+   * Design §3.3's `serve` row ("execute, search, describe") was written
+   * against the §6 four-step vocabulary the AGENT uses inside the
+   * sandbox, not against the store reads the serve PROCESS performs
+   * outside it — and design line 383 already mandated that the startup
+   * reads "become daemon calls at process start" without ever defining
+   * the calls. These three close that gap.
+   *
+   * All three are reads, and each answers with a PROJECTION computed
+   * daemon-side, never a repository row: `catalog.listing` returns the
+   * advertisement view (`{connections, sourceCount}`), and the two
+   * execution lookups return the §M1 `CheckPayload`. That keeps §3.3's
+   * "the socket carries service operations, never database access" — a
+   * proxied `connections.list()` would hand a client `credentialRef`,
+   * which is exactly the shape §3.3.1 exists to forbid.
+   *
+   * §8's "no widening beyond the §3.3 row" is not crossed in spirit:
+   * its own rationale names administrative verbs, and nothing here
+   * mutates anything or returns credential-adjacent material.
+   */
+  | { kind: "execution.get"; executionId: string }
+  | { kind: "execution.getByRequestKey"; requestKey: string }
+  /**
+   * Nullary on purpose: the client supplies NO parameters, so it cannot
+   * narrow, filter, or steer what comes back. The daemon returns exactly
+   * the advertisement projection it chooses, which makes "a client asked
+   * for a row it should not see" unrepresentable rather than merely
+   * unimplemented.
+   */
+  | { kind: "catalog.listing" }
   | { kind: "approvals.list" }
   | { kind: "approvals.resume"; executionId: string; decision: "approve" | "deny" }
   | { kind: "source.provision"; namespace: string; url: string; secret?: string }
@@ -140,9 +187,12 @@ export function decodeRequest(v: unknown): RpcRequest {
       return handshake;
     }
     case "execute": {
-      assertNoExtraKeys(v, ["kind", "code", "deadlineMs"]);
+      assertNoExtraKeys(v, ["kind", "code", "deadlineMs", "requestKey"]);
       if (!isString(v.code)) {
         throw new InvalidRpcRequest("execute.code must be a string");
+      }
+      if (v.requestKey !== undefined && !isString(v.requestKey)) {
+        throw new InvalidRpcRequest("execute.requestKey must be a string when present");
       }
       // Finite and non-negative, not merely "a number". `NaN`, `-1` and
       // `Infinity` are all typeof "number" and each corrupts the
@@ -155,7 +205,35 @@ export function decodeRequest(v: unknown): RpcRequest {
           "execute.deadlineMs must be a finite, non-negative number of milliseconds",
         );
       }
-      return { kind: "execute", code: v.code, deadlineMs: v.deadlineMs };
+      // Built conditionally, like handshake.dbPath: an absent key must
+      // stay ABSENT rather than become `requestKey: undefined`, which
+      // would make `"requestKey" in request` true for a request that
+      // carries none and hand `manager.start` an explicit undefined.
+      const execute: RpcRequest = { kind: "execute", code: v.code, deadlineMs: v.deadlineMs };
+      if (v.requestKey !== undefined) {
+        (execute as { requestKey?: string }).requestKey = v.requestKey;
+      }
+      return execute;
+    }
+    case "execution.get": {
+      assertNoExtraKeys(v, ["kind", "executionId"]);
+      if (!isString(v.executionId)) {
+        throw new InvalidRpcRequest("execution.get.executionId must be a string");
+      }
+      return { kind: "execution.get", executionId: v.executionId };
+    }
+    case "execution.getByRequestKey": {
+      assertNoExtraKeys(v, ["kind", "requestKey"]);
+      if (!isString(v.requestKey)) {
+        throw new InvalidRpcRequest("execution.getByRequestKey.requestKey must be a string");
+      }
+      return { kind: "execution.getByRequestKey", requestKey: v.requestKey };
+    }
+    case "catalog.listing": {
+      // Nullary: any field at all is a client trying to steer a
+      // projection it does not get to shape.
+      assertNoExtraKeys(v, ["kind"]);
+      return { kind: "catalog.listing" };
     }
     case "search": {
       assertNoExtraKeys(v, ["kind", "query"]);
@@ -220,7 +298,17 @@ export const CAPABILITIES: Record<
   "serve" | "approvals" | "add-mcp",
   ReadonlySet<RpcRequest["kind"]>
 > = {
-  serve: new Set(["execute", "search", "describe", "handshake"]),
+  // D-B1 added the three read-only kinds; the row stays free of every
+  // administrative verb, which is what §8's prohibition actually guards.
+  serve: new Set([
+    "execute",
+    "search",
+    "describe",
+    "handshake",
+    "execution.get",
+    "execution.getByRequestKey",
+    "catalog.listing",
+  ]),
   approvals: new Set(["approvals.list", "approvals.resume", "handshake"]),
   "add-mcp": new Set(["source.provision", "source.revalidate", "handshake"]),
 };

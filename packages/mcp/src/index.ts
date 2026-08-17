@@ -16,6 +16,10 @@ export {
   outcomeToPayload,
 } from "./payloads.js";
 export { type ApprovalRuntime, createApprovalRuntime } from "./runtime.js";
-export { runStdioServer } from "./runtime-stdio.js";
-export { type ConduitMcpServerOptions, createConduitMcpServer } from "./server.js";
+export { type RunStdioServerOptions, runStdioServer } from "./runtime-stdio.js";
+export {
+  type ConduitMcpServerOptions,
+  createConduitMcpServer,
+  type DaemonCall,
+} from "./server.js";
 export { openStoreClientFromEnv, openStoreFromEnv } from "./store-open.js";

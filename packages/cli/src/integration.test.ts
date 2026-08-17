@@ -1,5 +1,5 @@
-import { execFile } from "node:child_process";
-import { mkdtempSync, rmSync } from "node:fs";
+import { type ChildProcess, execFile, spawn } from "node:child_process";
+import { chmodSync, mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -142,14 +142,77 @@ function startMcpServer(): Promise<{
 }
 
 const scratch = mkdtempSync(join(tmpdir(), "conduit-cli-it-"));
-const dbPath = join(scratch, "it.db");
+/**
+ * The daemon's state directory — 0700, as the §3.2 boundary check requires.
+ *
+ * Since Task 6 `conduit serve` opens no database: the daemon does, and it
+ * derives its db path from this directory. A client that sets `CONDUIT_DB`
+ * is refused at handshake (§9.3 item 3), so the state directory — not the
+ * db path — is what a test varies.
+ */
+const stateDir = mkdtempSync(join(tmpdir(), "conduit-cli-it-state-"));
+chmodSync(stateDir, 0o700);
+const dbPath = join(stateDir, "conduit.db");
 const masterKey = SecretBox.generateKeyBytes();
 const masterKeyB64 = Buffer.from(masterKey).toString("base64");
 const cliBinPath = join(process.cwd(), "dist", "bin.js");
+/** The compiled mcp bin — `--daemon --state-dir` is the by-hand start path. */
+const mcpBinPath = join(process.cwd(), "..", "mcp", "dist", "bin.js");
+
+/** Every daemon this suite starts, killed in afterAll. */
+const daemons: ChildProcess[] = [];
+
+/**
+ * Starts a daemon by hand against `dir` and resolves once it is listening.
+ *
+ * `CONDUIT_MASTER_KEY` and the egress opt-in are set HERE, on the daemon,
+ * because the daemon is what opens the store and makes upstream calls —
+ * §9.3 default-only means a client's own values never transfer to it.
+ */
+function startDaemonAt(dir: string): Promise<ChildProcess> {
+  return new Promise((resolve, reject) => {
+    const child = spawn(process.execPath, [mcpBinPath, "--daemon", "--state-dir", dir], {
+      stdio: ["ignore", "pipe", "pipe"],
+      env: {
+        ...process.env,
+        CONDUIT_MASTER_KEY: masterKeyB64,
+        CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
+      },
+    });
+    daemons.push(child);
+    const timer = setTimeout(() => reject(new Error("daemon did not report listening")), 30_000);
+    let seen = "";
+    // The daemon logs lifecycle lines to stderr by default (bin.ts), which
+    // is also where its inherited log descriptor points in production.
+    const watch = (chunk: Buffer): void => {
+      seen += chunk.toString("utf8");
+      if (seen.includes("listening")) {
+        clearTimeout(timer);
+        resolve(child);
+      }
+    };
+    child.stdout?.on("data", watch);
+    child.stderr?.on("data", watch);
+    child.once("error", reject);
+    child.once("exit", (code) => {
+      clearTimeout(timer);
+      reject(new Error(`daemon exited early with code ${code}. Output: ${seen}`));
+    });
+  });
+}
 
 /** Seeds one source/integration/connection/secret + tools, in-process. */
 async function seedStore(): Promise<void> {
-  const client = createClient({ url: `file:${dbPath}` });
+  return seedStoreAt(dbPath);
+}
+
+/**
+ * Seeds a database directly. Only ever called while NO daemon owns that
+ * path — a direct open beside a live daemon is the second writer §17
+ * exists to eliminate.
+ */
+async function seedStoreAt(targetDb: string): Promise<void> {
+  const client = createClient({ url: `file:${targetDb}` });
   const store = await openSqliteStore({
     client,
     secretBox: await SecretBox.fromKeyBytes(masterKey),
@@ -194,10 +257,10 @@ const clients: Client[] = [];
 const transports: StdioClientTransport[] = [];
 
 /** Spawns `conduit serve` via the compiled CLI bin + a connected Client. */
-async function spawnClient(env: Record<string, string>): Promise<Client> {
+async function spawnClient(env: Record<string, string>, dir = stateDir): Promise<Client> {
   const transport = new StdioClientTransport({
     command: "node",
-    args: [cliBinPath, "serve"],
+    args: [cliBinPath, "serve", "--state-dir", dir],
     env,
     stderr: "pipe",
   });
@@ -217,17 +280,36 @@ function textPayload(res: Awaited<ReturnType<Client["callTool"]>>): unknown {
   return JSON.parse(first.text);
 }
 
+/**
+ * The environment a `conduit serve` process runs under.
+ *
+ * Carries NO `CONDUIT_DB`: a client that sets it is refused at handshake
+ * (§9.3 item 3), so exporting it would exercise the refusal path by
+ * accident. `CONDUIT_MASTER_KEY` stays because the approvals command —
+ * still a direct-store consumer until Task 7 — needs it; it is inert for
+ * `serve`, which opens nothing.
+ */
 const baseEnv = (): Record<string, string> => ({
+  ...(process.env as Record<string, string>),
   CONDUIT_DB: dbPath,
   CONDUIT_MASTER_KEY: masterKeyB64,
   CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
 });
 
+/** `serve`'s own env — the one that must NOT carry CONDUIT_DB. */
+const serveEnv = (): Record<string, string> => {
+  const env = baseEnv();
+  delete (env as Record<string, string | undefined>).CONDUIT_DB;
+  return env;
+};
+
 beforeAll(async () => {
   upstream = await startMcpServer();
   mcpLocation = `http://127.0.0.1:${upstream.port}/mcp`;
+  // Seed BEFORE the daemon opens the db and becomes its sole owner.
   await seedStore();
-}, 30_000);
+  await startDaemonAt(stateDir);
+}, 60_000);
 
 afterEach(async () => {
   for (const client of clients.splice(0)) {
@@ -243,15 +325,21 @@ afterEach(async () => {
 });
 
 afterAll(async () => {
+  // SIGKILL, not SIGTERM: a clean drain waits out the grace window for any
+  // READY-granted connection, and teardown need not exercise that path.
+  for (const child of daemons) {
+    if (child.exitCode === null) child.kill("SIGKILL");
+  }
   await new Promise<void>((resolve) => {
     upstream.server.close(() => resolve());
   });
   rmSync(scratch, { recursive: true, force: true });
+  rmSync(stateDir, { recursive: true, force: true });
 });
 
 describe("ring-2: conduit serve (spawned CLI bin)", () => {
   it("workflow: conduit serve exposes the two-tool MCP surface via tools/list", async () => {
-    const client = await spawnClient(baseEnv());
+    const client = await spawnClient(serveEnv());
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
 
@@ -277,15 +365,23 @@ describe("ring-2: conduit serve (spawned CLI bin)", () => {
   });
 
   it("INVARIANT /mcp M8: stdout purity holds through conduit serve — every stdout byte the client transport did NOT consume is protocol-framed", async () => {
-    // A fresh, unseeded db + the egress opt-in: startup writes both
-    // diagnostics (the egress WARNING and the empty-catalog "0 sources"
-    // hint, from the shared runStdioServer seam) — both MUST land on
-    // stderr only, or the JSON-RPC framing below would desync.
-    const emptyDbPath = join(scratch, "empty-purity.db"); // cleaned with scratch in afterAll
+    // A fresh, UNSEEDED daemon + the egress opt-in on the client: startup
+    // writes both diagnostics (the client-side egress WARNING and the
+    // empty-catalog "0 sources" hint, from the shared runStdioServer seam)
+    // — both MUST land on stderr only, or the JSON-RPC framing below would
+    // desync.
+    //
+    // Its own state directory rather than its own CONDUIT_DB: the hint
+    // fires on an EMPTY catalog and the suite's daemon is seeded, and the
+    // state directory is the unit of isolation now that the db path
+    // derives from it.
+    const emptyStateDir = mkdtempSync(join(tmpdir(), "conduit-cli-it-purity-"));
+    chmodSync(emptyStateDir, 0o700);
+    await startDaemonAt(emptyStateDir);
     const transport = new StdioClientTransport({
       command: "node",
-      args: [cliBinPath, "serve"],
-      env: { ...baseEnv(), CONDUIT_DB: emptyDbPath },
+      args: [cliBinPath, "serve", "--state-dir", emptyStateDir],
+      env: serveEnv(),
       stderr: "pipe",
     });
     transports.push(transport);
@@ -419,7 +515,24 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
 });
 
 describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop through conduit serve", () => {
-  const approvalsDbPath = join(scratch, "approvals-it.db"); // cleaned with scratch in afterAll
+  /**
+   * Its own state directory, because this suite mixes the two access
+   * models that Task 6 left temporarily side by side:
+   *
+   * - `conduit serve` reaches the database ONLY through the daemon.
+   * - `conduit approvals` still opens the store DIRECTLY — converting it
+   *   is Task 7's job, not Task 6's.
+   *
+   * Those cannot both be live against one database without recreating the
+   * dual-ownership §17 exists to eliminate, so the daemon is stopped
+   * before the approvals commands run and a fresh one is started after —
+   * the same stop-first posture `key rotate` takes (§3.4). This is an
+   * INTERIM shape: once Task 7 lands, `approvals` becomes a daemon client
+   * and the stop/restart dance disappears.
+   */
+  const approvalsStateDir = mkdtempSync(join(tmpdir(), "conduit-cli-it-appr-"));
+  chmodSync(approvalsStateDir, 0o700);
+  const approvalsDbPath = join(approvalsStateDir, "conduit.db");
 
   async function runApprovals(
     args: string[],
@@ -433,6 +546,18 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
       const err = error as { stdout?: string; stderr?: string; code?: number };
       return { stdout: err.stdout ?? "", stderr: err.stderr ?? "", exitCode: err.code ?? 1 };
     }
+  }
+
+  /**
+   * Stops ONLY this suite's daemon, so a direct opener is alone against
+   * `approvalsDbPath`. Scoped to a single child rather than the shared
+   * `daemons` registry — killing the suite-wide daemon here would break
+   * every other case.
+   */
+  async function stopDaemon(child: ChildProcess): Promise<void> {
+    if (child.exitCode !== null) return;
+    child.kill("SIGKILL");
+    await new Promise<void>((resolve) => child.once("exit", () => resolve()));
   }
 
   beforeAll(async () => {
@@ -477,7 +602,8 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
   }, 30_000);
 
   it("workflow: execute pauses on require_approval → approvals list shows it → approvals approve resumes it to completion", async () => {
-    const client = await spawnClient({ ...baseEnv(), CONDUIT_DB: approvalsDbPath });
+    const first = await startDaemonAt(approvalsStateDir);
+    const client = await spawnClient(serveEnv(), approvalsStateDir);
     const paused = await client.callTool({
       name: "execute",
       arguments: {
@@ -489,8 +615,12 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     expect(pausedPayload.status).toBe("paused");
     const { executionId } = pausedPayload;
 
-    // `approvals list` (a SEPARATE spawned process — the server child above
-    // is still holding the MCP session) shows the paused execution.
+    // Stop the daemon before the direct-store approvals commands run — see
+    // the suite docblock for why the two access models cannot overlap yet.
+    await stopDaemon(first);
+
+    // `approvals list` (a SEPARATE spawned process) shows the paused
+    // execution, read from the same durable state the daemon left behind.
     const listResult = await runApprovals(["list", "--json"]);
     expect(listResult.exitCode).toBe(0);
     const rows = JSON.parse(listResult.stdout) as Array<{ executionId: string; tool: string }>;
@@ -504,17 +634,23 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     expect(approveResult.stdout.trim()).toBe("completed");
     expect(upstream.upstreamCalls.some((c) => c.name === "delete_repo")).toBe(true);
 
-    // The original session's check_execution confirms the persisted result.
-    const checked = await client.callTool({
+    // `approvals list` is now empty — the resumed execution is no longer
+    // paused. Read while the daemon is still stopped, so this is the last
+    // of the direct-store reads.
+    const listAfter = await runApprovals(["list", "--json"]);
+    const rowsAfter = JSON.parse(listAfter.stdout) as Array<{ executionId: string }>;
+    expect(rowsAfter.some((r) => r.executionId === executionId)).toBe(false);
+
+    // A NEW daemon and a NEW serve session confirm the persisted result:
+    // the approval was granted by a process that this session never saw,
+    // and it is visible because the state is durable rather than in-memory.
+    await startDaemonAt(approvalsStateDir);
+    const poller = await spawnClient(serveEnv(), approvalsStateDir);
+    const checked = await poller.callTool({
       name: "check_execution",
       arguments: { executionId },
     });
     const checkedPayload = textPayload(checked) as { status: string };
     expect(checkedPayload.status).toBe("completed");
-
-    // `approvals list` is now empty — the resumed execution is no longer paused.
-    const listAfter = await runApprovals(["list", "--json"]);
-    const rowsAfter = JSON.parse(listAfter.stdout) as Array<{ executionId: string }>;
-    expect(rowsAfter.some((r) => r.executionId === executionId)).toBe(false);
-  });
+  }, 60_000);
 });
