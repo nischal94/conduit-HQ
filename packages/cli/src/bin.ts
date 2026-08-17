@@ -49,8 +49,21 @@ async function runCommand(command: Command, args: string[]): Promise<number> {
       await serve(parsed.stateDir !== undefined ? { stateDir: parsed.stateDir } : {});
       return 0;
     }
-    case "add-mcp":
-      return addMcp(args);
+    case "add-mcp": {
+      // Threaded since Task 8, for the same reason `serve` and `approvals`
+      // thread it: this command now selects a DAEMON, and therefore which
+      // database it provisions into. Read from the flag only, never the
+      // environment.
+      const parsed = takeStateDir("add-mcp", args);
+      if ("error" in parsed) {
+        process.stderr.write(parsed.error);
+        return 1;
+      }
+      return addMcp(
+        parsed.rest,
+        parsed.stateDir !== undefined ? { stateDir: parsed.stateDir } : {},
+      );
+    }
     case "approvals": {
       const parsed = takeStateDir("approvals", args);
       if ("error" in parsed) {

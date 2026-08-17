@@ -14,8 +14,13 @@ export const MAX_RESPONSE_BYTES = 5 * 1024 * 1024;
 export const MAX_TOOLS = 1024;
 
 /** Absolute whole-operation deadline for onboarding: handshake + tools/list
- * (+ any pagination / one session-expiry retry) must all complete within it. */
-const ONBOARDING_DEADLINE_MS = 5000;
+ * (+ any pagination / one session-expiry retry) must all complete within it.
+ *
+ * Exported since Task 8: this is the DAEMON-side bound on a
+ * `source.provision`/`source.revalidate`, and `server.ts` derives the
+ * client budget for those kinds from it so the client cannot abandon a
+ * fetch the daemon is still legitimately performing. */
+export const ONBOARDING_DEADLINE_MS = 5000;
 
 /**
  * `add-mcp`'s upstream precondition (design §2.2, §18-C4/C5): fetch

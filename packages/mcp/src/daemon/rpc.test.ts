@@ -33,17 +33,38 @@ describe("decodeRequest", () => {
         kind: "source.provision",
         namespace: "ns",
         url: "https://example.com",
+        prefix: "ns.p",
         secret: "s3cr3t",
+        replace: false,
+        clearCredential: false,
       }),
     ).toEqual({
       kind: "source.provision",
       namespace: "ns",
       url: "https://example.com",
+      prefix: "ns.p",
       secret: "s3cr3t",
+      replace: false,
+      clearCredential: false,
     });
+    // An absent `secret` stays ABSENT rather than becoming `secret: undefined`.
     expect(
-      decodeRequest({ kind: "source.provision", namespace: "ns", url: "https://example.com" }),
-    ).toEqual({ kind: "source.provision", namespace: "ns", url: "https://example.com" });
+      decodeRequest({
+        kind: "source.provision",
+        namespace: "ns",
+        url: "https://example.com",
+        prefix: "ns.p",
+        replace: true,
+        clearCredential: true,
+      }),
+    ).toEqual({
+      kind: "source.provision",
+      namespace: "ns",
+      url: "https://example.com",
+      prefix: "ns.p",
+      replace: true,
+      clearCredential: true,
+    });
     expect(decodeRequest({ kind: "source.revalidate", namespace: "ns" })).toEqual({
       kind: "source.revalidate",
       namespace: "ns",

@@ -95,7 +95,31 @@ export type RpcRequest =
   | { kind: "catalog.listing" }
   | { kind: "approvals.list" }
   | { kind: "approvals.resume"; executionId: string; decision: "approve" | "deny" }
-  | { kind: "source.provision"; namespace: string; url: string; secret?: string }
+  /**
+   * The onboarding write. `url` and `secret` are BOTH the operator's own
+   * data, supplied together in one request — that is the one case §3.3.1
+   * permits a client to name a destination alongside a credential, because
+   * nothing stored is being redirected outward. The daemon still applies
+   * §9.3 and never echoes the secret back.
+   *
+   * `prefix`, `replace` and `clearCredential` (Task 8) are the remaining
+   * operator decisions `add-mcp` has always taken, and they are NOT
+   * derivable from the other fields. They are safe to accept because
+   * neither carries a destination nor a credential: `replace` selects
+   * whether the daemon may retarget a namespace it already holds, and
+   * `clearCredential` selects whether the stored secret is dropped rather
+   * than preserved. Both resolve against the daemon's OWN stored row, and
+   * the credential-leak refusal in `provision.ts` sits downstream of both.
+   */
+  | {
+      kind: "source.provision";
+      namespace: string;
+      url: string;
+      prefix: string;
+      secret?: string;
+      replace: boolean;
+      clearCredential: boolean;
+    }
   | { kind: "source.revalidate"; namespace: string };
 
 export type RpcResponse =
@@ -264,17 +288,46 @@ export function decodeRequest(v: unknown): RpcRequest {
       return { kind: "approvals.resume", executionId: v.executionId, decision: v.decision };
     }
     case "source.provision": {
-      assertNoExtraKeys(v, ["kind", "namespace", "url", "secret"]);
+      assertNoExtraKeys(v, [
+        "kind",
+        "namespace",
+        "url",
+        "prefix",
+        "secret",
+        "replace",
+        "clearCredential",
+      ]);
       if (!isString(v.namespace)) {
         throw new InvalidRpcRequest("source.provision.namespace must be a string");
       }
       if (!isString(v.url)) {
         throw new InvalidRpcRequest("source.provision.url must be a string");
       }
+      if (!isString(v.prefix)) {
+        throw new InvalidRpcRequest("source.provision.prefix must be a string");
+      }
       if (v.secret !== undefined && !isString(v.secret)) {
         throw new InvalidRpcRequest("source.provision.secret must be a string when present");
       }
-      const result: RpcRequest = { kind: "source.provision", namespace: v.namespace, url: v.url };
+      // Required booleans rather than optional ones: an omitted flag would
+      // decode as `undefined` and read as false anyway, but making them
+      // explicit means a client that forgets one is TOLD so rather than
+      // silently getting the conservative branch of a decision the
+      // operator meant to take.
+      if (typeof v.replace !== "boolean") {
+        throw new InvalidRpcRequest("source.provision.replace must be a boolean");
+      }
+      if (typeof v.clearCredential !== "boolean") {
+        throw new InvalidRpcRequest("source.provision.clearCredential must be a boolean");
+      }
+      const result: RpcRequest = {
+        kind: "source.provision",
+        namespace: v.namespace,
+        url: v.url,
+        prefix: v.prefix,
+        replace: v.replace,
+        clearCredential: v.clearCredential,
+      };
       if (v.secret !== undefined) {
         (result as { secret?: string }).secret = v.secret;
       }

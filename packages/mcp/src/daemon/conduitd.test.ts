@@ -812,7 +812,7 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
-    "refuses unimplemented source RPCs distinguishably from malformed ones",
+    "answers implemented source RPCs, and still reads `invalid` on a malformed one",
     async () => {
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
@@ -822,10 +822,14 @@ describe("conduitd lifecycle", () => {
       const client = await connectClient(paths.socket);
       await handshake(client, "add-mcp");
 
-      // Well-formed and permitted for this capability, but not built:
-      // "unimplemented", never "invalid".
+      // Implemented since Task 8. A namespace with no stored source is a
+      // REFUSAL (`invalid`, carrying the operator's next move), never the
+      // old "unimplemented" placeholder — onboarding needs a url, and the
+      // only place a url may be supplied is `source.provision`.
       client.send({ kind: "source.revalidate", namespace: "ns" });
-      expect(await client.next()).toMatchObject({ kind: "error", code: "unimplemented" });
+      const refusal = (await client.next()) as { kind: string; code: string; message: string };
+      expect(refusal).toMatchObject({ kind: "error", code: "invalid" });
+      expect(refusal.message).toContain("no source is registered under namespace");
 
       // A genuinely malformed request still reads "invalid", so the two
       // remain distinguishable.

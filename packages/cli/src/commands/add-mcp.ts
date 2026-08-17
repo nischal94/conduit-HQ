@@ -1,29 +1,50 @@
-import { openStoreFromEnv } from "@conduithq/mcp";
 import {
-  type ConduitStore,
-  McpClientError,
-  normalizeMcp,
-  type RiskClass,
-  type Tool,
-} from "@conduithq/sdk";
-import { fetchToolsList } from "../mcp-fetch.js";
+  DaemonUnavailable,
+  DEFAULT_CONDUIT_DIR,
+  daemonRequest,
+  deadlineForRequest,
+  type ProvisionPayload,
+  type RpcRequest,
+  type RpcResponse,
+} from "@conduithq/mcp";
 
 /**
  * `conduit add-mcp` — atomic onboarding / re-sync of an upstream MCP source
- * (design §2.2, §4). READ CURRENT STATE FIRST: every second-run decision
- * (C3 retarget gate, C2 credential preserve-not-remove) resolves against the
- * read row before any write; the resolved writes then land in ONE
- * `provisionSource` transaction (C1).
+ * (design §2.2, §4), driven through the DAEMON since Task 8 (§17, §3.3.1).
  *
- * Injectable deps mirror the codebase's DI convention (createExecutionManager
- * takes a deps bag) so the command is unit-testable against a real store
- * without a network dependency: only `fetchTools` is mocked in tests.
+ * **This command opens no database, performs no fetch, and never sees a
+ * stored credential.** Before the conversion it did all three: it called
+ * `openStoreFromEnv`, then `store.secrets.reveal(...)` to obtain the stored
+ * credential for its onboarding fetch, then performed that fetch itself.
+ * §3.3.1 rules that out — not because the CLI is the agent (it is not, so
+ * this was never a §9.2 violation on its face), but because shipping
+ * plaintext across a new IPC boundary is the wrong default in a product
+ * built on credential containment. The daemon now performs the
+ * credential-bearing fetch on this command's behalf, and the plaintext
+ * never leaves it.
+ *
+ * The one secret that still travels client→daemon is a FRESH
+ * `CONDUIT_ADD_SECRET`: the operator is supplying it, in the same request
+ * that names its destination. That is the operator's own data going in, not
+ * a stored credential being redirected out — and it is never echoed back.
+ *
+ * **What this command may name, and what it may not.** It names a source
+ * IDENTITY (namespace, and for a first onboarding the url and prefix the
+ * operator typed). It cannot name a credential: no request shape has a
+ * field for one. `source.revalidate` carries only a namespace, and the
+ * daemon derives BOTH the url and the credential from its own stored row —
+ * which is what stops a client from pairing a daemon-held secret with an
+ * attacker-chosen destination.
+ *
+ * The single injectable dep is the daemon call itself (the DI seam that
+ * replaced `openStore` + `fetchTools`), so tests drive the whole command
+ * against a fake daemon with no sockets and no network.
  */
 
 const NAMESPACE_PATTERN = /^[a-z0-9_-]+$/;
 
 /** `conduit add-mcp --help` text (D5). dispatch.ts prints this directly
- * without invoking runAddMcp — no store open, no network. */
+ * without invoking runAddMcp — no daemon contact, no network. */
 export const USAGE = `Usage: conduit add-mcp --namespace <ns> --url <url> --prefix <prefix> [options]
 
 Register an upstream MCP source with conduit-mcp (atomic onboarding/re-sync).
@@ -51,15 +72,13 @@ export interface AddMcpArgs {
   json: boolean;
 }
 
+export type AddMcpDaemonCall = (request: RpcRequest) => Promise<RpcResponse>;
+
 export interface AddMcpDeps {
-  /** Defaults to `fetchToolsList`; injectable so tests never touch the network.
-   * `opts.authorization` carries the resolved onboarding credential (the full
-   * `Authorization` header value) — never logged, request-scoped only. */
-  fetchTools: (url: string, opts?: { authorization?: string }) => Promise<unknown[]>;
-  /** Defaults to `openStoreFromEnv`; injectable so tests can pre-open a store. */
-  openStore: (env?: NodeJS.ProcessEnv) => Promise<{ store: ConduitStore }>;
+  /** The onboarding write goes through here, capability `add-mcp`. */
+  daemon: AddMcpDaemonCall;
   env: NodeJS.ProcessEnv;
-  /** Defaults to console.log/console.error; captured in tests for the
+  /** Defaults to process stdout/stderr; captured in tests for the
    * secret-never-echoed assertion. */
   stdout: (line: string) => void;
   stderr: (line: string) => void;
@@ -113,9 +132,7 @@ export function parseAddMcpArgs(argv: string[]): AddMcpArgs {
   return args;
 }
 
-/** True iff `value` parses as a URL with an http: or https: protocol. Used by
- * Step-1 validation (D5) so a bad url/scheme fails as a validation error rather
- * than throwing later out of `new URL()` (TypeError / ERR_INVALID_PROTOCOL). */
+/** True iff `value` parses as a URL with an http: or https: protocol. */
 function isValidHttpUrl(value: string): boolean {
   let parsed: URL;
   try {
@@ -126,65 +143,81 @@ function isValidHttpUrl(value: string): boolean {
   return parsed.protocol === "http:" || parsed.protocol === "https:";
 }
 
-function countsByRiskClass(tools: readonly { riskClass: RiskClass }[]): {
-  safe: number;
-  review: number;
-  destructive: number;
-} {
-  const counts = { safe: 0, review: 0, destructive: 0 };
-  for (const tool of tools) {
-    counts[tool.riskClass]++;
+/**
+ * One daemon round trip, reduced to either a payload or an operator-facing
+ * refusal. Mirrors `approvals.ts`'s `Answer`, and for the same reason: a
+ * non-`result` answer is a REFUSAL, never an empty success. Reporting a
+ * provision as landed when the daemon never confirmed it would tell an
+ * operator their source is onboarded when no rows exist.
+ */
+type Answer = { ok: true; payload: unknown } | { ok: false; line: string; exitCode: number };
+
+function describeResponse(response: RpcResponse): Answer {
+  if (response.kind === "result") return { ok: true, payload: response.payload };
+  if (response.kind === "outcome-unknown") {
+    // §5's ambiguity. The connection died after the request bytes went out,
+    // so the atomic write may have landed and may not have. Never retried
+    // automatically: a blind re-issue against a source that DID provision
+    // would re-run the whole onboarding fetch, and (with --clear-credential)
+    // could drop a credential the first attempt already replaced. The
+    // operator is pointed at the read that settles it.
+    return {
+      ok: false,
+      exitCode: 1,
+      line:
+        `[conduit add-mcp] The outcome of this provisioning is UNKNOWN: the daemon connection ` +
+        `was lost after the request was sent, so the source may or may not have been written ` +
+        `(requestId ${response.requestId}). Do NOT blindly re-run it — check whether the source ` +
+        `is registered first.\n`,
+    };
   }
-  return counts;
+  if (response.kind === "error") {
+    // The daemon's own typed refusal. Its message is client-safe by
+    // construction and already carries the operator's next move — for a
+    // provisioning refusal it is the same `[conduit add-mcp] ... nothing
+    // was written` line this command printed before the conversion, so the
+    // terminal output is unchanged.
+    return { ok: false, exitCode: 1, line: `${response.message}\n` };
+  }
+  // `ready`/`handshake.ok` are prefaces the client already consumed.
+  return {
+    ok: false,
+    exitCode: 1,
+    line: `[conduit add-mcp] failed: protocol desync (unexpected ${response.kind} frame).\n`,
+  };
 }
 
 /**
- * Maps a `fetchTools` rejection to the fail-loud stderr line (design §18-C4:
- * specific errors replace the old discard-all catch). An `McpClientError`
- * routes by `kind`; anything else (a plain network throw, a URL parse error)
- * falls back to today's unreachable line. Never interpolates the secret — the
- * client's messages carry no header material. Trailing newline is added by the
- * caller.
+ * Calls the daemon, folding a thrown `DaemonUnavailable` into the same
+ * Answer shape. That error already carries the state directory, the
+ * deadline, and the daemon log path — everything the operator needs — and
+ * this is an operator-facing command, so it is surfaced undressed.
  */
-function mapFetchError(cause: unknown, url: string): string {
-  const unreachable = `[conduit add-mcp] upstream unreachable at ${url}; nothing was written. Re-run when reachable.`;
-  if (!(cause instanceof McpClientError)) {
-    return unreachable;
-  }
-  // The shared fallthrough: surface the client's own message verbatim. Used by
-  // non-auth http_status (e.g. 404/500), cap (byte/tool-count breach), and
-  // protocol — each carries a self-describing McpClientError.message.
-  const clientMessage = `[conduit add-mcp] ${cause.message}; nothing was written.`;
-  switch (cause.kind) {
-    case "http_status":
-      if (cause.status === 401 || cause.status === 403) {
-        return `[conduit add-mcp] upstream requires authorization (HTTP ${cause.status}): set CONDUIT_ADD_SECRET; nothing was written.`;
-      }
-      // Other non-2xx (e.g. 404/500) — surface the client's own message.
-      return clientMessage;
-    case "cap":
-    case "protocol":
-      return clientMessage;
-    case "timeout":
-      return `[conduit add-mcp] upstream did not complete within the onboarding budget; nothing was written.`;
-    case "network":
-      return unreachable;
-    default: {
-      // Exhaustiveness: every McpClientError kind is handled above, so a future
-      // sixth kind is a COMPILE error here (mirrors bin.ts's _exhaustive). The
-      // runtime return is the prefixed fallback, not the bare kind string, so a
-      // stale-compiled CLI against a newer SDK still emits a self-describing line
-      // rather than a raw `"new_kind"` with no `[conduit add-mcp]` prefix.
-      const _exhaustive: never = cause.kind;
-      void _exhaustive;
-      return unreachable;
-    }
+async function ask(deps: AddMcpDeps, request: RpcRequest): Promise<Answer> {
+  try {
+    return describeResponse(await deps.daemon(request));
+  } catch (error) {
+    return {
+      ok: false,
+      exitCode: 1,
+      line:
+        error instanceof DaemonUnavailable
+          ? `${error.message}\n`
+          : `[conduit add-mcp] could not reach the Conduit daemon: ${
+              error instanceof Error ? error.message : String(error)
+            }\n`,
+    };
   }
 }
 
 export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<AddMcpResult> {
   // Step 1: collect ALL missing/invalid required flags into ONE stderr line
-  // (D5 — single-pass validation) BEFORE any fetch/store access.
+  // (D5 — single-pass validation) BEFORE contacting the daemon. The daemon
+  // re-validates the same things (it is the authorization boundary and a
+  // hand-crafted frame need not have come through any CLI), but catching
+  // them here keeps a typo a local error rather than a round trip, and
+  // keeps the message a FLAG-shaped one — the daemon does not know which
+  // flag spelled a field.
   const missing: string[] = [];
   if (args.namespace === undefined || !NAMESPACE_PATTERN.test(args.namespace)) {
     missing.push("--namespace (must match /^[a-z0-9_-]+$/)");
@@ -192,10 +225,6 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
   if (args.url === undefined || args.url.trim() === "") {
     missing.push("--url");
   } else if (!isValidHttpUrl(args.url)) {
-    // Validate parseability + http(s) scheme HERE (D5 single-pass), so a
-    // malformed url or a non-http scheme fails as a validation error with the
-    // rest of the flags — never later as `new URL()` TypeError /
-    // ERR_INVALID_PROTOCOL masquerading as "upstream unreachable".
     missing.push("--url (must be a valid http(s) URL)");
   }
   if (args.prefix === undefined || args.prefix.trim() === "") {
@@ -205,204 +234,77 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     deps.stderr(`[conduit add-mcp] Missing/invalid required flags: ${missing.join(", ")}.\n`);
     return { exitCode: 1 };
   }
-  // Narrowed: all three are now known-defined, valid strings.
   const namespace: string = args.namespace as string;
   const url: string = args.url as string;
   const prefix: string = args.prefix as string;
 
-  // Step 2: open the store and READ existing state FIRST (design §18-C4 D2).
-  // The onboarding auth order requires read-before-fetch: the stored row and
-  // its credential decide whether the fetch is authorized, and the retarget
-  // credential-leak guard must refuse BEFORE any request goes to a new host.
-  const { store } = await deps.openStore(deps.env);
-  const sourceId = `src_${namespace}`;
-  const integrationId = `int_${namespace}`;
-  const connectionId = `conn_${namespace}`;
-  const derivedCredentialRef = `cred_${namespace}`;
-
-  const existingSource = await store.sources.get(sourceId);
-  const existingIntegration = await store.integrations.getByNamespace(namespace);
-  const existingConnection = existingIntegration
-    ? (await store.connections.list()).find((c) => c.integrationId === existingIntegration.id)
-    : undefined;
-
-  // Step 2b: cross-namespace prefix collision — `connections.prefix` is
-  // UNIQUE in the schema, so a DIFFERENT namespace already owning the
-  // requested --prefix would otherwise surface as a raw UNIQUE constraint
-  // error out of provisionSource, falling through to bin.ts's generic
-  // `[conduit] Fatal:` handler. Checked here (read-first, before any write)
-  // so it takes the same fail-loud path as every other precondition.
-  const prefixOwner = await store.connections.getByPrefix(prefix);
-  if (prefixOwner !== undefined && prefixOwner.integrationId !== integrationId) {
-    deps.stderr(
-      `[conduit add-mcp] prefix ${prefix} is already used by another source; nothing was written. ` +
-        `Choose a different --prefix.\n`,
-    );
-    return { exitCode: 1 };
-  }
-
-  const urlUnchanged = existingSource !== undefined && existingSource.location === url;
+  // Step 2: the one daemon round trip. A fresh CONDUIT_ADD_SECRET rides
+  // along verbatim — the operator's own data, travelling client→daemon
+  // once, never returned. It is read straight from the environment into
+  // the request and is never logged, never rendered, and never placed in
+  // any error line: nothing below reads it again.
   const suppliedSecret = deps.env.CONDUIT_ADD_SECRET;
   const hasFreshSecret = suppliedSecret !== undefined && suppliedSecret.trim() !== "";
-
-  // Step 2c: retarget credential-leak guard (design §18-C4 D2 — supersedes
-  // C2's preserve-not-remove for the retarget case). A `--replace` to a NEW
-  // url while a stored credential exists is REFUSED OUTRIGHT unless the
-  // operator supplies a fresh CONDUIT_ADD_SECRET (auth for the new upstream)
-  // or --clear-credential (drop it): the stored secret is bound to the old
-  // host and must never be sent to a different one. Checked before the fetch,
-  // so nothing — not even the network request — reaches the new url.
-  if (
-    args.replace &&
-    !urlUnchanged &&
-    existingConnection?.credentialRef !== undefined &&
-    !hasFreshSecret &&
-    !args.clearCredential
-  ) {
-    deps.stderr(
-      `[conduit add-mcp] refusing to retarget "${namespace}" to a new url while a stored ` +
-        `credential exists: pass CONDUIT_ADD_SECRET for the new upstream or --clear-credential ` +
-        `to drop it. Nothing was written.\n`,
-    );
-    return { exitCode: 1 };
-  }
-
-  // Step 3: C3 gate — refuse a silent retarget without --replace. The same
-  // "does url/prefix actually differ" condition gates the --replace warning
-  // below, so --replace on an unchanged source stays quiet.
-  const isRetarget =
-    existingSource !== undefined &&
-    (existingSource.location !== url ||
-      (existingConnection !== undefined && existingConnection.prefix !== prefix));
-  if (isRetarget && !args.replace) {
-    deps.stderr(
-      `[conduit add-mcp] Namespace "${namespace}" already exists with a different url or prefix. ` +
-        `Re-run with --replace to retarget it, or choose a different --namespace.\n`,
-    );
-    return { exitCode: 1 };
-  }
-  if (isRetarget && args.replace) {
-    deps.stderr(
-      `[conduit add-mcp] --replace: retargeting namespace "${namespace}" to a new url or prefix. ` +
-        `Manual policy overrides (keyed by tool name) will carry over to the retargeted source.\n`,
-    );
-  }
-
-  // Step 4: resolve the ONBOARDING auth for the fetch (design §18-C4 D2).
-  // Order: a fresh CONDUIT_ADD_SECRET always wins; else a stored credential is
-  // reused ONLY when the url is unchanged from the stored row (never sent to a
-  // new host — the retarget guard above already refused the leak case); else
-  // no auth (an unauthenticated onboarding fetch is legitimate, §9.1). The
-  // resolved value is the full `Authorization` header; it is passed
-  // request-scoped to the fetch and NEVER logged (mirrors
-  // createStoreCredentialResolver's read path).
-  let onboardingAuth: string | undefined;
-  if (hasFreshSecret) {
-    onboardingAuth = suppliedSecret;
-  } else if (urlUnchanged && existingConnection?.credentialRef !== undefined) {
-    const stored = await store.secrets.reveal(existingConnection.credentialRef);
-    if (stored !== undefined && stored !== "") {
-      onboardingAuth = stored;
-    }
-  }
-
-  // Step 5: fetch + normalize tools/list — a hard precondition BEFORE any
-  // store write. Every failure class takes the same fail-loud path (design
-  // §2.2): a `[conduit add-mcp] ... nothing was written` line + exit 1, never
-  // bin.ts's generic fatal handler. An `McpClientError` is mapped to a
-  // kind-specific line (auth guidance on 401/403, the cap message verbatim,
-  // the onboarding-budget line on timeout, the client message on protocol);
-  // a network error (and any non-client throw) falls back to today's
-  // unreachable line.
-  let rawTools: unknown[];
-  try {
-    rawTools = await deps.fetchTools(
-      url,
-      onboardingAuth !== undefined ? { authorization: onboardingAuth } : undefined,
-    );
-  } catch (cause) {
-    deps.stderr(`${mapFetchError(cause, url)}\n`);
-    return { exitCode: 1 };
-  }
-  let tools: Tool[];
-  try {
-    tools = normalizeMcp({ namespace, tools: rawTools });
-  } catch (cause) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
-    deps.stderr(
-      `[conduit add-mcp] upstream at ${url} returned an invalid tools/list; nothing was written. ` +
-        `Re-run when the upstream is fixed. Context: { cause: ${JSON.stringify(detail)} }\n`,
-    );
-    return { exitCode: 1 };
-  }
-
-  // Step 6: C2 credential resolution — resolved BEFORE the atomic write.
-  let credentialRef: string | undefined;
-  let secretToStore: { ref: string; value: string } | undefined;
-  // The deliberate deauth path (T-I2 amendment, user-approved): the old
-  // secret's DELETE now travels INSIDE the same atomic provisionSource batch
-  // as the source/integration/connection/tools write, via removeSecretRef.
-  // A failure anywhere in that batch rolls back the delete too, so the old
-  // secret + old connection stay fully intact on rejection — this is now a
-  // storage-layer guarantee (batch rollback), not an ordering discipline.
-  let secretRefToRemove: string | undefined;
-
-  if (args.clearCredential) {
-    credentialRef = undefined;
-    if (existingConnection?.credentialRef !== undefined) {
-      secretRefToRemove = existingConnection.credentialRef;
-    }
-  } else if (hasFreshSecret) {
-    credentialRef = derivedCredentialRef;
-    secretToStore = { ref: derivedCredentialRef, value: suppliedSecret as string };
-  } else if (existingConnection?.credentialRef !== undefined) {
-    // Preserve-not-remove: read-then-rewrite the same ref, no secret write.
-    credentialRef = existingConnection.credentialRef;
-  } else {
-    credentialRef = undefined;
-  }
-
-  // Step 7: build the atomic write and provision.
-  const source = { id: sourceId, type: "mcp" as const, namespace, location: url };
-  const integration = { id: integrationId, sourceId, namespace };
-  const connection = {
-    id: connectionId,
-    integrationId,
+  const request: RpcRequest = {
+    kind: "source.provision",
+    namespace,
+    url,
     prefix,
-    ...(credentialRef !== undefined ? { credentialRef } : {}),
+    replace: args.replace,
+    clearCredential: args.clearCredential,
+    ...(hasFreshSecret ? { secret: suppliedSecret as string } : {}),
   };
 
-  await store.provisionSource({
-    source,
-    integration,
-    connection,
-    ...(secretToStore !== undefined ? { secret: secretToStore } : {}),
-    ...(secretRefToRemove !== undefined ? { removeSecretRef: secretRefToRemove } : {}),
-    tools,
-  });
+  const answer = await ask(deps, request);
+  if (!answer.ok) {
+    deps.stderr(answer.line);
+    return { exitCode: answer.exitCode };
+  }
+  const result = answer.payload as ProvisionPayload;
 
-  // Step 8: success output — counts only, never per-tool names, never the secret.
-  const counts = countsByRiskClass(tools);
-  const credentialState = credentialRef !== undefined ? "present" : "absent";
+  // Step 3: advisories the daemon produced while deciding (today: the
+  // --replace retarget notice). Printed to stderr before the success line,
+  // matching the pre-conversion ordering — the warning was emitted before
+  // the fetch, so it reached the terminal first.
+  for (const warning of result.warnings ?? []) {
+    deps.stderr(`${warning}\n`);
+  }
+
+  // Step 4: success output — counts only, never per-tool names, never the
+  // secret. `credential` is the daemon's PRESENCE flag, not a ref.
   if (args.json) {
-    deps.stdout(`${JSON.stringify({ ...counts, credential: credentialState })}\n`);
+    deps.stdout(`${JSON.stringify({ ...result.counts, credential: result.credential })}\n`);
   } else {
     deps.stdout(
-      `seeded ${tools.length} tools for connection ${prefix} (namespace ${namespace}): ` +
-        `${counts.safe} safe (auto-allow), ${counts.review} review (approval), ` +
-        `${counts.destructive} destructive (approval)\n`,
+      `seeded ${result.toolCount} tools for connection ${result.prefix} (namespace ${result.namespace}): ` +
+        `${result.counts.safe} safe (auto-allow), ${result.counts.review} review (approval), ` +
+        `${result.counts.destructive} destructive (approval)\n`,
     );
   }
 
   return { exitCode: 0 };
 }
 
+export interface AddMcpOptions {
+  /** Defaults to the uid-derived `DEFAULT_CONDUIT_DIR` (design §3.1). */
+  stateDir?: string;
+}
+
 /** Production entrypoint wired into the CLI dispatch (bin.ts). */
-export async function addMcp(argv: string[]): Promise<number> {
+export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<number> {
+  const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
   const args = parseAddMcpArgs(argv);
   const result = await runAddMcp(args, {
-    fetchTools: fetchToolsList,
-    openStore: openStoreFromEnv,
+    daemon: (request) =>
+      daemonRequest({
+        stateDir,
+        role: "add-mcp",
+        request,
+        // Per-kind, via the shared table: a provision performs an outbound
+        // onboarding fetch daemon-side, so it carries the derived provision
+        // budget rather than a plain read's.
+        deadlineMs: deadlineForRequest(request),
+      }),
     env: process.env,
     stdout: (line) => process.stdout.write(line),
     stderr: (line) => process.stderr.write(line),

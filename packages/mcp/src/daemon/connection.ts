@@ -33,6 +33,7 @@ import {
   FrameTooLarge,
   MalformedFrame,
 } from "./frames.js";
+import { ProvisionRefused, provisionSourceRequest, revalidateSourceRequest } from "./provision.js";
 import {
   CAPABILITIES,
   type Capability,
@@ -540,6 +541,45 @@ async function submitSandboxWork(
   }
 }
 
+/**
+ * Runs one source-provisioning request, separating the daemon's own
+ * REFUSALS from genuine faults.
+ *
+ * A `ProvisionRefused` is the expected outcome of a well-formed request
+ * whose precondition did not hold — the namespace already points elsewhere,
+ * the upstream is unreachable, the retarget would leak a stored credential.
+ * Its message is written for the operator and is safe to echo: it is
+ * composed from the namespace, the prefix, the url, and the shared MCP
+ * client's own error text, none of which carry header or secret material
+ * (`provision.ts`, `mcp-client.ts`). So it goes out as `invalid` with the
+ * message intact, and the CLI prints it unchanged — the whole point being
+ * that moving this logic daemon-side is invisible in the terminal.
+ *
+ * Anything else is an unexpected fault whose message could carry store
+ * internals (absolute db paths, key-source context, sealed-secret detail),
+ * so it takes the same route every other internal error does: full cause in
+ * the daemon log, fixed string plus correlation id to the client.
+ */
+async function runSourceRequest(
+  ctx: ConnectionContext,
+  requestId: string,
+  deps: ConnectionDeps,
+  work: () => Promise<unknown>,
+): Promise<void> {
+  const { log } = deps;
+  let payload: unknown;
+  try {
+    payload = await work();
+  } catch (err) {
+    if (err instanceof ProvisionRefused) {
+      send(ctx.socket, { kind: "error", requestId, code: "invalid", message: err.message }, log);
+      return;
+    }
+    throw err;
+  }
+  sendResult(ctx, requestId, payload, log);
+}
+
 async function handleRequest(
   ctx: ConnectionContext,
   request: RpcRequest,
@@ -686,21 +726,39 @@ async function handleRequest(
       );
       return;
     }
-    case "source.provision":
+    /**
+     * §3.3.1's credential-bearing onboarding, performed HERE so the
+     * plaintext never crosses the socket (Task 8). Both handlers reveal
+     * stored credentials inside this process, attach them to a
+     * request-scoped header, and answer with a projection carrying counts
+     * and a presence flag — never a ref, never a secret, never a row.
+     *
+     * Answered OUTSIDE the ExecutionQueue, like the other non-sandbox
+     * kinds: the queue bounds concurrent SANDBOX execution (§3.1), and a
+     * provision runs no guest code. It does perform a bounded network
+     * fetch, which is why the CLIENT budget for these kinds is derived
+     * from the onboarding deadline rather than being a plain read's — see
+     * `PROVISION_CLIENT_DEADLINE_MS` in `server.ts`.
+     */
+    case "source.provision": {
+      await runSourceRequest(ctx, requestId, deps, () =>
+        provisionSourceRequest(
+          {
+            namespace: request.namespace,
+            url: request.url,
+            prefix: request.prefix,
+            replace: request.replace,
+            clearCredential: request.clearCredential,
+            ...(request.secret !== undefined ? { secret: request.secret } : {}),
+          },
+          { store },
+        ),
+      );
+      return;
+    }
     case "source.revalidate": {
-      // Well-formed and permitted for `add-mcp`, but §3.3.1's
-      // credential-handling design is not built here. `unimplemented`
-      // rather than `invalid` so a client can tell "not yet" from
-      // "you sent something wrong" and does not retry or reformat.
-      send(
-        ctx.socket,
-        {
-          kind: "error",
-          requestId,
-          code: "unimplemented",
-          message: `"${request.kind}" arrives with the client-conversion work; use direct store access until then`,
-        },
-        log,
+      await runSourceRequest(ctx, requestId, deps, () =>
+        revalidateSourceRequest(request.namespace, { store }),
       );
       return;
     }

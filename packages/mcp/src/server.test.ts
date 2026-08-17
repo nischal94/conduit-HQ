@@ -13,6 +13,7 @@ import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { beforeEach, describe, expect, it } from "vitest";
 import { RESUME_ADMISSION_DEADLINE_MS } from "./daemon/connection.js";
 import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
+import { ONBOARDING_DEADLINE_MS } from "./mcp-fetch.js";
 import { buildCatalogListing, executionToCheckPayload, outcomeToPayload } from "./payloads.js";
 import { createApprovalRuntime } from "./runtime.js";
 import {
@@ -21,6 +22,7 @@ import {
   deadlineForRequest,
   EXECUTE_ADMISSION_DEADLINE_MS,
   EXECUTE_CLIENT_DEADLINE_MS,
+  PROVISION_CLIENT_DEADLINE_MS,
   READ_DEADLINE_MS,
   RESUME_CLIENT_DEADLINE_MS,
 } from "./server.js";
@@ -469,6 +471,45 @@ describe("createConduitMcpServer", () => {
     // `approvals.list` IS a read — answered outside the queue, like the
     // D-B1 reads — so it keeps the short budget.
     expect(deadlineForRequest({ kind: "approvals.list" })).toBe(READ_DEADLINE_MS);
+  });
+
+  it("INVARIANT §17 / §5: source.provision carries a FETCH-sized budget that outlasts the onboarding deadline", () => {
+    // The two source kinds are the ONLY ones whose daemon-side work makes
+    // an outbound network call. They are not sandbox work — they never
+    // enter the ExecutionQueue, so neither admission constant applies —
+    // but they are not reads either: a read is a bounded local query,
+    // while a provision waits on a third-party MCP server.
+    //
+    // Same ordering discipline as execute and resume: the client must
+    // outlast the daemon's worst legal answer time, which here is the
+    // onboarding fetch's own absolute whole-operation deadline. A budget
+    // under it would abandon a fetch the daemon was still legitimately
+    // performing and report §5 ambiguity — and an ambiguous provision is
+    // worse than a slow one, since the operator cannot tell whether the
+    // atomic multi-table write landed.
+    expect(PROVISION_CLIENT_DEADLINE_MS).toBeGreaterThan(ONBOARDING_DEADLINE_MS);
+    // Strictly longer than a read's, because a read makes no network call.
+    expect(PROVISION_CLIENT_DEADLINE_MS).toBeGreaterThan(READ_DEADLINE_MS);
+
+    // Wired for BOTH kinds, not merely declared.
+    expect(
+      deadlineForRequest({
+        kind: "source.provision",
+        namespace: "ns",
+        url: "https://example.com",
+        prefix: "ns.p",
+        replace: false,
+        clearCredential: false,
+      }),
+    ).toBe(PROVISION_CLIENT_DEADLINE_MS);
+    expect(deadlineForRequest({ kind: "source.revalidate", namespace: "ns" })).toBe(
+      PROVISION_CLIENT_DEADLINE_MS,
+    );
+
+    // The onboarding bound is IMPORTED from the fetch module rather than
+    // re-declared, so raising the fetch's deadline raises this budget with
+    // it and the two cannot silently drift apart.
+    expect(PROVISION_CLIENT_DEADLINE_MS).toBe(ONBOARDING_DEADLINE_MS + READ_DEADLINE_MS);
   });
 
   it("execute forwards requestKey to the daemon only when the agent supplied one", async () => {

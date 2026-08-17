@@ -9,6 +9,7 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import { RESUME_ADMISSION_DEADLINE_MS } from "./daemon/connection.js";
 import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
+import { ONBOARDING_DEADLINE_MS } from "./mcp-fetch.js";
 import {
   type CatalogListing,
   CHECK_EXECUTION_TOOL,
@@ -140,10 +141,44 @@ export const READ_DEADLINE_MS = 30_000;
 export const RESUME_CLIENT_DEADLINE_MS =
   RESUME_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs + 30_000;
 
+/**
+ * The client budget for `source.provision` / `source.revalidate` (Task 8).
+ *
+ * These are the only kinds whose daemon-side work performs an OUTBOUND
+ * NETWORK FETCH. They are not sandbox work — they never enter the
+ * ExecutionQueue, so neither admission constant applies — but they are
+ * emphatically not reads either: a read is a bounded local query, while a
+ * provision waits on a third-party MCP server it does not control.
+ *
+ * Derived by the SAME ordering discipline as the execute and resume
+ * budgets: **the client must outlast the daemon's worst legal answer
+ * time.** The daemon's bound here is `ONBOARDING_DEADLINE_MS`, the
+ * absolute whole-operation deadline the shared MCP client enforces across
+ * handshake + `tools/list` + pagination + the one session-expiry retry
+ * (`mcp-fetch.ts`). Imported rather than re-declared so the two cannot
+ * drift; a client budget that fell under it would abandon a fetch the
+ * daemon was still legitimately performing and report §5 ambiguity for an
+ * onboarding that was about to succeed — and an ambiguous provision is
+ * worse than a slow one, because the operator cannot tell whether the
+ * atomic write landed.
+ *
+ * The remaining margin covers what the fetch does not: a COLD START (this
+ * is frequently the very first command run on a fresh install, so the
+ * client may spawn the daemon and wait for it to take its locks, open the
+ * store, sweep and bind), the handshake, and the atomic multi-table write
+ * that follows the fetch. `READ_DEADLINE_MS` is exactly the cold-start
+ * allowance sized for that in the D-B1 reads, so it is reused here as the
+ * same allowance rather than a second magic number.
+ */
+export const PROVISION_CLIENT_DEADLINE_MS = ONBOARDING_DEADLINE_MS + READ_DEADLINE_MS;
+
 /** The per-kind client budget. See the ordering constraint above. */
 export function deadlineForRequest(request: RpcRequest): number {
   if (request.kind === "execute") return EXECUTE_CLIENT_DEADLINE_MS;
   if (request.kind === "approvals.resume") return RESUME_CLIENT_DEADLINE_MS;
+  if (request.kind === "source.provision" || request.kind === "source.revalidate") {
+    return PROVISION_CLIENT_DEADLINE_MS;
+  }
   return READ_DEADLINE_MS;
 }
 
