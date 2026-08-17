@@ -14,4 +14,6 @@ minimumReleaseAge: 4320
 # parked per the standing Dependabot triage.
 overrides:
   "ip-address@<=10.3.0": ">=10.3.1"
-  "nanoid@<3.3.18": ">=3.3.18"
+  # Stay on the patched 3.x line: an open ">=3.3.18" resolves to nanoid 6
+  # (ESM-only, engines >=22), silently forced outside postcss's ^3.3.x range.
+  "nanoid@<3.3.18": ">=3.3.18 <4"
