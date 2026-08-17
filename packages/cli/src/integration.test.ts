@@ -203,6 +203,28 @@ function startDaemonAt(dir: string): Promise<ChildProcess> {
   });
 }
 
+/**
+ * Ensures a daemon is serving `dir`, whether or not one already is.
+ *
+ * `startDaemonAt` REJECTS on early exit, and a second daemon against a held
+ * lifecycle lock exits 3 "already running" — the designed singleton outcome
+ * (§3.5), not a failure. So a case that merely needs a live daemon cannot
+ * call `startDaemonAt` directly without coupling itself to whether some
+ * earlier case happened to start one.
+ *
+ * Exit code 3 is therefore translated to success here, and only here: the
+ * lock is held, which is exactly the postcondition the caller wanted. Every
+ * other exit code still propagates.
+ */
+async function ensureDaemonAt(dir: string): Promise<void> {
+  try {
+    await startDaemonAt(dir);
+  } catch (error) {
+    const message = error instanceof Error ? error.message : String(error);
+    if (!message.includes("already running")) throw error;
+  }
+}
+
 /** Seeds one source/integration/connection/secret + tools, in-process. */
 async function seedStore(): Promise<void> {
   return seedStoreAt(dbPath);
@@ -666,15 +688,43 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     // reported here with the verb-truth exit code. Pre-conversion this
     // branch was only ever driven in-process against a local store.
     //
-    // NOTE ON AUTO-START: there is deliberately no case here for
-    // "approvals starts a daemon when none is running against THIS state
-    // directory". `spawnDaemon` passes only `--daemon` and a constructed
-    // env with no HOME, so an auto-started daemon always derives the
-    // DEFAULT state directory (§3.1: the daemon resolves its own state
-    // dir; a client may never smuggle one in). Auto-start is therefore
-    // real for production's default path — pinned in
-    // `daemon/client.test.ts` — but unreachable for a `--state-dir` test
-    // fixture by design, not by omission.
+    // Depends on a live daemon at `approvalsStateDir`, demanded explicitly
+    // rather than inherited from the case above. `ensureDaemonAt` is the
+    // idempotent form: if the previous case's daemon is still up, the second
+    // one exits "already running" and that counts as success.
+    //
+    // Without this, running the case in isolation (`vitest -t`) or after an
+    // early failure of the previous one would find no daemon, auto-start a
+    // child that derives the DEFAULT state directory (see the NOTE below),
+    // never see the fixture socket appear, and burn a resume-sized client
+    // budget against this test's timeout — surfacing as a bare timeout that
+    // names no cause.
+    await ensureDaemonAt(approvalsStateDir);
+
+    // NOTE ON AUTO-START COVERAGE — what is and is not pinned.
+    //
+    // NOT covered anywhere: the REAL `spawnDaemon` → `bin.js --daemon`
+    // end-to-end path. `daemon/client.test.ts` drives every auto-start case
+    // through an INJECTED `spawn: testSpawn()`, and it declines to call the
+    // real `spawnDaemon` on purpose — that child resolves the DEFAULT state
+    // directory and would start a daemon over the developer's own database.
+    // What IS pinned there is the §3.5 decision table (with the injected
+    // spawn) and, separately, `spawnDaemon`'s env / entry-point / stdio
+    // properties in isolation.
+    //
+    // The residual risk this leaves, stated plainly: a build refactor that
+    // breaks `daemonEntryPoint()`'s dist-layout sibling assumption
+    // (`spawn.ts` — `dist/spawn.js` and `dist/bin.js` are siblings at
+    // runtime) would keep every suite green while production auto-start
+    // fails on first use.
+    //
+    // The gap is STRUCTURAL, not an omission: §3.1 forbids a client from
+    // smuggling a state directory into an auto-started daemon, so
+    // `spawnDaemon` passes only `--daemon` with a constructed env carrying
+    // no HOME. A test fixture therefore cannot point an auto-started daemon
+    // at its own `--state-dir`, which is exactly the property that makes
+    // the boundary trustworthy. Closing it would need a sacrificial default
+    // state directory (an isolated HOME), not a change to the product.
     const denied = await runApprovals(["deny", "exec_never_existed"]);
     expect(denied.exitCode).toBe(1);
     expect(denied.stdout.trim()).toBe("conflict");
