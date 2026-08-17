@@ -5,6 +5,7 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { EXIT_ALREADY_RUNNING } from "@conduithq/mcp";
 import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -198,7 +199,15 @@ function startDaemonAt(dir: string): Promise<ChildProcess> {
     child.once("error", reject);
     child.once("exit", (code) => {
       clearTimeout(timer);
-      reject(new Error(`daemon exited early with code ${code}. Output: ${seen}`));
+      // The exit code travels as a PROPERTY, not only inside the message.
+      // `seen` is all accumulated daemon stdout+stderr, so any caller
+      // classifying this rejection by message substring would be matching
+      // against arbitrary log content — the exact hazard conduitd.ts
+      // documents when it chose "listening" over a "ready"-prefixed word
+      // ("already running" contains "ready"). `ensureDaemonAt` reads this.
+      const error = new Error(`daemon exited early with code ${code}. Output: ${seen}`);
+      (error as Error & { exitCode?: number | null }).exitCode = code;
+      reject(error);
     });
   });
 }
@@ -212,16 +221,24 @@ function startDaemonAt(dir: string): Promise<ChildProcess> {
  * call `startDaemonAt` directly without coupling itself to whether some
  * earlier case happened to start one.
  *
- * Exit code 3 is therefore translated to success here, and only here: the
- * lock is held, which is exactly the postcondition the caller wanted. Every
- * other exit code still propagates.
+ * `EXIT_ALREADY_RUNNING` is therefore translated to success here, and only
+ * here: the lock is held, which is exactly the postcondition the caller
+ * wanted. Every other exit code still propagates.
+ *
+ * Keyed on the EXIT CODE, never on the message. The rejection's message
+ * embeds all accumulated daemon output, so a substring test would classify
+ * on arbitrary log content — a daemon that happened to log "already running"
+ * and then died of something else, under a different code, would be
+ * swallowed. The code is the daemon's actual §3.5 client contract, and
+ * `conduitd.ts` already documents this substring-keying hazard as its reason
+ * for logging "listening" rather than a "ready"-prefixed word.
  */
 async function ensureDaemonAt(dir: string): Promise<void> {
   try {
     await startDaemonAt(dir);
   } catch (error) {
-    const message = error instanceof Error ? error.message : String(error);
-    if (!message.includes("already running")) throw error;
+    const code = (error as (Error & { exitCode?: number | null }) | undefined)?.exitCode;
+    if (code !== EXIT_ALREADY_RUNNING) throw error;
   }
 }
 

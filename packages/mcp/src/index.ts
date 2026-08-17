@@ -3,6 +3,8 @@ export {
   DaemonUnavailable,
   daemonRequest,
 } from "./daemon/client.js";
+/** Exit codes are part of the §3.5 client contract — see conduitd.ts. */
+export { EXIT_ALREADY_RUNNING, EXIT_ROTATION_IN_PROGRESS } from "./daemon/conduitd.js";
 export type { Capability, RpcRequest, RpcResponse } from "./daemon/rpc.js";
 export {
   DEFAULT_CONDUIT_DIR,
