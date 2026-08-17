@@ -66,8 +66,9 @@ async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<voi
 }
 
 /**
- * How long an EXCLUSIVE acquisition lets SQLite's busy handler ride out
- * ANOTHER acquirer's transient locks before reading BUSY as "held".
+ * Collision backoff for the daemon LIFECYCLE acquisition — and for it
+ * alone. How long that one acquisition lets SQLite's busy handler ride
+ * out ANOTHER acquirer's transient locks before reading BUSY as "held".
  *
  * With busy_timeout=0, two processes racing BEGIN EXCLUSIVE on the same
  * fresh lock db can BOTH fail: each takes SHARED on its way up, one wins
@@ -83,22 +84,37 @@ async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<voi
  *
  * The window only needs to cover a peer's µs-scale acquisition attempt;
  * 1s is comfortably past that under CI load. The cost is bounded refusal
- * latency: a process losing to an ESTABLISHED holder now waits up to this
- * long before exiting "already running", which no §3.5 path depends on
- * being instant. SHARED acquisitions and probes stay at busy_timeout=0 —
- * a probe's whole job is an instant answer about the current holder.
+ * latency: a daemon losing to an ESTABLISHED holder waits up to this long
+ * before exiting "already running", which no §3.5 path depends on being
+ * instant.
+ *
+ * Lifecycle alone gets the backoff because symmetric auto-start is the
+ * only place two processes race BEGIN EXCLUSIVE on a fresh lock db.
+ * Rotation's MAINTENANCE acquisition must stay fail-fast per §3.5's
+ * probe/hold table: a busy maintenance lock is its decision input
+ * ("a daemon is up — coordinate, don't wait"), so waiting-then-acquiring
+ * would turn a refusal into a silent takeover. Hence the DEFAULT below
+ * is 0 and only conduitd's lifecycle call passes this.
  */
-const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
+export const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
 
 /**
  * BEGIN EXCLUSIVE, journal_mode=DELETE. null = BUSY (someone holds it).
  * Held open until `release()` is called (or the process dies, which
  * drops the fd and releases the fcntl lock at the kernel level).
+ *
+ * Non-blocking by default (`busyTimeoutMs: 0`): BUSY answers immediately,
+ * per the design's probe/hold semantics. Callers that must survive a
+ * SYMMETRIC acquisition race (daemon lifecycle) opt into the collision
+ * backoff by passing `EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS` — see its doc.
  */
-export async function acquireExclusive(lockDbPath: string): Promise<HeldLock | null> {
+export async function acquireExclusive(
+  lockDbPath: string,
+  opts?: { busyTimeoutMs?: number },
+): Promise<HeldLock | null> {
   const client = openLockClient(lockDbPath);
   try {
-    await prepareConnection(client, EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS);
+    await prepareConnection(client, opts?.busyTimeoutMs ?? 0);
     await client.execute("BEGIN EXCLUSIVE");
   } catch (err) {
     client.close();

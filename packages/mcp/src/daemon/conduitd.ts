@@ -36,7 +36,12 @@ import {
   FrameTooLarge,
   MalformedFrame,
 } from "./frames.js";
-import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
+import {
+  acquireExclusive,
+  acquireShared,
+  EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS,
+  type HeldLock,
+} from "./locks.js";
 import {
   CAPABILITIES,
   type Capability,
@@ -520,8 +525,13 @@ async function startDaemon(
   //    directory it just created as for one it found.
   await ensureStateDir(paths.stateDir);
 
-  // 2. Lifecycle EXCLUSIVE — singleton enforcement among daemons.
-  const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+  // 2. Lifecycle EXCLUSIVE — singleton enforcement among daemons. The
+  //    collision backoff makes a symmetric auto-start race end with one
+  //    winner rather than mutual BUSY refusals; lifecycle is the only
+  //    acquisition that opts in (see the constant's doc in locks.ts).
+  const lifecycle = await acquireExclusive(paths.lifecycleLockDb, {
+    busyTimeoutMs: EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS,
+  });
   if (lifecycle === null) {
     log("already running");
     throw new DaemonExit(EXIT_ALREADY_RUNNING, "already running");

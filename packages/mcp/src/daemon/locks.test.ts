@@ -203,6 +203,28 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
     await afterRelease?.release();
   });
 
+  it("acquireExclusive: default is fail-fast — BUSY answers immediately, it never waits out a live holder", async () => {
+    // The regression this pins: giving acquireExclusive a universal
+    // busy_timeout turned rotation's maintenance acquisition from
+    // non-blocking fail-fast into wait-and-acquire — a SHARED holder
+    // releasing during the wait let the "refused" acquisition silently
+    // succeed. Default-opts acquireExclusive must answer BUSY on the
+    // spot; only the daemon lifecycle call opts into the collision
+    // backoff, explicitly.
+    const db = newLockDbPath();
+    const { child: holder } = await spawnHolder("shared", db);
+
+    const started = Date.now();
+    expect(await acquireExclusive(db)).toBeNull();
+    const elapsed = Date.now() - started;
+    // Well under EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS (1000): a waiting
+    // acquisition would sit the full second before giving up.
+    expect(elapsed).toBeLessThan(250);
+
+    holder.kill("SIGKILL");
+    await waitForExclusiveFree(db);
+  });
+
   it("acquireShared: returns null (BUSY) while a real EXCLUSIVE holder lives", async () => {
     const db = newLockDbPath();
     const { child: holder } = await spawnHolder("exclusive", db);
