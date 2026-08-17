@@ -11,7 +11,18 @@ import {
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_CONDUIT_DIR, ensureDbFile, openStoreClientFromEnv } from "@conduithq/mcp";
+import {
+  acquireExclusive,
+  DEFAULT_CONDUIT_DIR,
+  daemonPaths,
+  describeHolder,
+  ensureDbFile,
+  type HeldLock,
+  MAINTENANCE_ROLE_GENERATE,
+  MAINTENANCE_ROLE_ROTATE,
+  openStoreClientFromEnv,
+  readLockHolder,
+} from "@conduithq/mcp";
 import { ReencryptError, reencryptSecrets, SecretBox } from "@conduithq/sdk";
 import { writeAllAndFsync } from "./key-fs.js";
 
@@ -53,10 +64,90 @@ export interface KeyResult {
 export async function runKey(args: string[], overrides?: Partial<KeyDeps>): Promise<KeyResult> {
   const deps: KeyDeps = { ...PROD_DEPS, ...overrides };
   const [sub] = args;
-  if (sub === "generate") return runKeyGenerate(deps);
-  if (sub === "rotate") return runKeyRotate(deps);
+  if (sub === "generate") {
+    return underMaintenance(deps, MAINTENANCE_ROLE_GENERATE, "generate", runKeyGenerate);
+  }
+  if (sub === "rotate") {
+    return underMaintenance(deps, MAINTENANCE_ROLE_ROTATE, "rotate", runKeyRotate);
+  }
   deps.stderr(`${KEY_USAGE}\n`);
   return { exitCode: 1 };
+}
+
+/**
+ * Runs a key subcommand while holding the §3.4 maintenance lock.
+ *
+ * The hold spans the ENTIRE subcommand, which is what makes it worth
+ * anything: §3.4 requires rotate to hold it "through key promotion,
+ * directory fsync, checkpoint, and hygiene", not merely across the
+ * re-seal. Releasing early would reopen the window a daemon can start in
+ * while `.next` is still unpromoted — the exact race the lock exists to
+ * close. `generate` is covered for the same reason: its `countSealedRows`
+ * inspection (§2.1's second direct `createClient`) reads a db the daemon
+ * may otherwise be writing, and its refusal-on-sealed-rows is a
+ * documented guarantee that a concurrent write could invalidate.
+ *
+ * Release rides in `finally` so it happens on every path, including a
+ * throw. The kernel dropping the lock at process death is the backstop,
+ * but an explicit release makes the lock free PROMPTLY — the next command
+ * should not have to wait for process teardown.
+ */
+async function underMaintenance(
+  deps: KeyDeps,
+  role: string,
+  verb: string,
+  run: (deps: KeyDeps) => Promise<KeyResult>,
+): Promise<KeyResult> {
+  const held = await acquireMaintenance(deps, role, verb);
+  if (held === null) return { exitCode: 1 };
+  try {
+    return await run(deps);
+  } finally {
+    await held.release();
+  }
+}
+
+/**
+ * Takes the §3.4 maintenance lock EXCLUSIVE, or explains who has it.
+ *
+ * This is the whole of §3.4's exclusion, and it REPLACES the old
+ * write-lock probe. That probe asked SQLite "is the db busy right now?",
+ * which is a liveness QUERY, and §3.4 rejects liveness queries outright:
+ * an unrelated client can auto-start a daemon in the window between the
+ * check and the rotation — including after rotate has loaded the old key
+ * but before the re-seal transaction commits. The kernel lock closes that
+ * window by construction, because the daemon takes the SAME lock SHARED
+ * before it resolves its key or opens the db, and holds it for its whole
+ * lifetime. Stop-first stops being a request the operator is trusted to
+ * honor and becomes something the kernel enforces.
+ *
+ * Non-blocking on purpose (`acquireExclusive`'s default `busyTimeoutMs`
+ * of 0): a busy maintenance lock is this command's DECISION INPUT — "a
+ * daemon is up, so refuse and tell the operator" — and waiting for it
+ * would silently convert a refusal into a takeover of a daemon that
+ * happened to stop mid-wait.
+ *
+ * The refusal names the holder when it can. That clause is diagnostics
+ * only (§3.4: metadata for a good error message, the lock for the
+ * exclusion) and is simply omitted when unreadable.
+ */
+async function acquireMaintenance(
+  deps: KeyDeps,
+  role: string,
+  verb: string,
+): Promise<HeldLock | null> {
+  const lockDb = daemonPaths(deps.conduitDir).maintenanceLockDb;
+  const held = await acquireExclusive(lockDb, { role });
+  if (held !== null) return held;
+  // Read the holder only AFTER the kernel has already refused us — the
+  // row is a companion to that verdict, never a substitute for it.
+  const holder = describeHolder(await readLockHolder(lockDb));
+  deps.stderr(
+    `[ConduitKey] ${verb} refused: another process owns ~/.conduit — the maintenance lock is held.` +
+      `${holder} ${verb} is stop-first: stop every conduit process and MCP client (the daemon exits on ` +
+      "SIGTERM), then re-run. Nothing was read or written.\n",
+  );
+  return null;
 }
 
 /** fsync a directory so a just-created/renamed entry survives a host crash. THROWS on failure — each caller decides whether to degrade (generate/post-promote: warn) or abort (pre-tx staging: refuse). */
@@ -298,9 +389,14 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
     );
   } catch (cause) {
     if (isBusyCause(cause)) {
+      // The maintenance lock is already held by this process, so no
+      // daemon can be the writer here — this is a NON-daemon opener
+      // (another rotate on a shared ~/.conduit, a stray sqlite client),
+      // which the kernel lock does not and cannot cover.
       deps.stderr(
-        "[ConduitKey] rotate preflight failed: could not acquire the write lock — stop running " +
-          `conduit processes and MCP clients, then re-run. Context: { cause: ${String(cause)} }\n`,
+        "[ConduitKey] rotate preflight failed: the database is locked by a process that is not a " +
+          "conduit daemon (the maintenance lock is held by this rotation, so no daemon can be the " +
+          `writer). Find and stop that process, then re-run. Context: { cause: ${String(cause)} }\n`,
       );
       return { exitCode: 1 };
     }
@@ -400,9 +496,12 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
           // ENOENT: already gone — nothing to note.
         }
         if (isBusyCause(cause)) {
+          // As in preflight: a daemon is excluded by the maintenance lock
+          // this rotation holds, so a BUSY here is a non-daemon opener.
           deps.stderr(
-            "[ConduitKey] rotation failed: could not acquire the write lock — stop running " +
-              `conduit processes and MCP clients, then re-run. Context: { cause: ${cause.message} }\n`,
+            "[ConduitKey] rotation failed: the database is locked by a process that is not a conduit " +
+              "daemon (the maintenance lock is held by this rotation). Find and stop that process, " +
+              `then re-run. Context: { cause: ${cause.message} }\n`,
           );
         } else {
           deps.stderr(`[ConduitKey] rotation failed (db unchanged): ${cause.message}\n`);

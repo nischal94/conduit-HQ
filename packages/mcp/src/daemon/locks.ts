@@ -12,8 +12,13 @@
  * `file:` protocol), so PRAGMA + BEGIN + the hold all land on that one
  * connection, and `close()` drops it, releasing the OS-level lock.
  *
- * The lock-db files carry no data; their contents are never read. They
- * are kernel lock handles with a `.db` extension.
+ * The lock-db files are kernel lock handles with a `.db` extension. They
+ * carry no PRODUCT data — the one thing they do store is the diagnostic
+ * holder row described at `HOLDER_TABLE` below, which exists so a refusal
+ * can name WHO holds the lock. That row is never the exclusion mechanism
+ * (§3.4: "the registry may still report metadata for a good error
+ * message, but the lock provides the exclusion") and nothing branches on
+ * it; it is advisory text for a human reading an error.
  */
 import { existsSync } from "node:fs";
 import { dirname } from "node:path";
@@ -53,6 +58,105 @@ function heldLock(client: Client): HeldLock {
 
 function isBusy(err: unknown): boolean {
   return err instanceof LibsqlError && err.code === "SQLITE_BUSY";
+}
+
+/**
+ * Who currently holds a lock, for DIAGNOSTICS ONLY (§3.4).
+ *
+ * `role` is the acquirer's own word for itself ("daemon", "rotate",
+ * "doctor --offline"), `pid` its process id, `since` an ISO timestamp.
+ * Nothing in the system branches on any of it: the kernel lock is the
+ * exclusion, and this row only turns "could not acquire" into "could not
+ * acquire — a daemon (pid 4711) has held it since 12:04".
+ *
+ * Deliberately NOT trusted as truth about liveness. A row can outlive its
+ * writer (SIGKILL leaves it behind while the kernel drops the lock), so a
+ * reader that finds one has learned who LAST acquired, not who is live —
+ * which is why the row is only ever read as a companion to a BUSY answer
+ * the kernel already gave. The two together are sound: the kernel says
+ * "someone holds it", the row says who most recently claimed it.
+ */
+export interface LockHolder {
+  pid: number;
+  role: string;
+  since: string;
+}
+
+/**
+ * One row, id pinned to 1 — the table holds the CURRENT holder, never a
+ * history. This lives in the LOCK db, which carries no product data and
+ * has no migration story; it is not a product schema change (§3.4's
+ * sanctioned diagnostic metadata).
+ */
+const HOLDER_TABLE =
+  "CREATE TABLE IF NOT EXISTS lock_holder (" +
+  "id INTEGER PRIMARY KEY CHECK (id = 1), pid INTEGER NOT NULL, " +
+  "role TEXT NOT NULL, since TEXT NOT NULL)";
+
+/**
+ * Stamps the holder row, BEFORE the acquiring transaction opens.
+ *
+ * The ordering is forced, not stylistic. An EXCLUSIVE holder blocks every
+ * reader on the file, so a row written INSIDE the hold is unreadable for
+ * exactly as long as the hold lasts — useless to the refusal it exists to
+ * inform. Written before the transaction, the row is durable and readable
+ * by anyone the hold does not block, which is precisely the case that
+ * matters: a daemon holding maintenance SHARED lets `readLockHolder`
+ * through, and that is the refusal `key rotate` must be able to name.
+ *
+ * Best-effort by construction: a failure here must never turn into a
+ * failure to acquire. Diagnostic prose is not worth converting a working
+ * lock acquisition into a refusal, so every fault is swallowed and the
+ * caller simply gets a hold with no readable metadata behind it.
+ */
+async function stampHolder(client: Client, role: string): Promise<void> {
+  try {
+    await client.execute(HOLDER_TABLE);
+    await client.execute({
+      sql:
+        "INSERT INTO lock_holder (id, pid, role, since) VALUES (1, ?, ?, ?) " +
+        "ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, role = excluded.role, since = excluded.since",
+      args: [process.pid, role, new Date().toISOString()],
+    });
+  } catch {
+    // Intentionally silent — see the doc above.
+  }
+}
+
+/**
+ * Reads the holder row, or null when there is nothing legible to report.
+ *
+ * Null covers every "we cannot say who" case with one answer, because the
+ * caller's response to all of them is identical — omit the clause naming
+ * the holder. That includes the lock db not existing yet, the table never
+ * having been created, and the read itself being BUSY (which is what an
+ * EXCLUSIVE holder produces). None of those are errors worth surfacing:
+ * the refusal this decorates has already been decided by the kernel.
+ */
+export async function readLockHolder(lockDbPath: string): Promise<LockHolder | null> {
+  if (!existsSync(lockDbPath)) return null;
+  const client = createClient({ url: `file:${lockDbPath}` });
+  try {
+    await client.execute("PRAGMA busy_timeout=0");
+    const rs = await client.execute("SELECT pid, role, since FROM lock_holder WHERE id = 1");
+    const row = rs.rows[0];
+    if (row === undefined) return null;
+    const pid = Number(row.pid);
+    const role = String(row.role);
+    const since = String(row.since);
+    if (!Number.isInteger(pid) || role === "" || since === "") return null;
+    return { pid, role, since };
+  } catch {
+    return null;
+  } finally {
+    client.close();
+  }
+}
+
+/** Renders a holder as a clause for an error message, or "" when unknown. */
+export function describeHolder(holder: LockHolder | null): string {
+  if (holder === null) return "";
+  return ` Held by ${holder.role} (pid ${holder.pid}) since ${holder.since}.`;
 }
 
 function openLockClient(lockDbPath: string): Client {
@@ -110,11 +214,15 @@ export const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
  */
 export async function acquireExclusive(
   lockDbPath: string,
-  opts?: { busyTimeoutMs?: number },
+  opts?: { busyTimeoutMs?: number; role?: string },
 ): Promise<HeldLock | null> {
   const client = openLockClient(lockDbPath);
   try {
     await prepareConnection(client, opts?.busyTimeoutMs ?? 0);
+    // Stamped BEFORE the hold opens — an EXCLUSIVE transaction blocks
+    // every reader, so a row written inside it could never be read while
+    // it mattered. See `stampHolder`.
+    if (opts?.role !== undefined) await stampHolder(client, opts.role);
     await client.execute("BEGIN EXCLUSIVE");
   } catch (err) {
     client.close();
@@ -130,10 +238,14 @@ export async function acquireExclusive(
  * `SELECT 1` need not touch the file — the schema read is what actually
  * forces the SHARED lock the design depends on.
  */
-export async function acquireShared(lockDbPath: string): Promise<HeldLock | null> {
+export async function acquireShared(
+  lockDbPath: string,
+  opts?: { role?: string },
+): Promise<HeldLock | null> {
   const client = openLockClient(lockDbPath);
   try {
     await prepareConnection(client);
+    if (opts?.role !== undefined) await stampHolder(client, opts.role);
     await client.execute("BEGIN");
     await client.execute("SELECT count(*) FROM sqlite_schema");
   } catch (err) {

@@ -1,3 +1,4 @@
+import { type ChildProcess, spawn } from "node:child_process";
 import {
   chmodSync,
   existsSync,
@@ -10,7 +11,13 @@ import {
 } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openStoreClientFromEnv } from "@conduithq/mcp";
+import {
+  acquireExclusive,
+  daemonPaths,
+  EXIT_ROTATION_IN_PROGRESS,
+  MAINTENANCE_ROLE_ROTATE,
+  openStoreClientFromEnv,
+} from "@conduithq/mcp";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runKey } from "./commands/key.js";
 
@@ -226,7 +233,14 @@ describe("conduit key rotate (design §3)", () => {
       const io = makeIo();
       const result = await runKey(["rotate"], { env: {}, conduitDir: dir, ...io });
       expect(result.exitCode).toBe(1);
-      expect(io.err.join("\n")).toMatch(/stop running conduit processes/i);
+      // Task 9: the holder here is a second in-process libsql connection —
+      // a genuinely NON-daemon opener, which is the only kind of writer the
+      // §3.4 maintenance lock (held by this rotation) cannot exclude. The
+      // message says exactly that rather than the pre-Task-9 "stop running
+      // conduit processes", which would now be misleading advice: stopping
+      // conduit processes cannot clear a stray sqlite client.
+      expect(io.err.join("\n")).toMatch(/not a conduit daemon/i);
+      expect(io.err.join("\n")).toMatch(/Find and stop that process/i);
       expect(existsSync(join(dir, "master-key.next"))).toBe(false); // cleaned up
       expect(readFileSync(join(dir, "master-key"), "utf8").trim()).toBe(key); // untouched
     } finally {
@@ -263,7 +277,9 @@ describe("conduit key rotate (design §3)", () => {
         },
       });
       expect(result.exitCode).toBe(1);
-      expect(io.err.join("\n")).toMatch(/stop running conduit processes/i);
+      // Same reclassification as the preflight case above (Task 9).
+      expect(io.err.join("\n")).toMatch(/not a conduit daemon/i);
+      expect(io.err.join("\n")).toMatch(/Find and stop that process/i);
       expect(existsSync(join(dir, "master-key.next"))).toBe(false); // written in step 3, removed by cleanup
       expect(readFileSync(keyPath, "utf8").trim()).toBe(key); // untouched
     } finally {
@@ -373,4 +389,158 @@ describe("conduit key rotate (design §3)", () => {
     expect(await opened.store.secrets.reveal("cred_seed")).toBe("seed-secret");
     opened.client.close();
   });
+});
+
+/**
+ * Task 9: the §3.4 maintenance lock — rotation's exclusion against the
+ * daemon, with REAL spawned daemon processes on both sides of the race.
+ *
+ * The old guard was a write-lock probe, which §3.4 rejects outright: a
+ * liveness query cannot close the window in which an unrelated client
+ * auto-starts a daemon between the check and the re-seal. What is pinned
+ * here is that the kernel lock closes it in BOTH orders.
+ */
+describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
+  let dir: string;
+  const spawned: ChildProcess[] = [];
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "conduit-rotate-lock-"));
+    // The §3.2 state-directory boundary the daemon asserts before binding.
+    chmodSync(dir, 0o700);
+  });
+
+  afterEach(async () => {
+    await Promise.all(
+      spawned.map((child) => {
+        if (child.exitCode !== null || child.signalCode !== null) return Promise.resolve();
+        if (!child.killed) child.kill("SIGKILL");
+        return new Promise<void>((resolve) => child.once("exit", () => resolve()));
+      }),
+    );
+    spawned.length = 0;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  /** The compiled mcp bin — `--daemon --state-dir` is the by-hand start path. */
+  const mcpBinPath = join(process.cwd(), "..", "mcp", "dist", "bin.js");
+
+  /**
+   * Starts a real daemon against `stateDir`, resolving with its exit code
+   * if it exits early (the refusal cases) or with `null` once it reports
+   * "listening". Keyed on the daemon's own lifecycle lines, exactly as the
+   * integration suite's `startDaemonAt` is.
+   */
+  function startDaemon(stateDir: string, key: string): Promise<number | null> {
+    return new Promise((resolve, reject) => {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        CONDUIT_MASTER_KEY: key,
+      };
+      delete env.CONDUIT_DB;
+      const child = spawn(process.execPath, [mcpBinPath, "--daemon", "--state-dir", stateDir], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+      });
+      spawned.push(child);
+      const timer = setTimeout(
+        () => reject(new Error(`daemon timed out. Output: ${seen}`)),
+        30_000,
+      );
+      let seen = "";
+      const watch = (chunk: Buffer): void => {
+        seen += chunk.toString("utf8");
+        if (seen.includes("listening")) {
+          clearTimeout(timer);
+          resolve(null);
+        }
+      };
+      child.stdout?.on("data", watch);
+      child.stderr?.on("data", watch);
+      child.once("error", reject);
+      child.once("exit", (code) => {
+        clearTimeout(timer);
+        resolve(code);
+      });
+    });
+  }
+
+  it("INVARIANT §17 / §3.4: order A — a LIVE daemon makes rotate refuse non-blocking, naming the holder", async () => {
+    const { key } = await rotatableInstall(dir);
+    // A real daemon, holding maintenance SHARED for its whole lifetime.
+    expect(await startDaemon(dir, key)).toBeNull();
+
+    const io = makeIo();
+    const started = Date.now();
+    const result = await runKey(["rotate"], { env: {}, conduitDir: dir, ...io });
+    const elapsed = Date.now() - started;
+
+    expect(result.exitCode).toBe(1);
+    const err = io.err.join("\n");
+    expect(err).toMatch(/maintenance lock is held/i);
+    // The §3.4 diagnostic metadata: the refusal names WHO holds it, so the
+    // operator is not sent hunting. A SHARED holder does not block the read.
+    expect(err).toMatch(/Held by daemon \(pid \d+\) since /);
+    // Non-blocking: a fail-fast refusal, never a wait-then-take. Well under
+    // EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS (1000), which only lifecycle uses.
+    expect(elapsed).toBeLessThan(2000);
+
+    // Nothing was read or written — the whole rotation sequence is behind
+    // the lock, so a refused rotate leaves no `.next` and no `.bak`.
+    expect(existsSync(join(dir, "master-key.next"))).toBe(false);
+    expect(existsSync(join(dir, "master-key.bak"))).toBe(false);
+    expect(readFileSync(join(dir, "master-key"), "utf8").trim()).toBe(key);
+  }, 60_000);
+
+  it("INVARIANT §17 / §3.4: order B — a HELD rotation makes a starting daemon exit `rotation in progress`", async () => {
+    const { key } = await rotatableInstall(dir);
+    // Hold maintenance EXCLUSIVE exactly as rotate does, then start a
+    // daemon into it. The daemon takes maintenance SHARED after lifecycle
+    // EXCLUSIVE, reads BUSY, and exits with the §3.5 contract code.
+    const held = await acquireExclusive(daemonPaths(dir).maintenanceLockDb, {
+      role: MAINTENANCE_ROLE_ROTATE,
+    });
+    expect(held).not.toBeNull();
+    try {
+      expect(await startDaemon(dir, key)).toBe(EXIT_ROTATION_IN_PROGRESS);
+    } finally {
+      await held?.release();
+    }
+
+    // And once the rotation releases, a daemon starts normally — the
+    // refusal was the lock, not a poisoned state directory.
+    expect(await startDaemon(dir, key)).toBeNull();
+  }, 60_000);
+
+  it("INVARIANT §17 / §3.4: `key generate` is behind the same lock — its db inspection cannot race a daemon", async () => {
+    // §3.4's closing note: key.ts's second direct `createClient` (the
+    // sealed-row count) sits inside the boundary too. A daemon holding
+    // maintenance must therefore refuse generate as well as rotate.
+    const { key } = await rotatableInstall(dir);
+    rmSync(join(dir, "master-key")); // generate needs the key file absent
+    expect(await startDaemon(dir, key)).toBeNull();
+
+    const io = makeIo();
+    const result = await runKey(["generate"], { env: {}, conduitDir: dir, ...io });
+
+    expect(result.exitCode).toBe(1);
+    expect(io.err.join("\n")).toMatch(/maintenance lock is held/i);
+    expect(io.err.join("\n")).toMatch(/Held by daemon \(pid \d+\)/);
+    expect(existsSync(join(dir, "master-key"))).toBe(false); // no key minted
+  }, 60_000);
+
+  it("rotate succeeds normally once no daemon holds the lock, and releases it afterwards", async () => {
+    // The lock must not be a one-way door: a plain rotate on a quiet
+    // install still works, and leaves maintenance free for the next one.
+    const { keyPath, key: oldKey } = await rotatableInstall(dir);
+    const io = makeIo();
+    expect((await runKey(["rotate"], { env: {}, conduitDir: dir, ...io })).exitCode).toBe(0);
+    expect(readFileSync(keyPath, "utf8").trim()).not.toBe(oldKey);
+
+    // Released promptly, not merely at process death: a second rotate in
+    // the same process acquires without waiting.
+    const after = await acquireExclusive(daemonPaths(dir).maintenanceLockDb);
+    expect(after).not.toBeNull();
+    await after?.release();
+  }, 30_000);
 });

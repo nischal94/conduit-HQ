@@ -4,7 +4,29 @@ export {
   daemonRequest,
 } from "./daemon/client.js";
 /** Exit codes are part of the §3.5 client contract — see conduitd.ts. */
-export { EXIT_ALREADY_RUNNING, EXIT_ROTATION_IN_PROGRESS } from "./daemon/conduitd.js";
+export {
+  type DaemonPaths,
+  daemonPaths,
+  EXIT_ALREADY_RUNNING,
+  EXIT_ROTATION_IN_PROGRESS,
+  MAINTENANCE_ROLE_DAEMON,
+  MAINTENANCE_ROLE_DOCTOR,
+  MAINTENANCE_ROLE_GENERATE,
+  MAINTENANCE_ROLE_ROTATE,
+} from "./daemon/conduitd.js";
+/**
+ * The §3.5 lock primitives. `key rotate` / `key generate` are the §3.4
+ * deliberate exception — they stay DIRECT-db and take the maintenance lock
+ * themselves rather than routing through the daemon — so the CLI package
+ * needs the acquisition and the diagnostic reader, not just the client.
+ */
+export {
+  acquireExclusive,
+  describeHolder,
+  type HeldLock,
+  type LockHolder,
+  readLockHolder,
+} from "./daemon/locks.js";
 export {
   type ProvisionDeps,
   type ProvisionInput,

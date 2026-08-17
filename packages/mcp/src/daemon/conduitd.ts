@@ -77,6 +77,19 @@ export { RESUME_ADMISSION_DEADLINE_MS } from "./connection.js";
 export const DRAIN_DEADLINE_MS = 30_000;
 
 /**
+ * The `role` strings stamped into the maintenance lock's diagnostic holder
+ * row (§3.4). They appear verbatim inside refusal messages a human reads
+ * ("Held by daemon (pid 4711) since …"), so they are named here rather
+ * than written as literals at each acquisition site — the daemon and the
+ * two CLI acquirers must agree on the vocabulary for those messages to
+ * read consistently.
+ */
+export const MAINTENANCE_ROLE_DAEMON = "daemon";
+export const MAINTENANCE_ROLE_ROTATE = "conduit key rotate";
+export const MAINTENANCE_ROLE_GENERATE = "conduit key generate";
+export const MAINTENANCE_ROLE_DOCTOR = "conduit-mcp --doctor --offline";
+
+/**
  * How often a NON-EMPTY queue re-checks its entries for deadline expiry.
  *
  * Without it, expiry is only ever evaluated as a side effect of another
@@ -485,7 +498,12 @@ async function startDaemon(
     // 3. Maintenance SHARED — mutual exclusion against offline rotation.
     //    Lifecycle-first ordering means rotation can never wedge itself
     //    between the two acquisitions.
-    maintenance = await acquireShared(paths.maintenanceLockDb);
+    //
+    //    The role stamp is diagnostics only (§3.4): a `key rotate` refused
+    //    by this very hold reads it back and names WHICH process is in the
+    //    way, instead of telling the operator to go hunt for it. A SHARED
+    //    holder does not block that read.
+    maintenance = await acquireShared(paths.maintenanceLockDb, { role: MAINTENANCE_ROLE_DAEMON });
     if (maintenance === null) {
       log("rotation in progress");
       throw new DaemonExit(EXIT_ROTATION_IN_PROGRESS, "rotation in progress");
