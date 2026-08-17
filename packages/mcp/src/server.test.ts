@@ -1,4 +1,10 @@
-import { type ConduitStore, normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
+import {
+  type ConduitStore,
+  DEFAULT_SANDBOX_LIMITS,
+  normalizeMcp,
+  openSqliteStore,
+  SecretBox,
+} from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
@@ -8,7 +14,14 @@ import { beforeEach, describe, expect, it } from "vitest";
 import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
 import { buildCatalogListing, executionToCheckPayload, outcomeToPayload } from "./payloads.js";
 import { createApprovalRuntime } from "./runtime.js";
-import { createConduitMcpServer, type DaemonCall } from "./server.js";
+import {
+  createConduitMcpServer,
+  type DaemonCall,
+  deadlineForRequest,
+  EXECUTE_ADMISSION_DEADLINE_MS,
+  EXECUTE_CLIENT_DEADLINE_MS,
+  READ_DEADLINE_MS,
+} from "./server.js";
 
 /**
  * Ring-1 protocol suite: drives `createConduitMcpServer` entirely over
@@ -392,6 +405,40 @@ describe("createConduitMcpServer", () => {
     ]) {
       expect(seen).not.toContain(administrative);
     }
+  });
+
+  it("INVARIANT §17 / §5: the client deadline outlasts the daemon's worst legal execute", () => {
+    // The defect this pins, concretely: the client's budget bounds the
+    // WHOLE round trip, while the daemon may legally spend
+    // EXECUTE_ADMISSION_DEADLINE_MS queuing an entry and THEN
+    // wallClockMs running it. A client that gives up inside that window
+    // returns `outcome-unknown` — "may have run, do NOT retry" — for an
+    // execution that is merely slow and completes normally moments
+    // later, which spends §5's ambiguity signal on routine slowness. It
+    // also loses the race against the daemon's own queue-expiry refusal,
+    // a typed retryable `busy` that is strictly the better answer.
+    const worstLegalDaemonAnswer =
+      EXECUTE_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs;
+    expect(EXECUTE_CLIENT_DEADLINE_MS).toBeGreaterThan(worstLegalDaemonAnswer);
+
+    // And the budget is actually WIRED per kind — asserting the
+    // constants alone would still pass if `deadlineForRequest` handed
+    // every request the short read budget.
+    expect(deadlineForRequest({ kind: "execute", code: "1", deadlineMs: 0 })).toBe(
+      EXECUTE_CLIENT_DEADLINE_MS,
+    );
+    for (const read of [
+      { kind: "catalog.listing" },
+      { kind: "execution.get", executionId: "e" },
+      { kind: "execution.getByRequestKey", requestKey: "r" },
+    ] as const) {
+      expect(deadlineForRequest(read)).toBe(READ_DEADLINE_MS);
+    }
+    // The reads are bounded well BELOW the execute budget — they are
+    // store reads answered outside the queue, so inheriting the
+    // execute-sized budget would make a wedged daemon hang a tools/list
+    // for minutes.
+    expect(READ_DEADLINE_MS).toBeLessThan(EXECUTE_CLIENT_DEADLINE_MS);
   });
 
   it("execute forwards requestKey to the daemon only when the agent supplied one", async () => {

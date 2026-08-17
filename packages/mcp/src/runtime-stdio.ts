@@ -3,20 +3,14 @@ import { DaemonUnavailable, daemonRequest } from "./daemon/client.js";
 import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
 import { DEFAULT_CONDUIT_DIR } from "./env.js";
 import type { CatalogListing } from "./payloads.js";
-import { createConduitMcpServer, type DaemonCall } from "./server.js";
+import { createConduitMcpServer, type DaemonCall, deadlineForRequest } from "./server.js";
 
-/**
- * One bounded budget for a single daemon round trip, waits and auto-start
- * included (`daemonRequest` spends it across probing, spawning, and the
- * exchange).
- *
- * Generous because the worst legitimate case is a cold start: no daemon
- * running, so the client spawns one and waits for it to take its locks,
- * open the store, run the crash-terminal sweep, and bind. That is the
- * FIRST tool call after a machine reboot, and failing it would make the
- * agent's opening move an error.
- */
-const DAEMON_DEADLINE_MS = 30_000;
+// The per-round-trip budget is KIND-DEPENDENT and lives with the
+// constants it must stay ordered against — see `deadlineForRequest` and
+// the ordering constraint documented at `EXECUTE_CLIENT_DEADLINE_MS` in
+// server.ts. A single flat budget here was a correctness defect: it
+// bounded the whole round trip below the daemon's own worst legal answer
+// time for an execute, so routine slowness surfaced as §5 ambiguity.
 
 /**
  * Starts the Conduit MCP server on stdio. Shared by the `conduit-mcp` bin
@@ -76,7 +70,12 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
    */
   const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
   const daemon: DaemonCall = (request: RpcRequest): Promise<RpcResponse> =>
-    daemonRequest({ stateDir, role: "serve", request, deadlineMs: DAEMON_DEADLINE_MS });
+    daemonRequest({
+      stateDir,
+      role: "serve",
+      request,
+      deadlineMs: deadlineForRequest(request),
+    });
 
   // Startup diagnostics come from the daemon's own handshake-backed view,
   // not from this process's environment. That is the §9.3 default-only

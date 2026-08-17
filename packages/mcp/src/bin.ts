@@ -8,9 +8,20 @@ import { openStoreFromEnv } from "./store-open.js";
 
 const VERSION = "0.1.0";
 const HELP = `conduit-mcp ${VERSION} — Conduit MCP server (stdio)
-Env: CONDUIT_DB (default ~/.conduit/conduit.db) · CONDUIT_MASTER_KEY (base64, 32 bytes;
-generate: ${KEYGEN_ONE_LINER}) · CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1 (dev/demo ONLY)
-· CONDUIT_APPROVAL_TTL (milliseconds)
+
+The stdio server opens NO database: the daemon owns ~/.conduit/conduit.db and
+the server reaches it over a Unix socket, auto-starting one if none is running.
+So the env below belongs to the DAEMON's environment on that path, not to this
+client's — an auto-started daemon inherits no CONDUIT_* value.
+
+Env: CONDUIT_DB — REFUSED by the daemon-backed server (it serves exactly the
+  default database, §9.3); unset it to use the daemon. Still honored by --doctor.
+· CONDUIT_MASTER_KEY (base64, 32 bytes; generate: ${KEYGEN_ONE_LINER}) — read by
+  the daemon and by --doctor, not by the stdio server.
+· CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1 (dev/demo ONLY) — belongs to the daemon,
+  which makes the upstream calls.
+· CONDUIT_APPROVAL_TTL (milliseconds) — read by whichever process runs the
+  execution (the daemon, on the server path).
 Flags: --version · --help · --doctor (validate config without an MCP client)
 · --daemon (run the store-owning daemon; stop with SIGTERM/SIGINT)`;
 

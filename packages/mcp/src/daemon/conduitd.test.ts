@@ -596,6 +596,62 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
+    "INVARIANT §17: a paused execution past its TTL reads back as `expired` on the DAEMON's clock",
+    async () => {
+      // The placement half of the CheckPayload projection, which the
+      // not_found case above cannot reach. `executionToCheckPayload`
+      // presents a `paused` row whose `expiresAt` has passed as
+      // `expired`, and that comparison must happen in the process that
+      // OWNS the row: a serve process with a skewed clock must not be
+      // able to present a live approval as dead, or a dead one as live.
+      //
+      // Driven through a REAL daemon with a REAL 1s approval TTL, so the
+      // row genuinely ages between the pause and the read — no clock
+      // injection, no fake timers. The serve-side client passes no clock
+      // at all (the `now` seam was removed in D-B1), so an `expired`
+      // answer here can ONLY have come from the daemon's own `Date.now()`.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--pause-execute", "--approval-ttl-ms", "1000"]);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({ kind: "execute", code: "pause me", deadlineMs: 60_000 });
+      const paused = (await client.next()) as {
+        kind: string;
+        payload: { status: string; executionId: string };
+      };
+      expect(paused.kind).toBe("result");
+      expect(paused.payload.status).toBe("paused");
+      const { executionId } = paused.payload;
+
+      // Immediately: still within the TTL, so still `paused`.
+      client.send({ kind: "execution.get", executionId });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "paused", executionId },
+      });
+
+      // Let the TTL genuinely lapse on the wall clock.
+      await new Promise((resolve) => setTimeout(resolve, 1_400));
+
+      // Same row, same request, same client — only the daemon's clock
+      // moved, and the projection now reads `expired`.
+      client.send({ kind: "execution.get", executionId });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "expired", executionId },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
     "INVARIANT §17 / §3.3: the D-B1 reads are denied to every capability except serve",
     async () => {
       // The ruling widened `serve` ALONE. An administrative client must not

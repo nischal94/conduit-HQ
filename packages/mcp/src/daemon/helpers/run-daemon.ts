@@ -69,6 +69,19 @@ const delayBindMs = delayBindFlag === -1 ? 0 : Number(rest[delayBindFlag + 1] ??
  * the wire, which is vacuous unless they actually exist.
  */
 const seedCatalog = rest.includes("--seed-catalog");
+/**
+ * Persists a genuinely `paused` execution and returns that outcome, so a
+ * client can then read the row back through `execution.get`.
+ *
+ * Paired with `--approval-ttl-ms`, this is what lets a test watch the
+ * CheckPayload projection flip `paused` → `expired` on the DAEMON's own
+ * clock as real wall time passes — no injected clock, no fake timers.
+ * `pausedOn.expiresAt` is computed here from the same TTL the real §5.5
+ * pause path uses.
+ */
+const pauseExecute = rest.includes("--pause-execute");
+const ttlFlag = rest.indexOf("--approval-ttl-ms");
+const approvalTtlMs = ttlFlag === -1 ? 60_000 : Number(rest[ttlFlag + 1] ?? 60_000);
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
@@ -137,114 +150,145 @@ const sweep: CrashTerminalSweep | undefined = seedCatalog
  * Supplied through the daemon's own `createRuntime` seam, so the daemon
  * under test is the real one with only this collaborator replaced.
  */
-const createRuntime = stallSandbox
+const createRuntime = pauseExecute
   ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
       const built = await createApprovalRuntime(runtimeOpts);
       return {
         ...built,
         manager: {
           ...built.manager,
-          start: () => {
-            console.log("stalling execute");
-            return forever();
-          },
-          resume: () => {
-            // Only ever reached if the resume was DISPATCHED. With the
-            // cap already full it must instead sit in the queue, so the
-            // absence of this line is the assertion.
-            console.log("stalling resume");
-            return forever();
+          // Writes a REAL paused row with a real `pausedOn.expiresAt`,
+          // then returns the matching paused outcome. The row is what the
+          // test reads back; the TTL is short so it genuinely lapses.
+          start: async (code: string) => {
+            const id = `exec_paused_${Date.now()}`;
+            const pausedOn = {
+              toolName: "github.delete_repo",
+              reason: "policy requires approval",
+              expiresAt: Date.now() + approvalTtlMs,
+            };
+            await runtimeOpts.store.executions.put({
+              id,
+              code,
+              status: "paused",
+              seeds: { now: Date.now(), random: 0.5 },
+              startedAt: Date.now(),
+              pausedOn,
+            });
+            console.log("paused execute");
+            return { status: "paused", executionId: id, pending: pausedOn } as never;
           },
         },
       };
     }
-  : throwExecute
+  : stallSandbox
     ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
         const built = await createApprovalRuntime(runtimeOpts);
         return {
           ...built,
           manager: {
             ...built.manager,
-            // Rejects the way a store fault would. Reached from INSIDE the
-            // queue's run closure, which is invoked as `void dispatch(...)`
-            // — so before the fix this became an unhandled rejection and
-            // took the whole daemon down with it.
             start: () => {
-              console.log("throwing execute");
-              return Promise.reject(new Error("simulated store fault"));
+              console.log("stalling execute");
+              return forever();
+            },
+            resume: () => {
+              // Only ever reached if the resume was DISPATCHED. With the
+              // cap already full it must instead sit in the queue, so the
+              // absence of this line is the assertion.
+              console.log("stalling resume");
+              return forever();
             },
           },
         };
       }
-    : hugeExecute
+    : throwExecute
       ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
           const built = await createApprovalRuntime(runtimeOpts);
           return {
             ...built,
             manager: {
               ...built.manager,
-              // A perfectly legal result that simply does not fit one
-              // frame. The sandbox's default maxOutputBytes EQUALS
-              // FRAME_CAP, so the envelope around a max-size payload
-              // necessarily overflows — no hostile input required.
-              //
-              // Returns a real `completed` ExecutionOutcome rather than a
-              // bare object: since D-B1 the daemon projects the outcome
-              // through `outcomeToPayload` BEFORE framing, and a shape
-              // with no `status` projects to `undefined` — which frames
-              // small and would make this test pass while pinning nothing.
-              start: async () => {
-                console.log("huge execute");
-                return {
-                  status: "completed",
-                  executionId: "exec_huge",
-                  value: { oversize: "x".repeat(FRAME_CAP) },
-                } as never;
+              // Rejects the way a store fault would. Reached from INSIDE the
+              // queue's run closure, which is invoked as `void dispatch(...)`
+              // — so before the fix this became an unhandled rejection and
+              // took the whole daemon down with it.
+              start: () => {
+                console.log("throwing execute");
+                return Promise.reject(new Error("simulated store fault"));
               },
             },
           };
         }
-      : stallExecute
+      : hugeExecute
         ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
             const built = await createApprovalRuntime(runtimeOpts);
             return {
               ...built,
               manager: {
                 ...built.manager,
-                start: () => {
-                  console.log("stalling execute");
-                  return forever();
+                // A perfectly legal result that simply does not fit one
+                // frame. The sandbox's default maxOutputBytes EQUALS
+                // FRAME_CAP, so the envelope around a max-size payload
+                // necessarily overflows — no hostile input required.
+                //
+                // Returns a real `completed` ExecutionOutcome rather than a
+                // bare object: since D-B1 the daemon projects the outcome
+                // through `outcomeToPayload` BEFORE framing, and a shape
+                // with no `status` projects to `undefined` — which frames
+                // small and would make this test pass while pinning nothing.
+                start: async () => {
+                  console.log("huge execute");
+                  return {
+                    status: "completed",
+                    executionId: "exec_huge",
+                    value: { oversize: "x".repeat(FRAME_CAP) },
+                  } as never;
                 },
               },
             };
           }
-        : stallRunning
+        : stallExecute
           ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
               const built = await createApprovalRuntime(runtimeOpts);
               return {
                 ...built,
                 manager: {
                   ...built.manager,
-                  // Unlike --stall-execute, this PERSISTS the execution row
-                  // first and stalls afterwards, leaving the row durably
-                  // `running` — the state a SIGKILLed daemon actually strands,
-                  // and the precondition the crash-terminal sweep recovers.
-                  // Stalling before the write would leave nothing to sweep.
-                  start: async (code: string) => {
-                    await runtimeOpts.store.executions.put({
-                      id: `exec_stalled_${Date.now()}`,
-                      code,
-                      status: "running",
-                      seeds: { now: Date.now(), random: 0.5 },
-                      startedAt: Date.now(),
-                    });
-                    console.log("stalling running");
+                  start: () => {
+                    console.log("stalling execute");
                     return forever();
                   },
                 },
               };
             }
-          : undefined;
+          : stallRunning
+            ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                const built = await createApprovalRuntime(runtimeOpts);
+                return {
+                  ...built,
+                  manager: {
+                    ...built.manager,
+                    // Unlike --stall-execute, this PERSISTS the execution row
+                    // first and stalls afterwards, leaving the row durably
+                    // `running` — the state a SIGKILLed daemon actually strands,
+                    // and the precondition the crash-terminal sweep recovers.
+                    // Stalling before the write would leave nothing to sweep.
+                    start: async (code: string) => {
+                      await runtimeOpts.store.executions.put({
+                        id: `exec_stalled_${Date.now()}`,
+                        code,
+                        status: "running",
+                        seeds: { now: Date.now(), random: 0.5 },
+                        startedAt: Date.now(),
+                      });
+                      console.log("stalling running");
+                      return forever();
+                    },
+                  },
+                };
+              }
+            : undefined;
 
 try {
   await runDaemon({

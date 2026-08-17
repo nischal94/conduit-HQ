@@ -116,13 +116,20 @@ in this package). `--help` and `--version` are available at the top level.
 
 ## Env vars
 
-Shared with `@conduithq/mcp` (one `resolveEnv` implementation):
+Shared with `@conduithq/mcp` (one `resolveEnv` implementation).
+
+**Which process reads them depends on the command.** `conduit serve` opens no
+database: the **daemon** owns `~/.conduit/conduit.db` and `serve` reaches it
+over a Unix socket, so on that path these variables belong to the daemon's
+environment (constructed, never inherited — every `CONDUIT_*` is stripped when
+a client auto-starts one). The direct-store commands (`approvals`, `add-mcp`,
+`key`) still read them from their own environment.
 
 | Var | Meaning | Default |
 | --- | --- | --- |
-| `CONDUIT_DB` | Path to the SQLite database file. Node does not expand `~` — if you set this yourself, use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
-| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. Overrides the key file when set; commands exit non-zero at startup if malformed. | optional when `~/.conduit/master-key` exists (env overrides file) |
-| `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only.** Applies to `serve` AND `approvals approve` (both doors compose the same §9.3 egress boundary). | off (fail-closed; §9.3) |
+| `CONDUIT_DB` | Path to the SQLite database file. **Refused by `conduit serve`**: a client whose environment sets it gets a typed `refused-custom-db` handshake refusal and exits non-zero, because the daemon serves exactly the default database (§9.3). Unset it for `serve`; it still applies to `approvals`, `add-mcp` and `key`. Node does not expand `~` — use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
+| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. **Not read by `serve`** — it opens no store, and a client's value never transfers to an auto-started daemon; set it for a daemon you start by hand, or use the key file. Still read by `approvals`, `add-mcp` and `key`. Malformed values fail startup non-zero. | optional when `~/.conduit/master-key` exists (env overrides file) |
+| `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only.** For `serve` it belongs to the **daemon**, which runs the sandbox and makes the upstream calls (a client's value does not transfer; setting it on the client prints a stderr warning saying so). For `approvals approve`, which still resumes in-process, it applies directly. | off (fail-closed; §9.3) |
 | `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72 hours) |
 | `CONDUIT_ADD_SECRET` | `add-mcp` only: the upstream credential to store for this source. Read from env, never a flag; never echoed. | none (optional — unauthenticated sources are legitimate) |
 

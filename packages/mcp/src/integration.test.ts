@@ -245,11 +245,16 @@ const daemons: ChildProcess[] = [];
  * reason.
  */
 function daemonEnv(allowPrivateEgress: boolean): NodeJS.ProcessEnv {
-  const env: NodeJS.ProcessEnv = { ...process.env, CONDUIT_MASTER_KEY: masterKeyB64 };
+  // Hermetic like `baseEnv()`: strip every ambient CONDUIT_* first, so an
+  // exported CONDUIT_DB cannot point this daemon at a database the suite
+  // never seeded, and only add back what this daemon is meant to have.
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("CONDUIT_")) delete env[key];
+  }
+  env.CONDUIT_MASTER_KEY = masterKeyB64;
   if (allowPrivateEgress) {
     env.CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS = "1";
-  } else {
-    delete env.CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS;
   }
   return env;
 }
@@ -368,22 +373,32 @@ function drainStderr(transport: StdioClientTransport): Promise<string> {
 /**
  * The environment a SERVE process runs under.
  *
- * Deliberately carries NO `CONDUIT_DB`: since Task 6 a client whose env
- * sets it is refused at handshake with `refused-custom-db` (§9.3 item 3),
- * so a test still exporting it would be testing the refusal path by
- * accident. The database is the daemon's, reached through its state
- * directory. `PATH` is inherited so the spawned `node` resolves.
+ * HERMETIC BY CONSTRUCTION: every `CONDUIT_*` variable the ambient
+ * environment might carry is DELETED after the spread, then only the ones
+ * this suite means to set are added back. `PATH` and friends are
+ * inherited so the spawned `node` resolves.
  *
- * `CONDUIT_MASTER_KEY` stays only because it is inert here — the serve
- * process no longer opens a store, and it never transfers to the daemon
+ * Deleting rather than merely not-setting is the point. `CONDUIT_DB` in
+ * particular is now refused at handshake with `refused-custom-db` (§9.3
+ * item 3), so a developer machine that exports it would fail this entire
+ * ring — not because anything is broken, but because the suite silently
+ * inherited a value it never meant to send. The same reasoning covers the
+ * egress flag: inheriting it would flip a fail-closed case open.
+ *
+ * `CONDUIT_MASTER_KEY` is set deliberately and is inert here — the serve
+ * process opens no store, and it never transfers to the daemon
  * (`spawnDaemon` strips every `CONDUIT_*`). Keeping it proves that
  * inertness rather than assuming it.
  */
-const baseEnv = (): Record<string, string> => ({
-  ...(process.env as Record<string, string>),
-  CONDUIT_MASTER_KEY: masterKeyB64,
-  CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
-});
+const baseEnv = (): Record<string, string> => {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("CONDUIT_")) delete env[key];
+  }
+  env.CONDUIT_MASTER_KEY = masterKeyB64;
+  env.CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS = "1";
+  return env as Record<string, string>;
+};
 
 beforeAll(async () => {
   upstream = await startMcpServer();
@@ -509,6 +524,58 @@ describe("ring-2: spawned bin integration", () => {
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
   });
+
+  it("INVARIANT M8: stdout purity holds in the SHIPPED bin — dist/bin.js's no-flag serve branch", async () => {
+    // The case above spawns the esbuild-bundled `run-serve` fixture, which
+    // proves `runStdioServer`'s own purity but NOT the artifact users
+    // actually run: a stray `console.log` added to `bin.ts` outside
+    // `runStdioServer` would pass every fixture-based purity test while
+    // corrupting the real thing. So this one spawns `dist/bin.js` with no
+    // flag — the exact entry point an MCP client config names.
+    //
+    // The bin resolves its state directory from the authenticated uid
+    // (`DEFAULT_CONDUIT_DIR` = `${homedir()}/.conduit`) and takes no
+    // `--state-dir`, by design. `homedir()` honors `$HOME` on POSIX, so
+    // pointing HOME at a temp dir redirects it — and the daemon is
+    // hand-started at that SAME derived path so the bin finds one there
+    // rather than auto-starting into the developer's real `~/.conduit`.
+    const fakeHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-home-"));
+    const binStateDir = join(fakeHome, ".conduit");
+    mkdirSync(binStateDir, { recursive: true, mode: 0o700 });
+    await startDaemonAt(binStateDir); // tracked in `daemons`, killed in afterAll
+
+    const transport = new StdioClientTransport({
+      command: "node",
+      args: [binPath],
+      env: { ...baseEnv(), HOME: fakeHome },
+      stderr: "pipe",
+    });
+    transports.push(transport);
+    const client = new Client({ name: "it-client-bin-purity", version: "0" });
+    await client.connect(transport);
+    clients.push(client);
+
+    // A full protocol conversation through the shipped bin. Any byte of
+    // non-protocol output on stdout desyncs the client's JSON-RPC framing,
+    // so these round-trips completing IS the purity assertion.
+    const res = await client.callTool({
+      name: "execute",
+      arguments: {
+        code: 'const { items } = await tools.search({ query: "anything" }); return items.length;',
+      },
+    });
+    const payload = textPayload(res) as { status: string; result: unknown };
+    expect(payload.status).toBe("completed");
+    expect(payload.result).toBe(0);
+
+    const { tools } = await client.listTools();
+    expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
+
+    // Both startup diagnostics landed on stderr, from the shipped binary.
+    const stderr = await drainStderr(transport);
+    expect(stderr).toMatch(/CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS/);
+    expect(stderr).toMatch(/0 sources in catalog/);
+  }, 60_000);
 
   it("pause → approve from a SEPARATE child process → poll sees the persisted result", async () => {
     // Its own state directory and its own daemon, for two reasons that are

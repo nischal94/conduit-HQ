@@ -173,11 +173,13 @@ function startDaemonAt(dir: string): Promise<ChildProcess> {
   return new Promise((resolve, reject) => {
     const child = spawn(process.execPath, [mcpBinPath, "--daemon", "--state-dir", dir], {
       stdio: ["ignore", "pipe", "pipe"],
-      env: {
-        ...process.env,
-        CONDUIT_MASTER_KEY: masterKeyB64,
-        CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
-      },
+      // Hermetic like `baseEnv()`: an ambient CONDUIT_DB would point this
+      // daemon at a database the suite never seeded.
+      env: (() => {
+        const env = baseEnv();
+        delete (env as Record<string, string | undefined>).CONDUIT_DB;
+        return env;
+      })(),
     });
     daemons.push(child);
     const timer = setTimeout(() => reject(new Error("daemon did not report listening")), 30_000);
@@ -281,22 +283,32 @@ function textPayload(res: Awaited<ReturnType<Client["callTool"]>>): unknown {
 }
 
 /**
- * The environment a `conduit serve` process runs under.
+ * The environment the DIRECT-STORE commands run under (`approvals`,
+ * `add-mcp`, `key`) — the ones not yet converted to daemon clients.
  *
- * Carries NO `CONDUIT_DB`: a client that sets it is refused at handshake
- * (§9.3 item 3), so exporting it would exercise the refusal path by
- * accident. `CONDUIT_MASTER_KEY` stays because the approvals command —
- * still a direct-store consumer until Task 7 — needs it; it is inert for
- * `serve`, which opens nothing.
+ * HERMETIC BY CONSTRUCTION: every ambient `CONDUIT_*` is deleted after
+ * the spread, then only what this suite means to set is added back. A
+ * developer machine exporting `CONDUIT_DB` would otherwise silently
+ * redirect these commands at a database the suite never seeded.
  */
-const baseEnv = (): Record<string, string> => ({
-  ...(process.env as Record<string, string>),
-  CONDUIT_DB: dbPath,
-  CONDUIT_MASTER_KEY: masterKeyB64,
-  CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
-});
+const baseEnv = (): Record<string, string> => {
+  const env: Record<string, string | undefined> = { ...process.env };
+  for (const key of Object.keys(env)) {
+    if (key.startsWith("CONDUIT_")) delete env[key];
+  }
+  env.CONDUIT_DB = dbPath;
+  env.CONDUIT_MASTER_KEY = masterKeyB64;
+  env.CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS = "1";
+  return env as Record<string, string>;
+};
 
-/** `serve`'s own env — the one that must NOT carry CONDUIT_DB. */
+/**
+ * `conduit serve`'s own env — the one that must NOT carry `CONDUIT_DB`.
+ *
+ * A serve client that sets it is refused at handshake with
+ * `refused-custom-db` (§9.3 item 3), so leaving it in would exercise the
+ * refusal path by accident rather than the behavior under test.
+ */
 const serveEnv = (): Record<string, string> => {
   const env = baseEnv();
   delete (env as Record<string, string | undefined>).CONDUIT_DB;

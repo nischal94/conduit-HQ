@@ -89,12 +89,20 @@ package adds no core logic of its own; it is a thin transport shell over
 
 ## Env vars
 
+**Which process reads these depends on the path.** The stdio MCP server
+(`conduit-mcp` with no flag, and `conduit serve`) does not open the database
+at all: the **daemon** owns `~/.conduit/conduit.db` and the server reaches it
+over a Unix socket. So on that path these variables belong to the daemon's
+environment, not the client's — the daemon's environment is *constructed*, not
+inherited, and every `CONDUIT_*` is stripped when a client auto-starts one.
+`--doctor` and `--doctor --offline` still read them directly.
+
 | Var | Meaning | Default |
 | --- | --- | --- |
-| `CONDUIT_DB` | Path to the SQLite database file. Node does not expand `~` — if you set this yourself, use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
-| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. Overrides the key file when set; the process exits nonzero at startup if malformed. | optional when `~/.conduit/master-key` exists (env overrides file) |
-| `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only** — prints a loud stderr warning at startup when enabled. | off (fail-closed; §9.3) |
-| `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72 hours) |
+| `CONDUIT_DB` | Path to the SQLite database file. **Refused on the daemon-backed serve path**: a client whose environment sets it gets a typed `refused-custom-db` handshake refusal and exits non-zero, because the daemon serves exactly the default database (§9.3). Unset it to use the daemon; custom-path installs keep direct access via `--doctor --offline` and forgo daemon features in v1. Node does not expand `~` — use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
+| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. **Read by the daemon, not by `serve`** — a client's value never transfers to an auto-started daemon; set it in the environment of a daemon you start by hand, or use the key file. Still read directly by `--doctor`. Malformed values fail startup non-zero. | optional when `~/.conduit/master-key` exists (env overrides file) |
+| `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only.** **Belongs to the daemon** — it runs the sandbox and makes every upstream call, and a client's value does not transfer (§9.3 default-only). Setting it on a serve client prints a stderr warning saying exactly that. | off (fail-closed; §9.3) |
+| `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. Read by the process that runs the execution — the daemon on the serve path. | `259200000` (72 hours) |
 
 ## `--doctor`
 

@@ -1,4 +1,4 @@
-import { buildExecuteTool } from "@conduithq/sdk";
+import { buildExecuteTool, DEFAULT_SANDBOX_LIMITS } from "@conduithq/sdk";
 import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import {
   CallToolRequestSchema,
@@ -57,8 +57,71 @@ export interface ConduitMcpServerOptions {
  * turn behind the concurrency cap is not refused as `busy`, while a
  * genuinely wedged queue still yields a typed answer rather than hanging
  * the agent's tool call to its own client-side timeout.
+ *
+ * **Read `EXECUTE_CLIENT_DEADLINE_MS` before changing this**: the two are
+ * ordered with respect to each other and to §16's wall clock, and the
+ * ordering is what keeps §5's ambiguity signal honest.
  */
 export const EXECUTE_ADMISSION_DEADLINE_MS = 60_000;
+
+/**
+ * THE ORDERING CONSTRAINT (stated once, here).
+ *
+ *     EXECUTE_CLIENT_DEADLINE_MS
+ *       >  EXECUTE_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs
+ *
+ * The client's budget bounds the WHOLE round trip — probe, spawn,
+ * handshake, and the wait for the response (`client.ts` spends one
+ * `deadlineMs` across all of them). The daemon's worst legal answer time
+ * for an `execute` is the sum of the two server-side bounds: an entry may
+ * sit in the queue until its admission deadline, and then run until §16's
+ * wall clock cuts it off. So the client must outlast that sum, or it
+ * abandons work the daemon is still legitimately performing.
+ *
+ * Getting this backwards is not a tuning nit, it is a correctness defect
+ * with two distinct consequences:
+ *
+ * 1. **It corrupts the §5 ambiguity signal.** A client that gives up
+ *    early returns `outcome-unknown` — which tells the agent "this may
+ *    have run; do NOT retry" — for an execution that is merely SLOW and
+ *    will complete normally seconds later. §5's ambiguity is supposed to
+ *    mean the daemon's fate is genuinely unknowable; spending it on
+ *    routine slowness trains agents to distrust the one signal that
+ *    protects against duplicated upstream side effects.
+ * 2. **It makes the daemon's own queue-expiry refusal unreachable.**
+ *    `connection.ts` answers an expired entry with a typed `busy`
+ *    ("queue deadline expired…"), which is a RETRYABLE first-attempt
+ *    answer and strictly better than ambiguity. If the client abandons
+ *    first, that answer is never delivered and the strictly worse verdict
+ *    wins the race.
+ *
+ * The margin is deliberate rather than tight: it absorbs handshake, frame
+ * transport, and a cold start's spawn without eating into the reserve.
+ * Pinned by "INVARIANT §17 / §5: the client deadline outlasts the daemon's
+ * worst legal execute" in `server.test.ts`.
+ */
+export const EXECUTE_CLIENT_DEADLINE_MS =
+  EXECUTE_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs + 30_000;
+
+/**
+ * The budget for the three D-B1 READS (`catalog.listing`,
+ * `execution.get`, `execution.getByRequestKey`).
+ *
+ * Short on purpose, and unrelated to the execute budget: these are
+ * bounded store reads answered outside the ExecutionQueue, so nothing
+ * legitimately makes one take a minute. The only slow case is a cold
+ * start — no daemon, so the client spawns one and waits for it to take
+ * its locks, open the store, run the crash-terminal sweep and bind — and
+ * that is what this is sized for. It is also the budget the FIRST call
+ * after a machine reboot spends, so failing it would make the agent's
+ * opening move an error.
+ */
+export const READ_DEADLINE_MS = 30_000;
+
+/** The per-kind client budget. See the ordering constraint above. */
+export function deadlineForRequest(request: RpcRequest): number {
+  return request.kind === "execute" ? EXECUTE_CLIENT_DEADLINE_MS : READ_DEADLINE_MS;
+}
 
 /**
  * Unwraps an `RpcResponse` into its payload, converting every non-result
@@ -235,6 +298,9 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
       const payload = await call(
         {
           kind: "execute",
+          // The DAEMON-side admission bound. The client's own budget for
+          // this same request is larger by construction — see the
+          // ordering constraint at EXECUTE_CLIENT_DEADLINE_MS.
           code,
           deadlineMs: EXECUTE_ADMISSION_DEADLINE_MS,
           ...(requestKey !== undefined ? { requestKey } : {}),
