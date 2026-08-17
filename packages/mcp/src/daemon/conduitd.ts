@@ -83,6 +83,23 @@ export const RESUME_ADMISSION_DEADLINE_MS = 60_000;
  */
 export const DRAIN_DEADLINE_MS = 30_000;
 
+/**
+ * How often a NON-EMPTY queue re-checks its entries for deadline expiry.
+ *
+ * Without it, expiry is only ever evaluated as a side effect of another
+ * submission or of work completing — so a queue that goes stationary
+ * (cap full of long-running work, no new arrivals) never expires anything.
+ * A client whose admission deadline has already passed would then hang to
+ * its own client-side timeout and report §5 `outcome unknown` for a
+ * request the daemon can prove never ran. The daemon owes it the truthful
+ * terminal answer — "expired" — and can only give it on its own clock.
+ *
+ * 250ms is granularity, not a bound: admission deadlines are seconds-scale
+ * (§3.3 `deadlineMs`, RESUME_ADMISSION_DEADLINE_MS is 60s), so this costs
+ * a no-op tick per quarter second only while entries are actually waiting.
+ */
+export const QUEUE_EXPIRY_TICK_MS = 250;
+
 export interface DaemonPaths {
   stateDir: string;
   socket: string;
@@ -205,6 +222,7 @@ export class ExecutionQueue {
   private active = 0;
   private readonly queue: QueueEntry[] = [];
   private highWaterMark = 0;
+  private expiryTimer: NodeJS.Timeout | null = null;
 
   private readonly cap: number;
   private readonly capacity: number;
@@ -269,6 +287,7 @@ export class ExecutionQueue {
     } else {
       this.queue.push(entry);
       this.highWaterMark = Math.max(this.highWaterMark, this.queue.length);
+      this.startExpiryTimer();
     }
 
     return {
@@ -286,6 +305,33 @@ export class ExecutionQueue {
     };
   }
 
+  /**
+   * Runs only while entries are actually waiting, and is `unref`'d so it
+   * is never itself a reason for the process to stay alive. Both matter:
+   * a timer that outlived the queue would hold Node's event loop open past
+   * the point the daemon released its locks, which is precisely the
+   * lingering-process hazard `bin.ts`'s hard exit exists to close.
+   */
+  private startExpiryTimer(): void {
+    if (this.expiryTimer !== null) return;
+    const timer = setInterval(() => {
+      this.dropExpired();
+    }, QUEUE_EXPIRY_TICK_MS);
+    timer.unref?.();
+    this.expiryTimer = timer;
+  }
+
+  private stopExpiryTimer(): void {
+    if (this.expiryTimer === null) return;
+    clearInterval(this.expiryTimer);
+    this.expiryTimer = null;
+  }
+
+  /** Releases the expiry timer; call once the queue is done being used. */
+  stop(): void {
+    this.stopExpiryTimer();
+  }
+
   private dropExpired(): void {
     const now = this.now();
     for (let i = this.queue.length - 1; i >= 0; i--) {
@@ -295,6 +341,8 @@ export class ExecutionQueue {
         entry.settle("expired");
       }
     }
+    // Nothing left to expire — the timer would just be a no-op tick.
+    if (this.queue.length === 0) this.stopExpiryTimer();
   }
 
   private async dispatch(entry: QueueEntry): Promise<void> {
@@ -374,10 +422,19 @@ const INTERNAL_ERROR_MESSAGE =
   "internal daemon error; see the daemon log for the cause, correlated by this error's requestId";
 
 /**
- * Runs the daemon, resolving only once it has fully stopped. The two
- * refusal paths throw `DaemonExit` rather than calling `process.exit`
- * directly, so the exit code stays a property of the protocol and the
- * caller owns process termination.
+ * Runs the daemon, resolving only once it has fully stopped — both locks
+ * released, endpoint removed. It never terminates the process itself: the
+ * two refusal paths throw `DaemonExit` rather than calling `process.exit`,
+ * so the exit code stays a property of the protocol and the CALLER owns
+ * process termination.
+ *
+ * That ownership carries an obligation, not just a choice. Resolving here
+ * does not cancel work the drain deadline abandoned, so a caller that
+ * keeps running after this resolves is a process holding live in-flight
+ * store work with the locks already released — a second writer against a
+ * successor's database. Every caller must exit promptly once this settles;
+ * `bin.ts`'s `--daemon` path does so explicitly, and the test fixture
+ * `helpers/run-daemon.ts` mirrors it.
  */
 export async function runDaemon(opts: RunDaemonOptions): Promise<void> {
   const log = opts.log ?? ((line: string) => console.error(line));
@@ -545,8 +602,29 @@ async function startDaemon(
   } finally {
     // §3.5 step 4: maintenance first, lifecycle last. Lifecycle release
     // is the very last act — a client that sees it free may start.
-    if (maintenance !== null) await maintenance.release();
-    await lifecycle.release();
+    //
+    // Nested rather than sequential: the maintenance release is a real
+    // store call and can throw (a ROLLBACK against an already-closing
+    // client, say). Left in sequence, that throw would skip the lifecycle
+    // release entirely and propagate — leaving the exclusive lock held by
+    // a process that is on its way out, so every successor exits "already
+    // running" until the OS drops it. The lifecycle release is the one
+    // step that must happen on every path, so it owns the `finally`.
+    //
+    // Kernel lock-drop at process death is the backstop underneath this
+    // (advisory locks die with the process, and `bin.ts` exits hard right
+    // after), but a backstop is not a reason to skip the ordered release:
+    // it is what makes the release visible PROMPTLY and in the §3.5 order,
+    // rather than whenever the kernel gets around to it.
+    try {
+      if (maintenance !== null) await maintenance.release();
+    } catch (err) {
+      log(
+        `[conduitd] Maintenance lock release failed: releasing lifecycle anyway. Context: {cause: ${err instanceof Error ? err.message : String(err)}}`,
+      );
+    } finally {
+      await lifecycle.release();
+    }
   }
 }
 
@@ -1184,6 +1262,7 @@ async function serve(opts: ServeOptions): Promise<void> {
   // otherwise the wait below reintroduces the unbounded hang this
   // deadline exists to prevent.
   for (const ctx of connections) ctx.socket.destroy();
+  queue.stop();
   await closed;
 
   unlinkIfStillOurs(paths.socket, bound, log);

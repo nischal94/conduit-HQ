@@ -72,7 +72,21 @@ async function main(): Promise<void> {
       }
       throw error;
     }
-    return;
+    // Exit HARD, not by falling off the end of `main`. `runDaemon`
+    // resolving means the drain deadline passed and BOTH locks were
+    // released — but abandoned in-flight work (a request stalled in the
+    // store or an upstream layer, or a sweep write that lost the SIGTERM
+    // race) is not cancelled by that release, only unawaited. Left alive,
+    // those promises keep Node's event loop open, and a stalled store
+    // call can still land AFTER a successor or a rotation has taken the
+    // locks — two writers against one database, which is exactly the
+    // single-ownership property §3.5 exists to guarantee. Abandoned work
+    // must therefore die with the process the instant ownership is
+    // released. The rows it leaves behind are recovered the same way a
+    // crash's are: by the successor's crash-terminal sweep. That is the
+    // whole recovery model, and it is only sound if we truly look like a
+    // crash here rather than lingering with released locks.
+    process.exit(process.exitCode ?? 0);
   }
   await runStdioServer();
 }

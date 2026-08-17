@@ -60,20 +60,45 @@ function openLockClient(lockDbPath: string): Client {
   return client;
 }
 
-async function prepareConnection(client: Client): Promise<void> {
+async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<void> {
   await client.execute("PRAGMA journal_mode=DELETE");
-  await client.execute("PRAGMA busy_timeout=0");
+  await client.execute(`PRAGMA busy_timeout=${busyTimeoutMs}`);
 }
 
 /**
- * BEGIN EXCLUSIVE, busy_timeout=0, journal_mode=DELETE. null = BUSY.
+ * How long an EXCLUSIVE acquisition lets SQLite's busy handler ride out
+ * ANOTHER acquirer's transient locks before reading BUSY as "held".
+ *
+ * With busy_timeout=0, two processes racing BEGIN EXCLUSIVE on the same
+ * fresh lock db can BOTH fail: each takes SHARED on its way up, one wins
+ * PENDING and gets immediate BUSY on EXCLUSIVE (the loser's SHARED is
+ * still there), while the loser gets immediate BUSY on PENDING. Both read
+ * the mutual collision as "a daemon already holds this" and refuse — the
+ * concurrent auto-start race ends with ZERO daemons, violating §3.5's
+ * "exactly one survives". The busy handler breaks the symmetry: SQLite
+ * returns immediate BUSY (handler deliberately not invoked) only to the
+ * side whose wait would deadlock — the SHARED holder blocking a PENDING
+ * holder — so that side backs off and releases, and the PENDING holder's
+ * handler then completes the upgrade. One winner, one refusal.
+ *
+ * The window only needs to cover a peer's µs-scale acquisition attempt;
+ * 1s is comfortably past that under CI load. The cost is bounded refusal
+ * latency: a process losing to an ESTABLISHED holder now waits up to this
+ * long before exiting "already running", which no §3.5 path depends on
+ * being instant. SHARED acquisitions and probes stay at busy_timeout=0 —
+ * a probe's whole job is an instant answer about the current holder.
+ */
+const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
+
+/**
+ * BEGIN EXCLUSIVE, journal_mode=DELETE. null = BUSY (someone holds it).
  * Held open until `release()` is called (or the process dies, which
  * drops the fd and releases the fcntl lock at the kernel level).
  */
 export async function acquireExclusive(lockDbPath: string): Promise<HeldLock | null> {
   const client = openLockClient(lockDbPath);
   try {
-    await prepareConnection(client);
+    await prepareConnection(client, EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS);
     await client.execute("BEGIN EXCLUSIVE");
   } catch (err) {
     client.close();

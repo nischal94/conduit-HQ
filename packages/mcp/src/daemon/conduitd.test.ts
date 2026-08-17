@@ -634,6 +634,16 @@ describe("conduitd lifecycle", () => {
     // Bounded: it must not wait on the stalled request forever, and it
     // must still release its locks and remove its endpoint on the way.
     expect(elapsed).toBeLessThan(DRAIN_DEADLINE_MS + 20_000);
+
+    // The PROCESS is gone, not merely "done draining". The stalled
+    // request never settles, so if the daemon relied on the event loop
+    // emptying it would linger forever with both locks already released —
+    // a second writer whose in-flight store call can land after a
+    // successor takes ownership. `waitForExit` above returning 0 is that
+    // assertion; this bound is the "promptly" half of it: exit follows the
+    // deadline, not the stall (which never resolves at all).
+    expect(elapsed).toBeLessThan(DRAIN_DEADLINE_MS + 10_000);
+    expect(daemon.child.killed || daemon.child.exitCode !== null).toBe(true);
     expect(daemon.lines.join("\n")).toContain("Drain deadline reached");
     expect(existsSync(paths.socket)).toBe(false);
 
@@ -960,6 +970,35 @@ describe("ExecutionQueue admission", () => {
 
     for (const b of blockers) b.release();
   });
+
+  it("a STATIONARY queue expires an entry on its own clock, with nothing else submitted", async () => {
+    // The regression: expiry used to be evaluated only as a side effect of
+    // another submission or of work completing. With the cap full of
+    // never-finishing work and no further arrivals, a queued entry whose
+    // admission deadline had already passed was never settled — the client
+    // hung to its own timeout and reported §5 `outcome unknown` for a
+    // request the daemon could prove never ran. Real timers here on
+    // purpose: the periodic sweep IS the behaviour under test.
+    const queue = new ExecutionQueue();
+    const blockers = Array.from({ length: CONCURRENCY_CAP }, () => blocker());
+    for (const b of blockers) queue.submit(b.run, 60_000);
+
+    let ran = false;
+    const queued = queue.submit(async () => {
+      ran = true;
+    }, 50);
+    if (queued.outcome !== "accepted") throw new Error("expected acceptance");
+    expect(queue.depth).toBe(1);
+
+    // Nothing else is submitted and nothing completes — the only thing
+    // that can settle this is the queue's own expiry tick.
+    expect(await queued.done).toBe("expired");
+    expect(ran).toBe(false);
+    expect(queue.depth).toBe(0);
+
+    queue.stop();
+    for (const b of blockers) b.release();
+  }, 10_000);
 
   it("resume shares the SAME queue as execute — concurrent resumes queue rather than exceeding the cap", () => {
     // Resume re-enters sandbox execution (it drives a paused execution's
