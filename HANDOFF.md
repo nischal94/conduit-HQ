@@ -31,68 +31,79 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-16 late (Lane A BUILT: PR #46 open, SDD + whole-branch review converged; next: load-bearing gauntlet on PR #46 → human quiz + merge)
+## Current handoff — updated 2026-08-17 (Lane A GAUNTLET COMPLETE on PR #46, codex CONVERGED; next: HUMAN passes the quiz + names the merge, then Lane B)
 
 ### Where things stand
 
-- **Lane A is BUILT and PR #46 is OPEN** (`feat/daemon-core` → main,
-  12 build commits on top of the design branch's docs, head at the
-  whole-branch fix wave). Full SDD run 2026-08-16: 5 tasks, fresh
-  implementer + task review + scoped re-review per fix round (every
-  task took exactly one fix round), then a whole-branch review → one
-  fix wave → re-review: converged, no open Critical/Important. Suites
-  at head: **mcp 147/147, sdk 444/444, cli 105/105**, tsc+biome clean,
-  20+ INVARIANT §17 rows. Ledger (per-task history, rulings, parked
-  items): `.superpowers/sdd/2026-08-16-daemon-ownership/progress.md`
-  (git-ignored, kept). Deviations D1–D6 + rulings are consolidated in
-  the PR #46 body.
-- **Notable in-branch catches** (all fixed + re-reviewed): bind-mode
-  ACL strip ordered before symlink validation; capability re-handshake
-  privilege escalation; daemon crash on an ordinary 1 MiB result
-  (sandbox output cap == frame cap) via unhandled rejection; a vacuous
-  §9.2 hygiene test that asserted against a successful reply.
-- **Known pre-existing flake (needs its own task, NOT Lane A's):**
-  conduitd's "exactly one daemon survives a concurrent auto-start race"
-  test intermittently has BOTH daemons exit "already running" —
-  reproduces on unmodified baseline, rarer on the branch; exit-code
-  analysis says spawn-timing artifact, not a lock defect. Separately,
-  the branch's first commit widened the quickjs overflow-stress test
-  timeout 30s→90s (pre-existing full-suite-load flake that blocked ALL
-  commits via the pre-commit hook).
-- **Dependabot drift: push banner now reports 9 open alerts** (2 high /
-  6 moderate / 1 low) vs the 8 parked on 2026-08-15 — one new advisory
-  since the triage. Still parked, NOT a blocker.
+- **Lane A is BUILT and the FULL load-bearing gauntlet is COMPLETE
+  agent-side.** PR #46 (`feat/daemon-core` → main, head `c5d9d9a`).
+  Trail: SDD (5 tasks, every task exactly one fix round) →
+  whole-branch review + fix wave → Tier-2 five-specialist wave (3
+  Critical + 15 Important + 10 minors → all fixed `58b32b6`, scoped
+  re-review clean) → /security-review ZERO findings → code-review
+  mechanic zero findings → **codex arc CONVERGED** (pass 1: 4 P1 + 3
+  P2 → fixes `746c79e`; pass 2 found one new P2 → fix `c5d9d9a`; pass
+  3: explicit convergence). Suites at head: **mcp 159/159, sdk
+  444/444, cli 105/105**, tsc+biome clean. Ledger:
+  `.superpowers/sdd/2026-08-16-daemon-ownership/progress.md`
+  (git-ignored, kept — full history, rulings, adjudications).
+  Deviations D1–D6 in the PR body; gauntlet summary + interim-window
+  note posted as a PR comment 2026-08-17.
+- **The carried auto-start race flake is RESOLVED at root cause**
+  (found during the codex fix wave): symmetric `BEGIN EXCLUSIVE` on a
+  fresh lock-db under busy_timeout=0 mutually aborts — both daemons
+  exit "already running". Fixed by scoping a 1s busy handler to
+  lifecycle acquisition ONLY (maintenance/probes stay fail-fast per
+  §3.5); 10/10 stress runs green, fail-fast pinned <250ms.
+- **Explainer + quiz delivered 2026-08-17**: Artifact "The Conduit
+  Daemon Core" (URL in chat/private notes — public-safe rule keeps it
+  off the PR). Five questions; the human must pass ALL before naming
+  the merge.
+- **Codex adjudications on record:** stdio serve unconverted + key
+  rotate not yet under the maintenance lock = the scheduled Lane B
+  Tasks 6/9 (interim coexistence window documented on the PR);
+  spawn-once rotation-race misclassification parked behind a
+  retry-policy decision (fail-safe today).
+- **Dependabot drift: banner now 10 alerts (3 high)** vs 8 parked
+  2026-08-15. Still parked, NOT a blocker, but the drift is
+  accelerating — fold into the next deliberate sweep.
+- GitHub API was intermittently 503ing at session close; PR #46 CI
+  status was not re-confirmed after the final push — verify checks
+  green before merging.
 
-### NEXT — the load-bearing gauntlet on PR #46, then human merge
+### NEXT — human quiz + named merge, then Lane B
 
-Lane A touches product code + the security boundary → full gauntlet:
-(1) `/pr-review-toolkit:review-pr all parallel`; (2) post-PR
-`code-review` mechanic; (3) `/security-review` (+ aikido if connected);
-(4) raw `codex exec` correctness pass per
-`~/.claude/rules/codex-one-path.md` (the design convergence does NOT
-cover this code); (5) `/explain-diff` explainer + quiz linked on the
-PR. Findings: fix in-branch → scoped re-verify; adjudications go in the
-ledger. CI green. Then the HUMAN passes the quiz fully and NAMES the
-merge — the agent never merges. Post-merge: branch sweep, `pnpm -r
-build`, then Lane B (plan Tasks 6–10) via SDD in a fresh session from
-merged main. Carry into Lane B: the auto-start race flake task; a
-wiring test for resume→submitSandboxWork (currently pinned only by
-reading); split conduitd's connection handling early (file is ~900
-lines); the `listRunningIds` rename question when Lane B settles the
-seam's public surface; oversize-result error-code taxonomy if clients
-need to branch on it.
+1. **Human:** open the "The Conduit Daemon Core" artifact, pass all 5
+   quiz questions (a miss = reread + retake), verify PR #46 CI is
+   green, then NAME the merge. The agent never merges.
+2. **Post-merge session:** branch sweep (delete local+remote
+   `feat/daemon-core` + `docs/daemon-ownership-design` after verifying
+   squash content on main; prune) → `pnpm -r build` (serve runs from
+   dist) → real-db canary-verified open → then **Lane B (plan Tasks
+   6–10) via SDD in a FRESH session from merged main** (branch
+   `feat/daemon-clients`). Carry into Lane B: fresh-dir auto-start
+   flake (~2/9 under load; MAX_PASSES exhausted via spawn-then-release
+   race — needs the retry-policy decision, same item as the parked
+   codex P2); split conduitd's connection handling early (~1,240
+   lines); `listRunningIds` rename question (`...ForCrashRecovery`)
+   when Lane B settles the seam; oversize-result error-code taxonomy
+   if clients need to branch; §9.2 hygiene test's decorative redaction
+   assertions.
+- Remaining human leisure item (carried): reserve the `conduithq` npm
+  org.
 
 ### KICKOFF PROMPT for the next session
 
 > Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
 > first and follow its protocol (incl. `gh pr list --state all --limit 5`).
-> **State: Lane A (daemon core) is BUILT — PR #46 open, SDD +
-> whole-branch review converged, suites green. Do NOT re-run SDD or the
-> whole-branch review.** If the gauntlet hasn't run: run it per the NEXT
-> section, fix findings in-branch, then hand to the human for quiz +
-> named merge. If PR #46 is merged: post-merge sweep, rebuild dists,
-> then Lane B (Tasks 6–10) via SDD from merged main. The agent never
-> merges.
+> **State: Lane A gauntlet is COMPLETE (PR #46, codex converged, all
+> suites green). Do NOT re-run any review layer.** If PR #46 is still
+> open: the only blockers are human steps (quiz pass on the "The
+> Conduit Daemon Core" artifact + CI-green check + named merge). If
+> merged: post-merge sweep (both work branches), `pnpm -r build`,
+> real-db canary open, then Lane B (Tasks 6–10) via
+> superpowers:subagent-driven-development from merged main, carrying
+> the Lane B items in the NEXT section. The agent never merges.
 
 ---
 

@@ -1913,3 +1913,57 @@ same shape as the design arc but shorter — each fix wave's residue was
 specification tightening (probe modes, ACL detection, queue bounds), not
 new architecture. Consistent with the step-1 pattern: budget confirming
 passes for every fix wave, expect the residue to shrink by class.
+
+## 2026-08-16/17 — Lane A build (SDD) + full gauntlet (PR #46)
+
+### 1. Every SDD task took exactly one fix round — and the reviews earned it
+
+Five tasks, five opus task reviews, five one-round fix loops. The
+catches were real, not review theater: an ACL strip ordered before
+symlink validation (an ACL-clearing primitive), a capability
+re-handshake escalation, a daemon crash on an ordinary max-size result
+(sandbox output cap == frame cap), and a §9.2 hygiene test that had
+been asserting against a successful reply. Cheap-model implementers on
+fully-specified tasks plus strong-model reviewers is the right split;
+the two opus-implemented tasks (runtime, client) also produced the two
+legitimate BLOCKED/deviation escalations.
+
+### 2. A "review the catches" lens misses unhandled 'error' EVENTS
+
+The silent-failure specialist's two Criticals were both unhandled
+EventEmitter 'error' events (spawned child, post-listen server) — not
+catch blocks. A catch-focused audit structurally cannot see them; grep
+for `.on("error"` / spawn/listen sites explicitly when reviewing Node
+lifecycle code.
+
+### 3. Bisect before hypothesizing; sample before convicting
+
+The codex-fix race-test regression burned two wrong causal hypotheses
+(honestly self-caught) before a bisection + 8-run baseline resample
+showed NO fix hunk was guilty — the failure was the pre-existing
+auto-start flake, amplified. Single-sample probes on a flaky test
+convict innocent code. The real mechanism (symmetric BEGIN EXCLUSIVE
+mutual abort under busy_timeout=0, both daemons exit "already running")
+was then provable by instrumentation — and its fix had to be SCOPED:
+the confirming codex pass caught the busy-handler leaking onto
+rotation's fail-fast path. Kernel-lock tuning parameters are per-role
+contracts, not global knobs.
+
+### 4. The gauntlet's layers found disjoint defect sets
+
+SDD reviews, the whole-branch review, five specialists, security
+review, and the codex arc overlapped almost nowhere: the specialists
+found the error-event class and contract-pin gaps; codex alone found
+the lingering-writer-after-lock-release class and the two Lane-B
+sequencing exposures; security found nothing (after everything
+upstream had fixed 60+ findings). No single layer would have shipped
+this safely; the disjointness is the argument for keeping all of them
+on load-bearing PRs.
+
+### 5. Subagent permission gates need a human in the loop for stash ops
+
+Two stash-pop round-trips through the human's terminal were needed
+because subagents (correctly) cannot pop stashes and the controller's
+own attempt was denied. When a subagent must snapshot work, prefer
+committing to a temp branch or copying files to the workspace over
+`git stash` — stashes strand work behind a human gate.
