@@ -6,3 +6,12 @@ allowBuilds:
 # Supply-chain: don't install versions published less than 3 days ago
 # (compromised-maintainer window). See CLAUDE.md "Security posture".
 minimumReleaseAge: 4320
+# Audit-gate overrides (2026-08-17): pin the two HIGH transitive advisories
+# past their patched versions. ip-address rides @modelcontextprotocol/sdk ->
+# express-rate-limit (SSRF-class; independently verified not to reach the
+# §9.3 egress guard, but the CI audit gate reads the advisory db, not our
+# threat model). nanoid is dev-only via tsup/vite -> postcss. Moderates stay
+# parked per the standing Dependabot triage.
+overrides:
+  "ip-address@<=10.3.0": ">=10.3.1"
+  "nanoid@<3.3.18": ">=3.3.18"
