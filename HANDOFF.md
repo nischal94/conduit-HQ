@@ -31,7 +31,83 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-16 (§17 v1 step 2 daemon ownership: design rev 8 CONVERGED + 10-task plan COMMITTED; next: BUILD Lane A via SDD in a fresh session)
+## Current handoff — updated 2026-08-17 (Lane A GAUNTLET COMPLETE on PR #46, codex CONVERGED; next: HUMAN passes the quiz + names the merge, then Lane B)
+
+### Where things stand
+
+- **Lane A is BUILT and the FULL load-bearing gauntlet is COMPLETE
+  agent-side.** PR #46 (`feat/daemon-core` → main, head `c5d9d9a`).
+  Trail: SDD (5 tasks, every task exactly one fix round) →
+  whole-branch review + fix wave → Tier-2 five-specialist wave (3
+  Critical + 15 Important + 10 minors → all fixed `58b32b6`, scoped
+  re-review clean) → /security-review ZERO findings → code-review
+  mechanic zero findings → **codex arc CONVERGED** (pass 1: 4 P1 + 3
+  P2 → fixes `746c79e`; pass 2 found one new P2 → fix `c5d9d9a`; pass
+  3: explicit convergence). Suites at head: **mcp 159/159, sdk
+  444/444, cli 105/105**, tsc+biome clean. Ledger:
+  `.superpowers/sdd/2026-08-16-daemon-ownership/progress.md`
+  (git-ignored, kept — full history, rulings, adjudications).
+  Deviations D1–D6 in the PR body; gauntlet summary + interim-window
+  note posted as a PR comment 2026-08-17.
+- **The carried auto-start race flake is RESOLVED at root cause**
+  (found during the codex fix wave): symmetric `BEGIN EXCLUSIVE` on a
+  fresh lock-db under busy_timeout=0 mutually aborts — both daemons
+  exit "already running". Fixed by scoping a 1s busy handler to
+  lifecycle acquisition ONLY (maintenance/probes stay fail-fast per
+  §3.5); 10/10 stress runs green, fail-fast pinned <250ms.
+- **Explainer + quiz delivered 2026-08-17**: Artifact "The Conduit
+  Daemon Core" (URL in chat/private notes — public-safe rule keeps it
+  off the PR). Five questions; the human must pass ALL before naming
+  the merge.
+- **Codex adjudications on record:** stdio serve unconverted + key
+  rotate not yet under the maintenance lock = the scheduled Lane B
+  Tasks 6/9 (interim coexistence window documented on the PR);
+  spawn-once rotation-race misclassification parked behind a
+  retry-policy decision (fail-safe today).
+- **Dependabot drift: banner now 10 alerts (3 high)** vs 8 parked
+  2026-08-15. Still parked, NOT a blocker, but the drift is
+  accelerating — fold into the next deliberate sweep.
+- GitHub API was intermittently 503ing at session close; PR #46 CI
+  status was not re-confirmed after the final push — verify checks
+  green before merging.
+
+### NEXT — human quiz + named merge, then Lane B
+
+1. **Human:** open the "The Conduit Daemon Core" artifact, pass all 5
+   quiz questions (a miss = reread + retake), verify PR #46 CI is
+   green, then NAME the merge. The agent never merges.
+2. **Post-merge session:** branch sweep (delete local+remote
+   `feat/daemon-core` + `docs/daemon-ownership-design` after verifying
+   squash content on main; prune) → `pnpm -r build` (serve runs from
+   dist) → real-db canary-verified open → then **Lane B (plan Tasks
+   6–10) via SDD in a FRESH session from merged main** (branch
+   `feat/daemon-clients`). Carry into Lane B: fresh-dir auto-start
+   flake (~2/9 under load; MAX_PASSES exhausted via spawn-then-release
+   race — needs the retry-policy decision, same item as the parked
+   codex P2); split conduitd's connection handling early (~1,240
+   lines); `listRunningIds` rename question (`...ForCrashRecovery`)
+   when Lane B settles the seam; oversize-result error-code taxonomy
+   if clients need to branch; §9.2 hygiene test's decorative redaction
+   assertions.
+- Remaining human leisure item (carried): reserve the `conduithq` npm
+  org.
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: Lane A gauntlet is COMPLETE (PR #46, codex converged, all
+> suites green). Do NOT re-run any review layer.** If PR #46 is still
+> open: the only blockers are human steps (quiz pass on the "The
+> Conduit Daemon Core" artifact + CI-green check + named merge). If
+> merged: post-merge sweep (both work branches), `pnpm -r build`,
+> real-db canary open, then Lane B (Tasks 6–10) via
+> superpowers:subagent-driven-development from merged main, carrying
+> the Lane B items in the NEXT section. The agent never merges.
+
+---
+
+## Superseded handoff — updated 2026-08-16 (design+plan converged; its NEXT [build Lane A] was completed the same day by the section above)
 
 ### Where things stand
 

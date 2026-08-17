@@ -260,7 +260,9 @@ describe("QuickJSSandbox", () => {
     // The old (unfixed) module poisoned at ~101 accumulated overflows, so a
     // count comfortably past that is what proves the rebuild prevents it.
     const PAST_POISON_THRESHOLD = 150;
-    const STRESS_TIMEOUT_MS = 30_000;
+    // 90s: the 150-iteration loops run ~20s alone but have hit 30s+ under
+    // full-suite parallel load; the margin bounds a hang, not a slow pass.
+    const STRESS_TIMEOUT_MS = 90_000;
     afterEach(() => setSandboxDiagnostic(undefined));
 
     it(

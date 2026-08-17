@@ -1850,3 +1850,120 @@ third-party advisory non-applicable. Structural fixes retire future
 alerts; denylist fixes accumulate them. The triage note records residual
 exposure honestly (whatever the MCP SDK does with these at runtime) —
 the point is that the boundary's own guarantee was verified, not assumed.
+
+## 2026-08-15 (later) — Daemon-ownership design: 5-pass convergence arc
+
+### 1. The reviews found different error classes — run both instruments
+
+The design went through an adversarial codex arc AND an independent
+claim-verification agent. They overlapped on exactly one finding (the
+credential-forwarding path) and otherwise partitioned cleanly: codex
+found the races and trust-boundary gaps (unlink split-brain, rotation
+race, spawn-env smuggling, lock-fd inheritance); the verifier found the
+false factual claims (a wrong entry-point table, a misattributed spec
+quote, a reworded MUST presented as a quotation). Neither instrument
+would have caught the other's class. A design review that runs only the
+adversarial pass ships with confident false citations; one that runs
+only fact-checking ships with correct citations and a split-brain race.
+
+### 2. Fix-the-finding creates the next finding — budget for the arc
+
+9 → 5 → 3 → 2 → 0 over five passes, mirroring step 1's arc. Every fix
+wave created new attack surface out of its own machinery: the daemon
+answer created the IPC boundary; the credential fix created the
+forwarding oracle; the lock fix created the fd-inheritance wedge; the
+spawn fix left PATH/cwd ambient channels. None of these were denylist
+loops — each was a distinct root cause in newly-introduced structure,
+which is exactly the convergence rule's "fix and re-run" branch, not its
+"change the shape" branch. Plan for 3-5 passes on any design that
+introduces a new process or trust boundary; a single pass plus fixes is
+an unreviewed design.
+
+### 3. An empty output file is not a failed run — check process liveness
+
+Three consecutive codex "failures" were one failure: reading the output
+file before the run finished. The notification fires when the shell
+wrapper exits, not when the detached process writes stdout; codex writes
+stdout ONCE at the end of a 4-7 minute run. Two invented diagnoses
+(skill-file wandering, an interactive-mode config flag) were both wrong
+and each consumed a full relaunch. The tell that should have stopped it:
+`pgrep -f "codex exec"` — alive means wait, not diagnose. Codified in
+~/.claude/rules/codex-one-path.md (liveness check, wait-on-process
+pattern, 1400s budget for design reviews, inline-the-document for
+document reviews).
+
+## 2026-08-16 — Design review closeout + plan (daemon ownership)
+
+### 1. Cross-model convergence does not cover the implementation platform
+
+Five codex passes converged the design as LOGIC; a platform-focused eng
+review then found both load-bearing mechanisms unimplementable in the
+actual runtime — Node ≥20 stdlib has neither flock(2) nor
+SO_PEERCRED/getpeereid. Neither fact was findable by reviewing the
+design's reasoning; both were findable by one grep and one stdlib check.
+A converged design review answers "is this correct?"; a separate pass
+must answer "can THIS stack build it?" — run both before writing a plan.
+(Resolution reused shipped machinery: SQLite lock databases as the
+kernel-lock primitive; the 0700 directory as the UID boundary.)
+
+### 2. The second arc converged too, and faster (5→1→0)
+
+Fixing the platform findings triggered its own codex arc (passes 6-8),
+same shape as the design arc but shorter — each fix wave's residue was
+specification tightening (probe modes, ACL detection, queue bounds), not
+new architecture. Consistent with the step-1 pattern: budget confirming
+passes for every fix wave, expect the residue to shrink by class.
+
+## 2026-08-16/17 — Lane A build (SDD) + full gauntlet (PR #46)
+
+### 1. Every SDD task took exactly one fix round — and the reviews earned it
+
+Five tasks, five opus task reviews, five one-round fix loops. The
+catches were real, not review theater: an ACL strip ordered before
+symlink validation (an ACL-clearing primitive), a capability
+re-handshake escalation, a daemon crash on an ordinary max-size result
+(sandbox output cap == frame cap), and a §9.2 hygiene test that had
+been asserting against a successful reply. Cheap-model implementers on
+fully-specified tasks plus strong-model reviewers is the right split;
+the two opus-implemented tasks (runtime, client) also produced the two
+legitimate BLOCKED/deviation escalations.
+
+### 2. A "review the catches" lens misses unhandled 'error' EVENTS
+
+The silent-failure specialist's two Criticals were both unhandled
+EventEmitter 'error' events (spawned child, post-listen server) — not
+catch blocks. A catch-focused audit structurally cannot see them; grep
+for `.on("error"` / spawn/listen sites explicitly when reviewing Node
+lifecycle code.
+
+### 3. Bisect before hypothesizing; sample before convicting
+
+The codex-fix race-test regression burned two wrong causal hypotheses
+(honestly self-caught) before a bisection + 8-run baseline resample
+showed NO fix hunk was guilty — the failure was the pre-existing
+auto-start flake, amplified. Single-sample probes on a flaky test
+convict innocent code. The real mechanism (symmetric BEGIN EXCLUSIVE
+mutual abort under busy_timeout=0, both daemons exit "already running")
+was then provable by instrumentation — and its fix had to be SCOPED:
+the confirming codex pass caught the busy-handler leaking onto
+rotation's fail-fast path. Kernel-lock tuning parameters are per-role
+contracts, not global knobs.
+
+### 4. The gauntlet's layers found disjoint defect sets
+
+SDD reviews, the whole-branch review, five specialists, security
+review, and the codex arc overlapped almost nowhere: the specialists
+found the error-event class and contract-pin gaps; codex alone found
+the lingering-writer-after-lock-release class and the two Lane-B
+sequencing exposures; security found nothing (after everything
+upstream had fixed 60+ findings). No single layer would have shipped
+this safely; the disjointness is the argument for keeping all of them
+on load-bearing PRs.
+
+### 5. Subagent permission gates need a human in the loop for stash ops
+
+Two stash-pop round-trips through the human's terminal were needed
+because subagents (correctly) cannot pop stashes and the controller's
+own attempt was denied. When a subagent must snapshot work, prefer
+committing to a temp branch or copying files to the workspace over
+`git stash` — stashes strand work behind a human gate.
