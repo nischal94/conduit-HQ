@@ -79,10 +79,10 @@ export const DRAIN_DEADLINE_MS = 30_000;
 /**
  * The `role` strings stamped into the maintenance lock's diagnostic holder
  * row (§3.4). They appear verbatim inside refusal messages a human reads
- * ("Held by daemon (pid 4711) since …"), so they are named here rather
- * than written as literals at each acquisition site — the daemon and the
- * two CLI acquirers must agree on the vocabulary for those messages to
- * read consistently.
+ * ("Last acquired by daemon (pid 4711) at … (may be stale)"), so they are
+ * named here rather than written as literals at each acquisition site —
+ * the daemon and the two CLI acquirers must agree on the vocabulary for
+ * those messages to read consistently.
  */
 export const MAINTENANCE_ROLE_DAEMON = "daemon";
 export const MAINTENANCE_ROLE_ROTATE = "conduit key rotate";

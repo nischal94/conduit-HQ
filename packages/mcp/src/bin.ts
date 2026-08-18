@@ -145,16 +145,6 @@ async function doctor(): Promise<number> {
  */
 async function doctorOffline(): Promise<number> {
   const paths = daemonPaths(DEFAULT_CONDUIT_DIR);
-  // A state directory that does not exist yet is the FRESH-INSTALL case,
-  // and diagnosing one is squarely this mode's job — "nothing is set up
-  // here" is a finding, not an error. It is also provably unlocked: a lock
-  // db nobody can open is a lock nobody can be holding, which is the same
-  // reading `probeShared` already takes for a missing directory.
-  //
-  // The directory is deliberately NOT created to take the lock. Creating
-  // `~/.conduit` is the daemon's prerogative (§3.2), and a read-only
-  // diagnostic that provisions the very state it claims to be inspecting
-  // would be the mutation this mode exists to avoid.
   // One reading of "the state directory isn't there", shared with the two
   // `key` subcommands: nothing can hold a lock in a directory that does
   // not exist, so `no-state-dir` proceeds to report on the fresh install

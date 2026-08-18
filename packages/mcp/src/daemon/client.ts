@@ -434,10 +434,20 @@ async function exchange(
     // so an observer can never be handed a malformed handshake's fields.
     const validated = decodeResponse(handshake);
     if (validated !== null && validated.kind === "handshake.ok") {
-      onHandshake?.({
-        dbPath: validated.dbPath,
-        allowPrivateEgress: validated.allowPrivateEgress,
-      });
+      try {
+        onHandshake?.({
+          dbPath: validated.dbPath,
+          allowPrivateEgress: validated.allowPrivateEgress,
+        });
+      } catch {
+        // "Cannot alter the exchange" is enforced, not merely intended.
+        // This sits AFTER the handshake write, so an escaping observer
+        // fault would unwind into §5's ambiguous zone and be reported as
+        // `outcome-unknown` — telling the caller its request may have run
+        // when the only thing that actually failed was a diagnostic
+        // callback. A reporting seam must never be able to manufacture
+        // ambiguity about the request it is merely watching.
+      }
     }
 
     // Encoded BEFORE the connection was ever made (see `daemonRequest`),
