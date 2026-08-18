@@ -4,6 +4,7 @@ import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { AGENT_VERSION } from "../env.js";
 import {
   CONCURRENCY_CAP,
   DRAIN_DEADLINE_MS,
@@ -98,6 +99,15 @@ interface Daemon {
  * lives inside the temp state dir, so no test ever touches a real one.
  */
 const TEST_KEY = Buffer.alloc(32, 7).toString("base64");
+
+/**
+ * The secret the `--throw-execute` fault embeds in its error message.
+ *
+ * Must stay in sync with the literal of the same name in
+ * `helpers/run-daemon.ts` — that file is spawned as a standalone process
+ * and excluded from the package tsconfig, so it cannot be imported here.
+ */
+const FAULT_SECRET = "Bearer thrown_fault_secret_do_not_leak";
 
 function spawnDaemon(stateDir: string, extraArgs: string[] = []): Daemon {
   const child = spawn(process.execPath, [HELPER, stateDir, ...extraArgs], {
@@ -431,6 +441,261 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
+    "routes sandbox module-recovery diagnostics to the DAEMON's log — and leaks no guest code",
+    async () => {
+      // Moved here from server.test.ts by D-B1: the sandbox now runs
+      // daemon-side, so `runDaemon` owns the process-global recovery sink.
+      // A real overflow through a real daemon, then a benign call that
+      // rebuilds — the events must reach the daemon's own log in the
+      // "[sandbox]" format, carrying NO guest code or values.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({
+        kind: "execute",
+        code: "let x = { secretMarker: 1 }; for (let i=0;i<20000;i++) x={n:x}; return x;",
+        deadlineMs: 60_000,
+      });
+      await client.next();
+      client.send({ kind: "execute", code: "return 1;", deadlineMs: 60_000 });
+      await client.next();
+
+      await waitFor(() => daemon.lines.some((l) => l.includes("sandbox.module.recovery.ok")));
+      const diag = daemon.lines.filter((l) => l.includes("[sandbox] "));
+      expect(diag.some((l) => l.includes("sandbox.module.poisoned"))).toBe(true);
+      expect(diag.some((l) => l.includes("sandbox.module.recovery.ok"))).toBe(true);
+      // §11: no diagnostic line carries guest code or guest values.
+      for (const line of diag) {
+        expect(line).not.toContain("secretMarker");
+        expect(line).not.toContain('"n"');
+      }
+
+      // Close before signalling: a READY-granted connection counts as
+      // active work, so the D6 drain grace would otherwise hold this
+      // daemon for the full DRAIN_DEADLINE_MS with nothing left to do.
+      client.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * D-B1 (controller-ruled): the three read-only kinds `serve` gained so the
+   * stdio server could stop opening the database itself. Driven against a
+   * REAL spawned daemon over the real socket, because what needs pinning is
+   * the whole path — capability check, dispatch, projection — not the
+   * projection functions alone (`server.test.ts` covers those in ring 1).
+   */
+  it(
+    "INVARIANT §17 / §3.3: the D-B1 reads answer with PROJECTIONS carrying no credential material",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--seed-catalog"]);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      client.send({ kind: "catalog.listing" });
+      const listing = (await client.next()) as {
+        kind: string;
+        payload: { connections: { prefix: string; label: string }[]; sourceCount: number };
+      };
+      expect(listing.kind).toBe("result");
+      // The advertisement view: the seeded connection is listed by prefix
+      // and namespace label, and the source count drives the startup hint.
+      expect(listing.payload.connections).toEqual([
+        { prefix: "github.acme.prod", label: "github tools" },
+      ]);
+      expect(listing.payload.sourceCount).toBe(1);
+
+      // §3.3.1, pinned on the WIRE rather than by reading the code: the
+      // connection row this projection derives from carries a
+      // `credentialRef`, and no field of it — nor the secret it points at —
+      // may appear in any byte the daemon sent. A future refactor that
+      // spreads the row instead of naming two fields fails here.
+      const wire = JSON.stringify(listing.payload);
+      expect(wire).not.toContain("credentialRef");
+      expect(wire).not.toContain("cred_gh");
+      expect(wire).not.toContain("secret");
+      expect(Object.keys(listing.payload.connections[0] ?? {}).sort()).toEqual(["label", "prefix"]);
+
+      // An unknown execution is `not_found`, never an error frame — "no
+      // such row" is a legitimate answer to a lookup, and collapsing it
+      // into a failure would make an agent retry a question already
+      // answered.
+      client.send({ kind: "execution.get", executionId: "exec_does_not_exist" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "not_found" },
+      });
+      client.send({ kind: "execution.getByRequestKey", requestKey: "rk-nope" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "not_found" },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: execute.requestKey round-trips — the same key returns conflict, never a second run",
+    async () => {
+      // §M1's duplicate suppression, end to end through the daemon. The
+      // key is persisted BEFORE the sandbox runs, so a reissue after a
+      // lost response must be refused as a `conflict` rather than started
+      // again — a replayed execution can duplicate upstream side effects
+      // that already landed.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      client.send({
+        kind: "execute",
+        code: "return 41 + 1;",
+        deadlineMs: 60_000,
+        requestKey: "rk-1",
+      });
+      const first = (await client.next()) as {
+        kind: string;
+        payload: { status: string; executionId: string; result: unknown };
+      };
+      expect(first.kind).toBe("result");
+      expect(first.payload.status).toBe("completed");
+      expect(first.payload.result).toBe(42);
+
+      // Same key again: refused as a conflict, and the SAME execution is
+      // then recoverable by that key — which is the whole point of the
+      // field (recover, don't re-run).
+      client.send({
+        kind: "execute",
+        code: "return 41 + 1;",
+        deadlineMs: 60_000,
+        requestKey: "rk-1",
+      });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "conflict" },
+      });
+
+      client.send({ kind: "execution.getByRequestKey", requestKey: "rk-1" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "completed", executionId: first.payload.executionId, result: 42 },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a paused execution past its TTL reads back as `expired` on the DAEMON's clock",
+    async () => {
+      // The placement half of the CheckPayload projection, which the
+      // not_found case above cannot reach. `executionToCheckPayload`
+      // presents a `paused` row whose `expiresAt` has passed as
+      // `expired`, and that comparison must happen in the process that
+      // OWNS the row: a serve process with a skewed clock must not be
+      // able to present a live approval as dead, or a dead one as live.
+      //
+      // Driven through a REAL daemon with a REAL 1s approval TTL, so the
+      // row genuinely ages between the pause and the read — no clock
+      // injection, no fake timers. The serve-side client passes no clock
+      // at all (the `now` seam was removed in D-B1), so an `expired`
+      // answer here can ONLY have come from the daemon's own `Date.now()`.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--pause-execute", "--approval-ttl-ms", "1000"]);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({ kind: "execute", code: "pause me", deadlineMs: 60_000 });
+      const paused = (await client.next()) as {
+        kind: string;
+        payload: { status: string; executionId: string };
+      };
+      expect(paused.kind).toBe("result");
+      expect(paused.payload.status).toBe("paused");
+      const { executionId } = paused.payload;
+
+      // Immediately: still within the TTL, so still `paused`.
+      client.send({ kind: "execution.get", executionId });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "paused", executionId },
+      });
+
+      // Let the TTL genuinely lapse on the wall clock.
+      await new Promise((resolve) => setTimeout(resolve, 1_400));
+
+      // Same row, same request, same client — only the daemon's clock
+      // moved, and the projection now reads `expired`.
+      client.send({ kind: "execution.get", executionId });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { status: "expired", executionId },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17 / §3.3: the D-B1 reads are denied to every capability except serve",
+    async () => {
+      // The ruling widened `serve` ALONE. An administrative client must not
+      // acquire an execution lookup as a side effect of that widening.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      for (const capability of ["approvals", "add-mcp"]) {
+        const client = await connectClient(paths.socket);
+        await handshake(client, capability);
+        for (const request of [
+          { kind: "catalog.listing" },
+          { kind: "execution.get", executionId: "exec_x" },
+          { kind: "execution.getByRequestKey", requestKey: "rk-x" },
+        ]) {
+          client.send(request);
+          expect(await client.next()).toMatchObject({
+            kind: "error",
+            code: "invalid",
+            message: expect.stringContaining(`does not permit "${request.kind}"`),
+          });
+        }
+        client.socket.destroy(); // see the drain-grace note above
+      }
+
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
     "INVARIANT §17: a client whose env sets CONDUIT_DB is refused at handshake",
     async () => {
       const stateDir = newStateDir();
@@ -485,6 +750,26 @@ describe("conduitd lifecycle", () => {
       // reach it by method name (§3.3).
       client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
       expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a fresh daemon's handshake.ok carries its build version (agentVersion) for skew diagnosis",
+    async () => {
+      // The daemon reports its OWN build version in every handshake.ok, so a
+      // NEW client talking to an OLD, still-running daemon can diagnose skew
+      // (§17). A fresh daemon must therefore fill it, and with the SAME string
+      // `--version` prints (both read env.ts `AGENT_VERSION`), so client and
+      // daemon agree by construction rather than coincidence.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      const ok = await handshake(client, "serve");
+      expect(ok).toMatchObject({ kind: "handshake.ok", agentVersion: AGENT_VERSION });
     },
     TIMEOUT,
   );
@@ -550,14 +835,42 @@ describe("conduitd lifecycle", () => {
         message:
           "internal daemon error; see the daemon log for the cause, correlated by this error's requestId",
       });
-      expect(reply.message).not.toContain(stateDir);
-      expect(reply.message).not.toContain(".db");
+
+      // The redaction assertions scan the WHOLE serialized frame, not
+      // `reply.message`. Asserting against `message` was decorative: the
+      // `toMatchObject` above already pins it to an exact constant, so a
+      // `not.toContain` on that same field could never fail whatever the
+      // daemon did — and it would keep passing if a future change added a
+      // `cause` or `detail` field carrying the raw error. The frame-wide
+      // scan is what actually pins §9.2, in the same shape
+      // `source-invariants.test.ts` uses for stored credentials.
+      //
+      // Load-bearing because the fault genuinely carries the material: the
+      // `--throw-execute` fixture rejects with an error embedding
+      // FAULT_SECRET and the absolute state-dir path (see run-daemon.ts).
+      const wire = JSON.stringify(reply);
+      expect(wire).not.toContain(FAULT_SECRET);
+      expect(wire).not.toContain(stateDir);
+      expect(wire).not.toContain(".db");
+      expect(wire).not.toContain("simulated store fault");
+
+      // The daemon's OWN log, by contrast, MUST carry the cause — that is
+      // the whole bargain the client-facing message strikes ("see the
+      // daemon log for the cause"). Asserting it here proves the secret
+      // was genuinely in play, so the frame scan above is not vacuous: a
+      // fixture that silently stopped throwing would fail this line rather
+      // than pass the redaction checks trivially.
+      // "Queued request failed" — this fault is raised inside the queue's
+      // run closure, so it takes the queued-dispatch reporting path rather
+      // than the direct one.
+      await waitFor(() => daemon.lines.some((l) => l.includes("Queued request failed: execute")));
+      expect(daemon.lines.join("\n")).toContain(FAULT_SECRET);
     },
     TIMEOUT,
   );
 
   it(
-    "refuses unimplemented source RPCs distinguishably from malformed ones",
+    "answers implemented source RPCs, and still reads `invalid` on a malformed one",
     async () => {
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
@@ -567,10 +880,16 @@ describe("conduitd lifecycle", () => {
       const client = await connectClient(paths.socket);
       await handshake(client, "add-mcp");
 
-      // Well-formed and permitted for this capability, but not built:
-      // "unimplemented", never "invalid".
+      // Implemented since Task 8. A namespace with no stored source is a
+      // REFUSAL (`invalid`, carrying the operator's next move), never a
+      // not-built-yet placeholder — onboarding needs a url, and the only
+      // place a url may be supplied is `source.provision`. (The placeholder
+      // code the refusal once used has since been removed from the error
+      // union outright; nothing emits it.)
       client.send({ kind: "source.revalidate", namespace: "ns" });
-      expect(await client.next()).toMatchObject({ kind: "error", code: "unimplemented" });
+      const refusal = (await client.next()) as { kind: string; code: string; message: string };
+      expect(refusal).toMatchObject({ kind: "error", code: "invalid" });
+      expect(refusal.message).toContain("no source is registered under namespace");
 
       // A genuinely malformed request still reads "invalid", so the two
       // remain distinguishable.

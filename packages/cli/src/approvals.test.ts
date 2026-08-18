@@ -3,7 +3,13 @@ import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { createApprovalRuntime } from "@conduithq/mcp";
+import type { RpcRequest, RpcResponse } from "@conduithq/mcp";
+import {
+  createApprovalRuntime,
+  DaemonUnavailable,
+  pausedToListRow,
+  resumeToPayload,
+} from "@conduithq/mcp";
 import type { ConduitStore, ResumeOutcome } from "@conduithq/sdk";
 import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
@@ -12,13 +18,24 @@ import type { ApprovalsDeps } from "./commands/approvals.js";
 import { runDecide, runList } from "./commands/approvals.js";
 
 /**
- * Unit suite for `conduit approvals`. `list` is driven against a real store
- * (mirrors sqlite.test.ts's listPaused fixture) with a fake clock so the
- * expiry label is deterministic. `approve`/`deny` are driven against a REAL
- * `createApprovalRuntime` manager over a real loopback MCP stub — mirrors
- * runtime.test.ts's fixture — including a genuine double-approve `conflict`
- * and the chained re-pause; outcome branches are ALSO pinned in isolation
- * via an injected runtime double, mirroring add-mcp.test.ts's DI style.
+ * Unit suite for `conduit approvals`, driven through the DAEMON seam.
+ *
+ * Since Task 7 this command opens NO database: every read and every resume
+ * is an `approvals`-capability RPC. The DI seam is now a single `daemon`
+ * call, and the suite substitutes for it at two depths:
+ *
+ * - **Real-runtime fakes** — a fake daemon that answers `approvals.*` by
+ *   driving a REAL `createApprovalRuntime` manager over a real loopback MCP
+ *   stub (mirrors runtime.test.ts's fixture), including a genuine
+ *   double-approve `conflict` and the chained re-pause. This is the same
+ *   coverage the pre-conversion suite had, now with the daemon's own
+ *   `resumeToPayload` projection in the path.
+ * - **Payload doubles** — the outcome-mapping cases pin individual verb-truth
+ *   branches in isolation, exactly as before.
+ *
+ * The daemon's TRANSPORT-level answers (`error`, `outcome-unknown`) get their
+ * own block: those are shapes only the converted command can meet, and §5's
+ * ambiguity must never be reported as a landed verb.
  */
 
 const PREFIX = "github.acme.prod";
@@ -113,29 +130,68 @@ async function openTestStore(
   return openSqliteStore({ client, secretBox: await SecretBox.fromKeyBytes(keyBytes) });
 }
 
+/** A `result` frame — the shape the daemon answers a served request with. */
+function result(payload: unknown): RpcResponse {
+  return { kind: "result", requestId: "req_1", payload };
+}
+
+/**
+ * A fake daemon backed by a REAL store and (when asked) a REAL approval
+ * runtime — the same work `connection.ts` does for the two `approvals.*`
+ * kinds, including the `resumeToPayload` projection. Everything the command
+ * sees is therefore a genuine wire-shaped answer, not a hand-written one.
+ */
+function realDaemon(opts: {
+  store: ConduitStore;
+  allowPrivateEgress?: boolean;
+  live?: boolean;
+}): (request: RpcRequest) => Promise<RpcResponse> {
+  return async (request) => {
+    if (request.kind === "approvals.list") {
+      const paused = await opts.store.executions.listPaused();
+      // The REAL daemon-side projection (`pausedToListRow`), not a
+      // hand-written echo of it — so this fixture cannot drift into
+      // asserting a wire shape the daemon no longer sends.
+      return result(paused.map((execution) => pausedToListRow(execution)));
+    }
+    if (request.kind === "approvals.resume") {
+      if (opts.live !== true) throw new Error("approvals.resume not stubbed for this test");
+      const { manager } = await createApprovalRuntime({
+        store: opts.store,
+        allowPrivateEgress: opts.allowPrivateEgress ?? false,
+      });
+      return result(
+        resumeToPayload(await manager.resume(request.executionId, { kind: request.decision })),
+      );
+    }
+    throw new Error(`[approvals.test] unexpected request kind: ${request.kind}`);
+  };
+}
+
 function makeDeps(
-  overrides: Partial<ApprovalsDeps> & { store: ConduitStore; allowPrivateEgress?: boolean },
+  overrides: Partial<ApprovalsDeps> & {
+    store?: ConduitStore;
+    allowPrivateEgress?: boolean;
+    live?: boolean;
+  },
 ): ApprovalsDeps & {
   stdoutLines: string[];
   stderrLines: string[];
 } {
   const stdoutLines: string[] = [];
   const stderrLines: string[] = [];
-  const { store, allowPrivateEgress, ...rest } = overrides;
+  const { store, allowPrivateEgress, live, ...rest } = overrides;
   return {
-    openStore: async () => ({
-      env: {
-        dbPath: "",
-        keyBytes: new Uint8Array(32) as Uint8Array<ArrayBuffer>,
-        keySource: "env",
-        allowPrivateEgress: allowPrivateEgress ?? false,
-      },
-      store,
-    }),
-    createRuntime: async () => {
-      throw new Error("createRuntime not stubbed for this test");
-    },
-    env: {},
+    daemon:
+      store !== undefined
+        ? realDaemon({
+            store,
+            ...(allowPrivateEgress !== undefined ? { allowPrivateEgress } : {}),
+            ...(live !== undefined ? { live } : {}),
+          })
+        : async () => {
+            throw new Error("daemon not stubbed for this test");
+          },
     now: () => Date.now(),
     stdout: (line) => stdoutLines.push(line),
     stderr: (line) => stderrLines.push(line),
@@ -304,7 +360,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
     const deps = makeDeps({
       store,
       allowPrivateEgress: true,
-      createRuntime: (opts) => createApprovalRuntime(opts),
+      live: true,
     });
 
     const result = await runDecide("approve", executionId, deps);
@@ -322,7 +378,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
     const deps = makeDeps({
       store,
       allowPrivateEgress: true,
-      createRuntime: (opts) => createApprovalRuntime(opts),
+      live: true,
     });
 
     const result = await runDecide("deny", executionId, deps);
@@ -358,7 +414,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
     const deps = makeDeps({
       store,
       allowPrivateEgress: true,
-      createRuntime: (opts) => createApprovalRuntime(opts),
+      live: true,
     });
     const result = await runDecide("approve", executionId, deps);
 
@@ -386,7 +442,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
     const deps = makeDeps({
       store,
       allowPrivateEgress: true,
-      createRuntime: (opts) => createApprovalRuntime(opts),
+      live: true,
     });
 
     const first = await runDecide("approve", executionId, deps);
@@ -405,41 +461,40 @@ describe("conduit approvals approve|deny — real runtime", () => {
     expect(upstream.calls.map((c) => c.name)).toEqual(["delete_repo"]);
   });
 
-  it("missing execution-id exits 1 without opening the store", async () => {
+  it("missing execution-id exits 1 without ever reaching the daemon", async () => {
     await setup();
-    const openStore = vi.fn();
-    const deps = makeDeps({ store, openStore: openStore as ApprovalsDeps["openStore"] });
+    const daemon = vi.fn();
+    const deps = makeDeps({ daemon: daemon as unknown as ApprovalsDeps["daemon"] });
     const result = await runDecide("approve", undefined, deps);
     expect(result.exitCode).toBe(1);
-    expect(openStore).not.toHaveBeenCalled();
+    // Argument validation is client-side and happens BEFORE any RPC: a
+    // malformed invocation must not auto-start a daemon.
+    expect(daemon).not.toHaveBeenCalled();
     expect(deps.stderrLines.join("")).toMatch(/missing required <execution-id>/);
   });
 });
 
-describe("conduit approvals approve|deny — outcome mapping (injected runtime)", () => {
-  function depsWithOutcome(outcome: ResumeOutcome, store: ConduitStore) {
+describe("conduit approvals approve|deny — outcome mapping (payload doubles)", () => {
+  /**
+   * Pins one verb-truth branch in isolation. The double answers with the
+   * daemon's OWN projection of the outcome (`resumeToPayload`), so these
+   * cases exercise the real wire shape rather than a hand-written one —
+   * a projection that stopped carrying `decisionApplied` would break them.
+   */
+  function depsWithOutcome(outcome: ResumeOutcome) {
     return makeDeps({
-      store,
-      createRuntime: async () => ({
-        manager: { resume: async () => outcome },
-      }),
+      daemon: async () => result(resumeToPayload(outcome)),
     });
   }
 
-  async function bareStore(): Promise<ConduitStore> {
-    const scratch = mkdtempSync(join(tmpdir(), "conduit-cli-approvals-outcome-"));
-    return openTestStore(join(scratch, "test.db"), SecretBox.generateKeyBytes());
-  }
-
   it("expired outcome (from approve) prints the 'no tool call was made' line and exits 0", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "expired",
       executionId: "exec_x",
       pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 1 },
       decisionApplied: false,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("approve", "exec_x", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("expired\n");
@@ -449,41 +504,38 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
   });
 
   it("expired outcome (from deny) ALSO prints the 'no tool call was made' line", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "expired",
       executionId: "exec_y",
       pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 1 },
       decisionApplied: false,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_y", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stderrLines.join("")).toMatch(/no tool call was made/i);
   });
 
   it("conflict outcome exits non-zero", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "conflict",
       executionId: "exec_z",
       decisionApplied: false,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("approve", "exec_z", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("conflict\n");
   });
 
   it("INVARIANT /cli deny-verb-truth: a deny that did NOT apply reports failure (exit 1), never 'denied'", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_w",
       error: { name: "SomeError", message: "boom" },
       decisionApplied: false,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_w", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("failed\n");
@@ -491,14 +543,13 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
   });
 
   it("INVARIANT /cli deny-verb-truth: an applied deny prints 'denied' and exits 0, keyed on decisionApplied — not the error name", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_denied",
       error: { name: "ConduitPolicyBlocked", message: "policy denied the execution" },
       decisionApplied: true,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_denied", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
@@ -508,14 +559,13 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
   });
 
   it("INVARIANT /cli deny-verb-truth: a guest-spoofed ConduitPolicyBlocked failure is NOT reported as 'denied' when the deny never applied", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_spoof",
       error: { name: "ConduitPolicyBlocked", message: "guest-forged name" },
       decisionApplied: false,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_spoof", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("failed\n");
@@ -523,14 +573,13 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
   });
 
   it("INVARIANT /cli deny-verb-truth: an applied deny is 'denied' (exit 0) even when the guest catches it and the drive COMPLETES", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "completed",
       executionId: "exec_caught",
       value: { blocked: true },
       decisionApplied: true,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_caught", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
@@ -538,14 +587,13 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
   });
 
   it("INVARIANT /cli deny-verb-truth: an applied deny followed by a later unrelated upstream failure is still 'denied' (exit 0)", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_later_fail",
       error: { name: "NetworkError", message: "connection failed" },
       decisionApplied: true,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_later_fail", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
@@ -553,14 +601,13 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
   });
 
   it("an applied deny that re-pauses on a NEW approval prints 'denied' plus the queue guidance", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "paused",
       executionId: "exec_repause",
       pending: { callId: "c", toolName: "github.push", input: {}, reason: "review", expiresAt: 9 },
       decisionApplied: true,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_repause", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
@@ -573,14 +620,13 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
     // the pending call (a divergence that never manifests as a call). The
     // denied call never ran — but the operator's deny did NOT apply either,
     // and exit codes track the verb.
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "completed",
       executionId: "exec_never_applied",
       value: { done: true },
       decisionApplied: false,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("deny", "exec_never_applied", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("completed\n");
@@ -592,14 +638,13 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
     // The same divergence-that-never-manifested-as-a-call class as the deny
     // guard: reporting unqualified success for an approve that never landed
     // is the same false-positive the deny fix exists to kill.
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "completed",
       executionId: "exec_approve_never_applied",
       value: { done: true },
       decisionApplied: false,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("approve", "exec_approve_never_applied", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("completed\n");
@@ -607,17 +652,131 @@ describe("conduit approvals approve|deny — outcome mapping (injected runtime)"
   });
 
   it("approve with a failed outcome still exits non-zero regardless of error name (unchanged)", async () => {
-    const store = await bareStore();
     const outcome: ResumeOutcome = {
       status: "failed",
       executionId: "exec_approve_blocked",
       error: { name: "ConduitPolicyBlocked", message: "policy denied the execution" },
       decisionApplied: true,
     };
-    const deps = depsWithOutcome(outcome, store);
+    const deps = depsWithOutcome(outcome);
     const result = await runDecide("approve", "exec_approve_blocked", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("failed\n");
     expect(deps.stderrLines.join("")).toMatch(/ConduitPolicyBlocked: policy denied the execution/);
+  });
+});
+
+/**
+ * The answers only a DAEMON CLIENT can receive. None of these existed while
+ * the command opened the store directly, and each one has a wrong-but-
+ * plausible handling that the verb-truth contract forbids.
+ */
+describe("conduit approvals — daemon transport answers", () => {
+  it("INVARIANT §17 / §5: an outcome-unknown resume is NEVER reported as a landed verb, and exits non-zero", async () => {
+    // §5's ambiguity: the connection died after the request bytes went out,
+    // so the resume may or may not have driven the execution. Reporting
+    // "denied"/exit 0 here would tell the operator their verb landed when
+    // nobody knows — the exact false positive PR #40 removed for the
+    // never-applied case. It must also not be retried.
+    const deps = makeDeps({
+      daemon: async () => ({ kind: "outcome-unknown", requestId: "req_9" }),
+    });
+    const result = await runDecide("deny", "exec_amb", deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).not.toContain("denied");
+    const stderr = deps.stderrLines.join("");
+    expect(stderr).toMatch(/unknown/i);
+    // Actionable: the operator is told to look it up, not to re-run it.
+    expect(stderr).toMatch(/do not retry|don't retry/i);
+    expect(stderr).toMatch(/approvals list/);
+    expect(stderr).toContain("req_9");
+  });
+
+  it("a typed daemon error (busy) exits non-zero and surfaces the daemon's own words", async () => {
+    const deps = makeDeps({
+      daemon: async () => ({
+        kind: "error",
+        requestId: "req_b",
+        code: "busy",
+        message: "the daemon is at capacity",
+      }),
+    });
+    const result = await runDecide("approve", "exec_busy", deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stderrLines.join("")).toMatch(/busy.*at capacity/is);
+  });
+
+  it("a rotation-in-progress refusal reaches the operator as a refusal, not a crash", async () => {
+    const deps = makeDeps({
+      daemon: async () => {
+        throw new DaemonUnavailable(
+          "rotation-in-progress",
+          "[conduit] Daemon unavailable: key rotation is in progress.",
+        );
+      },
+    });
+    const result = await runList({ json: false }, deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stderrLines.join("")).toMatch(/rotation is in progress/i);
+  });
+
+  it("list refuses a non-result frame rather than rendering an empty queue", async () => {
+    // An empty table for a queue the daemon never reported is a dangerous
+    // lie: the operator concludes nothing is waiting for them.
+    const deps = makeDeps({
+      daemon: async () => ({
+        kind: "error",
+        requestId: "req_e",
+        code: "internal",
+        message: "store fault",
+      }),
+    });
+    const result = await runList({ json: true }, deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("");
+    expect(deps.stderrLines.join("")).toMatch(/internal.*store fault/is);
+  });
+
+  it("a malformed approvals.list payload exits non-zero with the refusal, never a raw throw", async () => {
+    // The client seam converts a malformed payload into a typed `error`
+    // BEFORE it reaches this command (client.test.ts pins that half). What
+    // this pins is the operator-facing consequence: the refusal is printed
+    // and the exit is non-zero, rather than a TypeError escaping `.map` as
+    // a stack trace, and rather than an empty table. The wording is
+    // load-bearing — an operator must not read silence as "queue empty".
+    const deps = makeDeps({
+      daemon: async () => ({
+        kind: "error",
+        requestId: "req_m",
+        code: "internal",
+        message:
+          "the daemon's approvals.list answer was not a list of paused rows. " +
+          "Nothing is being reported about the queue — do NOT assume it is empty.",
+      }),
+    });
+    const result = await runList({ json: true }, deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("");
+    expect(deps.stderrLines.join("")).toContain("do NOT assume it is empty");
+  });
+
+  it("INVARIANT §17 / §3.3: the command reaches for NOTHING outside the approvals capability row", async () => {
+    const seen: RpcRequest["kind"][] = [];
+    const deps = makeDeps({
+      daemon: async (request) => {
+        seen.push(request.kind);
+        return request.kind === "approvals.list"
+          ? result([])
+          : result(
+              resumeToPayload({ status: "conflict", executionId: "x", decisionApplied: false }),
+            );
+      },
+    });
+    await runList({ json: true }, deps);
+    await runDecide("approve", "x", deps);
+    await runDecide("deny", "x", deps);
+    // `handshake` is the client's own, written inside daemonRequest — the
+    // command itself may only ever name these two kinds.
+    expect([...new Set(seen)].sort()).toEqual(["approvals.list", "approvals.resume"]);
   });
 });

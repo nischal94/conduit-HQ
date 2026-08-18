@@ -29,18 +29,21 @@ type EsbuildModule = {
   build(options: Record<string, unknown>): Promise<unknown>;
 };
 
-const HELPER_SRC = fileURLToPath(new URL("./run-daemon.ts", import.meta.url));
+const DAEMON_SRC = fileURLToPath(new URL("./run-daemon.ts", import.meta.url));
+const SERVE_SRC = fileURLToPath(new URL("./run-serve.ts", import.meta.url));
 
 export type HelperBundle = {
   /** Absolute path of the bundled `run-daemon.mjs`. */
   helper: string;
+  /** Absolute path of the bundled `run-serve.mjs` (the stdio server fixture). */
+  serve: string;
   /** Removes the temp bundle directory. Safe to call more than once. */
   cleanup(): void;
 };
 
 /**
- * Bundles `helpers/run-daemon.ts` into a fresh temp directory and returns
- * its path plus a cleanup callback.
+ * Bundles the spawnable helpers into a fresh temp directory and returns
+ * their paths plus a cleanup callback.
  *
  * The bundle is emitted inside the package, not the OS temp dir:
  * dependencies are left external, so it must sit somewhere `node_modules`
@@ -49,10 +52,11 @@ export type HelperBundle = {
 export async function bundleDaemonHelper(): Promise<HelperBundle> {
   const bundleDir = mkdtempSync(fileURLToPath(new URL("../../../.daemon-test-", import.meta.url)));
   const helper = join(bundleDir, "run-daemon.mjs");
+  const serve = join(bundleDir, "run-serve.mjs");
 
   const esbuild = requireFromTsup("esbuild") as EsbuildModule;
   await esbuild.build({
-    entryPoints: [HELPER_SRC],
+    entryPoints: [DAEMON_SRC, SERVE_SRC],
     bundle: true,
     platform: "node",
     format: "esm",
@@ -60,11 +64,13 @@ export async function bundleDaemonHelper(): Promise<HelperBundle> {
     // needs rewriting, and bundling native/WASM-backed deps would change
     // the runtime under test.
     packages: "external",
-    outfile: helper,
+    outdir: bundleDir,
+    outExtension: { ".js": ".mjs" },
   });
 
   return {
     helper,
+    serve,
     cleanup: () => rmSync(bundleDir, { recursive: true, force: true }),
   };
 }

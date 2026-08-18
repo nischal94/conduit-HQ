@@ -33,17 +33,38 @@ describe("decodeRequest", () => {
         kind: "source.provision",
         namespace: "ns",
         url: "https://example.com",
+        prefix: "ns.p",
         secret: "s3cr3t",
+        replace: false,
+        clearCredential: false,
       }),
     ).toEqual({
       kind: "source.provision",
       namespace: "ns",
       url: "https://example.com",
+      prefix: "ns.p",
       secret: "s3cr3t",
+      replace: false,
+      clearCredential: false,
     });
+    // An absent `secret` stays ABSENT rather than becoming `secret: undefined`.
     expect(
-      decodeRequest({ kind: "source.provision", namespace: "ns", url: "https://example.com" }),
-    ).toEqual({ kind: "source.provision", namespace: "ns", url: "https://example.com" });
+      decodeRequest({
+        kind: "source.provision",
+        namespace: "ns",
+        url: "https://example.com",
+        prefix: "ns.p",
+        replace: true,
+        clearCredential: true,
+      }),
+    ).toEqual({
+      kind: "source.provision",
+      namespace: "ns",
+      url: "https://example.com",
+      prefix: "ns.p",
+      replace: true,
+      clearCredential: true,
+    });
     expect(decodeRequest({ kind: "source.revalidate", namespace: "ns" })).toEqual({
       kind: "source.revalidate",
       namespace: "ns",
@@ -52,6 +73,61 @@ describe("decodeRequest", () => {
 
   it("rejects an unknown kind", () => {
     expect(() => decodeRequest({ kind: "nonsense" })).toThrow();
+  });
+
+  /**
+   * D-B1 (controller-ruled): the three read-only kinds the `serve` process
+   * needs, plus `execute.requestKey`. Each is a PROJECTION request — the
+   * daemon answers with a computed view, never a repository row shape.
+   */
+  it("accepts the D-B1 read-only kinds", () => {
+    expect(decodeRequest({ kind: "execution.get", executionId: "exec_1" })).toEqual({
+      kind: "execution.get",
+      executionId: "exec_1",
+    });
+    expect(decodeRequest({ kind: "execution.getByRequestKey", requestKey: "rk-1" })).toEqual({
+      kind: "execution.getByRequestKey",
+      requestKey: "rk-1",
+    });
+    expect(decodeRequest({ kind: "catalog.listing" })).toEqual({ kind: "catalog.listing" });
+  });
+
+  it("carries an optional execute.requestKey, still rejecting unknown keys", () => {
+    expect(
+      decodeRequest({ kind: "execute", code: "1+1", deadlineMs: 5000, requestKey: "rk-1" }),
+    ).toEqual({ kind: "execute", code: "1+1", deadlineMs: 5000, requestKey: "rk-1" });
+    // Absent stays absent — never materialized as `undefined`, which would
+    // make `"requestKey" in request` true for a request that carries none.
+    expect(decodeRequest({ kind: "execute", code: "1+1", deadlineMs: 5000 })).toEqual({
+      kind: "execute",
+      code: "1+1",
+      deadlineMs: 5000,
+    });
+    expect(() =>
+      decodeRequest({ kind: "execute", code: "1+1", deadlineMs: 5000, requestKey: 5 }),
+    ).toThrow(InvalidRpcRequest);
+    // The widening is ONE named field, not a hole.
+    expect(() =>
+      decodeRequest({ kind: "execute", code: "1+1", deadlineMs: 5000, limits: {} }),
+    ).toThrow(InvalidRpcRequest);
+  });
+
+  it("rejects wrong field types and extra keys on the D-B1 kinds", () => {
+    expect(() => decodeRequest({ kind: "execution.get", executionId: 5 })).toThrow(
+      InvalidRpcRequest,
+    );
+    expect(() => decodeRequest({ kind: "execution.get" })).toThrow(InvalidRpcRequest);
+    expect(() => decodeRequest({ kind: "execution.getByRequestKey", requestKey: null })).toThrow(
+      InvalidRpcRequest,
+    );
+    // catalog.listing is a nullary request: it takes NO parameters, so a
+    // client cannot narrow, filter, or otherwise steer what it returns.
+    expect(() => decodeRequest({ kind: "catalog.listing", namespace: "ns" })).toThrow(
+      InvalidRpcRequest,
+    );
+    expect(() =>
+      decodeRequest({ kind: "execution.get", executionId: "exec_1", reveal: true }),
+    ).toThrow(InvalidRpcRequest);
   });
 
   it("rejects wrong field types", () => {
@@ -153,8 +229,48 @@ describe("decodeRequest", () => {
 });
 
 describe("CAPABILITIES", () => {
-  it("serve = execute/search/describe/handshake", () => {
-    expect(CAPABILITIES.serve).toEqual(new Set(["execute", "search", "describe", "handshake"]));
+  it("serve = execute/search/describe/handshake + the D-B1 read-only kinds", () => {
+    expect(CAPABILITIES.serve).toEqual(
+      new Set([
+        "execute",
+        "search",
+        "describe",
+        "handshake",
+        "execution.get",
+        "execution.getByRequestKey",
+        "catalog.listing",
+      ]),
+    );
+  });
+
+  /**
+   * D-B1 widened `serve` ONLY. The ruling is explicit that the other two
+   * rows gain nothing, and this pins that: a read added for the stdio
+   * server must not silently become reachable from an administrative
+   * client's connection.
+   */
+  it("D-B1 widened serve alone — approvals and add-mcp gain nothing", () => {
+    for (const kind of ["execution.get", "execution.getByRequestKey", "catalog.listing"] as const) {
+      expect(CAPABILITIES.approvals.has(kind)).toBe(false);
+      expect(CAPABILITIES["add-mcp"].has(kind)).toBe(false);
+    }
+  });
+
+  /**
+   * The §3.3 hard line, pinned at the capability table: `serve` is the
+   * agent-facing row, so no administrative verb may ever appear in it.
+   * D-B1 added three READS; this fails if a future widening slips a
+   * mutation in beside them.
+   */
+  it("INVARIANT §17 / §3.3: no administrative verb is reachable from serve", () => {
+    for (const administrative of [
+      "approvals.list",
+      "approvals.resume",
+      "source.provision",
+      "source.revalidate",
+    ] as const) {
+      expect(CAPABILITIES.serve.has(administrative)).toBe(false);
+    }
   });
 
   it("approvals = approvals.*/handshake", () => {

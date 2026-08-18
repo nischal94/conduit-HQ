@@ -7,12 +7,43 @@ import {
   readFileSync,
   statSync,
 } from "node:fs";
-import { homedir } from "node:os";
+import { userInfo } from "node:os";
 import { dirname, join } from "node:path";
 
 export const KEYGEN_ONE_LINER = `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`;
 
-export const DEFAULT_CONDUIT_DIR = join(homedir(), ".conduit");
+/**
+ * The single source of truth for this build's version string. `--version`
+ * prints it, `--help` names it, and the daemon reports it in `handshake.ok`
+ * (§17), so all three agree by construction rather than by coincidence.
+ *
+ * It is a plain DIAGNOSTIC string, not a security input: the handshake
+ * carries it so a NEW client talking to an OLD, still-running daemon can
+ * name the mismatch ("your daemon is a stale build — restart it") instead
+ * of surfacing an opaque capability refusal. No authorization decision is
+ * ever made on it — capability scoping is the boundary (`rpc.ts`), and this
+ * value never gates anything.
+ */
+export const AGENT_VERSION = "0.1.0";
+
+/**
+ * The default state directory, anchored to the PASSWD entry for the real
+ * uid — `userInfo().homedir` — never `$HOME` (design §17 §4, P2-HOME).
+ *
+ * `os.homedir()` honors `$HOME` on POSIX and falls back to the passwd entry
+ * only when `HOME` is unset. That made the default differ across the spawn
+ * boundary: the client runs with a full environment and gets `$HOME`, while
+ * the auto-started daemon child is deliberately `HOME`-stripped
+ * (`spawn.ts`) and gets the passwd home. `HOME=/tmp/x` desynchronized them —
+ * the client bound `/tmp/x/.conduit`, the child bound the real home's
+ * `.conduit`, and they never met. `userInfo().homedir` is the passwd home
+ * unconditionally, so BOTH sides compute the same string with `HOME` absent
+ * or present, because neither reads it. This is the exact fallback
+ * `homedir()` already uses when `HOME` is unset; making it unconditional
+ * removes `HOME` from the computation on every consumer at once. Do not
+ * "fix" this back to `os.homedir()` — see spawn.ts's HOME-strip note.
+ */
+export const DEFAULT_CONDUIT_DIR = join(userInfo().homedir, ".conduit");
 export const DEFAULT_KEY_FILE = join(DEFAULT_CONDUIT_DIR, "master-key");
 
 export interface ResolvedEnv {

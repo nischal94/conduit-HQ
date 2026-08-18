@@ -27,6 +27,7 @@ import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_CONDUIT_DIR } from "../env.js";
 
 /**
  * The daemon's `PATH`, fixed here rather than reused from the client. An
@@ -71,7 +72,26 @@ export function daemonSpawnEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * Starts a detached daemon against `stateDir` and returns immediately.
+ * Starts a detached daemon against the DEFAULT state directory and returns
+ * immediately.
+ *
+ * **Zero-argument by construction (Codex ARC F5 — the structural half).**
+ * The spawned child receives only `--daemon` and derives the default state
+ * directory from its own uid (`bin.ts`: no `--state-dir`, so `runDaemon`
+ * falls back to `DEFAULT_CONDUIT_DIR`). A client cannot select the daemon's
+ * state directory, so this function must not be able to be HANDED one
+ * either: taking a `stateDir` parameter would let a caller spawn a child
+ * whose cwd and log sit under a directory the child then never serves —
+ * the "default daemon running, client polling a custom dir" split F5
+ * closes. The directory is hardcoded here, matching what the child derives,
+ * so the cwd/log and the served database can never diverge.
+ *
+ * The one path that legitimately spawns against a non-default directory is
+ * a TEST injecting its own spawn seam (`DaemonRequestOptions.spawn`); that
+ * seam takes the dir it targets. Production auto-start (`daemonRequest`
+ * with no injected seam) reaches this function and only ever for the
+ * default directory — see the auto-start gate in `client.ts`.
+ *
  * Deliberately returns `void`: §3.5 step 2 is explicit that the spawning
  * client never acquires a lock or otherwise coordinates with the child —
  * it spawns and then re-probes like any other client. There is no
@@ -82,7 +102,8 @@ export function daemonSpawnEnv(): NodeJS.ProcessEnv {
  * lock and the other exits `already running`. That is the designed
  * outcome, not a race to prevent.
  */
-export function spawnDaemon(stateDir: string): void {
+export function spawnDaemon(): void {
+  const stateDir = DEFAULT_CONDUIT_DIR;
   // On a fresh install the state directory does not exist yet, and the
   // log below is opened INSIDE it — so the directory has to exist before
   // the very first daemon can be started. `recursive: true` makes this
@@ -107,15 +128,18 @@ export function spawnDaemon(stateDir: string): void {
       // session ever resolves.
       cwd: stateDir,
       // The allowlist. `PATH` is the daemon-owned constant; every
-      // `CONDUIT_*` variable is absent, and so is `HOME`. The daemon
-      // resolves its state directory through `os.homedir()` (`env.ts`:
-      // `join(homedir(), ".conduit")`), and on POSIX `homedir()` returns
-      // `$HOME` when it is set and falls back to the passwd entry for
-      // the real uid when it is not. Omitting `HOME` from this env is
-      // therefore precisely what forces that fallback — the uid the
-      // kernel authenticated, not a string the client chose. A hostile
-      // `HOME` is inert because it is absent, not because `homedir()`
-      // ignores it.
+      // `CONDUIT_*` variable is absent, and so is `HOME`. Since §17 §4 the
+      // default state directory is anchored on BOTH sides to the passwd
+      // entry for the real uid (`env.ts`: `join(userInfo().homedir,
+      // ".conduit")`), which does NOT consult `$HOME` at all — so the CLIENT
+      // (full environment) and this HOME-stripped child compute the SAME
+      // `~/.conduit` string whether `HOME` is set or not. Stripping `HOME`
+      // here is now belt-and-braces rather than the sole guarantee: a hostile
+      // `HOME` is doubly inert — absent from the child, and unread by the
+      // resolver on either side. (Before §17 §4 the default used
+      // `os.homedir()`, which honors `$HOME`; that made the client and this
+      // child agree only because the child's `HOME` was stripped, and left
+      // the client itself honoring a poisoned `HOME` — the P2-HOME hole.)
       env: daemonSpawnEnv(),
       // stdin closed; stdout and stderr to the daemon's own log. No other
       // descriptor is inherited — in particular no lock-db descriptor,

@@ -4,14 +4,26 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
-  mkdirSync,
   openSync,
   readdirSync,
   renameSync,
   unlinkSync,
 } from "node:fs";
 import { join } from "node:path";
-import { DEFAULT_CONDUIT_DIR, ensureDbFile, openStoreClientFromEnv } from "@conduithq/mcp";
+import {
+  acquireExclusiveIfPresent,
+  DEFAULT_CONDUIT_DIR,
+  daemonPaths,
+  describeHolder,
+  type ExclusiveAcquisition,
+  ensureDbFile,
+  ensureStateDir,
+  MAINTENANCE_ROLE_GENERATE,
+  MAINTENANCE_ROLE_ROTATE,
+  openStoreClientFromEnv,
+  readLockHolder,
+  resolveEffectiveStateDir,
+} from "@conduithq/mcp";
 import { ReencryptError, reencryptSecrets, SecretBox } from "@conduithq/sdk";
 import { writeAllAndFsync } from "./key-fs.js";
 
@@ -36,6 +48,12 @@ export interface KeyDeps {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   openStoreClient: typeof openStoreClientFromEnv;
+  /**
+   * Creates + validates the state directory under the §3.2 boundary. Used by
+   * `generate` to create-then-lock (F4) before taking the maintenance lock.
+   * Injectable so a test can point generate at a temp dir.
+   */
+  ensureStateDir: typeof ensureStateDir;
 }
 
 const PROD_DEPS: KeyDeps = {
@@ -44,6 +62,7 @@ const PROD_DEPS: KeyDeps = {
   stdout: (line) => process.stdout.write(line),
   stderr: (line) => process.stderr.write(line),
   openStoreClient: openStoreClientFromEnv,
+  ensureStateDir,
 };
 
 export interface KeyResult {
@@ -51,12 +70,162 @@ export interface KeyResult {
 }
 
 export async function runKey(args: string[], overrides?: Partial<KeyDeps>): Promise<KeyResult> {
-  const deps: KeyDeps = { ...PROD_DEPS, ...overrides };
+  const merged: KeyDeps = { ...PROD_DEPS, ...overrides };
+  // Derive `key`'s base through the SAME single resolver every other consumer
+  // runs (§17 §2, consumer 4). `key` has no custom `--state-dir` surface, so
+  // no attacker-supplied spelling reaches it and the classifier is not needed;
+  // what it needs is to never DRIFT from the daemon it shares a directory
+  // with. On the production `DEFAULT_CONDUIT_DIR` constant this is an
+  // idempotent no-op; the guarantee is that it is the identical no-op the
+  // daemon and client perform, so a poisoned-HOME default (now closed at the
+  // source in `env.ts`) could never again put `key`'s files under one dir
+  // while the auto-started daemon serves another. Tests that inject a temp
+  // `conduitDir` get its own canonical form, keeping every `key` path
+  // consistent with what a daemon in that temp dir would bind.
+  const deps: KeyDeps = { ...merged, conduitDir: resolveEffectiveStateDir(merged.conduitDir) };
   const [sub] = args;
-  if (sub === "generate") return runKeyGenerate(deps);
-  if (sub === "rotate") return runKeyRotate(deps);
+  if (sub === "generate") {
+    return generateUnderMaintenance(deps);
+  }
+  if (sub === "rotate") {
+    return rotateUnderMaintenance(deps);
+  }
   deps.stderr(`${KEY_USAGE}\n`);
   return { exitCode: 1 };
+}
+
+/**
+ * `key generate` while holding the §3.4 maintenance lock — CREATES the state
+ * directory FIRST, then locks (Codex ARC F4).
+ *
+ * The order is a TOCTOU fix. The previous shape acquired the lock first, and
+ * on a fresh install the acquisition returned `no-state-dir` — the directory
+ * did not exist yet — so `generate` ran UNLOCKED for its whole duration and
+ * created the directory itself moments later. That left a window: between
+ * "observe no state dir" and "create it", an env-key daemon (which needs no
+ * key file to start) could create the directory, take the maintenance lock
+ * SHARED, and open the db — and `generate`'s unlocked `countSealedRows`
+ * inspection would then race the daemon's writes, its refusal-on-sealed-rows
+ * guarantee reading a db under concurrent mutation.
+ *
+ * Observation-of-absence is not a held lock. So `generate` now CREATES and
+ * validates the state directory under the §3.2 boundary (`ensureStateDir`:
+ * mkdir 0700 then assert ownership/mode/ACL), and only THEN acquires the
+ * maintenance lock — which, the directory now existing, resolves to a real
+ * EXCLUSIVE hold rather than `no-state-dir`. A daemon racing to start is now
+ * excluded by the kernel lock for `generate`'s whole run, exactly as §3.4
+ * requires.
+ *
+ * The hold still spans the ENTIRE subcommand (the `countSealedRows`
+ * inspection and the key publication both run under it), released in
+ * `finally` on every path.
+ */
+async function generateUnderMaintenance(deps: KeyDeps): Promise<KeyResult> {
+  // Create + validate the state directory BEFORE the lock. A create failure
+  // (an unsafe pre-existing directory, an un-strippable ACL) is generate's
+  // own refusal, not a lock error.
+  try {
+    await deps.ensureStateDir(deps.conduitDir);
+  } catch (cause) {
+    deps.stderr(
+      `[ConduitKey] generate refused: the state directory ${deps.conduitDir} could not be ` +
+        `created or validated (§3.2 ownership/mode/ACL boundary). Fix its ownership and ` +
+        `permissions, then re-run. Context: { cause: ${String(cause)} }\n`,
+    );
+    return { exitCode: 1 };
+  }
+
+  const acquisition = await acquireMaintenance(deps, MAINTENANCE_ROLE_GENERATE, "generate");
+  // `no-state-dir` is now unreachable — `ensureStateDir` above created it.
+  // Treated as a refusal rather than an unlocked proceed if it ever occurs
+  // (a directory removed in the microsecond between create and acquire),
+  // because proceeding unlocked is exactly the window this fix closes.
+  if (acquisition.outcome !== "acquired") return { exitCode: 1 };
+
+  try {
+    return await runKeyGenerate(deps);
+  } finally {
+    await acquisition.lock.release();
+  }
+}
+
+/**
+ * `key rotate` while holding the §3.4 maintenance lock — refuses OUTRIGHT on
+ * a keyless / dir-less install (Codex ARC F4).
+ *
+ * The previous shape let `no-state-dir` PROCEED UNLOCKED, on the reasoning
+ * that rotate would then fail "on its own terms". But proceeding unlocked at
+ * all is the hole: a daemon could create the directory and take the
+ * maintenance lock in the window, and rotate would re-encrypt the live
+ * daemon's db with no EXCLUSIVE hold — breaking stop-first and the
+ * two-openers guarantee. A keyless / dir-less install genuinely has nothing
+ * to rotate, so refusing immediately is both safe and the more correct
+ * diagnosis; there is no legitimate case in which rotate should run without
+ * the lock.
+ *
+ * `busy` and `no-state-dir` both refuse; only a real EXCLUSIVE hold proceeds.
+ */
+async function rotateUnderMaintenance(deps: KeyDeps): Promise<KeyResult> {
+  const acquisition = await acquireMaintenance(deps, MAINTENANCE_ROLE_ROTATE, "rotate");
+  if (acquisition.outcome === "busy") return { exitCode: 1 };
+  if (acquisition.outcome === "no-state-dir") {
+    deps.stderr(
+      `[ConduitKey] rotate refused: no Conduit state directory at ${deps.conduitDir} — there is ` +
+        "nothing to rotate. Run `conduit key generate` to create a key first. (Rotation never " +
+        "proceeds without the maintenance lock, and a dir-less install has no lock to take.)\n",
+    );
+    return { exitCode: 1 };
+  }
+
+  try {
+    return await runKeyRotate(deps);
+  } finally {
+    await acquisition.lock.release();
+  }
+}
+
+/**
+ * Takes the §3.4 maintenance lock EXCLUSIVE, or explains who has it.
+ *
+ * This is the whole of §3.4's exclusion, and it REPLACES the old
+ * write-lock probe. That probe asked SQLite "is the db busy right now?",
+ * which is a liveness QUERY, and §3.4 rejects liveness queries outright:
+ * an unrelated client can auto-start a daemon in the window between the
+ * check and the rotation — including after rotate has loaded the old key
+ * but before the re-seal transaction commits. The kernel lock closes that
+ * window by construction, because the daemon takes the SAME lock SHARED
+ * before it resolves its key or opens the db, and holds it for its whole
+ * lifetime. Stop-first stops being a request the operator is trusted to
+ * honor and becomes something the kernel enforces.
+ *
+ * Non-blocking on purpose (`acquireExclusive`'s default `busyTimeoutMs`
+ * of 0): a busy maintenance lock is this command's DECISION INPUT — "a
+ * daemon is up, so refuse and tell the operator" — and waiting for it
+ * would silently convert a refusal into a takeover of a daemon that
+ * happened to stop mid-wait.
+ *
+ * The refusal names the holder when it can. That clause is diagnostics
+ * only (§3.4: metadata for a good error message, the lock for the
+ * exclusion) and is simply omitted when unreadable.
+ */
+async function acquireMaintenance(
+  deps: KeyDeps,
+  role: string,
+  verb: string,
+): Promise<ExclusiveAcquisition> {
+  const lockDb = daemonPaths(deps.conduitDir).maintenanceLockDb;
+  const acquisition = await acquireExclusiveIfPresent(lockDb, { role });
+  if (acquisition.outcome !== "busy") return acquisition;
+  // Read the holder only AFTER the kernel has already refused us — the
+  // row is a companion to that verdict, never a substitute for it, and it
+  // is rendered hedged because it can name a departed process.
+  const holder = describeHolder(await readLockHolder(lockDb));
+  deps.stderr(
+    `[ConduitKey] ${verb} refused: another process owns ~/.conduit — the maintenance lock is held.` +
+      `${holder} ${verb} is stop-first: stop every conduit process and MCP client (the daemon exits on ` +
+      "SIGTERM), then re-run. Nothing was read or written.\n",
+  );
+  return acquisition;
 }
 
 /** fsync a directory so a just-created/renamed entry survives a host crash. THROWS on failure — each caller decides whether to degrade (generate/post-promote: warn) or abort (pre-tx staging: refuse). */
@@ -139,7 +308,10 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
   // heal them now. No-op on a fresh/nonexistent db (nothing to heal yet).
   if (existsSync(dbPath)) ensureDbFile(dbPath);
 
-  mkdirSync(deps.conduitDir, { recursive: true, mode: 0o700 });
+  // The state directory already exists and was validated 0700 by
+  // `generateUnderMaintenance`'s `ensureStateDir` (F4: create-then-lock), so
+  // there is no directory to create here — this function runs only under the
+  // held maintenance lock.
   const stale = readdirSync(deps.conduitDir).filter((f) => f.startsWith("master-key.tmp-"));
   if (stale.length > 0) {
     deps.stderr(
@@ -298,9 +470,14 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
     );
   } catch (cause) {
     if (isBusyCause(cause)) {
+      // The maintenance lock is already held by this process, so no
+      // daemon can be the writer here — this is a NON-daemon opener
+      // (another rotate on a shared ~/.conduit, a stray sqlite client),
+      // which the kernel lock does not and cannot cover.
       deps.stderr(
-        "[ConduitKey] rotate preflight failed: could not acquire the write lock — stop running " +
-          `conduit processes and MCP clients, then re-run. Context: { cause: ${String(cause)} }\n`,
+        "[ConduitKey] rotate preflight failed: the database is locked by a process that is not a " +
+          "conduit daemon (the maintenance lock is held by this rotation, so no daemon can be the " +
+          `writer). Find and stop that process, then re-run. Context: { cause: ${String(cause)} }\n`,
       );
       return { exitCode: 1 };
     }
@@ -400,9 +577,12 @@ async function runKeyRotate(deps: KeyDeps): Promise<KeyResult> {
           // ENOENT: already gone — nothing to note.
         }
         if (isBusyCause(cause)) {
+          // As in preflight: a daemon is excluded by the maintenance lock
+          // this rotation holds, so a BUSY here is a non-daemon opener.
           deps.stderr(
-            "[ConduitKey] rotation failed: could not acquire the write lock — stop running " +
-              `conduit processes and MCP clients, then re-run. Context: { cause: ${cause.message} }\n`,
+            "[ConduitKey] rotation failed: the database is locked by a process that is not a conduit " +
+              "daemon (the maintenance lock is held by this rotation). Find and stop that process, " +
+              `then re-run. Context: { cause: ${cause.message} }\n`,
           );
         } else {
           deps.stderr(`[ConduitKey] rotation failed (db unchanged): ${cause.message}\n`);

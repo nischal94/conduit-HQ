@@ -1,9 +1,9 @@
 import {
   type ConduitStore,
+  DEFAULT_SANDBOX_LIMITS,
   normalizeMcp,
   openSqliteStore,
   SecretBox,
-  setSandboxDiagnostic,
 } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -11,7 +11,21 @@ import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import type { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { ErrorCode } from "@modelcontextprotocol/sdk/types.js";
 import { beforeEach, describe, expect, it } from "vitest";
-import { createConduitMcpServer } from "./server.js";
+import { RESUME_ADMISSION_DEADLINE_MS } from "./daemon/connection.js";
+import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
+import { ONBOARDING_DEADLINE_MS } from "./mcp-fetch.js";
+import { buildCatalogListing, executionToCheckPayload, outcomeToPayload } from "./payloads.js";
+import { createApprovalRuntime } from "./runtime.js";
+import {
+  createConduitMcpServer,
+  type DaemonCall,
+  deadlineForRequest,
+  EXECUTE_ADMISSION_DEADLINE_MS,
+  EXECUTE_CLIENT_DEADLINE_MS,
+  PROVISION_CLIENT_DEADLINE_MS,
+  READ_DEADLINE_MS,
+  RESUME_CLIENT_DEADLINE_MS,
+} from "./server.js";
 
 /**
  * Ring-1 protocol suite: drives `createConduitMcpServer` entirely over
@@ -20,6 +34,13 @@ import { createConduitMcpServer } from "./server.js";
  * (execute.ts createCatalogToolHost); the require_approval pause test never
  * reaches upstream either, because policy refuses BEFORE the invoker calls
  * out (§5.3 step 2 precedes step 3).
+ *
+ * Since Task 6 the server holds no store, so this ring drives it through an
+ * IN-PROCESS fake daemon (`fakeDaemon` below) instead of an in-memory store.
+ * The fake answers with the SAME projection functions the real daemon uses
+ * (`connection.ts` calls exactly these), so what the ring pins is the MCP
+ * surface and the client-side unwrapping — the socket, framing, capability
+ * check and queue are ring-2's job (`daemon/conduitd.test.ts`).
  */
 
 const PREFIX = "github.acme.prod";
@@ -69,6 +90,67 @@ async function seedStore(): Promise<ConduitStore> {
   return store;
 }
 
+/**
+ * An in-process stand-in for the daemon: same request vocabulary, same
+ * projection functions, no socket. Deliberately reuses
+ * `buildCatalogListing` / `outcomeToPayload` / `executionToCheckPayload`
+ * rather than re-deriving the payloads, so a change to what the daemon
+ * actually returns cannot silently diverge from what this ring asserts.
+ *
+ * `failWith` lets a case inject the daemon's own typed refusals (the
+ * `error` and `outcome-unknown` frames) without a real daemon dying.
+ */
+function fakeDaemon(
+  store: ConduitStore,
+  opts: { log?: (line: string) => void; failWith?: () => RpcResponse | undefined } = {},
+): DaemonCall {
+  const log = opts.log ?? (() => {});
+  return async (request: RpcRequest): Promise<RpcResponse> => {
+    const injected = opts.failWith?.();
+    if (injected !== undefined) return injected;
+    const requestId = "r1";
+    switch (request.kind) {
+      case "catalog.listing":
+        return { kind: "result", requestId, payload: await buildCatalogListing(store, log) };
+      case "execute": {
+        const { manager } = await createApprovalRuntime({ store, allowPrivateEgress: false, log });
+        return {
+          kind: "result",
+          requestId,
+          payload: outcomeToPayload(
+            await manager.start(
+              request.code,
+              request.requestKey !== undefined ? { requestKey: request.requestKey } : undefined,
+            ),
+          ),
+        };
+      }
+      case "execution.get":
+        return {
+          kind: "result",
+          requestId,
+          payload: executionToCheckPayload(
+            await store.executions.get(request.executionId),
+            Date.now(),
+          ),
+        };
+      case "execution.getByRequestKey":
+        return {
+          kind: "result",
+          requestId,
+          payload: executionToCheckPayload(
+            await store.executions.getByRequestKey(request.requestKey),
+            Date.now(),
+          ),
+        };
+      default:
+        // The MCP surface must never reach for anything else. If it does,
+        // that is the finding — not something to answer politely.
+        throw new Error(`[server.test] fake daemon got an unexpected kind: ${request.kind}`);
+    }
+  };
+}
+
 async function connect(server: Server): Promise<Client> {
   const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
   const client = new Client({ name: "test", version: "0" });
@@ -91,53 +173,14 @@ describe("createConduitMcpServer", () => {
 
   beforeEach(async () => {
     store = await seedStore();
-    server = createConduitMcpServer({ store, log: () => {} });
+    server = createConduitMcpServer({ daemon: fakeDaemon(store), log: () => {} });
   });
 
-  it("routes sandbox module-recovery diagnostics to THIS server's log — and leaks no guest code", async () => {
-    // The recovery sink is process-global (the shared module is too), installed
-    // once at construction by createConduitMcpServer. Prove it actually ROUTES:
-    // drive a real overflow through the server, then a benign call that
-    // rebuilds, and assert the events land on this server's log in the
-    // "[sandbox]" format with NO guest code.
-    setSandboxDiagnostic(undefined);
-    const lines: string[] = [];
-    const own = createConduitMcpServer({ store, log: (line) => lines.push(line) });
-    const client = await connect(own);
-    const overflow = "let x = { secretMarker: 1 }; for (let i=0;i<20000;i++) x={n:x}; return x;";
-    await client.callTool({ name: "execute", arguments: { code: overflow } });
-    await client.callTool({ name: "execute", arguments: { code: "return 1;" } }); // rebuilds
-
-    const diag = lines.filter((l) => l.startsWith("[sandbox] "));
-    expect(diag.some((l) => l.includes("sandbox.module.poisoned"))).toBe(true);
-    expect(diag.some((l) => l.includes("sandbox.module.recovery.ok"))).toBe(true);
-    // No diagnostic line carries guest code or values.
-    for (const l of diag) {
-      expect(l).not.toContain("secretMarker");
-      expect(l).not.toContain('"n"');
-    }
-    setSandboxDiagnostic(undefined);
-  }, 30_000);
-
-  it("one owner per process: the last server constructed owns the global sink (documented model)", async () => {
-    // Two servers in one process is not our deployment model, but the semantics
-    // must be explicit and pinned, not silent: last-writer-wins.
-    setSandboxDiagnostic(undefined);
-    const first: string[] = [];
-    const second: string[] = [];
-    createConduitMcpServer({ store, log: (line) => first.push(line) });
-    const later = createConduitMcpServer({ store, log: (line) => second.push(line) });
-    const client = await connect(later);
-    await client.callTool({
-      name: "execute",
-      arguments: { code: "let x={v:0};for(let i=0;i<20000;i++)x={n:x};return x;" },
-    });
-    await client.callTool({ name: "execute", arguments: { code: "return 1;" } });
-
-    expect(second.some((l) => l.includes("sandbox.module.recovery.ok"))).toBe(true);
-    expect(first.some((l) => l.startsWith("[sandbox] "))).toBe(false);
-    setSandboxDiagnostic(undefined);
-  }, 30_000);
+  // NOTE: the two sandbox module-recovery diagnostics cases that lived here
+  // moved to `daemon/conduitd.test.ts` with the sandbox itself. Since Task 6
+  // this process runs no sandbox, so a sink registered by
+  // `createConduitMcpServer` could never fire — asserting on it here would
+  // have been a test that passes while pinning nothing.
 
   it("tools/list exposes exactly execute + check_execution, with fresh connections", async () => {
     const client = await connect(server);
@@ -249,6 +292,254 @@ describe("createConduitMcpServer", () => {
     ).rejects.not.toMatchObject({
       message: expect.stringContaining(rawCause),
     });
+  });
+
+  /**
+   * D-B1 client-side unwrapping. The three non-`result` frames the daemon
+   * can send are genuinely different verdicts and must not collapse into
+   * one generic failure.
+   */
+  it("INVARIANT §17 / §5: an outcome-unknown execute is reported as ambiguous and tells the agent NOT to retry", async () => {
+    // §5's whole point: after the request bytes are written, "the daemon
+    // never saw it" and "it ran and the ack was lost" are indistinguishable,
+    // and they have opposite correct responses. The agent must be told to
+    // look the execution up, never to re-issue it — a replayed tool call is
+    // an upstream side effect the operator never authorized.
+    const own = createConduitMcpServer({
+      daemon: fakeDaemon(store, {
+        failWith: () => ({ kind: "outcome-unknown", requestId: "r7" }),
+      }),
+      log: () => {},
+    });
+    const client = await connect(own);
+    await expect(
+      client.callTool({ name: "execute", arguments: { code: "return 1;" } }),
+    ).rejects.toMatchObject({
+      code: ErrorCode.InternalError,
+      message: expect.stringMatching(/UNKNOWN/),
+    });
+    // Names the recovery path and forbids the dangerous one, by correlation id.
+    await expect(
+      client.callTool({ name: "execute", arguments: { code: "return 1;" } }),
+    ).rejects.toMatchObject({ message: expect.stringMatching(/Do NOT retry/) });
+    await expect(
+      client.callTool({ name: "execute", arguments: { code: "return 1;" } }),
+    ).rejects.toMatchObject({ message: expect.stringMatching(/check_execution/) });
+    await expect(
+      client.callTool({ name: "execute", arguments: { code: "return 1;" } }),
+    ).rejects.toMatchObject({ message: expect.stringMatching(/r7/) });
+  });
+
+  it("a typed daemon refusal surfaces its code without inventing a result", async () => {
+    // `busy` is the queue-full refusal (§3.1). It is NOT an ambiguity — the
+    // request provably never ran — so it must read as a refusal the agent
+    // can act on, carrying the daemon's own stable code.
+    const own = createConduitMcpServer({
+      daemon: fakeDaemon(store, {
+        failWith: () => ({
+          kind: "error",
+          requestId: "r9",
+          code: "busy",
+          message: "daemon busy",
+        }),
+      }),
+      log: () => {},
+    });
+    const client = await connect(own);
+    await expect(
+      client.callTool({ name: "execute", arguments: { code: "return 1;" } }),
+    ).rejects.toMatchObject({
+      code: ErrorCode.InternalError,
+      message: expect.stringMatching(/busy/),
+    });
+  });
+
+  it("a daemon transport failure is redacted behind a correlation id (the path names leak nothing)", async () => {
+    // DaemonUnavailable's own message carries the state-directory path and
+    // the daemon log location — operator information, not agent
+    // information. The agent gets a correlation id; the operator gets the
+    // cause in the log.
+    const rawCause = "no daemon could be reached, stateDir: /Users/somebody/.conduit";
+    const own = createConduitMcpServer({
+      daemon: () => Promise.reject(new Error(rawCause)),
+      log: () => {},
+    });
+    const client = await connect(own);
+    const failure = client.callTool({ name: "execute", arguments: { code: "return 1;" } });
+    await expect(failure).rejects.toMatchObject({
+      code: ErrorCode.InternalError,
+      message: expect.stringMatching(/correlation \w+/),
+    });
+    await expect(failure).rejects.not.toMatchObject({
+      message: expect.stringContaining("/Users/somebody/.conduit"),
+    });
+  });
+
+  it("INVARIANT §17 / §3.3: the MCP surface reaches for NO administrative verb", async () => {
+    // The fake daemon throws on any kind outside the serve reads, so this
+    // exercises the whole surface and fails loudly if a handler ever
+    // reaches for approvals.* or source.* — the §3.3 hard line, pinned at
+    // the consumer rather than only at the capability table.
+    const seen: RpcRequest["kind"][] = [];
+    const own = createConduitMcpServer({
+      daemon: async (request) => {
+        seen.push(request.kind);
+        return await fakeDaemon(store)(request);
+      },
+      log: () => {},
+    });
+    const client = await connect(own);
+    await client.listTools();
+    const run = await client.callTool({
+      name: "execute",
+      arguments: { code: "return 1;", requestKey: "rk-admin-probe" },
+    });
+    const { executionId } = textPayload(run) as { executionId: string };
+    await client.callTool({ name: "check_execution", arguments: { executionId } });
+    await client.callTool({ name: "check_execution", arguments: { requestKey: "rk-admin-probe" } });
+
+    expect(new Set(seen)).toEqual(
+      new Set(["catalog.listing", "execute", "execution.get", "execution.getByRequestKey"]),
+    );
+    for (const administrative of [
+      "approvals.list",
+      "approvals.resume",
+      "source.provision",
+      "source.revalidate",
+    ]) {
+      expect(seen).not.toContain(administrative);
+    }
+  });
+
+  it("INVARIANT §17 / §5: the client deadline outlasts the daemon's worst legal execute", () => {
+    // The defect this pins, concretely: the client's budget bounds the
+    // WHOLE round trip, while the daemon may legally spend
+    // EXECUTE_ADMISSION_DEADLINE_MS queuing an entry and THEN
+    // wallClockMs running it. A client that gives up inside that window
+    // returns `outcome-unknown` — "may have run, do NOT retry" — for an
+    // execution that is merely slow and completes normally moments
+    // later, which spends §5's ambiguity signal on routine slowness. It
+    // also loses the race against the daemon's own queue-expiry refusal,
+    // a typed retryable `busy` that is strictly the better answer.
+    const worstLegalDaemonAnswer =
+      EXECUTE_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs;
+    expect(EXECUTE_CLIENT_DEADLINE_MS).toBeGreaterThan(worstLegalDaemonAnswer);
+
+    // And the budget is actually WIRED per kind — asserting the
+    // constants alone would still pass if `deadlineForRequest` handed
+    // every request the short read budget.
+    expect(deadlineForRequest({ kind: "execute", code: "1", deadlineMs: 0 })).toBe(
+      EXECUTE_CLIENT_DEADLINE_MS,
+    );
+    for (const read of [
+      { kind: "catalog.listing" },
+      { kind: "execution.get", executionId: "e" },
+      { kind: "execution.getByRequestKey", requestKey: "r" },
+    ] as const) {
+      expect(deadlineForRequest(read)).toBe(READ_DEADLINE_MS);
+    }
+    // The reads are bounded well BELOW the execute budget — they are
+    // store reads answered outside the queue, so inheriting the
+    // execute-sized budget would make a wedged daemon hang a tools/list
+    // for minutes.
+    expect(READ_DEADLINE_MS).toBeLessThan(EXECUTE_CLIENT_DEADLINE_MS);
+  });
+
+  it("INVARIANT §17 / §5: `approvals.resume` carries a RUN-sized budget, not a read's — the same ordering constraint as execute", () => {
+    // A resume is not a read. `connection.ts` admits it through the SAME
+    // ExecutionQueue as execute (so it may wait out
+    // RESUME_ADMISSION_DEADLINE_MS) and then it DRIVES a paused
+    // execution's replay, bounded by §16's wall clock. Handing it
+    // READ_DEADLINE_MS would abandon an approve that is merely queued
+    // behind the concurrency cap and report §5 ambiguity — telling an
+    // operator their decision may or may not have landed on an execution
+    // that would have completed normally seconds later.
+    const worstLegalResumeAnswer =
+      RESUME_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs;
+    expect(RESUME_CLIENT_DEADLINE_MS).toBeGreaterThan(worstLegalResumeAnswer);
+
+    // Wired, not merely declared.
+    expect(
+      deadlineForRequest({
+        kind: "approvals.resume",
+        executionId: "e",
+        decision: "approve",
+      }),
+    ).toBe(RESUME_CLIENT_DEADLINE_MS);
+    expect(RESUME_CLIENT_DEADLINE_MS).toBeGreaterThan(READ_DEADLINE_MS);
+
+    // `approvals.list` IS a read — answered outside the queue, like the
+    // D-B1 reads — so it keeps the short budget.
+    expect(deadlineForRequest({ kind: "approvals.list" })).toBe(READ_DEADLINE_MS);
+  });
+
+  it("INVARIANT §17 / §5: source.provision carries a FETCH-sized budget that outlasts the onboarding deadline", () => {
+    // The two source kinds are the ONLY ones whose daemon-side work makes
+    // an outbound network call. They are not sandbox work — they never
+    // enter the ExecutionQueue, so neither admission constant applies —
+    // but they are not reads either: a read is a bounded local query,
+    // while a provision waits on a third-party MCP server.
+    //
+    // Same ordering discipline as execute and resume: the client must
+    // outlast the daemon's worst legal answer time, which here is the
+    // onboarding fetch's own absolute whole-operation deadline. A budget
+    // under it would abandon a fetch the daemon was still legitimately
+    // performing and report §5 ambiguity — and an ambiguous provision is
+    // worse than a slow one, since the operator cannot tell whether the
+    // atomic multi-table write landed.
+    expect(PROVISION_CLIENT_DEADLINE_MS).toBeGreaterThan(ONBOARDING_DEADLINE_MS);
+    // Strictly longer than a read's, because a read makes no network call.
+    expect(PROVISION_CLIENT_DEADLINE_MS).toBeGreaterThan(READ_DEADLINE_MS);
+
+    // Wired for BOTH kinds, not merely declared.
+    expect(
+      deadlineForRequest({
+        kind: "source.provision",
+        namespace: "ns",
+        url: "https://example.com",
+        prefix: "ns.p",
+        replace: false,
+        clearCredential: false,
+      }),
+    ).toBe(PROVISION_CLIENT_DEADLINE_MS);
+    expect(deadlineForRequest({ kind: "source.revalidate", namespace: "ns" })).toBe(
+      PROVISION_CLIENT_DEADLINE_MS,
+    );
+
+    // The onboarding bound is IMPORTED from the fetch module rather than
+    // re-declared, so raising the fetch's deadline raises this budget with
+    // it and the two cannot silently drift apart.
+    expect(PROVISION_CLIENT_DEADLINE_MS).toBe(ONBOARDING_DEADLINE_MS + READ_DEADLINE_MS);
+  });
+
+  it("execute forwards requestKey to the daemon only when the agent supplied one", async () => {
+    // Absent must stay ABSENT on the wire: `decodeRequest` rejects unknown
+    // keys, and a materialized `requestKey: undefined` would also make the
+    // daemon persist an explicit undefined against the row.
+    const sent: RpcRequest[] = [];
+    const own = createConduitMcpServer({
+      daemon: async (request) => {
+        sent.push(request);
+        return await fakeDaemon(store)(request);
+      },
+      log: () => {},
+    });
+    const client = await connect(own);
+    await client.callTool({ name: "execute", arguments: { code: "return 1;" } });
+    await client.callTool({
+      name: "execute",
+      arguments: { code: "return 2;", requestKey: "rk-x" },
+    });
+
+    const executes = sent.filter((r) => r.kind === "execute");
+    expect(executes[0]).not.toHaveProperty("requestKey");
+    expect(executes[1]).toMatchObject({ requestKey: "rk-x" });
+    // The admission deadline is always sent, and is finite/non-negative —
+    // the decoder rejects anything else (§3.3).
+    for (const e of executes) {
+      expect(Number.isFinite((e as { deadlineMs: number }).deadlineMs)).toBe(true);
+      expect((e as { deadlineMs: number }).deadlineMs).toBeGreaterThan(0);
+    }
   });
 
   it("a require_approval policy pauses; payload carries pending + stop-and-report message", async () => {

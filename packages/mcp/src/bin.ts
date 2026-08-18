@@ -1,35 +1,292 @@
 #!/usr/bin/env node
+import { existsSync, statSync } from "node:fs";
+import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
-import { DaemonExit, runDaemon } from "./daemon/conduitd.js";
+import { takeStateDir } from "./args.js";
+import {
+  DaemonUnavailable,
+  daemonRequest,
+  isDefaultStateDir,
+  resolveEffectiveStateDir,
+} from "./daemon/client.js";
+import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
+import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
-import { DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER } from "./env.js";
+import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
-import { openStoreFromEnv } from "./store-open.js";
+import { READ_DEADLINE_MS } from "./server.js";
 
-const VERSION = "0.1.0";
+const VERSION = AGENT_VERSION;
 const HELP = `conduit-mcp ${VERSION} — Conduit MCP server (stdio)
-Env: CONDUIT_DB (default ~/.conduit/conduit.db) · CONDUIT_MASTER_KEY (base64, 32 bytes;
-generate: ${KEYGEN_ONE_LINER}) · CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1 (dev/demo ONLY)
-· CONDUIT_APPROVAL_TTL (milliseconds)
-Flags: --version · --help · --doctor (validate config without an MCP client)
-· --daemon (run the store-owning daemon; stop with SIGTERM/SIGINT)`;
 
-async function doctor(): Promise<number> {
-  try {
-    const { env, store } = await openStoreFromEnv();
-    const sources = await store.sources.list();
-    console.error(`ok: key decodes (32 bytes)`);
-    console.error(`ok: database opens at ${env.dbPath}`);
+The stdio server opens NO database: the daemon owns ~/.conduit/conduit.db and
+the server reaches it over a Unix socket, auto-starting one if none is running.
+So the env below belongs to the DAEMON's environment on that path, not to this
+client's — an auto-started daemon inherits no CONDUIT_* value.
+
+Env: CONDUIT_DB — REFUSED by the daemon-backed server AND by --doctor (both
+  reach the daemon, which serves exactly the default database, §9.3); unset it
+  to use either.
+· CONDUIT_MASTER_KEY (base64, 32 bytes; generate: ${KEYGEN_ONE_LINER}) — read by
+  the daemon and by --doctor --offline, not by the stdio server.
+· CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1 (dev/demo ONLY) — belongs to the daemon,
+  which makes the upstream calls.
+· CONDUIT_APPROVAL_TTL (milliseconds) — read by whichever process runs the
+  execution (the daemon, on the server path).
+Flags: --version · --help · --daemon (run the store-owning daemon; stop with
+  SIGTERM/SIGINT)
+· --doctor — ask the running daemon for its health (auto-starts one if absent);
+  targets the DEFAULT state directory only (an auto-started daemon runs against
+  it), so it refuses a custom --state-dir — use --offline for that
+· --doctor --offline [--state-dir <path>] — diagnose a SICK install: takes the
+  maintenance lock exclusively (so it refuses beside a live daemon or a
+  rotation) and inspects key + files WITHOUT opening the database; honors
+  --state-dir since it is dir-scoped and never spawns`;
+
+/**
+ * The default `--doctor`: ask the DAEMON about its own health (§9 item 1).
+ *
+ * The old implementation called `openStoreFromEnv` directly, which is not
+ * read-only — it creates and heals files, sets journal mode, runs
+ * migrations and may bootstrap the key canary. Outside any lock, that
+ * made a diagnostic command a second writer against a database the daemon
+ * owns, which is exactly the ownership break §17 exists to close.
+ *
+ * So the health being reported is now the daemon's, not a private
+ * re-derivation of it. That is also the more truthful answer: a diagnostic
+ * that opens its own store tells the operator whether A store opens, while
+ * what they need to know is whether THE store their agent will use is
+ * healthy. The handshake supplies the db path and the effective egress
+ * setting; `catalog.listing` supplies the source count — no new capability
+ * row (§3.3), just the reads `serve` already carries.
+ *
+ * Auto-start is deliberate rather than incidental: on a healthy install
+ * with no daemon running, "start one and report on it" IS the diagnosis
+ * the operator wants, and it exercises the same spawn path a real client
+ * takes. A daemon that cannot start fails here loudly, which is the
+ * finding.
+ */
+async function doctor(stateDir: string): Promise<number> {
+  // `--state-dir` is REFUSED on the daemon-backed doctor, and the refusal is
+  // the same F5 boundary the client enforces (Codex ARC F5). This path
+  // auto-starts a daemon when none is running, and the production spawn can
+  // only ever start the DEFAULT-dir daemon — so honoring a custom dir here
+  // would auto-start a default daemon while querying the custom directory,
+  // reporting on a daemon nobody asked about. A custom-dir diagnosis is
+  // exactly what `--offline` is for (it is dir-scoped and never spawns), or
+  // the operator can ask a by-hand daemon directly. Decided coherently with
+  // the auto-start rule: the one command that spawns refuses a custom dir.
+  if (!isDefaultStateDir(stateDir)) {
     console.error(
-      `ok: ${sources.length} source(s) in catalog${sources.length === 0 ? " — onboard one with `conduit add-mcp`" : ""}`,
+      `[conduitd] --doctor cannot target a custom state directory (${stateDir}): the daemon-backed ` +
+        "doctor auto-starts a daemon, and an auto-started daemon runs against the DEFAULT directory, " +
+        "not this one. Diagnose the custom directory offline (no daemon, no spawn): " +
+        `conduit-mcp --doctor --offline --state-dir ${stateDir} — or start a daemon there by hand ` +
+        `(conduit-mcp --daemon --state-dir ${stateDir}) and inspect it directly.`,
+    );
+    return 1;
+  }
+  try {
+    // Captured from the handshake, which is where the daemon reports its
+    // effective non-secret configuration (§9 item 3). The egress setting
+    // in particular is reportable by NO other means on a live install —
+    // `--offline` refuses while a daemon runs — and it is among the most
+    // likely things an operator is actually debugging.
+    let daemonConfig: { dbPath: string; allowPrivateEgress: boolean } | undefined;
+    const response = await daemonRequest({
+      // Guaranteed the canonical default by the refusal above; passed
+      // through rather than re-deriving the constant so the one source of
+      // the directory is the parsed argument.
+      stateDir,
+      onHandshake: (info) => {
+        daemonConfig = info;
+      },
+      // `serve` is the agent-facing read role, and `catalog.listing` is
+      // one of its D-B1 reads. Doctor deliberately does NOT get a
+      // capability of its own: a new row would be a wider authorization
+      // surface for a command that only needs to read what serve reads.
+      role: "serve",
+      request: { kind: "catalog.listing" },
+      // A read's budget (§17 deadline discipline): the handshake and the
+      // listing are both bounded store reads, and the only slow case is
+      // the cold start this may itself trigger — precisely what
+      // READ_DEADLINE_MS is sized for.
+      deadlineMs: READ_DEADLINE_MS,
+    });
+
+    if (response.kind === "error") {
+      console.error(`daemon reported: ${response.code} — ${response.message}`);
+      return 1;
+    }
+    if (response.kind !== "result") {
+      // `outcome-unknown` on a read: the connection died mid-request. For
+      // a diagnostic there is nothing ambiguous to protect (a read has no
+      // side effects to duplicate), but it is still a failed diagnosis.
+      console.error(
+        "daemon health could not be determined: the connection dropped before the daemon answered. " +
+          `Re-run; if it persists, see ${join(stateDir, "conduitd.log")}`,
+      );
+      return 1;
+    }
+
+    // Typed by `RpcPayloadFor<"catalog.listing">` rather than re-declared
+    // through a cast. The cast this replaces was the OTHER half of the
+    // payload-seam defect: it described the same wire kind differently from
+    // `runtime-stdio.ts`'s, so the two readers of one projection disagreed
+    // about its shape. The VALUE-level hedges below stay — a diagnostic
+    // reports what arrived and must not throw while doing it.
+    const payload = response.payload;
+    const sourceCount = typeof payload.sourceCount === "number" ? payload.sourceCount : 0;
+    console.error("ok: daemon reachable (handshake accepted)");
+    if (daemonConfig !== undefined) {
+      console.error(`ok: daemon owns the database at ${daemonConfig.dbPath}`);
+      console.error(
+        `egress opt-in: ${daemonConfig.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`,
+      );
+    } else {
+      // Said rather than left blank. The db path and the egress setting are
+      // among the most likely things an operator is debugging, and their
+      // ABSENCE from a report that otherwise looks healthy reads as "not
+      // applicable" instead of "not observed". A missing handshake is a real
+      // (if odd) state — the response arrived without one being surfaced —
+      // and naming it is what stops a reader silently assuming the default.
+      console.error(
+        "warn: daemon config could not be read from the handshake — db path and egress setting " +
+          "are NOT being reported below (this is an observation gap, not a confirmed default).",
+      );
+    }
+    console.error(
+      `ok: ${sourceCount} source(s) in catalog${sourceCount === 0 ? " — onboard one with `conduit add-mcp`" : ""}`,
     );
     console.error(
-      `egress opt-in: ${env.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`,
+      `ok: ${Array.isArray(payload.connections) ? payload.connections.length : 0} connection(s) advertised`,
     );
     return 0;
   } catch (error) {
+    if (error instanceof DaemonUnavailable) {
+      console.error(error.message);
+      console.error(
+        "For a sick or unreachable daemon, diagnose offline: conduit-mcp --doctor --offline",
+      );
+      return 1;
+    }
     console.error(String(error instanceof Error ? error.message : error));
     return 1;
+  }
+}
+
+/**
+ * `--doctor --offline`: inspect a SICK install without opening the store.
+ *
+ * Two properties define this mode, and both are load-bearing.
+ *
+ * **It takes the maintenance lock EXCLUSIVE**, so it cannot run beside a
+ * live daemon or a rotation. That is not caution about reading — it is
+ * what makes the report COHERENT. An inspection racing a rotation would
+ * report a key file and a db that belong to different moments.
+ *
+ * **It never calls `openStoreFromEnv`**, which is the whole point:
+ * that path creates, heals and migrates. This mode answers from the
+ * filesystem and from key RESOLUTION alone (`resolveEnv` reads and
+ * decodes; it opens nothing), so a genuinely broken install is described
+ * rather than silently repaired. The cost is accepted and stated in the
+ * output: it cannot verify the key actually DECRYPTS the database,
+ * because proving that requires opening the store and checking the canary.
+ */
+async function doctorOffline(rawStateDir: string): Promise<number> {
+  // Resolve the ONE effective base (§17 §2, consumer 3) — the same
+  // kernel-faithful resolver the client and the daemon run, over the same
+  // operator argument, so the doctor inspects the object a real daemon would
+  // bind under, not whatever a lexical `join` of the raw argv points at. The
+  // EXCEPTION to the §5 refusal: offline never spawns and its whole job is
+  // inspecting a sick, not-yet-healthy install, so it resolves and then
+  // REPORTS — it does NOT apply the custom-NOT_FOUND refusal the auto-starting
+  // client does. `canonicalOfMissing` (inside the resolver) already walks a
+  // partly- or not-yet-existent dir faithfully, so a broken install is
+  // described rather than refused.
+  const stateDir = resolveEffectiveStateDir(rawStateDir);
+  const paths = daemonPaths(stateDir);
+  // The key file is a property of the state directory, exactly as the db and
+  // the locks are (`daemonPaths`). Honoring `--state-dir` here means
+  // inspecting THAT directory's key, not the default's — the whole point of
+  // an offline, dir-scoped diagnosis. On the default directory this equals
+  // `DEFAULT_KEY_FILE`.
+  const keyFile = join(stateDir, "master-key");
+  // One reading of "the state directory isn't there", shared with the two
+  // `key` subcommands: nothing can hold a lock in a directory that does
+  // not exist, so `no-state-dir` proceeds to report on the fresh install
+  // rather than refusing. The directory is never created to take the lock
+  // — creation is the daemon's prerogative (§3.2), and a read-only
+  // diagnostic must not provision the state it claims to inspect.
+  const acquisition = await acquireExclusiveIfPresent(paths.maintenanceLockDb, {
+    role: MAINTENANCE_ROLE_DOCTOR,
+  });
+  if (acquisition.outcome === "busy") {
+    const holder = describeHolder(await readLockHolder(paths.maintenanceLockDb));
+    console.error(
+      "offline diagnosis refused: the maintenance lock is held, so a daemon is running or a key " +
+        `rotation is in progress.${holder} An offline inspection beside a live owner would report a ` +
+        "state nobody was ever in. Stop the daemon (SIGTERM) or wait for the rotation, then re-run — " +
+        "or run `conduit-mcp --doctor` to ask the live daemon instead.",
+    );
+    return 1;
+  }
+  try {
+    // Key resolution only — decode and report the source. `resolveEnv`
+    // reads the key file (or the env var) and validates its shape; it
+    // opens no database and creates nothing.
+    let keyOk = false;
+    try {
+      const resolved = resolveEnv(process.env, { keyFilePath: keyFile });
+      console.error(`ok: key decodes (32 bytes), source: ${resolved.keySource}`);
+      console.error(
+        `egress opt-in: ${resolved.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`,
+      );
+      keyOk = true;
+    } catch (error) {
+      // Reported, NOT thrown: a missing or malformed key is the single
+      // most likely reason someone is running the offline doctor, and the
+      // file-level findings below are exactly what they need next. The
+      // verbatim `resolveEnv` diagnostics ("Missing master key",
+      // "Malformed master key in …") are the pinned contract and reach
+      // stderr unchanged.
+      console.error(String(error instanceof Error ? error.message : error));
+    }
+
+    // Folded into the exit code below. A file-level finding is a FINDING:
+    // printing "missing: database at …" and then exiting 0 tells every
+    // caller that reads status rather than prose — a health check, a CI
+    // step, an operator's `&&` — that the install is fine, which is the one
+    // wrong answer a sick-install diagnostic must never give.
+    let missing = false;
+
+    for (const [label, path] of [
+      ["key file", keyFile],
+      ["database", paths.db],
+    ] as const) {
+      if (!existsSync(path)) {
+        console.error(`missing: ${label} at ${path}`);
+        missing = true;
+        continue;
+      }
+      const mode = statSync(path).mode & 0o777;
+      const wide = (mode & 0o077) !== 0;
+      console.error(
+        `ok: ${label} present at ${path} (mode ${mode.toString(8).padStart(4, "0")})${
+          wide ? ` — WARNING: wider than 0600, fix with: chmod 600 ${path}` : ""
+        }`,
+      );
+    }
+
+    // Named explicitly rather than left as an unstated limit: this mode
+    // trades the canary check for not touching the database at all.
+    console.error(
+      "note: offline mode does not open the database, so it cannot confirm the key DECRYPTS it. " +
+        "Run `conduit-mcp --doctor` against a live daemon for that.",
+    );
+    return keyOk && !missing ? 0 : 1;
+  } finally {
+    if (acquisition.outcome === "acquired") await acquisition.lock.release();
   }
 }
 
@@ -56,12 +313,56 @@ async function main(): Promise<void> {
     return;
   }
   if (arg === "--doctor") {
-    process.exitCode = await doctor();
+    // `--state-dir <path>` is parsed on the doctor path too, through the
+    // SAME shared parser both bins use (`args.ts`) — a second, textually
+    // different reading of the flag is exactly the drift that parser
+    // exists to remove. Before this, `--doctor --state-dir /custom`
+    // silently IGNORED the flag and diagnosed (and auto-started) the
+    // default, the F5 gap on the doctor path.
+    const parsed = takeStateDir("[conduitd]", process.argv);
+    if ("error" in parsed) {
+      console.error(parsed.error.trimEnd());
+      process.exitCode = 1;
+      return;
+    }
+    const stateDir = parsed.stateDir ?? DEFAULT_CONDUIT_DIR;
+    // `--offline` is scanned rather than positionally required so
+    // `--doctor --offline` reads naturally in either order. Offline is
+    // dir-scoped and never spawns, so it HONORS a custom `--state-dir`;
+    // the daemon-backed doctor auto-starts and therefore REFUSES one (see
+    // `doctor`), keeping the boundary coherent with the client's F5 gate.
+    process.exitCode = parsed.rest.includes("--offline")
+      ? await doctorOffline(stateDir)
+      : await doctor(stateDir);
     return;
   }
   if (arg === "--daemon") {
+    // `--state-dir <path>` runs the daemon against a non-default state
+    // directory — see `args.ts` for why it is an argument rather than an
+    // environment variable, and why BOTH bins parse it through that one
+    // function. The parse this replaced was a second, textually different
+    // reading of the same flag; a daemon started under one reading and a
+    // client pointed at it under the other reach different databases.
+    const parsed = takeStateDir("[conduitd]", process.argv);
+    if ("error" in parsed) {
+      // The shared parser's line ends in a newline; `console.error` adds
+      // its own, so the message is trimmed back to this bin's convention.
+      console.error(parsed.error.trimEnd());
+      process.exitCode = 1;
+      return;
+    }
+    const override = parsed.stateDir;
+    // Resolve the ONE effective base at the daemon entry point (§17 §2,
+    // consumer 2 — closes P2-lexical), BEFORE `runDaemon`. `runDaemon` /
+    // `daemonPaths` / `ensureStateDir` then all derive from THIS resolved
+    // object, so a by-hand `--state-dir <attacker>/link/../custom` binds the
+    // socket + locks under the SAME kernel-faithful object a client resolving
+    // the same argv reaches — instead of the lexically-collapsed
+    // `<attacker>/custom` that `path.join` would produce from the raw
+    // spelling. Client and by-hand daemon meet at one filesystem object.
+    const resolvedStateDir = resolveEffectiveStateDir(override ?? DEFAULT_CONDUIT_DIR);
     try {
-      await runDaemon({ stateDir: DEFAULT_CONDUIT_DIR, sweep: sweepDaemonStore });
+      await runDaemon({ stateDir: resolvedStateDir, sweep: sweepDaemonStore });
     } catch (error) {
       // The two refusal paths carry their own exit codes (§3.5's client
       // decision table) — a client branches on the code, not on prose.

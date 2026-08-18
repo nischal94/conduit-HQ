@@ -1,8 +1,18 @@
+import { lookup as lookupCb } from "node:dns";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import type { AddressInfo } from "node:net";
 import { McpClientError } from "@conduithq/sdk";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, describe, expect, it, vi } from "vitest";
 import { fetchToolsList, MAX_RESPONSE_BYTES, MAX_TOOLS } from "./mcp-fetch.js";
+
+// The sdk's `createPinnedLookup` calls the callback-form `dns.lookup`; the
+// built sdk bundle imports it as bare "dns". Wrapping that one export in a spy
+// (delegating to the real resolver) lets the pinning test observe the seam
+// end-to-end without changing any behavior.
+vi.mock("dns", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("node:dns")>();
+  return { ...actual, default: actual, lookup: vi.fn(actual.lookup) };
+});
 
 /**
  * Fix 1 (P1): a hostile upstream must not be able to force unbounded memory
@@ -283,5 +293,53 @@ describe("fetchToolsList — onboarding auth", () => {
       kind: "http_status",
       status: 401,
     });
+  });
+});
+
+describe("fetchToolsList — §9.3 pinned egress (design §18-C4 D2, §3.3.1)", () => {
+  it("resolves the onboarding host through the PINNED lookup, not the socket's own DNS", async () => {
+    // The pinning guarantee is that the address the §9.3 guard vetted IS the
+    // address connected to — which only holds if a pinned `lookup` is actually
+    // handed to the request. `createPinnedLookup` always resolves with
+    // `all: true` (so every candidate address is vetted) regardless of what the
+    // socket asked for; observing that call shape at the dns seam is therefore
+    // proof the pinned lookup ran, and not node's default resolution path.
+    const tools = [{ name: "ok_tool", inputSchema: { type: "object" } }];
+    const spy = vi.mocked(lookupCb);
+    spy.mockClear();
+    const url = await startHandshakeServer((res, id) => {
+      sendJson(res, 200, { jsonrpc: "2.0", id, result: { tools } });
+    });
+    // A hostname, not a literal: an IP literal never reaches dns.lookup at all,
+    // so it could not distinguish a pinned path from an unpinned one.
+    const hostUrl = url.replace("127.0.0.1", "localhost");
+
+    const result = await fetchToolsList(hostUrl);
+
+    expect(result).toEqual(tools);
+    const pinnedCalls = spy.mock.calls.filter(
+      ([host, opts]) =>
+        host === "localhost" &&
+        typeof opts === "object" &&
+        opts !== null &&
+        (opts as { all?: boolean }).all === true,
+    );
+    expect(pinnedCalls.length).toBeGreaterThan(0);
+  });
+
+  it("allowPrivate keeps a loopback upstream reachable — the filter is waived, the pinning is not", async () => {
+    // §18-C4 D2: `add-mcp` passes `allowPrivate: true`, because a local MCP
+    // server is a legitimate onboarding target. Without the waiver the pinned
+    // lookup would fail closed on `localhost` (every resolved address private)
+    // and onboarding a loopback upstream would be impossible. This pins the
+    // waiver as deliberate, so a future tightening cannot silently break it.
+    const tools = [{ name: "ok_tool", inputSchema: { type: "object" } }];
+    const url = await startHandshakeServer((res, id) => {
+      sendJson(res, 200, { jsonrpc: "2.0", id, result: { tools } });
+    });
+
+    const result = await fetchToolsList(url.replace("127.0.0.1", "localhost"));
+
+    expect(result).toEqual(tools);
   });
 });

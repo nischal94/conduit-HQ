@@ -67,10 +67,25 @@ export interface McpEndpoint {
   headers: Record<string, string>;
   /**
    * Pinned DNS lookup that forces the connection to a single pre-resolved,
-   * SSRF-vetted IP (§9.3, closes DNS-rebinding). SSRF-significant: OMITTING it
-   * means UNPINNED egress over plain DNS — correct ONLY for operator-typed URLs
-   * (onboarding, where the human owns the destination). An agent-driven URL
-   * MUST pass a pinned lookup; serve-time (`upstream.ts`) always does.
+   * SSRF-vetted IP (§9.3, closes DNS-rebinding).
+   *
+   * SSRF-significant. **EVERY production caller pins**, onboarding
+   * included: `upstream.ts` at serve time, and both `add-mcp` paths
+   * (provision and revalidate). Omitting it means UNPINNED egress over
+   * plain DNS, and there is no currently-sanctioned use for that — the
+   * field stays optional for tests and for callers that supply their own
+   * agent, not as a licence to skip pinning.
+   *
+   * The distinction this field once documented — that operator-typed URLs
+   * could go unpinned because the human owns the destination — was
+   * WITHDRAWN. It conflated two different things: onboarding waives the
+   * PRIVATE-ADDRESS FILTER (`allowPrivate: true`, so an operator may
+   * onboard a source on their own network), and never the pinning.
+   * Pinning defends against the destination CHANGING between the vetting
+   * lookup and the connect, which an operator typing a trusted hostname
+   * does not prevent — and the revalidate hop re-resolves a STORED url
+   * inside the credential-holding daemon, where a rebind would carry an
+   * Authorization header to the rebound address.
    */
   lookup?: LookupFunction;
 }
