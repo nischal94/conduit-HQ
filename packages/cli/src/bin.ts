@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import { takeStateDir as parseStateDir } from "@conduithq/mcp";
 import { addMcp } from "./commands/add-mcp.js";
 import { approvals } from "./commands/approvals.js";
 import { runKey } from "./commands/key.js";
@@ -10,32 +11,19 @@ import { type Command, dispatch } from "./dispatch.js";
 // see design §6. Every other command prints normally.
 
 /**
- * Extracts the shared `--state-dir <path>` flag, returning the remaining
- * argv alongside it.
+ * Extracts the shared `--state-dir <path>` flag under THIS bin's error
+ * convention.
  *
- * Deliberately UNDOCUMENTED in `--help`: it points a daemon client at a
- * non-default state directory, which only makes sense next to a daemon
- * someone started by hand there (design §3.1's supported override path). It
- * grants nothing a caller could not already do by running the daemon
- * themselves, and it is NOT an environment variable precisely so a client's
- * ambient env can never redirect which database is reached (§9.3).
- *
- * Shared by every daemon-client command rather than reimplemented per
- * command: `serve` (Task 6) and `approvals` (Task 7) must agree on how a
- * test or operator names the daemon, or the two clients silently reach
- * different databases.
+ * The parse itself lives in the mcp package (`args.ts`) so the daemon bin
+ * and every client here read the flag identically — two readings of the
+ * same flag would let a daemon and a client pointed at it silently reach
+ * different databases. Only the `[conduit] <command>:` prefix is local.
  */
 function takeStateDir(
   command: string,
   args: string[],
 ): { rest: string[]; stateDir?: string } | { error: string } {
-  const at = args.indexOf("--state-dir");
-  if (at === -1) return { rest: args };
-  const stateDir = args[at + 1];
-  if (stateDir === undefined || stateDir.startsWith("--")) {
-    return { error: `[conduit] ${command}: --state-dir requires a path argument\n` };
-  }
-  return { rest: [...args.slice(0, at), ...args.slice(at + 2)], stateDir };
+  return parseStateDir(`[conduit] ${command}:`, args);
 }
 
 async function runCommand(command: Command, args: string[]): Promise<number> {

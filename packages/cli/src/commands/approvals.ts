@@ -1,5 +1,4 @@
 import {
-  DaemonUnavailable,
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
   deadlineForRequest,
@@ -7,8 +6,8 @@ import {
   type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
-  type RpcResponseFor,
 } from "@conduithq/mcp";
+import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
 /**
  * `conduit approvals list|approve|deny` — the human approval queue (design
@@ -88,20 +87,13 @@ function prodDeps(stateDir: string): ApprovalsDeps {
 type PausedRowWire = PausedListRow;
 
 /**
- * One daemon round trip, reduced to either a payload or an operator-facing
- * refusal. Every non-`result` answer is a REFUSAL rather than an empty
- * success, which matters most for `list`: rendering "no paused executions"
- * for a queue the daemon never reported would tell an operator that nothing
- * awaits them, which is the one wrong answer this command must never give.
+ * This command's operator prose for the shared daemon-answer reduction
+ * (`daemon-answer.ts`). The reduction decides the SHAPE of every non-result
+ * answer; these lines are what the operator actually reads, and they stay
+ * here because each names this command's verb and its own next step.
  */
-type Answer<P> = { ok: true; payload: P } | { ok: false; line: string; exitCode: number };
-
-function describeResponse<K extends RpcRequest["kind"]>(
-  response: RpcResponseFor<K>,
-  verb: string,
-): Answer<RpcPayloadFor<K>> {
-  if (response.kind === "result") return { ok: true, payload: response.payload };
-  if (response.kind === "outcome-unknown") {
+function approvalsContext(verb: string): AnswerContext {
+  return {
     // §5's ambiguity, and the one answer whose mishandling is dangerous in
     // BOTH directions. The connection died after the request bytes went
     // out, so the resume may have driven the execution and may not have.
@@ -109,67 +101,30 @@ function describeResponse<K extends RpcRequest["kind"]>(
     // decisionApplied contract exists to kill; retrying could apply a
     // second decision to an execution that already consumed one. So: no
     // verb line, a non-zero exit, and a lookup instruction.
-    return {
-      ok: false,
-      exitCode: 1,
-      line:
-        `[conduit approvals] The outcome of this ${verb} is UNKNOWN: the daemon connection was ` +
-        `lost after the request was sent, so it may or may not have been applied ` +
-        `(requestId ${response.requestId}). Do NOT retry it — run "conduit approvals list" to ` +
-        `see whether the execution is still awaiting a decision.` +
-        // The §5 verdict is unchanged by the cause; the cause only tells the
-        // operator WHICH failure they are looking at (a misbehaving daemon
-        // versus a dropped connection), which is the difference between
-        // reading the daemon log and retrying later.
-        `${response.detail !== undefined ? ` Cause: ${response.detail}.` : ""}\n`,
-    };
-  }
-  if (response.kind === "error") {
+    outcomeUnknown: (requestId) =>
+      `[conduit approvals] The outcome of this ${verb} is UNKNOWN: the daemon connection was ` +
+      `lost after the request was sent, so it may or may not have been applied ` +
+      `(requestId ${requestId}). Do NOT retry it — run "conduit approvals list" to ` +
+      `see whether the execution is still awaiting a decision.`,
     // The daemon's own typed refusal. Its message is client-safe by
     // construction (`connection.ts` sends a fixed string for `internal`),
     // and it is strictly more useful than a generic line: `busy` and
     // `rotation-in-progress` each name a different next step.
-    return {
-      ok: false,
-      exitCode: 1,
-      line: `[conduit approvals] ${verb} refused by the daemon (${response.code}): ${response.message}\n`,
-    };
-  }
-  // `ready`/`handshake.ok` are prefaces the client already consumed.
-  return {
-    ok: false,
-    exitCode: 1,
-    line: `[conduit approvals] ${verb} failed: protocol desync (unexpected ${response.kind} frame).\n`,
+    refused: (code, message) =>
+      `[conduit approvals] ${verb} refused by the daemon (${code}): ${message}`,
+    desync: (kind) =>
+      `[conduit approvals] ${verb} failed: protocol desync (unexpected ${kind} frame).`,
+    unreachable: (detail) =>
+      `[conduit approvals] ${verb} could not reach the Conduit daemon: ${detail}`,
   };
 }
 
-/**
- * Calls the daemon, folding a thrown `DaemonUnavailable` into the same
- * Answer shape. That error is NOT dressed up: it already carries the state
- * directory, the deadline, and the daemon log path that explains why a
- * child exited — everything the operator needs to act, and this is an
- * operator-facing command, so unlike the agent-facing `serve` seam there is
- * nothing here to redact it from.
- */
-async function ask<K extends RpcRequest["kind"]>(
+function ask<K extends RpcRequest["kind"]>(
   deps: ApprovalsDeps,
   request: Extract<RpcRequest, { kind: K }>,
   verb: string,
 ): Promise<Answer<RpcPayloadFor<K>>> {
-  try {
-    return describeResponse<K>((await deps.daemon(request)) as RpcResponseFor<K>, verb);
-  } catch (error) {
-    return {
-      ok: false,
-      exitCode: 1,
-      line:
-        error instanceof DaemonUnavailable
-          ? `${error.message}\n`
-          : `[conduit approvals] ${verb} could not reach the Conduit daemon: ${
-              error instanceof Error ? error.message : String(error)
-            }\n`,
-    };
-  }
+  return askDaemon<K>(deps.daemon, request, approvalsContext(verb));
 }
 
 interface PausedRow {

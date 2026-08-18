@@ -593,6 +593,52 @@ describe("the re-entry floor (MIN_PASS_BUDGET_MS)", () => {
     },
     TIMEOUT,
   );
+
+  it(
+    "INVARIANT §17: a sub-floor deadline is refused BY NAMING THE MINIMUM, not as an absent daemon",
+    async () => {
+      // A sub-floor budget probes nothing and spawns nothing, so reporting
+      // the generic "no daemon could be reached or started" would state
+      // evidence about a daemon that was never looked for — and point the
+      // operator at a daemon log with nothing in it. The refusal must
+      // instead name the floor, so the caller can fix the one thing that is
+      // actually wrong: their own arithmetic.
+      await expect(
+        daemonRequest({
+          stateDir: newStateDir(),
+          role: "serve",
+          request: { kind: "catalog.listing" },
+          deadlineMs: MIN_PASS_BUDGET_MS - 1,
+          spawn: () => {
+            throw new Error("a sub-floor budget must never reach the spawn boundary");
+          },
+        }),
+      ).rejects.toThrow(new RegExp(`minimumMs: ${MIN_PASS_BUDGET_MS}`));
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a non-finite deadline is refused by the same floor check",
+    async () => {
+      // `NaN` compares false against every bound, so without the explicit
+      // finiteness check it would pass the floor guard and then make the
+      // loop's own `remaining(expiry) >= MIN_PASS_BUDGET_MS` false forever —
+      // the same silent no-probe, reached by a different route.
+      await expect(
+        daemonRequest({
+          stateDir: newStateDir(),
+          role: "serve",
+          request: { kind: "catalog.listing" },
+          deadlineMs: Number.NaN,
+          spawn: () => {
+            throw new Error("a non-finite budget must never reach the spawn boundary");
+          },
+        }),
+      ).rejects.toBeInstanceOf(DaemonUnavailable);
+    },
+    TIMEOUT,
+  );
 });
 
 describe("the result-payload seam", () => {
@@ -696,6 +742,211 @@ describe("the result-payload seam", () => {
       ];
       const response = await askWithPayload({ kind: "approvals.list" }, rows);
       expect(response).toMatchObject({ kind: "result", payload: rows });
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * The seam covers ALL structurally-consumed kinds, not `approvals.list`
+   * alone. One malformed case per kind below, each asserting the same two
+   * things: the answer is a typed refusal (never a `result` a caller would
+   * read defaults out of), and its wording forbids the specific wrong
+   * inference that kind's malformed payload would otherwise invite.
+   */
+
+  it(
+    "INVARIANT §17: a catalog.listing payload without a usable source count is REFUSED",
+    async () => {
+      // `sourceCount` drives the "0 sources — onboard one" startup hint and
+      // `connections` the advertised tool list. Before the seam covered this
+      // kind, a payload missing either degraded to a plausible default —
+      // telling an operator with a full catalog that nothing is onboarded.
+      const response = await askWithPayload(
+        { kind: "catalog.listing" },
+        { connections: [{ prefix: "gh", label: "github tools" }] },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("do NOT assume it is empty");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a catalog.listing payload whose connections are not listing views is REFUSED",
+    async () => {
+      const response = await askWithPayload(
+        { kind: "catalog.listing" },
+        { connections: ["gh"], sourceCount: 1 },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("catalog");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a well-formed catalog.listing payload passes the seam untouched",
+    async () => {
+      const listing = { connections: [{ prefix: "gh", label: "github tools" }], sourceCount: 2 };
+      const response = await askWithPayload({ kind: "catalog.listing" }, listing);
+      expect(response).toMatchObject({ kind: "result", payload: listing });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a source.provision payload with malformed counts is REFUSED, not printed as success",
+    async () => {
+      // The site where a bad payload was worst: the daemon has ALREADY
+      // committed the atomic write, and the CLI would print "undefined safe,
+      // undefined review" as a success line — an onboarding the operator
+      // would rationally re-run against a source that is already there.
+      const response = await askWithPayload(
+        {
+          kind: "source.provision",
+          namespace: "ns",
+          url: "https://u",
+          prefix: "p",
+          replace: false,
+          clearCredential: false,
+        },
+        { namespace: "ns", prefix: "p", toolCount: 3, credential: "absent" },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("do NOT assume");
+      expect(response.message).toContain("nothing was written");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a source.revalidate payload whose warnings are not an array of strings is REFUSED",
+    async () => {
+      // `warnings` is genuinely optional — absence is a well-formed answer
+      // the caller's `?? []` handles. A PRESENT non-array is a protocol
+      // fault, and swallowing it as "no advisories" hides the one thing the
+      // daemon was trying to tell the operator.
+      const response = await askWithPayload(
+        { kind: "source.revalidate", namespace: "ns" },
+        {
+          namespace: "ns",
+          prefix: "p",
+          toolCount: 1,
+          counts: { safe: 1, review: 0, destructive: 0 },
+          credential: "present",
+          warnings: "a retarget notice",
+        },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("source.revalidate");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a provisioning payload with absent warnings passes the seam untouched",
+    async () => {
+      const payload = {
+        namespace: "ns",
+        prefix: "p",
+        toolCount: 2,
+        counts: { safe: 2, review: 0, destructive: 0 },
+        credential: "absent",
+      };
+      const response = await askWithPayload(
+        {
+          kind: "source.provision",
+          namespace: "ns",
+          url: "https://u",
+          prefix: "p",
+          replace: false,
+          clearCredential: false,
+        },
+        payload,
+      );
+      expect(response).toMatchObject({ kind: "result", payload });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: an approvals.resume payload with no decisionApplied is REFUSED, never read as false",
+    async () => {
+      // The sharpest arm of the whole seam. `decisionApplied` is the
+      // OPERATOR'S VERB truth, and an absent field defaulting to `false`
+      // reports a deny that LANDED as "never applied" (exit 1) — sending the
+      // operator to re-issue a decision the execution already consumed.
+      // Absence must be a refusal, not a hedge.
+      const response = await askWithPayload(
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        { status: "completed", executionId: "exec_1" },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("Do NOT assume it was not");
+      // NOT §5 ambiguity: the response arrived, so the failure is a
+      // malformed answer rather than an unknown outcome.
+      expect(response.kind).not.toBe("outcome-unknown");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a well-formed approvals.resume payload passes the seam untouched",
+    async () => {
+      const payload = { status: "completed", executionId: "exec_1", decisionApplied: true };
+      const response = await askWithPayload(
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        payload,
+      );
+      expect(response).toMatchObject({ kind: "result", payload });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: an execute payload carrying no status is REFUSED",
+    async () => {
+      // These payloads are handed to the AGENT verbatim, so no client field
+      // access throws — but every documented branch of the execute/check
+      // protocol keys on `status`, and a payload without one is a frame the
+      // agent cannot act on. The refusal must not let it read as "did not
+      // run".
+      const response = await askWithPayload(
+        { kind: "execute", code: "x", deadlineMs: 1000 },
+        { executionId: "exec_1", result: null },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("do NOT assume it did not run");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "an execution.get payload carrying no status is REFUSED",
+    async () => {
+      const response = await askWithPayload({ kind: "execution.get", executionId: "exec_1" }, {});
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("execution.get");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a well-formed check payload passes the seam untouched",
+    async () => {
+      const payload = { status: "not_found" };
+      const response = await askWithPayload(
+        { kind: "execution.getByRequestKey", requestKey: "k" },
+        payload,
+      );
+      expect(response).toMatchObject({ kind: "result", payload });
     },
     TIMEOUT,
   );

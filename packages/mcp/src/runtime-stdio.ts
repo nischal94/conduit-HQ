@@ -127,12 +127,14 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
     process.exit(1);
   }
 
-  // `!== a positive number` rather than `=== 0`: the hint's job is to tell a
-  // fresh install how to onboard, and a payload that failed to carry a
-  // usable count is exactly when the operator most needs it. Keying on
-  // `=== 0` made a malformed answer SUPPRESS the hint — the one reading
-  // where staying silent is worse than being wrong.
-  if (!(typeof listing.sourceCount === "number" && listing.sourceCount > 0)) {
+  // A plain `=== 0` since the client's payload seam guards `catalog.listing`
+  // structurally: a payload whose `sourceCount` is missing or not a finite
+  // number is REFUSED there and never reaches this line, so the branch above
+  // took the `response.kind !== "result"` exit. The `typeof` hedge this
+  // replaced existed only because the seam guarded `approvals.list` alone,
+  // and it substituted "print the onboarding hint" for an answer the daemon
+  // never gave — a plausible default in place of a refusal.
+  if (listing.sourceCount === 0) {
     console.error("[ConduitMcp] 0 sources in catalog — onboard one with `conduit add-mcp`");
   }
   // Kept for the operator who set the flag on the CLIENT and would

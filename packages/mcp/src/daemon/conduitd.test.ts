@@ -860,9 +860,11 @@ describe("conduitd lifecycle", () => {
       await handshake(client, "add-mcp");
 
       // Implemented since Task 8. A namespace with no stored source is a
-      // REFUSAL (`invalid`, carrying the operator's next move), never the
-      // old "unimplemented" placeholder — onboarding needs a url, and the
-      // only place a url may be supplied is `source.provision`.
+      // REFUSAL (`invalid`, carrying the operator's next move), never a
+      // not-built-yet placeholder — onboarding needs a url, and the only
+      // place a url may be supplied is `source.provision`. (The placeholder
+      // code the refusal once used has since been removed from the error
+      // union outright; nothing emits it.)
       client.send({ kind: "source.revalidate", namespace: "ns" });
       const refusal = (await client.next()) as { kind: string; code: string; message: string };
       expect(refusal).toMatchObject({ kind: "error", code: "invalid" });

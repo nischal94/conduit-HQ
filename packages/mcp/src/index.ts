@@ -1,3 +1,4 @@
+export { type StateDirParse, takeStateDir } from "./args.js";
 export {
   type DaemonRequestOptions,
   DaemonUnavailable,

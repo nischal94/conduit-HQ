@@ -42,7 +42,18 @@ export interface DaemonRequestOptions<K extends RpcRequest["kind"] = RpcRequest[
   stateDir: string;
   role: keyof typeof CAPABILITIES;
   request: Extract<RpcRequest, { kind: K }>;
-  /** One bounded budget for the WHOLE attempt, waits and spawn included. */
+  /**
+   * One bounded budget for the WHOLE attempt, waits and spawn included.
+   *
+   * **Must be at least `MIN_PASS_BUDGET_MS`.** The decision loop refuses to
+   * enter a pass it has no room to act on, so a budget below that floor
+   * would probe nothing, spawn nothing, and fall straight to the terminal
+   * `unavailable` — a real daemon reported as absent because the caller's
+   * arithmetic produced a number too small, with a message naming the
+   * daemon log for a daemon that was never contacted. A sub-floor deadline
+   * is therefore its own typed refusal naming the minimum, rather than a
+   * silent no-probe "unavailable".
+   */
   deadlineMs: number;
   /** Injectable for tests; production spawns the real daemon. */
   spawn?: (stateDir: string) => void;
@@ -84,6 +95,34 @@ export const UNCORRELATED = "uncorrelated";
 
 /** How long to wait for the lifecycle lock to release before re-probing. */
 const LIFECYCLE_WAIT_POLL_MS = 50;
+
+/**
+ * The pacing for a pass that made NO PROGRESS.
+ *
+ * Every pass of the decision table opens lock-db clients — `probeShared`
+ * takes a fresh one per probe by design (each hold/probe gets a dedicated
+ * client; sharing one across passes is what the lock design forbids), so a
+ * pass costs 2–3 client opens. At the 50ms poll interval a long deadline
+ * spends that cost hundreds of times over: a 60s budget paced at 50ms
+ * admits ~1,200 passes and roughly 2,400–3,600 client opens, nearly all of
+ * them re-reading a state that has not changed.
+ *
+ * The distinction that makes this safe to slow down is PROGRESS. A pass
+ * that observed a transition — the lock released, a socket appeared — is
+ * chasing something moving and stays at the poll interval, because latency
+ * there is the client's whole responsiveness. A pass that observed the SAME
+ * state it observed last time is watching a daemon drain or fail to come
+ * up, and neither finishes faster for being polled 20 times a second.
+ *
+ * At 4× the poll interval the two no-progress paths cost ~5 passes/second
+ * instead of ~20. Worst case for a deadline D, all passes no-progress:
+ * `floor((D − MIN_PASS_BUDGET_MS) / NO_PROGRESS_PACE_MS) + 1` passes, so at
+ * most 3 probes each — for D = 60s that is ≤300 passes and ≤900 probes,
+ * down from ~1,200 passes and ~3,600 probes. §3.5 semantics are untouched:
+ * the same rows are read in the same order, the spawn is still rationed by
+ * count, and no path that can make progress is slowed.
+ */
+const NO_PROGRESS_PACE_MS = LIFECYCLE_WAIT_POLL_MS * 4;
 
 /**
  * How long a re-entry of the decision table must be able to make progress
@@ -169,6 +208,24 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
 ): Promise<RpcResponseFor<K>> {
   const paths = daemonPaths(opts.stateDir);
   const spawnChild = opts.spawn ?? spawnDaemon;
+
+  // The floor, refused explicitly rather than discovered as a silent
+  // no-probe. Below it the loop below is never entered even once, so the
+  // client would report "no daemon could be reached or started" about a
+  // daemon it never looked for — and point the operator at a daemon log
+  // that has nothing to say, because no child was ever spawned. Naming the
+  // minimum turns an unfalsifiable "unavailable" into a caller bug the
+  // caller can fix.
+  if (!Number.isFinite(opts.deadlineMs) || opts.deadlineMs < MIN_PASS_BUDGET_MS) {
+    throw new DaemonUnavailable(
+      "unavailable",
+      `[conduit] Daemon unavailable: the request deadline is below the minimum one decision pass ` +
+        `needs, so no daemon was probed or started. Context: {deadlineMs: ${opts.deadlineMs}, ` +
+        `minimumMs: ${MIN_PASS_BUDGET_MS}} — this is a caller-side budget too small to act on, ` +
+        `not evidence about any daemon.`,
+    );
+  }
+
   const expiry = Date.now() + opts.deadlineMs;
 
   // Encoded BEFORE anything connects, so an oversized request is refused
@@ -229,6 +286,16 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
     // remembered. Rotation is fail-fast with no spawn: a daemon started
     // now would only exit "rotation in progress" itself, and spinning
     // would starve the rotation this refusal exists to let finish.
+    //
+    // NOTE the converse race, which runs the other way: this probe takes
+    // the maintenance lock SHARED for the instant it reads, so a `key
+    // rotate` attempting its EXCLUSIVE acquisition inside that window is
+    // refused BUSY by a client that is merely looking. The window is one
+    // probe wide, and it is self-healing — the rotation's own refusal tells
+    // the operator to retry, and the probe is gone by then. It is why the
+    // no-progress pacing above matters beyond client cost: fewer probes per
+    // second is proportionally fewer instants in which a rotation can be
+    // spuriously refused by a waiting client.
     if ((await probeShared(paths.maintenanceLockDb)) === "busy") {
       // Name the holder, exactly as `key rotate`'s own refusal does: the
       // operator gets told WHO to wait on rather than only that something
@@ -300,7 +367,11 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
       // `waitForLifecycleHeld`) or terminates. Under the old fixed pass
       // count this spin was capped by the count itself; with a
       // time-bounded loop the pacing has to be explicit.
-      await sleep(Math.min(LIFECYCLE_WAIT_POLL_MS, remaining(expiry)));
+      //
+      // Paced at the NO-PROGRESS interval rather than the poll interval:
+      // this pass observed a daemon that is draining, and a drain does not
+      // finish faster for being watched. See `NO_PROGRESS_PACE_MS`.
+      await sleep(Math.min(NO_PROGRESS_PACE_MS, remaining(expiry)));
       continue;
     }
 
@@ -549,9 +620,9 @@ async function exchange(
 }
 
 /**
- * Validates the PAYLOAD of a `result` for the kinds whose misreading is
- * dangerous, degrading to an `error` the caller already knows how to
- * report.
+ * Validates the PAYLOAD of a `result` for every kind whose payload a caller
+ * structurally consumes, degrading to an `error` the caller already knows
+ * how to report.
  *
  * `decodeResponse` validates the envelope and stops one field short: a
  * `result` with a `payload` key of any shape passes. That gap is where a
@@ -561,54 +632,204 @@ async function exchange(
  * operator command or, worse, an empty table that reads as "nothing awaits
  * you".
  *
- * Deliberately NOT a general payload schema check. The client is not the
- * authorization boundary (see `decodeResponse`), and validating every
+ * The seam covers ALL the structurally-consumed kinds rather than that one.
+ * Guarding a single kind was the more dangerous arrangement, not the
+ * cheaper one: it made the OTHER call sites read as deliberately
+ * unguarded, so each grew its own value-level hedge (a `typeof` on
+ * `sourceCount`, a `?? []` on `warnings`) that silently substituted a
+ * plausible default for an answer the daemon never gave. A per-kind
+ * default is exactly the wrong-answer class this seam exists to convert
+ * into a refusal.
+ *
+ * Deliberately still NOT a general payload schema check. The client is not
+ * the authorization boundary (see `decodeResponse`), and validating every
  * field of every projection would be a second copy of the daemon's
- * senders, drifting from them. What is checked here is the STRUCTURAL
- * assumption each caller then relies on — the shape whose absence makes
- * the caller misbehave rather than merely read a missing field.
+ * senders, drifting from them. What is checked per kind is the STRUCTURAL
+ * assumption its callers then rely on — the shape whose absence makes a
+ * caller misbehave rather than merely read a missing optional field.
  *
  * Refusals are `error`/`internal` rather than `outcome-unknown`: these are
- * reads, and a read that returned a malformed answer has no side effect to
- * be ambiguous ABOUT. Reporting §5 ambiguity here would tell an operator
- * their query may have changed something, which is both false and the
- * opposite of actionable.
+ * reads (and, for `source.provision`, a write whose response arrived — the
+ * ambiguity §5 protects is about a response that never came, not about one
+ * that came malformed). A malformed answer to a completed exchange has no
+ * side effect to be ambiguous ABOUT. Reporting §5 ambiguity here would tell
+ * an operator their query may have changed something, which is both false
+ * and the opposite of actionable.
+ *
+ * Every message says what the operator must NOT assume, following the
+ * `approvals.list` refusal's pattern: a protocol fault that reads as a
+ * benign empty/absent answer is the failure mode, so each refusal names the
+ * inference it is forbidding.
  */
 function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcResponse {
   if (response.kind !== "result") return response;
 
-  if (kind === "approvals.list") {
-    const rows = response.payload;
-    if (!Array.isArray(rows)) {
-      return {
-        kind: "error",
-        requestId: response.requestId,
-        code: "internal",
-        message:
-          "the daemon's approvals.list answer was not a list of paused rows. " +
-          "Nothing is being reported about the queue — do NOT assume it is empty. " +
-          'Re-run "conduit approvals list"; if it persists, see the daemon log.',
-      };
-    }
-    // Each row is rendered as a table cell and a date, so a row missing the
-    // fields the renderer reads produces "Invalid Date" or a RangeError at
-    // an operator rather than a refusal. Refuse the ROW SET rather than
-    // dropping bad rows: a silently shorter queue is the same wrong answer
-    // as an empty one.
-    if (!rows.every(isPausedRowShape)) {
-      return {
-        kind: "error",
-        requestId: response.requestId,
-        code: "internal",
-        message:
-          "the daemon's approvals.list answer contained a malformed paused row. " +
-          "Nothing is being reported about the queue — do NOT assume it is empty. " +
-          'Re-run "conduit approvals list"; if it persists, see the daemon log.',
-      };
-    }
-  }
+  const refuse = (message: string): RpcResponse => ({
+    kind: "error",
+    requestId: response.requestId,
+    code: "internal",
+    message,
+  });
 
-  return response;
+  switch (kind) {
+    case "approvals.list": {
+      const rows = response.payload;
+      if (!Array.isArray(rows)) {
+        return refuse(
+          "the daemon's approvals.list answer was not a list of paused rows. " +
+            "Nothing is being reported about the queue — do NOT assume it is empty. " +
+            'Re-run "conduit approvals list"; if it persists, see the daemon log.',
+        );
+      }
+      // Each row is rendered as a table cell and a date, so a row missing
+      // the fields the renderer reads produces "Invalid Date" or a
+      // RangeError at an operator rather than a refusal. Refuse the ROW SET
+      // rather than dropping bad rows: a silently shorter queue is the same
+      // wrong answer as an empty one.
+      if (!rows.every(isPausedRowShape)) {
+        return refuse(
+          "the daemon's approvals.list answer contained a malformed paused row. " +
+            "Nothing is being reported about the queue — do NOT assume it is empty. " +
+            'Re-run "conduit approvals list"; if it persists, see the daemon log.',
+        );
+      }
+      return response;
+    }
+
+    case "catalog.listing": {
+      // `connections` is iterated to build `tools/list` and its length is
+      // reported; `sourceCount` drives the "0 sources — onboard one" hint.
+      // A missing/mistyped either one previously degraded to a plausible
+      // default (an empty advertisement, a hint that fires anyway), which
+      // tells the operator a fresh install has nothing on file when the
+      // daemon may hold a full catalog.
+      if (!isCatalogListingShape(response.payload)) {
+        return refuse(
+          "the daemon's catalog.listing answer was not a catalog projection. " +
+            "Nothing is being reported about the catalog — do NOT assume it is empty or that " +
+            "no sources are onboarded. Re-run; if it persists, see the daemon log.",
+        );
+      }
+      return response;
+    }
+
+    case "source.provision":
+    case "source.revalidate": {
+      // `counts` is destructured into the success line and the --json
+      // object, and `warnings` is iterated. A malformed `counts` printed
+      // "undefined safe, undefined review" as a SUCCESS line after the
+      // daemon had already committed the write — an onboarding the operator
+      // would rationally re-run.
+      if (!isProvisionPayloadShape(response.payload)) {
+        return refuse(
+          `the daemon's ${kind} answer was not a provisioning projection. ` +
+            "The source's state on the daemon is NOT being reported here — do NOT assume " +
+            "nothing was written. Check whether the source is registered before re-running.",
+        );
+      }
+      return response;
+    }
+
+    case "approvals.resume": {
+      // `decisionApplied` carries the OPERATOR'S VERB truth (§17 D-T7-2):
+      // whether the staged decision was consumed by the pending call. An
+      // ABSENT field must never read as `false` — that reports a landed
+      // deny as "never applied" (exit 1), sending the operator to re-issue
+      // a decision the execution already consumed. It is the one field
+      // whose default is wrong in a direction that causes action, so its
+      // absence is a typed refusal rather than a hedge.
+      const payload = response.payload;
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        typeof (payload as { decisionApplied?: unknown }).decisionApplied !== "boolean"
+      ) {
+        return refuse(
+          "the daemon's approvals.resume answer did not report whether the decision was " +
+            "applied. Do NOT assume it was not — the decision may well have been consumed by " +
+            'the pending call. Run "conduit approvals list" to see whether the execution is ' +
+            "still awaiting a decision, and do not re-issue a decision blindly.",
+        );
+      }
+      return response;
+    }
+
+    case "execute":
+    case "execution.get":
+    case "execution.getByRequestKey": {
+      // These payloads are handed to the AGENT verbatim (`toTextResult`
+      // JSON-stringifies them), so no client field access can throw. What
+      // the agent-facing contract does rely on is `status` — every
+      // documented branch of the execute/check protocol keys on it, and a
+      // payload without one is a frame the agent cannot act on at all.
+      // Checked to exactly that depth and no further: adding field-by-field
+      // validation of `result`/`error`/`pending` here would be a second
+      // copy of the daemon's projection, which is the drift this seam's
+      // docblock rules out.
+      const payload = response.payload;
+      if (
+        typeof payload !== "object" ||
+        payload === null ||
+        typeof (payload as { status?: unknown }).status !== "string"
+      ) {
+        return refuse(
+          `the daemon's ${kind} answer carried no execution status. ` +
+            "The execution's fate is NOT being reported here — do NOT assume it did not run. " +
+            "Look it up with check_execution before re-issuing anything.",
+        );
+      }
+      return response;
+    }
+
+    default:
+      return response;
+  }
+}
+
+/**
+ * The structural shape `runtime-stdio.ts` and `--doctor` depend on.
+ *
+ * `connections` must be a real array of listing views because it is
+ * iterated into the advertised tool list; `sourceCount` must be a finite
+ * number because it is compared against zero to decide whether to print the
+ * onboarding hint.
+ */
+function isCatalogListingShape(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const p = payload as Record<string, unknown>;
+  if (typeof p.sourceCount !== "number" || !Number.isFinite(p.sourceCount)) return false;
+  if (!Array.isArray(p.connections)) return false;
+  return p.connections.every((entry) => {
+    if (typeof entry !== "object" || entry === null) return false;
+    const e = entry as Record<string, unknown>;
+    return typeof e.prefix === "string" && typeof e.label === "string";
+  });
+}
+
+/**
+ * The structural shape `add-mcp` depends on.
+ *
+ * `counts` is checked as three FINITE numbers: they are interpolated into
+ * the success line and the `--json` object, where `undefined` or `NaN`
+ * renders a committed provisioning as a nonsense summary. `warnings` is
+ * absent-or-an-array-of-strings — genuinely optional (the daemon omits it
+ * when there is nothing to say), so absence is fine and the caller's
+ * `?? []` handles it, but a non-array present value would be iterated.
+ */
+function isProvisionPayloadShape(payload: unknown): boolean {
+  if (typeof payload !== "object" || payload === null) return false;
+  const p = payload as Record<string, unknown>;
+  const counts = p.counts;
+  if (typeof counts !== "object" || counts === null) return false;
+  const c = counts as Record<string, unknown>;
+  for (const field of ["safe", "review", "destructive"] as const) {
+    if (typeof c[field] !== "number" || !Number.isFinite(c[field])) return false;
+  }
+  if (p.warnings !== undefined) {
+    if (!Array.isArray(p.warnings)) return false;
+    if (!p.warnings.every((w) => typeof w === "string")) return false;
+  }
+  return true;
 }
 
 /**
@@ -813,14 +1034,24 @@ function createReader(socket: Socket, decoder: FrameDecoder, alreadyRead: unknow
  * held, no socket), and they resolve in opposite directions. Watching
  * only for release would make a healthy start cost the full deadline;
  * watching only for the socket would hang on a daemon that is leaving.
+ *
+ * The FIRST iteration polls at `LIFECYCLE_WAIT_POLL_MS`, because a
+ * daemon that is nearly finished binding resolves within one tick and
+ * that latency is the client's cold-start responsiveness. Subsequent
+ * iterations — each one having observed the same held-lock, no-socket
+ * state again — pace at `NO_PROGRESS_PACE_MS`: past the first tick this is
+ * a wait on something slow, and each iteration costs both a connect
+ * attempt and a lock-db client.
  */
 async function waitForStartOrRelease(
   paths: DaemonPaths,
   expiry: number,
   onErrno?: (code: string) => void,
 ): Promise<Socket | null> {
+  let pace = LIFECYCLE_WAIT_POLL_MS;
   while (Date.now() < expiry) {
-    await sleep(Math.min(LIFECYCLE_WAIT_POLL_MS, remaining(expiry)));
+    await sleep(Math.min(pace, remaining(expiry)));
+    pace = NO_PROGRESS_PACE_MS;
 
     const socket = await tryConnect(paths.socket, remaining(expiry), onErrno);
     if (socket !== null) return socket;

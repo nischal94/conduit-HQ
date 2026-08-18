@@ -2,6 +2,7 @@
 import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
+import { takeStateDir } from "./args.js";
 import { DaemonUnavailable, daemonRequest } from "./daemon/client.js";
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
@@ -272,21 +273,20 @@ async function main(): Promise<void> {
   }
   if (arg === "--daemon") {
     // `--state-dir <path>` runs the daemon against a non-default state
-    // directory. This is the OPERATOR-BY-HAND path design §3.1 already
-    // sanctions (the same posture as `CONDUIT_MASTER_KEY`), and it is an
-    // argument rather than an environment variable on purpose: auto-start
-    // constructs the child's environment from an allowlist and strips
-    // every `CONDUIT_*`, so an env-based override would be both ignored
-    // there and, if honored, exactly the client-chosen redirection §9.3
-    // removes. A client can never reach this — only a person running the
-    // command can.
-    const at = process.argv.indexOf("--state-dir");
-    const override = at === -1 ? undefined : process.argv[at + 1];
-    if (at !== -1 && (override === undefined || override.startsWith("--"))) {
-      console.error("[conduitd] --state-dir requires a path argument");
+    // directory — see `args.ts` for why it is an argument rather than an
+    // environment variable, and why BOTH bins parse it through that one
+    // function. The parse this replaced was a second, textually different
+    // reading of the same flag; a daemon started under one reading and a
+    // client pointed at it under the other reach different databases.
+    const parsed = takeStateDir("[conduitd]", process.argv);
+    if ("error" in parsed) {
+      // The shared parser's line ends in a newline; `console.error` adds
+      // its own, so the message is trimmed back to this bin's convention.
+      console.error(parsed.error.trimEnd());
       process.exitCode = 1;
       return;
     }
+    const override = parsed.stateDir;
     try {
       await runDaemon({ stateDir: override ?? DEFAULT_CONDUIT_DIR, sweep: sweepDaemonStore });
     } catch (error) {

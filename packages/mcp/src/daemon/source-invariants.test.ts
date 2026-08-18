@@ -345,8 +345,8 @@ describe("§3.3.1 anti-oracle invariants", () => {
 
       // Rejected BY CONSTRUCTION: `decodeRequest`'s extra-key strictness
       // means the field is unrepresentable, so this never reaches a
-      // handler that could act on it. `invalid`, not `unimplemented` — the
-      // client sent something malformed.
+      // handler that could act on it. `invalid` is the right code — the
+      // client sent something malformed, and it is told to fix it.
       expect(refusal).toMatchObject({ kind: "error", code: "invalid" });
       expect((refusal as { message: string }).message).toContain("url");
 

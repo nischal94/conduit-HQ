@@ -1,13 +1,12 @@
 import {
-  DaemonUnavailable,
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
   deadlineForRequest,
   type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
-  type RpcResponseFor,
 } from "@conduithq/mcp";
+import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
 /**
  * `conduit add-mcp` — atomic onboarding / re-sync of an upstream MCP source
@@ -145,75 +144,43 @@ function isValidHttpUrl(value: string): boolean {
 }
 
 /**
- * One daemon round trip, reduced to either a payload or an operator-facing
- * refusal. Mirrors `approvals.ts`'s `Answer`, and for the same reason: a
- * non-`result` answer is a REFUSAL, never an empty success. Reporting a
- * provision as landed when the daemon never confirmed it would tell an
- * operator their source is onboarded when no rows exist.
+ * This command's operator prose for the shared daemon-answer reduction
+ * (`daemon-answer.ts`). The reduction decides the SHAPE of every non-result
+ * answer — a non-`result` is a REFUSAL, never an empty success, because
+ * reporting a provision as landed when the daemon never confirmed it would
+ * tell an operator their source is onboarded when no rows exist.
  */
-type Answer<P> = { ok: true; payload: P } | { ok: false; line: string; exitCode: number };
+const ADD_MCP_CONTEXT: AnswerContext = {
+  // §5's ambiguity. The connection died after the request bytes went out,
+  // so the atomic write may have landed and may not have. Never retried
+  // automatically: a blind re-issue against a source that DID provision
+  // would re-run the whole onboarding fetch, and (with --clear-credential)
+  // could drop a credential the first attempt already replaced. The
+  // operator is pointed at the read that settles it. The shared reduction
+  // appends the client's cause detail — an asymmetry against `approvals`
+  // until this extraction, and the cause is as actionable here: it
+  // separates a misbehaving daemon from a dropped connection.
+  outcomeUnknown: (requestId) =>
+    `[conduit add-mcp] The outcome of this provisioning is UNKNOWN: the daemon connection ` +
+    `was lost after the request was sent, so the source may or may not have been written ` +
+    `(requestId ${requestId}). Do NOT blindly re-run it — check whether the source ` +
+    `is registered first.`,
+  // The daemon's own typed refusal. Its message is client-safe by
+  // construction and already carries the operator's next move — for a
+  // provisioning refusal it is the same `[conduit add-mcp] ... nothing was
+  // written` line this command printed before the conversion, so the
+  // terminal output is unchanged. The code is deliberately NOT prefixed
+  // onto it here, unlike `approvals`.
+  refused: (_code, message) => message,
+  desync: (kind) => `[conduit add-mcp] failed: protocol desync (unexpected ${kind} frame).`,
+  unreachable: (detail) => `[conduit add-mcp] could not reach the Conduit daemon: ${detail}`,
+};
 
-function describeResponse<K extends RpcRequest["kind"]>(
-  response: RpcResponseFor<K>,
-): Answer<RpcPayloadFor<K>> {
-  if (response.kind === "result") return { ok: true, payload: response.payload };
-  if (response.kind === "outcome-unknown") {
-    // §5's ambiguity. The connection died after the request bytes went out,
-    // so the atomic write may have landed and may not have. Never retried
-    // automatically: a blind re-issue against a source that DID provision
-    // would re-run the whole onboarding fetch, and (with --clear-credential)
-    // could drop a credential the first attempt already replaced. The
-    // operator is pointed at the read that settles it.
-    return {
-      ok: false,
-      exitCode: 1,
-      line:
-        `[conduit add-mcp] The outcome of this provisioning is UNKNOWN: the daemon connection ` +
-        `was lost after the request was sent, so the source may or may not have been written ` +
-        `(requestId ${response.requestId}). Do NOT blindly re-run it — check whether the source ` +
-        `is registered first.\n`,
-    };
-  }
-  if (response.kind === "error") {
-    // The daemon's own typed refusal. Its message is client-safe by
-    // construction and already carries the operator's next move — for a
-    // provisioning refusal it is the same `[conduit add-mcp] ... nothing
-    // was written` line this command printed before the conversion, so the
-    // terminal output is unchanged.
-    return { ok: false, exitCode: 1, line: `${response.message}\n` };
-  }
-  // `ready`/`handshake.ok` are prefaces the client already consumed.
-  return {
-    ok: false,
-    exitCode: 1,
-    line: `[conduit add-mcp] failed: protocol desync (unexpected ${response.kind} frame).\n`,
-  };
-}
-
-/**
- * Calls the daemon, folding a thrown `DaemonUnavailable` into the same
- * Answer shape. That error already carries the state directory, the
- * deadline, and the daemon log path — everything the operator needs — and
- * this is an operator-facing command, so it is surfaced undressed.
- */
-async function ask<K extends RpcRequest["kind"]>(
+function ask<K extends RpcRequest["kind"]>(
   deps: AddMcpDeps,
   request: Extract<RpcRequest, { kind: K }>,
 ): Promise<Answer<RpcPayloadFor<K>>> {
-  try {
-    return describeResponse<K>((await deps.daemon(request)) as RpcResponseFor<K>);
-  } catch (error) {
-    return {
-      ok: false,
-      exitCode: 1,
-      line:
-        error instanceof DaemonUnavailable
-          ? `${error.message}\n`
-          : `[conduit add-mcp] could not reach the Conduit daemon: ${
-              error instanceof Error ? error.message : String(error)
-            }\n`,
-    };
-  }
+  return askDaemon<K>(deps.daemon, request, ADD_MCP_CONTEXT);
 }
 
 export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<AddMcpResult> {
@@ -276,6 +243,13 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
   // --replace retarget notice). Printed to stderr before the success line,
   // matching the pre-conversion ordering — the warning was emitted before
   // the fetch, so it reached the terminal first.
+  //
+  // `?? []` handles genuine ABSENCE only. The field is optional on the wire
+  // (the daemon omits it when there is nothing to say), so an absent
+  // `warnings` is a well-formed answer. A PRESENT-but-not-an-array
+  // `warnings` is a protocol fault, and the client's payload seam refuses
+  // that before it reaches here rather than letting `?? []` swallow it as
+  // "no advisories".
   for (const warning of result.warnings ?? []) {
     deps.stderr(`${warning}\n`);
   }

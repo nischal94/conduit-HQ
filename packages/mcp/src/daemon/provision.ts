@@ -109,6 +109,41 @@ export interface ProvisionDeps {
   fetchTools?: (url: string, opts?: { authorization?: string }) => Promise<unknown[]>;
 }
 
+/**
+ * The stored rows a namespace resolves to, read as ONE triple.
+ *
+ * Both handlers need exactly this lookup, and both derive the source id the
+ * same way (`src_${namespace}`). Keeping the derivation and the three reads
+ * in one place is a §3.3.1 property, not a tidiness one: `revalidate`'s
+ * whole anti-oracle argument is that its url comes from the row this lookup
+ * returns, so if its lookup could ever diverge from `provision`'s — a
+ * different id prefix, a different connection-selection rule — the two
+ * handlers would be resolving "the same namespace" to different rows, and
+ * the url `revalidate` fetches would no longer be the one `provision`
+ * wrote. Any change to the derivation now changes both by construction.
+ *
+ * Connection selection matches the pre-existing behavior exactly: the first
+ * connection whose `integrationId` matches, or `undefined` when the
+ * integration is absent.
+ */
+async function readStoredSource(
+  store: ConduitStore,
+  namespace: string,
+): Promise<{
+  sourceId: string;
+  source: Awaited<ReturnType<ConduitStore["sources"]["get"]>>;
+  integration: Awaited<ReturnType<ConduitStore["integrations"]["getByNamespace"]>>;
+  connection: Awaited<ReturnType<ConduitStore["connections"]["list"]>>[number] | undefined;
+}> {
+  const sourceId = `src_${namespace}`;
+  const source = await store.sources.get(sourceId);
+  const integration = await store.integrations.getByNamespace(namespace);
+  const connection = integration
+    ? (await store.connections.list()).find((c) => c.integrationId === integration.id)
+    : undefined;
+  return { sourceId, source, integration, connection };
+}
+
 /** The decoded `source.provision` request, minus its `kind`. */
 export interface ProvisionInput {
   namespace: string;
@@ -219,16 +254,15 @@ export async function provisionSourceRequest(
   }
 
   const { namespace, url, prefix } = input;
-  const sourceId = `src_${namespace}`;
   const integrationId = `int_${namespace}`;
   const connectionId = `conn_${namespace}`;
   const derivedCredentialRef = `cred_${namespace}`;
 
-  const existingSource = await store.sources.get(sourceId);
-  const existingIntegration = await store.integrations.getByNamespace(namespace);
-  const existingConnection = existingIntegration
-    ? (await store.connections.list()).find((c) => c.integrationId === existingIntegration.id)
-    : undefined;
+  const {
+    sourceId,
+    source: existingSource,
+    connection: existingConnection,
+  } = await readStoredSource(store, namespace);
 
   // Step 2: cross-namespace prefix collision. `connections.prefix` is
   // UNIQUE in the schema, so a different namespace owning this prefix
@@ -359,12 +393,10 @@ export async function revalidateSourceRequest(
     );
   }
 
-  const sourceId = `src_${namespace}`;
-  const source = await store.sources.get(sourceId);
-  const integration = await store.integrations.getByNamespace(namespace);
-  const connection = integration
-    ? (await store.connections.list()).find((c) => c.integrationId === integration.id)
-    : undefined;
+  // The SAME lookup `provision` performs, by construction — see
+  // `readStoredSource` for why the §3.3.1 derivation must not be able to
+  // diverge between the two handlers.
+  const { sourceId, source, integration, connection } = await readStoredSource(store, namespace);
 
   if (source === undefined || integration === undefined || connection === undefined) {
     throw new ProvisionRefused(
