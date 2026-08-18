@@ -12,11 +12,11 @@ import {
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
-import { DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
+import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
 import { READ_DEADLINE_MS } from "./server.js";
 
-const VERSION = "0.1.0";
+const VERSION = AGENT_VERSION;
 const HELP = `conduit-mcp ${VERSION} — Conduit MCP server (stdio)
 
 The stdio server opens NO database: the daemon owns ~/.conduit/conduit.db and

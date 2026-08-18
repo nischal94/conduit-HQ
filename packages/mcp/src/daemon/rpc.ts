@@ -124,7 +124,27 @@ export type RpcRequest =
 
 export type RpcResponse =
   | { kind: "ready" }
-  | { kind: "handshake.ok"; protocol: 1; dbPath: string; allowPrivateEgress: boolean }
+  | {
+      kind: "handshake.ok";
+      protocol: 1;
+      dbPath: string;
+      allowPrivateEgress: boolean;
+      /**
+       * The daemon's OWN build version (env.ts `AGENT_VERSION`), reported so
+       * a client can DIAGNOSE version skew (§17). `protocol` stays 1 across a
+       * vocabulary-only change like D-B1 — a matched upgraded client+daemon
+       * pair speak it fine — so the protocol number cannot signal "this
+       * daemon predates the capability I am about to use". This string can:
+       * a NEW client that sees a `handshake.ok` whose `agentVersion` is
+       * ABSENT is talking to a daemon built before this field existed, i.e.
+       * before the D-B1 vocabulary, and can say so.
+       *
+       * It is a plain diagnostic, NOT a capability gate and NOT
+       * security-sensitive: no authorization decision is made on it. The
+       * capability set (§3.3) remains the sole boundary.
+       */
+      agentVersion: string;
+    }
   | { kind: "result"; requestId: string; payload: unknown }
   | {
       kind: "error";

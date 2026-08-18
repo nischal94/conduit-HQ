@@ -13,6 +13,20 @@ import { dirname, join } from "node:path";
 export const KEYGEN_ONE_LINER = `node -e "console.log(require('node:crypto').randomBytes(32).toString('base64'))"`;
 
 /**
+ * The single source of truth for this build's version string. `--version`
+ * prints it, `--help` names it, and the daemon reports it in `handshake.ok`
+ * (§17), so all three agree by construction rather than by coincidence.
+ *
+ * It is a plain DIAGNOSTIC string, not a security input: the handshake
+ * carries it so a NEW client talking to an OLD, still-running daemon can
+ * name the mismatch ("your daemon is a stale build — restart it") instead
+ * of surfacing an opaque capability refusal. No authorization decision is
+ * ever made on it — capability scoping is the boundary (`rpc.ts`), and this
+ * value never gates anything.
+ */
+export const AGENT_VERSION = "0.1.0";
+
+/**
  * The default state directory, anchored to the PASSWD entry for the real
  * uid — `userInfo().homedir` — never `$HOME` (design §17 §4, P2-HOME).
  *

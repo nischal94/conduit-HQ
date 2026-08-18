@@ -4,6 +4,7 @@ import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { AGENT_VERSION } from "../env.js";
 import {
   CONCURRENCY_CAP,
   DRAIN_DEADLINE_MS,
@@ -749,6 +750,26 @@ describe("conduitd lifecycle", () => {
       // reach it by method name (§3.3).
       client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
       expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a fresh daemon's handshake.ok carries its build version (agentVersion) for skew diagnosis",
+    async () => {
+      // The daemon reports its OWN build version in every handshake.ok, so a
+      // NEW client talking to an OLD, still-running daemon can diagnose skew
+      // (§17). A fresh daemon must therefore fill it, and with the SAME string
+      // `--version` prints (both read env.ts `AGENT_VERSION`), so client and
+      // daemon agree by construction rather than coincidence.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      const ok = await handshake(client, "serve");
+      expect(ok).toMatchObject({ kind: "handshake.ok", agentVersion: AGENT_VERSION });
     },
     TIMEOUT,
   );

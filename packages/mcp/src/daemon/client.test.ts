@@ -797,6 +797,143 @@ describe("the READY-gate decoder handoff", () => {
   );
 });
 
+describe("handshake.ok agentVersion (§17 version-skew diagnosis)", () => {
+  /**
+   * Drives one request against a daemon double that answers the handshake
+   * with a caller-chosen `handshake.ok` frame, then a trivial result. The
+   * point is to put a handshake shape on the wire the current daemon would
+   * or would not send — specifically, one that OMITS `agentVersion`, which
+   * is exactly the frame a daemon built before this field existed sends.
+   */
+  async function askAgainstHandshake(
+    handshakeOk: Record<string, unknown>,
+  ): Promise<{ dbPath: string; allowPrivateEgress: boolean; agentVersion: string | undefined }> {
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const server = createServer((socket) => {
+      socket.write(encodeFrame({ kind: "ready" }));
+      let handshakeSent = false;
+      socket.on("data", () => {
+        if (!handshakeSent) {
+          handshakeSent = true;
+          socket.write(encodeFrame(handshakeOk as never));
+          return;
+        }
+        socket.write(encodeFrame({ kind: "result", requestId: "r1", payload: [] }));
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(paths.socket, resolve));
+    // The client only takes the connect path when lifecycle reads busy.
+    const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+    if (lifecycle) locks.push(lifecycle);
+    let observed:
+      | { dbPath: string; allowPrivateEgress: boolean; agentVersion: string | undefined }
+      | undefined;
+    try {
+      await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 15_000,
+        spawn: () => {},
+        onHandshake: (info) => {
+          observed = info;
+        },
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+    if (observed === undefined) throw new Error("onHandshake never fired");
+    return observed;
+  }
+
+  it(
+    "INVARIANT §17: a handshake.ok WITHOUT agentVersion is accepted (backward compat) and onHandshake reports it undefined",
+    async () => {
+      // The load-bearing compatibility case: a NEW client MUST complete the
+      // handshake with an OLD daemon whose handshake.ok predates
+      // `agentVersion`, because that absence is the very skew signal
+      // downstream code branches on. Rejecting the frame here would break the
+      // diagnosis it exists to enable — the client could never observe the
+      // stale daemon to name it.
+      const info = await askAgainstHandshake({
+        kind: "handshake.ok",
+        protocol: 1,
+        dbPath: "/tmp/x.db",
+        allowPrivateEgress: false,
+        // agentVersion deliberately ABSENT — the pre-this-PR daemon frame.
+      });
+      expect(info.agentVersion).toBeUndefined();
+      expect(info.dbPath).toBe("/tmp/x.db");
+      expect(info.allowPrivateEgress).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a handshake.ok WITH agentVersion surfaces the string through onHandshake",
+    async () => {
+      const info = await askAgainstHandshake({
+        kind: "handshake.ok",
+        protocol: 1,
+        dbPath: "/tmp/x.db",
+        allowPrivateEgress: true,
+        agentVersion: "9.9.9",
+      });
+      expect(info.agentVersion).toBe("9.9.9");
+      expect(info.allowPrivateEgress).toBe(true);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a handshake.ok whose agentVersion is present but NOT a string is rejected as malformed",
+    async () => {
+      // Present-but-wrong-type is a malformed frame, distinct from absent:
+      // the decoder tolerates absence (old daemon) but not a non-string
+      // value. A rejected handshake yields outcome-unknown, never a
+      // completed handshake — so onHandshake must not fire.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const server = createServer((socket) => {
+        socket.write(encodeFrame({ kind: "ready" }));
+        socket.once("data", () => {
+          socket.write(
+            encodeFrame({
+              kind: "handshake.ok",
+              protocol: 1,
+              dbPath: "/tmp/x.db",
+              allowPrivateEgress: false,
+              agentVersion: 42,
+            } as never),
+          );
+        });
+      });
+      await new Promise<void>((resolve) => server.listen(paths.socket, resolve));
+      const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+      if (lifecycle) locks.push(lifecycle);
+      let fired = false;
+      try {
+        const response = await daemonRequest({
+          stateDir,
+          role: "serve",
+          request: { kind: "search", query: "anything" },
+          deadlineMs: 15_000,
+          spawn: () => {},
+          onHandshake: () => {
+            fired = true;
+          },
+        });
+        expect(response.kind).toBe("outcome-unknown");
+        expect(fired).toBe(false);
+      } finally {
+        await new Promise<void>((resolve) => server.close(() => resolve()));
+      }
+    },
+    TIMEOUT,
+  );
+});
+
 describe("the re-entry floor (MIN_PASS_BUDGET_MS)", () => {
   it("INVARIANT §17: the floor is derived from the poll interval, leaving room for real polls", () => {
     // The floor exists so a re-entry always has room to DO the work it is

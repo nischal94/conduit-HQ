@@ -26,6 +26,7 @@ import { type Stats, statSync, unlinkSync } from "node:fs";
 import { createServer } from "node:net";
 import { join } from "node:path";
 import { type ConduitStore, logSandboxDiagnosticsTo } from "@conduithq/sdk";
+import { AGENT_VERSION } from "../env.js";
 import { createApprovalRuntime } from "../runtime.js";
 import { openStoreFromEnv } from "../store-open.js";
 import {
@@ -673,6 +674,10 @@ async function serve(opts: ServeOptions): Promise<void> {
     store,
     allowPrivateEgress,
     dbPath,
+    // The build's version (§17), the same string `--version` prints, echoed
+    // in every handshake.ok so a client can diagnose skew against a daemon
+    // from an older build. Fixed at build time — nothing runtime-configures it.
+    agentVersion: AGENT_VERSION,
     log,
     createRuntime,
     submit: (run, deadlineMs): Admission => queue.submit(run, deadlineMs),

@@ -92,6 +92,22 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
   // surfaces below as a startup failure rather than a silent mismatch.
   let listing: CatalogListing;
   try {
+    // The daemon's build version, captured from the handshake so a refusal
+    // below can be attributed to VERSION SKEW when it is one (§17). An old,
+    // still-running daemon (there is no stop command and no idle-exit — it
+    // runs until killed) predates this field entirely, so it sends a valid
+    // `handshake.ok` with NO `agentVersion`. `staleDaemon` records exactly
+    // that: the handshake COMPLETED, yet carried no version — which means the
+    // daemon was built before the D-B1 capability vocabulary this process is
+    // about to use, so its smaller `serve` set refuses `catalog.listing`.
+    //
+    // Tracked as a dedicated flag rather than inferred from a `undefined`
+    // version alone, because `onHandshake` firing at all is itself the
+    // signal that the handshake completed: if the handshake never landed
+    // (the connection dropped, or the handshake response was itself an
+    // error), `onHandshake` does not fire and this stays false — that is a
+    // dropped/refused handshake, NOT skew.
+    let staleDaemon = false;
     // Through `daemonRequest` directly rather than the `DaemonCall` seam:
     // the seam is deliberately kind-agnostic (it is what `server.ts`
     // injects), while this one startup read wants the typed payload the
@@ -101,12 +117,42 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
       role: "serve",
       request: { kind: "catalog.listing" },
       deadlineMs: deadlineForRequest({ kind: "catalog.listing" }),
+      onHandshake: (info) => {
+        // Fires only on a completed handshake.ok. A missing agentVersion
+        // there is the definitive skew tell.
+        staleDaemon = info.agentVersion === undefined;
+      },
     });
     if (response.kind !== "result") {
-      // A refusal here is terminal and worth the daemon's own words:
-      // `refused-custom-db` is the common one (§9.3 item 3) and it names
-      // the exact fix. Startup-error compatibility is by CODE and
-      // actionable guidance, not byte-identity (design §5).
+      // A refusal here is terminal. Distinguish the two shapes it takes,
+      // because they need OPPOSITE operator actions:
+      //
+      //  - VERSION SKEW — a daemon from an older build is still running and
+      //    does not know the capability this client just used. Its
+      //    handshake.ok omitted `agentVersion`, so we know it is stale before
+      //    reading the refusal's words at all. The fix is to STOP the stale
+      //    daemon so a current one can take over; the opaque "capability does
+      //    not permit" text would send the operator hunting for a config bug
+      //    that does not exist.
+      //  - anything else (e.g. `refused-custom-db`, §9.3 item 3) — a CURRENT
+      //    daemon refusing for a real reason, whose own message names the fix.
+      //
+      // The skew branch keys on the handshake having COMPLETED without an
+      // agentVersion, not on the error code/message: a stale daemon's refusal
+      // wording is exactly the generic capability text we must not surface,
+      // and the version absence is the unambiguous, wording-independent tell.
+      if (staleDaemon) {
+        console.error(
+          "[ConduitMcp] Cannot start: a daemon from an older Conduit build is still running and " +
+            "does not support this client. Stop it so a current one can take over: " +
+            "`pkill -f 'bin.js --daemon'` (or `kill <pid>`), then reconnect.",
+        );
+        process.exit(1);
+      }
+      // A current daemon's refusal: echo its own words, which name the fix.
+      // `refused-custom-db` is the common one (§9.3 item 3). Startup-error
+      // compatibility is by CODE and actionable guidance, not byte-identity
+      // (design §5).
       const detail =
         response.kind === "error"
           ? `${response.code}: ${response.message}`

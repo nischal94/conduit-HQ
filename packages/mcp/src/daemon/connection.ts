@@ -83,6 +83,13 @@ export interface ConnectionDeps {
   store: ConduitStore;
   allowPrivateEgress: boolean;
   dbPath: string;
+  /**
+   * This daemon's own build version, echoed in `handshake.ok` for skew
+   * diagnosis (§17). Threaded like `dbPath`/`allowPrivateEgress` — a
+   * daemon-scope value fixed at start, not per-connection. Plain diagnostic
+   * string, never an authorization input.
+   */
+  agentVersion: string;
   log: (line: string) => void;
   createRuntime: typeof createApprovalRuntime;
   /** The daemon's admission queue, reached only through submit. */
@@ -355,7 +362,7 @@ function handleHandshake(
   requestId: string,
   deps: ConnectionDeps,
 ): void {
-  const { log, dbPath, allowPrivateEgress } = deps;
+  const { log, dbPath, allowPrivateEgress, agentVersion } = deps;
   // A connection's capability is assigned EXACTLY ONCE. `handshake` is a
   // member of every capability set (§3.3), so without this guard a
   // client refused an out-of-set request could simply re-handshake as a
@@ -396,7 +403,11 @@ function handleHandshake(
     return;
   }
   ctx.capability = request.capability;
-  send(ctx.socket, { kind: "handshake.ok", protocol: 1, dbPath, allowPrivateEgress }, log);
+  send(
+    ctx.socket,
+    { kind: "handshake.ok", protocol: 1, dbPath, allowPrivateEgress, agentVersion },
+    log,
+  );
 }
 
 /** Fresh catalog snapshot per call (M6) — never cached across requests. */

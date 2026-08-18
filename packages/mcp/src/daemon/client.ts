@@ -128,8 +128,20 @@ export interface DaemonRequestOptions<K extends RpcRequest["kind"] = RpcRequest[
    *
    * Read-only by construction: the callback cannot alter the exchange,
    * and it fires at most once per attempt.
+   *
+   * `agentVersion` is the daemon's build version (§17), reported so a
+   * client can diagnose version skew. It is `string | undefined`: a daemon
+   * built BEFORE this field existed (pre-D-B1) sends a `handshake.ok`
+   * without it, and that ABSENCE is itself the skew signal — a NEW client
+   * observing `agentVersion: undefined` is talking to a stale daemon whose
+   * capability vocabulary predates the request it is about to send. It is
+   * NEVER used to authorize anything; it is a diagnostic.
    */
-  onHandshake?: (info: { dbPath: string; allowPrivateEgress: boolean }) => void;
+  onHandshake?: (info: {
+    dbPath: string;
+    allowPrivateEgress: boolean;
+    agentVersion: string | undefined;
+  }) => void;
 }
 
 /**
@@ -803,9 +815,18 @@ async function exchange(
     const validated = decodeResponse(handshake);
     if (validated !== null && validated.kind === "handshake.ok") {
       try {
+        // `agentVersion` is read defensively rather than off the static type:
+        // `decodeResponse` tolerates its ABSENCE (an old daemon omits it),
+        // so the declared `string` can be `undefined` at runtime. That
+        // undefined is not a defect to paper over — it is the skew signal the
+        // observer is meant to receive. `typeof` narrows a present string and
+        // maps everything else (including absence) to `undefined`.
+        const agentVersion =
+          typeof validated.agentVersion === "string" ? validated.agentVersion : undefined;
         onHandshake?.({
           dbPath: validated.dbPath,
           allowPrivateEgress: validated.allowPrivateEgress,
+          agentVersion,
         });
       } catch {
         // "Cannot alter the exchange" is enforced, not merely intended.
@@ -1160,9 +1181,17 @@ function decodeResponse(frame: unknown): RpcResponse | null {
     case "ready":
       return frame as RpcResponse;
     case "handshake.ok":
+      // `agentVersion` (§17) is validated as a string WHEN PRESENT but
+      // TOLERATED as absent: an OLD daemon predating the field sends a
+      // handshake.ok without it, and rejecting that would break the very
+      // backward compatibility this diagnostic exists to preserve — a new
+      // client MUST be able to complete the handshake with a stale daemon so
+      // it can then observe the absence and name the skew. A present-but-
+      // non-string value IS malformed and rejected.
       return f.protocol === 1 &&
         typeof f.dbPath === "string" &&
-        typeof f.allowPrivateEgress === "boolean"
+        typeof f.allowPrivateEgress === "boolean" &&
+        (f.agentVersion === undefined || typeof f.agentVersion === "string")
         ? (frame as RpcResponse)
         : null;
     case "result":
