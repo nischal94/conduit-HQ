@@ -69,23 +69,28 @@ DEFERRED, tracked below.
 
 ### DEFERRED FOLLOW-UPS (carry to future sessions; none blocks anything shipped)
 
-1. **§16 sandbox worker-crash flake — DID NOT REPRODUCE locally (12/12 clean).**
-   CI unit-test job failed once, passed on re-run: NOT the QuickJS teardown
-   abort (that is harmless expected stderr, 509× in a green run — proven),
-   but a vitest WORKER crash during the sdk §16 stress tests (150-iteration
-   overflow loops) with all tests passing. Pre-existing sdk sandbox code,
-   disjoint from Lane B. **VERDICT (12× local repro loop + 2 full-suite runs
-   during commits, all exit 0, zero worker crashes):** the crash is
-   CI-ENVIRONMENT-SPECIFIC, not deterministic — strongly indicates benign
-   memory/timing pressure OOM-ing a vitest worker on the constrained CI
-   runner, NOT a real abort escaping the sandbox catch (a real §16 boundary
-   break would surface sometimes in 12 local runs; it surfaced never). NOT
-   proven 100% benign — "unreproducible locally" ≠ "proven benign". Next
-   step (deferred, non-urgent): give the §16 stress block its own vitest
-   worker with raised memory / or a retry, so a CI resource blip surfaces as
-   a retry not a red run — do NOT add a blanket retry that could mask a real
-   assertion failure. Since it re-ran green and never reproduces locally, it
-   does not gate anything.
+1. **§16 sandbox worker-crash flake — FIXED (PR #49 → main `88b898f`).**
+   CI unit-test job flaked red once on PR #48's head, passed on re-run: NOT
+   the QuickJS teardown abort (harmless expected stderr, 509× in a green
+   run — proven), but a vitest WORKER crash during the sdk §16 stress tests
+   (150-iteration overflow loops, each rebuilding the QuickJS WASM module)
+   with every test PASSING. Root cause: vitest's default UNBOUNDED forks
+   pool let the 5 WASM-heavy sdk test files pile onto one constrained CI
+   worker and exhaust its heap → worker killed → non-zero step exit. NOT a
+   sandbox defect: 15/15 clean locally (12× repro loop + 3 full-suite runs).
+   FIX: `packages/sdk/vitest.config.ts` caps `maxForks:2` so WASM files
+   spread across workers instead of piling up — structural, NOT a blanket
+   retry (a retry could mask a real §16 assertion failure). Verified: local
+   444/444 (~45s, slightly faster), CI green incl. the previously-flaking
+   Unit tests job, CodeRabbit+Greptile passed, focused code-review clean
+   (config valid vitest 3.2.6, preserves default per-file isolation, the
+   :memory: trap is orthogonal to fork scheduling). Honest caveat: one green
+   CI run is consistent-with-fixed but not ironclad for an intermittent
+   flake that never reproduced locally — the mechanism fix is correct;
+   sustained greenness across future runs is the final confirmation. If it
+   EVER recurs: the worker crash is the signal, not the abort stderr; check
+   whether maxForks needs lowering further or the §16 stress block needs its
+   own dedicated worker.
 2. **Unbounded daemon log.** `spawn.ts` opens `conduitd.log` append-only, no
    rotation/size cap, logs a line PER ADMISSION on every execute/resume. The
    daemon is now long-lived → unbounded disk. Fix: rotate/size-cap, or drop
