@@ -146,7 +146,28 @@ export type RpcResponse =
         | "internal";
       message: string;
     }
-  | { kind: "outcome-unknown"; requestId: string };
+  | {
+      kind: "outcome-unknown";
+      requestId: string;
+      /**
+       * Why the outcome is unknown, when the client can say.
+       *
+       * CLIENT-LOCAL AND NEVER ON THE WIRE. No daemon sends
+       * `outcome-unknown` — it is synthesized by `client.ts` precisely
+       * when the daemon that would have answered is gone — so this field
+       * does not widen the §3.3 response vocabulary and the daemon's
+       * decoder never sees it.
+       *
+       * It exists because "the daemon sent bytes we could not parse" and
+       * "the connection dropped" are indistinguishable from the caller's
+       * side and have different causes: only the first means the daemon
+       * is misbehaving. The diagnostic was already being collected
+       * (`Reader.decodeFault`) and then discarded for want of a
+       * declaration; operator-facing surfaces append it, and the
+       * agent-facing ones deliberately do not.
+       */
+      detail?: string;
+    };
 
 export class InvalidRpcRequest extends Error {
   constructor(message: string) {

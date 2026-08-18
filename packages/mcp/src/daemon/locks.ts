@@ -145,13 +145,48 @@ const HOLDER_TABLE =
 /**
  * Stamps the holder row, BEFORE the acquiring transaction opens.
  *
- * The ordering is forced, not stylistic. An EXCLUSIVE holder blocks every
- * reader on the file, so a row written INSIDE the hold is unreadable for
- * exactly as long as the hold lasts — useless to the refusal it exists to
- * inform. Written before the transaction, the row is durable and readable
- * by anyone the hold does not block, which is precisely the case that
- * matters: a daemon holding maintenance SHARED lets `readLockHolder`
- * through, and that is the refusal `key rotate` must be able to name.
+ * The ordering is forced, not stylistic — and the alternatives are
+ * IMPOSSIBLE rather than merely worse, which is worth recording so nobody
+ * "fixes" this into a broken shape. Every stamp-after-acquire variant was
+ * probed against libsql/SQLite directly:
+ *
+ * - **Same connection, after `BEGIN`+`SELECT` (SHARED).** The write
+ *   succeeds and upgrades the transaction to RESERVED, and other SHARED
+ *   acquirers still get in — but the row sits UNCOMMITTED for the whole
+ *   hold, so an outside `readLockHolder` reads zero rows. The row exists
+ *   and is invisible to the only reader it was written for.
+ * - **Same connection, inside a `BEGIN EXCLUSIVE`.** Release rolls the
+ *   transaction back, which DISCARDS the stamp entirely.
+ * - **A second connection, after this process holds the lock.** Blocked
+ *   `SQLITE_BUSY` under both SHARED and EXCLUSIVE: the stamp is a write,
+ *   a write needs RESERVED, and our own hold is in the way.
+ *
+ * So the row must be written before the transaction opens. Written there
+ * it is durable and readable by anyone the hold does not block, which is
+ * the case that matters: a daemon holding maintenance SHARED lets
+ * `readLockHolder` through, and that is the refusal `key rotate` names.
+ *
+ * **The residual window, and why it is now closed on the failure path.**
+ * Stamping first means a row can exist for an acquisition that never
+ * happened. Two ways in, with different fixes:
+ *
+ * - *The acquisition FAILS* (BUSY, or any throw). Previously the row
+ *   survived, naming this process as the holder of a lock it never got —
+ *   affirmatively wrong, not merely stale. The acquire paths now clear it
+ *   (see `clearHolderBestEffort` at their catch sites).
+ * - *The process DIES between the stamp and `BEGIN`.* No code can run in
+ *   that window, so no ordering closes it. It is bounded by being
+ *   microseconds wide and is exactly what `describeHolder`'s hedge exists
+ *   for — the row is documented as a lead ("may be stale"), never a
+ *   verdict, and the kernel lock remains the only exclusion.
+ *
+ * **The concurrency orderings that look unsafe and are NOT — do not
+ * "fix" these.** A stamp racing a LIVE holder cannot corrupt that
+ * holder's row, because the stamp is a write and SQLite refuses it: the
+ * live holder's SHARED or EXCLUSIVE lock makes the racer's INSERT return
+ * BUSY, which this function swallows. The racer then fails its own
+ * acquisition too. So "B stamps over A's row while A holds the lock" is
+ * unreachable through SQLite's own locking, not through any check here.
  *
  * Best-effort by construction: a failure here must never turn into a
  * failure to acquire. Diagnostic prose is not worth converting a working
@@ -167,6 +202,29 @@ async function stampHolder(client: Client, role: string): Promise<void> {
         "ON CONFLICT(id) DO UPDATE SET pid = excluded.pid, role = excluded.role, since = excluded.since",
       args: [process.pid, role, new Date().toISOString()],
     });
+  } catch {
+    // Intentionally silent — see the doc above.
+  }
+}
+
+/**
+ * Clears a stamp this process wrote for an acquisition that then FAILED.
+ *
+ * Without this, a failed acquire leaves the lock db naming this process as
+ * the holder of a lock it never obtained — a row that is affirmatively
+ * WRONG rather than merely stale, and one that outlives the attempt. The
+ * next `key rotate` refusal would then name a pid that never held anything,
+ * sending an operator to investigate an innocent process.
+ *
+ * Runs on the SAME connection that wrote the stamp and before it closes, so
+ * it is not subject to the BUSY that blocks any other connection's write.
+ * Deliberately swallowing: this is cleanup on an already-failing path, and
+ * a failure to tidy diagnostics must not replace the caller's real error
+ * (the BUSY answer, or the genuine fault) with a bookkeeping one.
+ */
+async function clearHolderBestEffort(client: Client): Promise<void> {
+  try {
+    await clearHolder(client);
   } catch {
     // Intentionally silent — see the doc above.
   }
@@ -296,6 +354,10 @@ export async function acquireExclusive(
     if (opts?.role !== undefined) await stampHolder(client, opts.role);
     await client.execute("BEGIN EXCLUSIVE");
   } catch (err) {
+    // The acquisition failed, so any stamp written moments ago names a
+    // holder that never existed. Cleared before the connection closes —
+    // see `clearHolderBestEffort`.
+    if (opts?.role !== undefined) await clearHolderBestEffort(client);
     client.close();
     if (isBusy(err)) return null;
     throw err;
@@ -320,6 +382,9 @@ export async function acquireShared(
     await client.execute("BEGIN");
     await client.execute("SELECT count(*) FROM sqlite_schema");
   } catch (err) {
+    // Same reasoning as `acquireExclusive`: a stamp without an acquisition
+    // is a row naming a never-holder.
+    if (opts?.role !== undefined) await clearHolderBestEffort(client);
     client.close();
     if (isBusy(err)) return null;
     throw err;

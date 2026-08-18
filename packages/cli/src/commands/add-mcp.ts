@@ -3,9 +3,10 @@ import {
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
   deadlineForRequest,
-  type ProvisionPayload,
+  type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
+  type RpcResponseFor,
 } from "@conduithq/mcp";
 
 /**
@@ -150,9 +151,11 @@ function isValidHttpUrl(value: string): boolean {
  * provision as landed when the daemon never confirmed it would tell an
  * operator their source is onboarded when no rows exist.
  */
-type Answer = { ok: true; payload: unknown } | { ok: false; line: string; exitCode: number };
+type Answer<P> = { ok: true; payload: P } | { ok: false; line: string; exitCode: number };
 
-function describeResponse(response: RpcResponse): Answer {
+function describeResponse<K extends RpcRequest["kind"]>(
+  response: RpcResponseFor<K>,
+): Answer<RpcPayloadFor<K>> {
   if (response.kind === "result") return { ok: true, payload: response.payload };
   if (response.kind === "outcome-unknown") {
     // §5's ambiguity. The connection died after the request bytes went out,
@@ -193,9 +196,12 @@ function describeResponse(response: RpcResponse): Answer {
  * deadline, and the daemon log path — everything the operator needs — and
  * this is an operator-facing command, so it is surfaced undressed.
  */
-async function ask(deps: AddMcpDeps, request: RpcRequest): Promise<Answer> {
+async function ask<K extends RpcRequest["kind"]>(
+  deps: AddMcpDeps,
+  request: Extract<RpcRequest, { kind: K }>,
+): Promise<Answer<RpcPayloadFor<K>>> {
   try {
-    return describeResponse(await deps.daemon(request));
+    return describeResponse<K>((await deps.daemon(request)) as RpcResponseFor<K>);
   } catch (error) {
     return {
       ok: false,
@@ -260,7 +266,11 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
     deps.stderr(answer.line);
     return { exitCode: answer.exitCode };
   }
-  const result = answer.payload as ProvisionPayload;
+  // No cast: `source.provision` is typed to `ProvisionPayload`. This is the
+  // site where a blind cast was worst — it threw AFTER the daemon had already
+  // committed the provision, turning a successful onboarding into a fatal
+  // error the operator would rationally re-run.
+  const result = answer.payload;
 
   // Step 3: advisories the daemon produced while deciding (today: the
   // --replace retarget notice). Printed to stderr before the success line,

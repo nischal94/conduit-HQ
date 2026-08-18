@@ -30,6 +30,7 @@
 
 import { connect, type Socket } from "node:net";
 import { join } from "node:path";
+import type { RpcPayloadFor } from "../payloads.js";
 import { type DaemonPaths, daemonPaths } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { describeHolder, probeShared, readLockHolder } from "./locks.js";
@@ -37,10 +38,10 @@ import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
 import { DAEMON_LOG, spawnDaemon } from "./spawn.js";
 import { assertStateDir, StateDirError } from "./state-dir.js";
 
-export interface DaemonRequestOptions {
+export interface DaemonRequestOptions<K extends RpcRequest["kind"] = RpcRequest["kind"]> {
   stateDir: string;
   role: keyof typeof CAPABILITIES;
-  request: RpcRequest;
+  request: Extract<RpcRequest, { kind: K }>;
   /** One bounded budget for the WHOLE attempt, waits and spawn included. */
   deadlineMs: number;
   /** Injectable for tests; production spawns the real daemon. */
@@ -119,7 +120,14 @@ const LIFECYCLE_WAIT_POLL_MS = 50;
  * probe round-trips between them, so the floor sits a small multiple
  * above that interval rather than at an independently-chosen number.
  */
-const MIN_PASS_BUDGET_MS = LIFECYCLE_WAIT_POLL_MS * 4;
+export const MIN_PASS_BUDGET_MS = LIFECYCLE_WAIT_POLL_MS * 4;
+
+/**
+ * Exported ONLY so the floor's derivation can be pinned by a test — the
+ * relationship to the poll interval is the invariant, not the number.
+ * Nothing outside this module reads it to make a decision.
+ */
+export const LIFECYCLE_WAIT_POLL_MS_FOR_TEST = LIFECYCLE_WAIT_POLL_MS;
 
 export class DaemonUnavailable extends Error {
   readonly code: "rotation-in-progress" | "unavailable";
@@ -132,14 +140,33 @@ export class DaemonUnavailable extends Error {
 }
 
 /**
+ * The response type for a given request kind: every non-`result` arm
+ * unchanged, and `result.payload` narrowed to that kind's projection via
+ * `RpcPayloadFor`.
+ *
+ * This is what retires the six blind `as` casts at the call sites. It is a
+ * COMPILE-TIME claim about what the daemon is supposed to send, not
+ * evidence about what arrived — `decodeResponse` still validates the
+ * envelope, and the shapes whose misreading is dangerous are guarded at
+ * the seam below. A caller reading `payload` on a kind whose answer is
+ * genuinely open still gets `unknown` and must narrow it itself.
+ */
+export type RpcResponseFor<K extends RpcRequest["kind"]> =
+  | Exclude<RpcResponse, { kind: "result" }>
+  | { kind: "result"; requestId: string; payload: RpcPayloadFor<K> };
+
+/**
  * Runs one request against the daemon, auto-starting it if absent.
  *
- * Returns an `RpcResponse`. A returned `outcome-unknown` is a real,
+ * Returns an `RpcResponse` whose `result` payload is typed for the request
+ * kind (see `RpcResponseFor`). A returned `outcome-unknown` is a real,
  * terminal answer — the caller must NOT retry it (§5). A thrown
  * `DaemonUnavailable` means nothing was ever written, so the caller may
  * retry as a first attempt.
  */
-export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResponse> {
+export async function daemonRequest<K extends RpcRequest["kind"]>(
+  opts: DaemonRequestOptions<K>,
+): Promise<RpcResponseFor<K>> {
   const paths = daemonPaths(opts.stateDir);
   const spawnChild = opts.spawn ?? spawnDaemon;
   const expiry = Date.now() + opts.deadlineMs;
@@ -250,7 +277,15 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
         // zone ends. The READY gate's decoder and any frames it already
         // read past READY travel into the exchange — see `awaitReady`
         // for why starting a fresh decoder here would be a bug.
-        return await exchange(socket, opts.role, expiry, ready, requestFrame, opts.onHandshake);
+        return (await exchange(
+          socket,
+          opts.role,
+          expiry,
+          ready,
+          requestFrame,
+          opts.request.kind,
+          opts.onHandshake,
+        )) as RpcResponseFor<K>;
       }
       // Connected but no READY — accepted-or-queued during DRAINING.
       // Identical to a refused connect, and crucially NOTHING was
@@ -452,6 +487,7 @@ async function exchange(
   expiry: number,
   ready: Extract<ReadyResult, { ready: true }>,
   requestFrame: Buffer,
+  requestKind: RpcRequest["kind"],
   onHandshake?: DaemonRequestOptions["onHandshake"],
 ): Promise<RpcResponse> {
   // The reader was built by the READY gate over the decoder that consumed
@@ -503,11 +539,98 @@ async function exchange(
     socket.write(requestFrame);
     const response = await reader.next(remaining(expiry));
     if (response === null) return unknownOutcome(null, reader.decodeFault());
-    return decodeResponseOrUnknown(response);
+    // Envelope first, then the payload shapes the callers structurally
+    // depend on — one seam, so no call site has to defend itself.
+    return validatePayload(decodeResponseOrUnknown(response), requestKind);
   } finally {
     reader.dispose();
     socket.destroy();
   }
+}
+
+/**
+ * Validates the PAYLOAD of a `result` for the kinds whose misreading is
+ * dangerous, degrading to an `error` the caller already knows how to
+ * report.
+ *
+ * `decodeResponse` validates the envelope and stops one field short: a
+ * `result` with a `payload` key of any shape passes. That gap is where a
+ * protocol fault turns into a WRONG ANSWER rather than a refusal —
+ * `approvals.list` is the sharp case, because its caller maps over the
+ * payload and a non-array produces either a raw `TypeError` out of an
+ * operator command or, worse, an empty table that reads as "nothing awaits
+ * you".
+ *
+ * Deliberately NOT a general payload schema check. The client is not the
+ * authorization boundary (see `decodeResponse`), and validating every
+ * field of every projection would be a second copy of the daemon's
+ * senders, drifting from them. What is checked here is the STRUCTURAL
+ * assumption each caller then relies on — the shape whose absence makes
+ * the caller misbehave rather than merely read a missing field.
+ *
+ * Refusals are `error`/`internal` rather than `outcome-unknown`: these are
+ * reads, and a read that returned a malformed answer has no side effect to
+ * be ambiguous ABOUT. Reporting §5 ambiguity here would tell an operator
+ * their query may have changed something, which is both false and the
+ * opposite of actionable.
+ */
+function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcResponse {
+  if (response.kind !== "result") return response;
+
+  if (kind === "approvals.list") {
+    const rows = response.payload;
+    if (!Array.isArray(rows)) {
+      return {
+        kind: "error",
+        requestId: response.requestId,
+        code: "internal",
+        message:
+          "the daemon's approvals.list answer was not a list of paused rows. " +
+          "Nothing is being reported about the queue — do NOT assume it is empty. " +
+          'Re-run "conduit approvals list"; if it persists, see the daemon log.',
+      };
+    }
+    // Each row is rendered as a table cell and a date, so a row missing the
+    // fields the renderer reads produces "Invalid Date" or a RangeError at
+    // an operator rather than a refusal. Refuse the ROW SET rather than
+    // dropping bad rows: a silently shorter queue is the same wrong answer
+    // as an empty one.
+    if (!rows.every(isPausedRowShape)) {
+      return {
+        kind: "error",
+        requestId: response.requestId,
+        code: "internal",
+        message:
+          "the daemon's approvals.list answer contained a malformed paused row. " +
+          "Nothing is being reported about the queue — do NOT assume it is empty. " +
+          'Re-run "conduit approvals list"; if it persists, see the daemon log.',
+      };
+    }
+  }
+
+  return response;
+}
+
+/**
+ * The structural shape `toPausedRow` and the table renderer depend on.
+ *
+ * `startedAt`/`expiresAt` are checked as FINITE numbers specifically: they
+ * reach `new Date(...).toISOString()` and an arithmetic expiry comparison,
+ * where `undefined` renders "Invalid Date" and a non-finite value throws
+ * `RangeError` mid-table — both of which present a protocol fault as
+ * either a malformed queue or a crash, instead of as a refusal.
+ */
+function isPausedRowShape(row: unknown): boolean {
+  if (typeof row !== "object" || row === null) return false;
+  const r = row as Record<string, unknown>;
+  return (
+    typeof r.executionId === "string" &&
+    typeof r.toolName === "string" &&
+    typeof r.startedAt === "number" &&
+    Number.isFinite(r.startedAt) &&
+    typeof r.expiresAt === "number" &&
+    Number.isFinite(r.expiresAt)
+  );
 }
 
 /**
@@ -549,11 +672,7 @@ function unknownOutcome(partial: unknown, detail?: string): RpcResponse {
     typeof (partial as { requestId?: unknown }).requestId === "string"
       ? (partial as { requestId: string }).requestId
       : UNCORRELATED;
-  const outcome: RpcResponse = { kind: "outcome-unknown", requestId };
-  if (detail !== undefined) {
-    (outcome as { detail?: string }).detail = detail;
-  }
-  return outcome;
+  return { kind: "outcome-unknown", requestId, ...(detail !== undefined ? { detail } : {}) };
 }
 
 /**

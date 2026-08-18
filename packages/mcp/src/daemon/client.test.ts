@@ -5,7 +5,13 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
-import { DaemonUnavailable, daemonRequest, UNCORRELATED } from "./client.js";
+import {
+  DaemonUnavailable,
+  daemonRequest,
+  LIFECYCLE_WAIT_POLL_MS_FOR_TEST,
+  MIN_PASS_BUDGET_MS,
+  UNCORRELATED,
+} from "./client.js";
 import { daemonPaths } from "./conduitd.js";
 import { encodeFrame, FRAME_CAP, FrameTooLarge } from "./frames.js";
 import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
@@ -544,6 +550,152 @@ describe("the READY-gate decoder handoff", () => {
       } finally {
         await new Promise<void>((resolve) => server.close(() => resolve()));
       }
+    },
+    TIMEOUT,
+  );
+});
+
+describe("the re-entry floor (MIN_PASS_BUDGET_MS)", () => {
+  it("INVARIANT §17: the floor is derived from the poll interval, leaving room for real polls", () => {
+    // The floor exists so a re-entry always has room to DO the work it is
+    // re-entering for: a couple of `LIFECYCLE_WAIT_POLL_MS` polls plus the
+    // probe round-trips between them. Pinning the RELATIONSHIP rather than
+    // the number is what makes a mutation to 0 — or to any value that no
+    // longer clears a poll — a test failure instead of a silent hot spin.
+    expect(MIN_PASS_BUDGET_MS).toBeGreaterThanOrEqual(LIFECYCLE_WAIT_POLL_MS_FOR_TEST * 2);
+    expect(MIN_PASS_BUDGET_MS).toBe(LIFECYCLE_WAIT_POLL_MS_FOR_TEST * 4);
+  });
+
+  it(
+    "a budget below the floor refuses immediately rather than spinning the decision table",
+    async () => {
+      // The behavioral half of the same invariant. With the floor at 0 the
+      // `while` guard admits a pass that has no time to act, and the loop
+      // re-probes hot until the deadline — the exact failure the floor
+      // replaced a fixed pass count to prevent. A sub-floor budget must
+      // therefore come back promptly with the terminal refusal.
+      const stateDir = newStateDir();
+      const started = Date.now();
+      await expect(
+        daemonRequest({
+          stateDir,
+          role: "serve",
+          request: { kind: "catalog.listing" },
+          // Below the floor by construction, so the loop must not be entered.
+          deadlineMs: MIN_PASS_BUDGET_MS - 1,
+          spawn: () => {
+            throw new Error("a sub-floor budget must never reach the spawn boundary");
+          },
+        }),
+      ).rejects.toBeInstanceOf(DaemonUnavailable);
+      // Generous, but far below the deadline a hot spin would burn.
+      expect(Date.now() - started).toBeLessThan(MIN_PASS_BUDGET_MS * 10);
+    },
+    TIMEOUT,
+  );
+});
+
+describe("the result-payload seam", () => {
+  /**
+   * Drives one request against a daemon double that answers with a chosen
+   * `result` payload. The double is deliberately dumber than the real
+   * daemon — the point is to put a payload on the wire that the real
+   * daemon would never send, which is the case the seam exists for.
+   */
+  async function askWithPayload(
+    request: Parameters<typeof daemonRequest>[0]["request"],
+    payload: unknown,
+  ): Promise<Awaited<ReturnType<typeof daemonRequest>>> {
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const server = createServer((socket) => {
+      socket.write(encodeFrame({ kind: "ready" }));
+      socket.once("data", () => {
+        socket.write(
+          encodeFrame({
+            kind: "handshake.ok",
+            protocol: 1,
+            dbPath: paths.db,
+            allowPrivateEgress: false,
+          }),
+        );
+        socket.once("data", () => {
+          socket.write(encodeFrame({ kind: "result", requestId: "r_seam", payload }));
+        });
+      });
+    });
+    await new Promise<void>((resolve) => server.listen(paths.socket, resolve));
+    const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+    if (lifecycle) locks.push(lifecycle);
+    try {
+      return await daemonRequest({
+        stateDir,
+        role: "approvals",
+        request,
+        deadlineMs: 15_000,
+        spawn: () => {},
+      });
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  }
+
+  it(
+    "INVARIANT §17: a non-array approvals.list payload is REFUSED, never handed on as a queue",
+    async () => {
+      // The exact shape the specialists converged on: `decodeResponse`
+      // accepted this (it has a `payload` key), the CLI cast it, and
+      // `.map` threw a raw TypeError out of an operator command. The
+      // refusal must instead be typed, and its wording must forbid the
+      // dangerous inference — an operator who reads "no rows" concludes
+      // nothing awaits them.
+      const response = await askWithPayload({ kind: "approvals.list" }, {});
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("do NOT assume it is empty");
+      // NOT §5 ambiguity: a read has no side effect to be ambiguous about,
+      // and telling an operator their list may have changed something
+      // would be both false and unactionable.
+      expect(response.kind).not.toBe("outcome-unknown");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a paused row missing the fields the renderer reads is refused, not rendered as Invalid Date",
+    async () => {
+      // `startedAt` reaches `new Date(...).toISOString()` and `expiresAt`
+      // an arithmetic comparison. Undefined renders "Invalid Date" at an
+      // operator; a non-finite value throws RangeError mid-table. Both
+      // present a protocol fault as a malformed queue instead of a
+      // refusal, so the ROW SET is refused rather than the bad row dropped
+      // — a silently shorter queue is the same lie as an empty one.
+      const response = await askWithPayload({ kind: "approvals.list" }, [
+        { executionId: "exec_1", toolName: "delete_repo", reason: "r", expiresAt: 1 },
+      ]);
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("do NOT assume it is empty");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a well-formed approvals.list payload passes the seam untouched",
+    async () => {
+      // The guard must not be a wall: the shape the daemon actually sends
+      // has to survive it, or the seam would refuse every real queue.
+      const rows = [
+        {
+          executionId: "exec_1",
+          startedAt: 1,
+          toolName: "delete_repo",
+          reason: "destructive",
+          expiresAt: 2,
+        },
+      ];
+      const response = await askWithPayload({ kind: "approvals.list" }, rows);
+      expect(response).toMatchObject({ kind: "result", payload: rows });
     },
     TIMEOUT,
   );

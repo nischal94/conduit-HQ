@@ -86,7 +86,16 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
   // surfaces below as a startup failure rather than a silent mismatch.
   let listing: CatalogListing;
   try {
-    const response = await daemon({ kind: "catalog.listing" });
+    // Through `daemonRequest` directly rather than the `DaemonCall` seam:
+    // the seam is deliberately kind-agnostic (it is what `server.ts`
+    // injects), while this one startup read wants the typed payload the
+    // generic gives, and it is issued before the server exists anyway.
+    const response = await daemonRequest({
+      stateDir,
+      role: "serve",
+      request: { kind: "catalog.listing" },
+      deadlineMs: deadlineForRequest({ kind: "catalog.listing" }),
+    });
     if (response.kind !== "result") {
       // A refusal here is terminal and worth the daemon's own words:
       // `refused-custom-db` is the common one (§9.3 item 3) and it names
@@ -99,7 +108,10 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
       console.error(`[ConduitMcp] Cannot start: the daemon refused this client. ${detail}`);
       process.exit(1);
     }
-    listing = response.payload as CatalogListing;
+    // No cast: `catalog.listing` is typed to its projection. The remaining
+    // defensiveness is about VALUES rather than shape — see the
+    // `sourceCount` read below, which no longer assumes the field arrived.
+    listing = response.payload;
   } catch (error) {
     // DaemonUnavailable already carries the state dir, the deadline, and
     // the path of the daemon log that explains why the child exited —
@@ -115,7 +127,12 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
     process.exit(1);
   }
 
-  if (listing.sourceCount === 0) {
+  // `!== a positive number` rather than `=== 0`: the hint's job is to tell a
+  // fresh install how to onboard, and a payload that failed to carry a
+  // usable count is exactly when the operator most needs it. Keying on
+  // `=== 0` made a malformed answer SUPPRESS the hint — the one reading
+  // where staying silent is worse than being wrong.
+  if (!(typeof listing.sourceCount === "number" && listing.sourceCount > 0)) {
     console.error("[ConduitMcp] 0 sources in catalog — onboard one with `conduit add-mcp`");
   }
   // Kept for the operator who set the flag on the CLIENT and would

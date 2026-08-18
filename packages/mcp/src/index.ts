@@ -2,6 +2,7 @@ export {
   type DaemonRequestOptions,
   DaemonUnavailable,
   daemonRequest,
+  type RpcResponseFor,
 } from "./daemon/client.js";
 /** Exit codes are part of the §3.5 client contract — see conduitd.ts. */
 export {
@@ -63,6 +64,7 @@ export {
   type PausedListRow,
   pausedToListRow,
   type ResumePayload,
+  type RpcPayloadFor,
   resumeToPayload,
 } from "./payloads.js";
 export { type ApprovalRuntime, createApprovalRuntime } from "./runtime.js";

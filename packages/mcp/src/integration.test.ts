@@ -55,6 +55,28 @@ import { bundleDaemonHelper, type HelperBundle } from "./daemon/helpers/bundle.j
 
 const execFileAsync = promisify(execFile);
 
+/**
+ * Runs `--doctor --offline` expecting a NON-ZERO exit, returning its output.
+ *
+ * `execFileAsync` rejects on a non-zero exit, and the rejection carries the
+ * captured `stdout`/`stderr` — so a case that must assert BOTH the exit code
+ * and the prose needs the error object, which `expect(...).rejects` does not
+ * hand back. Since the file-level findings now drive the exit code, that
+ * combination is the normal shape for these cases rather than an exception.
+ */
+async function runOfflineDoctorExpectingExit1(
+  env: Record<string, string | undefined>,
+): Promise<{ stdout: string; stderr: string }> {
+  try {
+    await execFileAsync("node", [binPath, "--doctor", "--offline"], { env });
+  } catch (error) {
+    const failure = error as { code?: number; stdout?: string; stderr?: string };
+    expect(failure.code).toBe(1);
+    return { stdout: failure.stdout ?? "", stderr: failure.stderr ?? "" };
+  }
+  throw new Error("--doctor --offline exited 0, but a file-level finding was expected");
+}
+
 const PREFIX = "github.acme.prod";
 const NAMESPACE = "github";
 const SECRET = "Bearer it_secret_do_not_leak_7f3a";
@@ -911,12 +933,48 @@ describe("ring-2: bin flag and doctor exit paths", () => {
       };
       delete env.CONDUIT_MASTER_KEY;
       delete env.CONDUIT_DB;
-      const { stdout, stderr } = await execFileAsync("node", [binPath, "--doctor", "--offline"], {
-        env,
-      });
+      // Exits 1, not 0: the key resolves, but this isolated HOME has no
+      // database, so the run prints "missing: database" — a FINDING, and a
+      // sick install must never report success to a caller that reads the
+      // status rather than the prose.
+      const failed = await runOfflineDoctorExpectingExit1(env);
+      const { stdout, stderr } = failed;
       expect(stdout).toBe("");
       expect(stderr).toMatch(/ok: key decodes \(32 bytes\), source: file/);
       expect(stderr).toMatch(/ok: key file present/);
+      expect(stderr).toMatch(/missing: database/);
+    } finally {
+      rmSync(isolatedHome, { recursive: true, force: true });
+    }
+  });
+
+  it("INVARIANT §17 / §9.1: `--doctor --offline` exits NON-ZERO when a file-level finding was printed", async () => {
+    // The one wrong answer a sick-install diagnostic must not give. The
+    // exit code was driven by key resolution ALONE, so an install with a
+    // perfectly good key and NO DATABASE printed "missing: database at …"
+    // and then exited 0 — telling every caller that reads status rather
+    // than prose (a health check, a CI step, an operator's `&&`) that the
+    // install was fine.
+    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-sick-"));
+    try {
+      const conduitDir = join(isolatedHome, ".conduit");
+      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      // A VALID key: this isolates the finding to the missing database, so
+      // a pass cannot come from the key half of the exit code.
+      writeFileSync(
+        join(conduitDir, "master-key"),
+        `${Buffer.from(SecretBox.generateKeyBytes()).toString("base64")}\n`,
+        { mode: 0o600 },
+      );
+      const env: Record<string, string | undefined> = { ...process.env, HOME: isolatedHome };
+      delete env.CONDUIT_MASTER_KEY;
+      delete env.CONDUIT_DB;
+
+      const { stderr } = await runOfflineDoctorExpectingExit1(env);
+      // Both halves of the claim: the key was fine, and the database
+      // finding is what carried the non-zero exit.
+      expect(stderr).toMatch(/ok: key decodes/);
+      expect(stderr).toMatch(/missing: database/);
     } finally {
       rmSync(isolatedHome, { recursive: true, force: true });
     }
@@ -937,9 +995,10 @@ describe("ring-2: bin flag and doctor exit paths", () => {
       };
       delete env.CONDUIT_MASTER_KEY;
       delete env.CONDUIT_DB;
-      const { stdout, stderr } = await execFileAsync("node", [binPath, "--doctor", "--offline"], {
-        env,
-      });
+      // Same as above: a valid key but no database means exit 1. The
+      // assertion here is about WHERE the warning goes (stderr only), which
+      // the exit code does not change.
+      const { stdout, stderr } = await runOfflineDoctorExpectingExit1(env);
       expect(stderr).toMatch(
         new RegExp(`WARNING.*${keyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*0600`),
       );

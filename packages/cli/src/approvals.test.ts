@@ -737,6 +737,29 @@ describe("conduit approvals — daemon transport answers", () => {
     expect(deps.stderrLines.join("")).toMatch(/internal.*store fault/is);
   });
 
+  it("a malformed approvals.list payload exits non-zero with the refusal, never a raw throw", async () => {
+    // The client seam converts a malformed payload into a typed `error`
+    // BEFORE it reaches this command (client.test.ts pins that half). What
+    // this pins is the operator-facing consequence: the refusal is printed
+    // and the exit is non-zero, rather than a TypeError escaping `.map` as
+    // a stack trace, and rather than an empty table. The wording is
+    // load-bearing — an operator must not read silence as "queue empty".
+    const deps = makeDeps({
+      daemon: async () => ({
+        kind: "error",
+        requestId: "req_m",
+        code: "internal",
+        message:
+          "the daemon's approvals.list answer was not a list of paused rows. " +
+          "Nothing is being reported about the queue — do NOT assume it is empty.",
+      }),
+    });
+    const result = await runList({ json: true }, deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("");
+    expect(deps.stderrLines.join("")).toContain("do NOT assume it is empty");
+  });
+
   it("INVARIANT §17 / §3.3: the command reaches for NOTHING outside the approvals capability row", async () => {
     const seen: RpcRequest["kind"][] = [];
     const deps = makeDeps({

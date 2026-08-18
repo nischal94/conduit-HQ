@@ -7,15 +7,14 @@ import {
   McpError,
   type Tool as McpToolDefinition,
 } from "@modelcontextprotocol/sdk/types.js";
+import type { RpcResponseFor } from "./daemon/client.js";
 import { RESUME_ADMISSION_DEADLINE_MS } from "./daemon/connection.js";
 import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
 import { ONBOARDING_DEADLINE_MS } from "./mcp-fetch.js";
 import {
-  type CatalogListing,
   CHECK_EXECUTION_TOOL,
-  type CheckPayload,
-  type ExecutePayload,
   extendExecuteDefinition,
+  type RpcPayloadFor,
   toTextResult,
 } from "./payloads.js";
 
@@ -99,8 +98,10 @@ export const EXECUTE_ADMISSION_DEADLINE_MS = 60_000;
  *
  * The margin is deliberate rather than tight: it absorbs handshake, frame
  * transport, and a cold start's spawn without eating into the reserve.
- * Pinned by "INVARIANT §17 / §5: the client deadline outlasts the daemon's
- * worst legal execute" in `server.test.ts`.
+ * Pinned in `server.test.ts` under the `INVARIANT §17 / §5:` prefix, and
+ * rowed in `INVARIANTS.md`. The prefix is the durable handle rather than a
+ * quoted full test name: names get reworded, the prefix is the ledger's own
+ * convention. Its two peers below carry the same pointer.
  */
 export const EXECUTE_CLIENT_DEADLINE_MS =
   EXECUTE_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs + 30_000;
@@ -137,6 +138,10 @@ export const READ_DEADLINE_MS = 30_000;
  * The admission constant is imported from the daemon rather than
  * re-declared, so the two cannot drift apart silently — the whole point of
  * the constraint is that the client outlasts the daemon's own bound.
+ *
+ * Pinned in `server.test.ts` under the `INVARIANT §17 / §5:` prefix, and
+ * rowed in `INVARIANTS.md` — same ordering constraint as
+ * `EXECUTE_CLIENT_DEADLINE_MS`.
  */
 export const RESUME_CLIENT_DEADLINE_MS =
   RESUME_ADMISSION_DEADLINE_MS + DEFAULT_SANDBOX_LIMITS.wallClockMs + 30_000;
@@ -169,6 +174,10 @@ export const RESUME_CLIENT_DEADLINE_MS =
  * that follows the fetch. `READ_DEADLINE_MS` is exactly the cold-start
  * allowance sized for that in the D-B1 reads, so it is reused here as the
  * same allowance rather than a second magic number.
+ *
+ * Pinned in `server.test.ts` under the `INVARIANT §17 / §5:` prefix, and
+ * rowed in `INVARIANTS.md` — same ordering constraint as
+ * `EXECUTE_CLIENT_DEADLINE_MS`.
  */
 export const PROVISION_CLIENT_DEADLINE_MS = ONBOARDING_DEADLINE_MS + READ_DEADLINE_MS;
 
@@ -193,15 +202,26 @@ export function deadlineForRequest(request: RpcRequest): number {
  * protocol faults); and `outcome-unknown` is §5's ambiguity, which is NOT
  * an error to retry but a verdict to report — the request may have run.
  */
-function unwrap(response: RpcResponse, log: (line: string) => void, context: string): unknown {
+function unwrap<K extends RpcRequest["kind"]>(
+  response: RpcResponseFor<K>,
+  log: (line: string) => void,
+  context: string,
+): RpcPayloadFor<K> {
   if (response.kind === "result") return response.payload;
   if (response.kind === "outcome-unknown") {
     // §5: never retried, never silently converted into a failure. The
     // agent is told the outcome is genuinely unknown so it looks the
     // execution up rather than re-issuing it — a replayed tool call is a
     // side effect the operator never authorized.
+    // The cause goes to the LOG only, never into the McpError below: this
+    // is the agent-facing surface, and `detail` describes daemon-side
+    // misbehavior (undecodable frames) that the §5 verdict does not change
+    // and an agent has no action to take on. The operator reading the log
+    // is the one who can act on it.
     log(
-      `[ConduitMcp] ${context}: outcome unknown — the daemon connection was lost after the request was sent. Context: {requestId: ${response.requestId}}`,
+      `[ConduitMcp] ${context}: outcome unknown — the daemon connection was lost after the request was sent. Context: {requestId: ${response.requestId}${
+        response.detail !== undefined ? `, cause: ${response.detail}` : ""
+      }}`,
     );
     throw new McpError(
       ErrorCode.InternalError,
@@ -273,14 +293,21 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
    * gets the redacted correlation-id treatment, because those messages
    * name paths and daemon internals the agent has no business seeing.
    */
-  async function call(request: RpcRequest, context: string): Promise<unknown> {
-    let response: RpcResponse;
+  async function call<K extends RpcRequest["kind"]>(
+    request: Extract<RpcRequest, { kind: K }>,
+    context: string,
+  ): Promise<RpcPayloadFor<K>> {
+    let response: RpcResponseFor<K>;
     try {
-      response = await daemon(request);
+      // The injected seam stays kind-agnostic on purpose — it is the DI
+      // point tests replace with a fake daemon — so the kind correspondence
+      // is re-attached here, at the one place that knows both the request
+      // and what its answer is supposed to be.
+      response = (await daemon(request)) as RpcResponseFor<K>;
     } catch (cause) {
       throw internalErrorFor(log, context, cause);
     }
-    return unwrap(response, log, context);
+    return unwrap<K>(response, log, context);
   }
 
   // NOTE: sandbox module-recovery diagnostics are registered by the
@@ -299,7 +326,7 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
     // §17 startup-reload caveat closing (design §4) — and it is why the
     // M6 per-call snapshot workaround is no longer this process's
     // problem.
-    const listing = (await call({ kind: "catalog.listing" }, "tools/list")) as CatalogListing;
+    const listing = await call({ kind: "catalog.listing" }, "tools/list");
     const definition = extendExecuteDefinition(
       buildExecuteTool({ connections: listing.connections }),
     );
@@ -366,7 +393,7 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
         },
         "execute",
       );
-      return toTextResult(payload as ExecutePayload);
+      return toTextResult(payload);
     }
     if (name === "check_execution") {
       const a = assertOnlyKeys(args ?? {}, ["executionId", "requestKey"], "check_execution");
@@ -394,7 +421,7 @@ export function createConduitMcpServer(options: ConduitMcpServerOptions): Server
           : { kind: "execution.getByRequestKey", requestKey: requestKey as string },
         "check_execution",
       );
-      return toTextResult(payload as CheckPayload);
+      return toTextResult(payload);
     }
     throw new McpError(ErrorCode.InvalidParams, `[ConduitMcp] Unknown tool: ${name}`);
   });

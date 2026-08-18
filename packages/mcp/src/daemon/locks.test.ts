@@ -210,6 +210,40 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
     await afterRelease?.release();
   });
 
+  it("INVARIANT §17 / §3.4: a FAILED acquisition leaves no holder row naming a never-holder", async () => {
+    // The stamp is written BEFORE the acquiring transaction opens, and that
+    // ordering is forced (every stamp-after-acquire variant is either
+    // invisible-because-uncommitted, rolled back on release, or BUSY —
+    // see `stampHolder`). The cost is a window in which a row can exist for
+    // an acquisition that never happened, and a row naming a process that
+    // never held the lock is AFFIRMATIVELY WRONG, not merely stale: the
+    // next refusal would send an operator after an innocent pid.
+    //
+    // The failure path is the half that code can close, and this pins it: a
+    // live SHARED holder makes the EXCLUSIVE acquire below fail, and the
+    // loser must clean up the stamp it just wrote.
+    const db = newLockDbPath();
+    const { child: holder } = await spawnHolder("shared", db);
+
+    // The real holder took the lock with no role, so any row present after
+    // the failed attempt below can only have come from that attempt.
+    const before = await readLockHolder(db);
+    expect(before).toBeNull();
+
+    const refused = await acquireExclusive(db, { role: "rotate" });
+    expect(refused).toBeNull();
+
+    // The row the losing acquirer stamped must be gone. Left behind, it
+    // would name THIS process (pid + role "rotate") as the holder of a
+    // lock it never obtained.
+    const after = await readLockHolder(db);
+    expect(after).toBeNull();
+    expect(describeHolder(after)).toBe("");
+
+    holder.kill("SIGKILL");
+    await waitForExclusiveFree(db);
+  });
+
   it("acquireExclusive: default is fail-fast — BUSY answers immediately, it never waits out a live holder", async () => {
     // The regression this pins: giving acquireExclusive a universal
     // busy_timeout turned rotation's maintenance acquisition from

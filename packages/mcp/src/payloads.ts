@@ -7,6 +7,8 @@ import type {
   PendingApproval,
   ResumeOutcome,
 } from "@conduithq/sdk";
+import type { ProvisionPayload } from "./daemon/provision.js";
+import type { RpcRequest } from "./daemon/rpc.js";
 
 /** Shared agent-visible error envelope (design M8). */
 export interface ErrorEnvelope {
@@ -115,6 +117,44 @@ export interface PausedListRow {
   reason: string;
   expiresAt: number;
 }
+
+/**
+ * The request-kind → result-payload correspondence, in ONE place.
+ *
+ * Before this map the correspondence existed only in the heads of the
+ * people writing call sites: `RpcResponse`'s `result` arm types `payload`
+ * as `unknown` (correctly — the daemon's decoder cannot know which kind it
+ * is answering), and every caller recovered the shape with a bare `as`.
+ * Six of those casts existed, and two of them DISAGREED about the same
+ * wire kind, which is the tell that a cast is not a substitute for a
+ * relationship the type system can check.
+ *
+ * Making it a mapped type rather than six annotations means the daemon's
+ * senders and the clients' readers are checked against the SAME row: a
+ * change to `PausedListRow` now breaks `approvals.ts` at compile time
+ * instead of at an operator's terminal. Kinds whose payload is not a
+ * defined projection (`handshake`, and the two whose answers the daemon
+ * composes ad hoc) map to `unknown`, so nothing is silently claimed to be
+ * typed that isn't.
+ *
+ * Compile-time ONLY. This buys inference at the call sites and nothing at
+ * runtime — a daemon can still put anything on the wire, which is why the
+ * seam in `client.ts` validates the dangerous shapes rather than trusting
+ * this map. Types describe intent; the guard defends against the wire.
+ */
+export type RpcPayloadFor<K extends RpcRequest["kind"]> = K extends "catalog.listing"
+  ? CatalogListing
+  : K extends "execute"
+    ? ExecutePayload
+    : K extends "execution.get" | "execution.getByRequestKey"
+      ? CheckPayload
+      : K extends "approvals.list"
+        ? PausedListRow[]
+        : K extends "approvals.resume"
+          ? ResumePayload
+          : K extends "source.provision" | "source.revalidate"
+            ? ProvisionPayload
+            : unknown;
 
 /**
  * Projects one paused `Execution` for the `approvals.list` response.

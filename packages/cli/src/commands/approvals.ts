@@ -4,9 +4,10 @@ import {
   daemonRequest,
   deadlineForRequest,
   type PausedListRow,
-  type ResumePayload,
+  type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
+  type RpcResponseFor,
 } from "@conduithq/mcp";
 
 /**
@@ -93,9 +94,12 @@ type PausedRowWire = PausedListRow;
  * for a queue the daemon never reported would tell an operator that nothing
  * awaits them, which is the one wrong answer this command must never give.
  */
-type Answer = { ok: true; payload: unknown } | { ok: false; line: string; exitCode: number };
+type Answer<P> = { ok: true; payload: P } | { ok: false; line: string; exitCode: number };
 
-function describeResponse(response: RpcResponse, verb: string): Answer {
+function describeResponse<K extends RpcRequest["kind"]>(
+  response: RpcResponseFor<K>,
+  verb: string,
+): Answer<RpcPayloadFor<K>> {
   if (response.kind === "result") return { ok: true, payload: response.payload };
   if (response.kind === "outcome-unknown") {
     // §5's ambiguity, and the one answer whose mishandling is dangerous in
@@ -112,7 +116,12 @@ function describeResponse(response: RpcResponse, verb: string): Answer {
         `[conduit approvals] The outcome of this ${verb} is UNKNOWN: the daemon connection was ` +
         `lost after the request was sent, so it may or may not have been applied ` +
         `(requestId ${response.requestId}). Do NOT retry it — run "conduit approvals list" to ` +
-        `see whether the execution is still awaiting a decision.\n`,
+        `see whether the execution is still awaiting a decision.` +
+        // The §5 verdict is unchanged by the cause; the cause only tells the
+        // operator WHICH failure they are looking at (a misbehaving daemon
+        // versus a dropped connection), which is the difference between
+        // reading the daemon log and retrying later.
+        `${response.detail !== undefined ? ` Cause: ${response.detail}.` : ""}\n`,
     };
   }
   if (response.kind === "error") {
@@ -142,9 +151,13 @@ function describeResponse(response: RpcResponse, verb: string): Answer {
  * operator-facing command, so unlike the agent-facing `serve` seam there is
  * nothing here to redact it from.
  */
-async function ask(deps: ApprovalsDeps, request: RpcRequest, verb: string): Promise<Answer> {
+async function ask<K extends RpcRequest["kind"]>(
+  deps: ApprovalsDeps,
+  request: Extract<RpcRequest, { kind: K }>,
+  verb: string,
+): Promise<Answer<RpcPayloadFor<K>>> {
   try {
-    return describeResponse(await deps.daemon(request), verb);
+    return describeResponse<K>((await deps.daemon(request)) as RpcResponseFor<K>, verb);
   } catch (error) {
     return {
       ok: false,
@@ -227,7 +240,10 @@ export async function runList(
     return { exitCode: answer.exitCode };
   }
   const now = deps.now();
-  const rows = (answer.payload as PausedRowWire[]).map((row) => toPausedRow(row, now));
+  // No cast: `approvals.list` is typed to its projection, and the client
+  // seam has already refused a payload that is not actually a row list —
+  // so a malformed answer reached the refusal above, never this `.map`.
+  const rows = answer.payload.map((row) => toPausedRow(row, now));
 
   if (args.json) {
     deps.stdout(
@@ -294,7 +310,7 @@ export async function runDecide(
     deps.stderr(answer.line);
     return { exitCode: answer.exitCode };
   }
-  const outcome = answer.payload as ResumePayload;
+  const outcome = answer.payload;
 
   // Deny verb-truth: the exit code and the "denied" line report the OPERATOR'S
   // VERB, and the verb's success is `decisionApplied` — the manager's host-side

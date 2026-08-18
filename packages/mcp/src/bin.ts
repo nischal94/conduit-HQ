@@ -98,19 +98,38 @@ async function doctor(): Promise<number> {
       return 1;
     }
 
-    const payload = response.payload as { connections?: unknown[]; sourceCount?: number };
-    const sourceCount = payload.sourceCount ?? 0;
+    // Typed by `RpcPayloadFor<"catalog.listing">` rather than re-declared
+    // through a cast. The cast this replaces was the OTHER half of the
+    // payload-seam defect: it described the same wire kind differently from
+    // `runtime-stdio.ts`'s, so the two readers of one projection disagreed
+    // about its shape. The VALUE-level hedges below stay — a diagnostic
+    // reports what arrived and must not throw while doing it.
+    const payload = response.payload;
+    const sourceCount = typeof payload.sourceCount === "number" ? payload.sourceCount : 0;
     console.error("ok: daemon reachable (handshake accepted)");
     if (daemonConfig !== undefined) {
       console.error(`ok: daemon owns the database at ${daemonConfig.dbPath}`);
       console.error(
         `egress opt-in: ${daemonConfig.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`,
       );
+    } else {
+      // Said rather than left blank. The db path and the egress setting are
+      // among the most likely things an operator is debugging, and their
+      // ABSENCE from a report that otherwise looks healthy reads as "not
+      // applicable" instead of "not observed". A missing handshake is a real
+      // (if odd) state — the response arrived without one being surfaced —
+      // and naming it is what stops a reader silently assuming the default.
+      console.error(
+        "warn: daemon config could not be read from the handshake — db path and egress setting " +
+          "are NOT being reported below (this is an observation gap, not a confirmed default).",
+      );
     }
     console.error(
       `ok: ${sourceCount} source(s) in catalog${sourceCount === 0 ? " — onboard one with `conduit add-mcp`" : ""}`,
     );
-    console.error(`ok: ${payload.connections?.length ?? 0} connection(s) advertised`);
+    console.error(
+      `ok: ${Array.isArray(payload.connections) ? payload.connections.length : 0} connection(s) advertised`,
+    );
     return 0;
   } catch (error) {
     if (error instanceof DaemonUnavailable) {
@@ -186,12 +205,20 @@ async function doctorOffline(): Promise<number> {
       console.error(String(error instanceof Error ? error.message : error));
     }
 
+    // Folded into the exit code below. A file-level finding is a FINDING:
+    // printing "missing: database at …" and then exiting 0 tells every
+    // caller that reads status rather than prose — a health check, a CI
+    // step, an operator's `&&` — that the install is fine, which is the one
+    // wrong answer a sick-install diagnostic must never give.
+    let missing = false;
+
     for (const [label, path] of [
       ["key file", DEFAULT_KEY_FILE],
       ["database", paths.db],
     ] as const) {
       if (!existsSync(path)) {
         console.error(`missing: ${label} at ${path}`);
+        missing = true;
         continue;
       }
       const mode = statSync(path).mode & 0o777;
@@ -209,7 +236,7 @@ async function doctorOffline(): Promise<number> {
       "note: offline mode does not open the database, so it cannot confirm the key DECRYPTS it. " +
         "Run `conduit-mcp --doctor` against a live daemon for that.",
     );
-    return keyOk ? 0 : 1;
+    return keyOk && !missing ? 0 : 1;
   } finally {
     if (acquisition.outcome === "acquired") await acquisition.lock.release();
   }

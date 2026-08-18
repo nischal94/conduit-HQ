@@ -527,19 +527,54 @@ async function submitSandboxWork(
   log(`queue depth=${stats.depth} max=${stats.maxObservedDepth} active=${stats.activeCount}`);
   const settled = await admission.done;
   ctx.queued.delete(admission.abandon);
-  if (settled === "expired") {
-    // Nothing ran, so this is not an ambiguous outcome — the request
-    // was never admitted and may be retried as a first attempt.
-    send(
-      ctx.socket,
-      {
-        kind: "error",
-        requestId,
-        code: "busy",
-        message: "queue deadline expired before a slot became available",
-      },
-      log,
-    );
+  // Exhaustive rather than a single `if`: the three outcomes are three
+  // different facts about whether the work RAN, and the arm that was
+  // missing (`abandoned`) was silently indistinguishable from the arm that
+  // did run. The `never` guard is the same shape `runSourceRequest` uses
+  // for its McpClientError mapping — a fourth outcome must break the build
+  // rather than fall through to silence.
+  switch (settled) {
+    case "ran":
+      // `runGuarded` already sent the answer (result or typed error).
+      return;
+    case "expired":
+      // Nothing ran, so this is not an ambiguous outcome — the request
+      // was never admitted and may be retried as a first attempt.
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "busy",
+          message: "queue deadline expired before a slot became available",
+        },
+        log,
+      );
+      return;
+    case "abandoned": {
+      // Nothing to SEND — abandonment happens when the connection is gone
+      // (client disconnect, or the drain deadline closing us down), so
+      // there is no socket left to answer on. But the fact is worth
+      // recording, and it is a DEFINITE one: an abandoned entry was never
+      // admitted, so it provably never ran.
+      //
+      // That certainty is exactly what the client cannot have. Its request
+      // bytes went out, so from out there this is §5's ambiguous zone and
+      // it must report "may or may not have been applied" — for a resume,
+      // that the operator's decision may have landed. The daemon is the
+      // only party that knows it definitely did not, and the log is the
+      // only place that knowledge can survive. An operator reconciling a
+      // §5 ambiguity against this line learns the decision was NEVER
+      // applied and can safely re-issue it.
+      log(
+        `[conduitd] Queued request abandoned: client disconnected before admission. Context: {requestId: ${requestId}, kind: ${kind}}`,
+      );
+      return;
+    }
+    default: {
+      const unreachable: never = settled;
+      throw new Error(`[conduitd] unhandled queue outcome: ${String(unreachable)}`);
+    }
   }
 }
 
@@ -669,6 +704,14 @@ async function handleRequest(
       return;
     }
     case "approvals.list": {
+      // NOTE the clock asymmetry against `execution.get` above, which is
+      // DELIBERATE (controller ruling) and easy to misread as an
+      // inconsistency. `execution.get` decides `paused`-past-TTL →
+      // `expired` on the DAEMON's clock because that is a STATUS the row's
+      // owner must adjudicate. This list ships raw `expiresAt` values and
+      // lets the CLI label them, because "3m remaining" is PRESENTATION
+      // computed at display time against the reader's own clock. Nothing
+      // here decides a status, so nothing here needs the daemon's clock.
       const paused = await store.executions.listPaused();
       // Projected like every other answer: the raw row's `pausedOn` is a
       // `PendingApproval` whose `input` is the paused call's ARGUMENTS, which
