@@ -86,15 +86,27 @@ function heldLock(client: Client, stamped: boolean): HeldLock {
  * polling a daemon through its startup window died on the poll rather
  * than reading the lock state it asked for.
  *
- * The code is the decision because the code is what SQLite defines.
- * `rawCode === 5` is accepted alongside the string so a future libsql that
- * drops the textual `code` still classifies correctly — same reasoning as
- * `isMissingDirectory` below, which refuses to trust libsql's error prose.
+ * The code is the decision because the code is what SQLite defines. The
+ * numeric `rawCode` is accepted alongside the string so a future libsql
+ * that drops the textual `code` still classifies correctly — same
+ * reasoning as `isMissingDirectory` below, which refuses to trust
+ * libsql's error prose.
+ *
+ * BUSY and LOCKED are treated as ONE answer, matching the repo's sibling
+ * predicate (`isBusyCause` in `cli/src/commands/key.ts`). SQLite returns
+ * `SQLITE_LOCKED` (6) rather than `SQLITE_BUSY` (5) when the conflict is
+ * with a connection in the SAME process rather than a different one — a
+ * distinction about WHICH connection is in the way, not about whether the
+ * lock is available. Both mean "someone else holds this right now", which
+ * is the only question this predicate exists to answer, and letting
+ * LOCKED fall through to a raw throw would reproduce the exact escape
+ * this fix removes for BUSY.
  */
 function isBusy(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   const { code, rawCode } = err as { code?: unknown; rawCode?: unknown };
-  return code === "SQLITE_BUSY" || rawCode === 5;
+  if (typeof code === "string" && /^SQLITE_(BUSY|LOCKED)$/.test(code)) return true;
+  return rawCode === 5 || rawCode === 6;
 }
 
 /**
@@ -410,8 +422,8 @@ export async function acquireExclusiveIfPresent(
  * startup window opens the lock db BEFORE the daemon's `ensureStateDir`
  * runs and re-checks AFTER it lands, finds the directory now present, and
  * rethrows the raw `ConnectionFailed("… : 14")` at a caller that was only
- * asking whether anyone held the lock. Reproduced at ~11 escapes per 60
- * real spawns against a missing state dir.
+ * asking whether anyone held the lock. Reproduced at ~11 CANTOPEN escapes
+ * per 60 real spawns against a missing state dir.
  *
  * Both readings below are the same truthful answer — "no holder could
  * have existed at open time":
@@ -432,6 +444,16 @@ export async function acquireExclusiveIfPresent(
  * raw error still throws. Checking the filesystem directly keeps the
  * answer true or false for a reason that does not depend on libsql's
  * error prose.
+ *
+ * One consequence is worth naming explicitly: a directory that EXISTS but
+ * is unusable, with no lock db inside it, reads as absence. That is sound
+ * on its own terms — an absent file holds no fcntl range, so no holder
+ * can exist — and `daemonRequest` never reaches it unguarded, because
+ * `assertStateDir` has already vetted the directory before the loop
+ * begins. Callers NOT behind that gate (`key rotate`, `--doctor
+ * --offline`) therefore read "free" here and must rely on their own
+ * boundary checks, not on this probe, to notice an unusable state
+ * directory.
  */
 function isMissingDirectory(err: unknown, lockDbPath: string): boolean {
   if ((err as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return true;
