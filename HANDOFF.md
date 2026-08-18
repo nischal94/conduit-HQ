@@ -69,15 +69,23 @@ DEFERRED, tracked below.
 
 ### DEFERRED FOLLOW-UPS (carry to future sessions; none blocks anything shipped)
 
-1. **§16 sandbox worker-crash flake (INVESTIGATING at session close).** CI
-   unit-test job failed once, passed on re-run: NOT the QuickJS teardown
+1. **§16 sandbox worker-crash flake — DID NOT REPRODUCE locally (12/12 clean).**
+   CI unit-test job failed once, passed on re-run: NOT the QuickJS teardown
    abort (that is harmless expected stderr, 509× in a green run — proven),
    but a vitest WORKER crash during the sdk §16 stress tests (150-iteration
    overflow loops) with all tests passing. Pre-existing sdk sandbox code,
-   disjoint from Lane B. A local 12× repro loop was running at close — read
-   its verdict (benign teardown under CI memory pressure → quarantine/isolate
-   the stress test; OR a real abort escaping the sandbox catch → §16 must-fix).
-   Repro logs: /tmp/claude/s16-run-*.log.
+   disjoint from Lane B. **VERDICT (12× local repro loop + 2 full-suite runs
+   during commits, all exit 0, zero worker crashes):** the crash is
+   CI-ENVIRONMENT-SPECIFIC, not deterministic — strongly indicates benign
+   memory/timing pressure OOM-ing a vitest worker on the constrained CI
+   runner, NOT a real abort escaping the sandbox catch (a real §16 boundary
+   break would surface sometimes in 12 local runs; it surfaced never). NOT
+   proven 100% benign — "unreproducible locally" ≠ "proven benign". Next
+   step (deferred, non-urgent): give the §16 stress block its own vitest
+   worker with raised memory / or a retry, so a CI resource blip surfaces as
+   a retry not a red run — do NOT add a blanket retry that could mask a real
+   assertion failure. Since it re-ran green and never reproduces locally, it
+   does not gate anything.
 2. **Unbounded daemon log.** `spawn.ts` opens `conduitd.log` append-only, no
    rotation/size cap, logs a line PER ADMISSION on every execute/resume. The
    daemon is now long-lived → unbounded disk. Fix: rotate/size-cap, or drop
