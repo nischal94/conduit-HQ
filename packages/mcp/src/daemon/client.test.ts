@@ -848,6 +848,36 @@ describe("the result-payload seam", () => {
   );
 
   it(
+    "a source.provision payload missing toolCount is REFUSED, not printed as 'seeded undefined tools'",
+    async () => {
+      // Same class as the malformed `counts` case: the daemon has already
+      // committed the write, and every field the success line interpolates
+      // fails the same way. `counts` alone was an arbitrary place to stop.
+      const response = await askWithPayload(
+        {
+          kind: "source.provision",
+          namespace: "ns",
+          url: "https://u",
+          prefix: "p",
+          replace: false,
+          clearCredential: false,
+        },
+        {
+          namespace: "ns",
+          prefix: "p",
+          counts: { safe: 1, review: 0, destructive: 0 },
+          credential: "absent",
+        },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("do NOT assume");
+      expect(response.message).toContain("nothing was written");
+    },
+    TIMEOUT,
+  );
+
+  it(
     "a provisioning payload with absent warnings passes the seam untouched",
     async () => {
       const payload = {
@@ -891,6 +921,26 @@ describe("the result-payload seam", () => {
       // NOT §5 ambiguity: the response arrived, so the failure is a
       // malformed answer rather than an unknown outcome.
       expect(response.kind).not.toBe("outcome-unknown");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "an approvals.resume payload carrying decisionApplied but no status is REFUSED",
+    async () => {
+      // The other half of the same false negative. `runDecide` selects its
+      // ENTIRE output path on `status`: without one it prints "settled as
+      // undefined" and then falls through to the never-applied arm — exit 1
+      // on a decision that may well have landed, which is the identical
+      // wrong answer omitting `decisionApplied` produces. Guarding one
+      // field and not the other left the seam short of its own standard.
+      const response = await askWithPayload(
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        { executionId: "exec_1", decisionApplied: false },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("Do NOT assume it was not applied");
     },
     TIMEOUT,
   );

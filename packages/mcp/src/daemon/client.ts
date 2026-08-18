@@ -731,24 +731,36 @@ function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcRe
     }
 
     case "approvals.resume": {
+      // TWO fields, because `runDecide` branches on both and a break in
+      // either produces the SAME false negative.
+      //
       // `decisionApplied` carries the OPERATOR'S VERB truth (§17 D-T7-2):
       // whether the staged decision was consumed by the pending call. An
       // ABSENT field must never read as `false` — that reports a landed
       // deny as "never applied" (exit 1), sending the operator to re-issue
-      // a decision the execution already consumed. It is the one field
-      // whose default is wrong in a direction that causes action, so its
-      // absence is a typed refusal rather than a hedge.
+      // a decision the execution already consumed.
+      //
+      // `status` selects the command's ENTIRE output path: the deny arm
+      // reads it to describe what the drive then did, and every arm below
+      // that dispatches on it. Guarding `decisionApplied` alone left a
+      // payload with `decisionApplied: false` and no `status` passing the
+      // seam — printing "settled as undefined" and then falling through to
+      // the never-applied arm, which is the identical wrong answer reached
+      // by omitting the other field. Both are structural here, so both are
+      // refusals rather than hedges.
       const payload = response.payload;
       if (
         typeof payload !== "object" ||
         payload === null ||
-        typeof (payload as { decisionApplied?: unknown }).decisionApplied !== "boolean"
+        typeof (payload as { decisionApplied?: unknown }).decisionApplied !== "boolean" ||
+        typeof (payload as { status?: unknown }).status !== "string"
       ) {
         return refuse(
-          "the daemon's approvals.resume answer did not report whether the decision was " +
-            "applied. Do NOT assume it was not — the decision may well have been consumed by " +
-            'the pending call. Run "conduit approvals list" to see whether the execution is ' +
-            "still awaiting a decision, and do not re-issue a decision blindly.",
+          "the daemon's approvals.resume answer did not report the decision's fate " +
+            "(whether it was applied, and what the execution then settled as). Do NOT assume " +
+            "it was not applied — the decision may well have been consumed by the pending " +
+            'call. Run "conduit approvals list" to see whether the execution is still ' +
+            "awaiting a decision, and do not re-issue a decision blindly.",
         );
       }
       return response;
@@ -809,22 +821,40 @@ function isCatalogListingShape(payload: unknown): boolean {
 /**
  * The structural shape `add-mcp` depends on.
  *
- * `counts` is checked as three FINITE numbers: they are interpolated into
- * the success line and the `--json` object, where `undefined` or `NaN`
- * renders a committed provisioning as a nonsense summary. `warnings` is
- * absent-or-an-array-of-strings — genuinely optional (the daemon omits it
- * when there is nothing to say), so absence is fine and the caller's
- * `?? []` handles it, but a non-array present value would be iterated.
+ * EVERY field the success output interpolates is checked, because they all
+ * fail the same way: the daemon has already committed the atomic write, so
+ * a missing field renders a landed provisioning as a nonsense summary —
+ * "seeded undefined tools for connection undefined" — which an operator
+ * would rationally re-run against a source that is already there.
+ *
+ * - `counts` — three FINITE numbers, each interpolated into the success
+ *   line and spread into the `--json` object.
+ * - `toolCount` — a finite number, the headline of the success line.
+ * - `namespace`/`prefix` — strings, both named in the success line.
+ * - `credential` — the two-valued PRESENCE flag, emitted in `--json`; any
+ *   other value would answer the operator's "did my secret stick?" with
+ *   something that is neither "present" nor "absent".
+ * - `warnings` — absent-or-an-array-of-strings. Genuinely optional (the
+ *   daemon omits it when there is nothing to say), so absence is fine and
+ *   the caller's `?? []` handles it; a non-array PRESENT value would be
+ *   iterated, and swallowing it hides the one thing the daemon was trying
+ *   to say.
  */
 function isProvisionPayloadShape(payload: unknown): boolean {
   if (typeof payload !== "object" || payload === null) return false;
   const p = payload as Record<string, unknown>;
+
+  if (typeof p.namespace !== "string" || typeof p.prefix !== "string") return false;
+  if (typeof p.toolCount !== "number" || !Number.isFinite(p.toolCount)) return false;
+  if (p.credential !== "present" && p.credential !== "absent") return false;
+
   const counts = p.counts;
   if (typeof counts !== "object" || counts === null) return false;
   const c = counts as Record<string, unknown>;
   for (const field of ["safe", "review", "destructive"] as const) {
     if (typeof c[field] !== "number" || !Number.isFinite(c[field])) return false;
   }
+
   if (p.warnings !== undefined) {
     if (!Array.isArray(p.warnings)) return false;
     if (!p.warnings.every((w) => typeof w === "string")) return false;
