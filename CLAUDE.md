@@ -84,14 +84,24 @@ puts the human decision AFTER the clean-room CI evidence exists.
   (see the ci.yml activation checklist): merge only on green, after
   reading the review — and for load-bearing PRs, after passing the
   explainer quiz.
-- **Merge authority is separate from review, and it is the human's.**
-  The agent never merges a PR the human has not explicitly named for
-  merging — housekeeping included. Review can be delegated to agents
-  and CI; the decision to land on main cannot. A general "wrap things
-  up" or "decide what's best" is not a per-PR merge instruction.
+- **Merge authority is the human's to grant; the agent asks, then acts.**
+  The flow is simple: the agent asks "should I merge PR #N?", and once
+  the human answers to merge that specific PR, the agent merges it —
+  immediately, without re-asking or deferring. A direct instruction to
+  merge a named PR ("merge", "merge #48", "yes merge it") **IS** the
+  authorization — treat it as a green light and execute. What the agent
+  must NOT do is merge on its own initiative or on a vague signal
+  ("wrap things up", "decide what's best") that names no PR — that
+  needs a confirming ask first. The rule is a guard against merging
+  WITHOUT the human's word, never a reason to refuse or stall a merge
+  the human HAS asked for, and never a claim that the human lacks
+  authority (they always have it). Review can be delegated to agents
+  and CI; the go-ahead to land on main comes from the human.
   (Added 2026-07-07 after the agent merged housekeeping PR #16 on the
-  tier exemption alone; the review was adequate, the authorization was
-  not.)
+  tier exemption alone; reworded 2026-08-18 after the agent over-read
+  "never merges" and repeatedly refused/deferred a merge the human had
+  explicitly named — the review was the point, not blocking an
+  authorized merge.)
 - Enforced mechanically by `githooks/pre-push` — a tripwire, not a wall.
   A `--no-verify` bypass is an incident worth a LEARNINGS note.
 - When branch protection becomes available (Pro or public repo), turn on
