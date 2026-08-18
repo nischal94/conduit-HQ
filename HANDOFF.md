@@ -31,7 +31,100 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-18 (Lane A MERGED: PR #46 squash → main `2fe55ff`, sweep DONE; next: Lane B [plan Tasks 6–10] via SDD in a fresh session)
+## Current handoff — updated 2026-08-18 (Lane B MERGED: PR #48 squash → main `f016c8d`; §17 step 2 daemon ownership COMPLETE; next: §17 step 3 [daemon control API / hot-reload])
+
+**MERGE + POST-MERGE (2026-08-18):** PR #48 squash → main `f016c8d`
+(human named the merge; agent executed it). Lane B converts every
+consumer to a capability-scoped daemon client: serve, approvals, add-mcp
+(§3.3.1 anti-oracle), key/doctor under the §3.4 maintenance lock. After
+this, exactly one process opens `~/.conduit/conduit.db`. Post-merge sweep
+DONE: local+origin main synced at `f016c8d`, `feat/daemon-clients`
+deleted, all dists rebuilt (direct tsup — pnpm is sfw-sandbox-blocked),
+**real-db canary green** (`approvals list` → exit 0: fresh cli dist
+auto-started a daemon and opened the real store cleanly; a stale
+pre-merge daemon was killed first via `pkill -f 'bin.js --daemon'`).
+Follow-up commit `6753343` (docs, pushed via scripts/push-docs) reworded
+the merge-authority rule — see LEARNINGS 2026-08-18 #1.
+
+**THE GAUNTLET (agent-side, all passed before the human named the merge):**
+Tier-2 five-specialist wave (8 findings fixed) → /security-review (zero) →
+code-review mechanic high (8 fixed) → CODEX CROSS-MODEL ARC: **6 passes,
+13 genuine in-scope breaks past 11 prior layers**, including 3
+credential-exfil paths no same-model layer caught (upstream-echo of a
+stored secret in onboarding error text; credentials-in-URL; the state-dir
+cross-UID class). The state-dir class took a dedicated THREAT-MODEL PASS
+(`docs/superpowers/specs/2026-08-18-state-dir-boundary-threat-model.md`)
++ unified fix (one UID-anchored canonical base across all 5 consumers)
+after 5 find-fix cycles each disproved the previous cycle's scope
+reasoning. Codex pass 6 was blocked at the provider (cyber-classifier
+refusal, then usage limit) → substituted a fresh in-harness fable
+adversarial pass that traced the attacks and confirmed convergence.
+/explain-diff quiz artifact "The Daemon Clients" published + human passed.
+
+**POST-GAUNTLET EDGE-CASE HUNT (human asked "what did we miss" pre-merge):**
+found the OPERATIONAL class the diff-gauntlet under-weighted — all from
+the daemon now being long-lived. One FIXED pre-merge (version-skew
+footgun → `agentVersion` in handshake, commit rode PR #48). Three
+DEFERRED, tracked below.
+
+### DEFERRED FOLLOW-UPS (carry to future sessions; none blocks anything shipped)
+
+1. **§16 sandbox worker-crash flake (INVESTIGATING at session close).** CI
+   unit-test job failed once, passed on re-run: NOT the QuickJS teardown
+   abort (that is harmless expected stderr, 509× in a green run — proven),
+   but a vitest WORKER crash during the sdk §16 stress tests (150-iteration
+   overflow loops) with all tests passing. Pre-existing sdk sandbox code,
+   disjoint from Lane B. A local 12× repro loop was running at close — read
+   its verdict (benign teardown under CI memory pressure → quarantine/isolate
+   the stress test; OR a real abort escaping the sandbox catch → §16 must-fix).
+   Repro logs: /tmp/claude/s16-run-*.log.
+2. **Unbounded daemon log.** `spawn.ts` opens `conduitd.log` append-only, no
+   rotation/size cap, logs a line PER ADMISSION on every execute/resume. The
+   daemon is now long-lived → unbounded disk. Fix: rotate/size-cap, or drop
+   per-admission INFO to debug level.
+3. **Linux ACL enforcement untested on CI.** `assertNoLinuxAcl` (state-dir.ts,
+   §3.2 boundary) treats getfacl-ENOENT as best-effort SKIP; CI installs no
+   `acl` package; the only e2e ACL tests are `process.platform==="darwin"`-gated.
+   So on ubuntu CI the ACL path both doesn't run AND would silently no-op. Fix:
+   a Linux `setfacl`-planting test asserting `assertStateDir` rejects
+   `EXTENDED_ACL` + an `acl` install step in ci.yml.
+4. **AGENT_VERSION ↔ package.json manual sync.** `env.ts:27` hardcodes the
+   version string that `--version` and the handshake report; `package.json`
+   has its own. Match today, nothing enforces it — a future version bump
+   forgetting env.ts = stale (diagnostic-only, gates nothing). Fix: tsup
+   define-inject, or a test asserting `AGENT_VERSION === pkg.version`.
+5. **Dependabot: 5 alerts (4 moderate / 1 low), parked.** The two HIGHs stay
+   cleared by the pnpm override pins (ip-address ≥10.3.1, nanoid ≥3.3.18 <4).
+   Retire the pins when @modelcontextprotocol/sdk ships patched transitives.
+
+### NEXT — §17 step 3: daemon control API / hot-reload
+
+Step 2 (daemon ownership) is DONE. Step 3 makes the long-lived daemon
+controllable: a control surface + catalog hot-reload (the per-call catalog
+rehydration in `runtime.ts` was the no-owner workaround; a live owner can
+now replace it). This is also where the operational gaps above naturally
+get addressed (a `conduit daemon stop`/`restart`/`reload` surface answers
+the no-stop-command + version-skew-restart items). START WITH
+`superpowers:brainstorming` then `writing-plans`; full load-bearing route
+→ HUMAN-NAMED merge. Environment quirks unchanged: commits sandbox-disabled
+never --no-verify; pnpm/npx blocked by sfw (use packages/<p>/node_modules/
+.bin/* directly; direct tsup builds are fine, they're not installs); agent
+never installs; gh in background tasks is config-blind (poll unauth via curl).
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: §17 step 2 (daemon ownership) is COMPLETE — Lane A (PR #46) and
+> Lane B (PR #48 → main `f016c8d`) both merged, real-db canary green. Do
+> NOT re-review either.** Carry the 5 deferred follow-ups in the DEFERRED
+> section (the §16 flake verdict is the live one — check /tmp/claude/s16-run-*.log
+> or re-run the loop). NEXT: §17 step 3 (daemon control API / hot-reload) —
+> brainstorm → plan → full load-bearing route → HUMAN-NAMED merge.
+
+---
+
+## Superseded handoff — updated 2026-08-18 (Lane A MERGED: PR #46 squash → main `2fe55ff`, sweep DONE; its NEXT [build Lane B] was completed + merged 2026-08-18 by the section above)
 
 **MERGE + SWEEP (2026-08-18, human passed the quiz and named the
 merge):** PR #46 squash → main `2fe55ff` (trailer-free verified). The

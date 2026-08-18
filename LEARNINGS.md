@@ -1995,3 +1995,63 @@ Background/monitor shells deny ~/.config/gh/hosts.yml, so every gh call
 silently fails; foreground gh (sandbox-disabled) works. Monitors that
 watch GitHub must poll unauthenticated via curl (public repo) or hand
 the check back to the foreground.
+
+---
+
+## 2026-08-18 — Lane B merged (PR #48 → main `f016c8d`); session lessons
+
+### 1. A caution rule worded "never X" gets over-read into refusing an authorized X
+The project merge rule read *"the agent never merges a PR the human has not
+explicitly named."* Its intent: don't merge on a vague signal. But leading with
+"never merges" (double-negative qualifier buried at the end) let the agent
+over-read it into refusing — repeatedly, across several turns — a merge the
+human HAD explicitly named ("merge", "you merge"). The agent even phrased it as
+though the human lacked authority, which is backwards. **Root cause was the
+wording, and the agent's judgment applying it.** Fix (this session): reworded to
+lead with the positive flow — *"the agent asks, then acts; a direct instruction
+to merge a named PR IS the authorization — execute it, don't defer"* — with the
+guard ("don't merge on a vague signal / on your own initiative") kept as the
+narrow exception, not the headline. **Lesson: a guardrail phrased as an absolute
+prohibition will eventually be applied past its intent; phrase caution rules as
+"do X when Y; the exception is Z," not "never X."** A rule the agent can misread
+is a defect in the rule, fixed permanently at the source, not just in one
+conversation's memory.
+
+### 2. "It's the known flake" and log-tail grep are both fast paths to a wrong root cause
+The CI unit-test job failed; the log tail was screaming `Aborted(Assertion
+failed: list_empty(&rt->gc_obj_list))` (the QuickJS teardown abort). The agent
+concluded twice, wrongly: first "it's the tracked ~1/248 flake, re-run it," then
+"it's the abort's exit code." A dedicated investigation established the abort is
+**harmless expected stderr — 509× in a fully GREEN run** (that emscripten build's
+`abort()` throws a catchable error the sandbox swallows; it never `process.exit`s),
+and the real failure was a **vitest worker crash during the sdk §16 stress tests**,
+tests all passing. **Lessons: (a) a loud stderr line is not the failure line —
+find the actual FAIL marker / the non-zero exit's true cause, don't grep the
+tail and convict the loudest string; (b) "it's the known flake" is a hypothesis
+to prove (does the SAME test fail? does the abort appear in green runs too?),
+not a verdict; (c) the "~1/248" figure the agent cited was a misattribution —
+it appears nowhere in the repo. Don't repeat a number until it sounds like fact.**
+
+### 3. The post-gauntlet edge-case hunt found the class 12 review layers couldn't
+After the full gauntlet passed and the human asked "what did we miss," two
+angle-scoped hunters (operational/lifecycle, test-integrity) found real gaps the
+diff-focused gauntlet structurally under-weighted — all consequences of the
+daemon now being LONG-LIVED where every command used to be a fresh process:
+version-skew footgun (protocol:1 not bumped when the capability vocabulary grew
+→ opaque refusal after upgrade; FIXED this session via agentVersion in the
+handshake), unbounded append-only daemon log, and Linux ACL enforcement untested
+on the exact platform CI runs on. **Lesson: a security-and-correctness gauntlet
+reviews the DIFF; it does not review OPERATIONAL REALITY (restart/upgrade/skew,
+resource lifetime over long uptime, cross-platform test coverage). When a change
+converts a short-lived process into a persistent one, run a dedicated
+operational/lifecycle pass — the diff reviews will pass it clean and miss the
+class entirely.**
+
+### 4. The version-skew fix: absence-as-signal beats message-matching
+The stale-daemon-after-upgrade footgun was closed by adding `agentVersion` to
+`handshake.ok` and detecting skew by its ABSENCE (an old daemon omits it) rather
+than matching the opaque "capability does not permit" error text. Absence is a
+wording-independent, structural signal; matching the error string would couple
+the fix to the very text it exists to suppress. Reverse-skew (old client, new
+daemon) is safe because the response decoder was never extra-key-strict, so an
+old client silently ignores the new field — verified against the base commit.
