@@ -1,19 +1,25 @@
 # @conduithq/cli
 
-The minimal `conduit` command (spec §17 step 3). Most subcommands are thin
-wrappers over the same SDK pipeline and security boundary the `/mcp` server
-uses. `conduit key` is the exception: `generate` is CLI-resident logic
-(SecretBox + raw fs, no sdk seam), and `rotate`'s orchestration (backup,
-staging, promotion, crash recovery) lives in the CLI too — only the re-seal
-transaction itself is delegated to the sdk.
+The minimal `conduit` command (spec §17 step 3).
 
-| Command | What it does | Seam it calls |
+**Most subcommands open no database.** A background daemon owns
+`~/.conduit/conduit.db`, and `serve`, `add-mcp` and `approvals` are thin
+clients of it over a Unix socket, auto-starting one if none is running. See
+[The daemon](../mcp/README.md#the-daemon) for lifecycle, stopping, and the
+refusals you may see.
+
+`conduit key` is the deliberate exception: it still opens the store directly,
+because rotation is stop-first and cannot ask the daemon to re-encrypt the
+database out from under itself. It excludes the daemon with a kernel lock
+instead (see [Rotation walkthrough](#rotation-walkthrough)).
+
+| Command | What it does | How it reaches the store |
 | --- | --- | --- |
-| `conduit serve` | Runs the stdio MCP server (identical to `conduit-mcp`). | `runStdioServer` (`@conduithq/mcp`) |
-| `conduit add-mcp` | Onboards or re-syncs an upstream MCP source. | `provisionSource` (`@conduithq/sdk`) |
-| `conduit approvals list\|approve\|deny` | The human approval queue. | `listPaused` + `createApprovalRuntime` |
-| `conduit key generate` | Mints the master key. | CLI-resident (SecretBox + fs; no sdk seam) |
-| `conduit key rotate` | Rotates the master key. | CLI-resident orchestration; re-seal via `reencryptSecrets` (`@conduithq/sdk`) |
+| `conduit serve` | Runs the stdio MCP server (identical to `conduit-mcp`). | Daemon client (`execute`, `check_execution` reads) |
+| `conduit add-mcp` | Onboards or re-syncs an upstream MCP source. | Daemon client (`source.provision`) — the credential-bearing fetch runs daemon-side |
+| `conduit approvals list\|approve\|deny` | The human approval queue. | Daemon client (`approvals.list`, `approvals.resume`) |
+| `conduit key generate` | Mints the master key. | Direct store, under the maintenance lock |
+| `conduit key rotate` | Rotates the master key. | Direct store, under the maintenance lock; re-seal via `reencryptSecrets` (`@conduithq/sdk`) |
 
 Nothing is published to npm yet — run the built file directly:
 `node <abs path>/packages/cli/dist/bin.js <command>` (build with `npm run build`
@@ -37,17 +43,24 @@ in this package). `--help` and `--version` are available at the top level.
    conduit add-mcp --url https://mcp.example.com/mcp --namespace github --prefix github.acme.prod
    ```
 
-   `add-mcp` fetches the upstream's `tools/list` first (5s timeout) and writes
-   NOTHING unless the fetch succeeds — a dead upstream leaves zero rows. On
-   success it prints a risk-class count summary (e.g.
+   The **daemon** fetches the upstream's `tools/list` first (5s timeout) and
+   writes NOTHING unless the fetch succeeds — a dead upstream leaves zero
+   rows. The CLI itself never opens the store, never performs the fetch, and
+   never sees a stored credential: it sends the request and renders the
+   answer. On success it prints a risk-class count summary (e.g.
    `seeded 12 tools for connection github.acme.prod (namespace github): 8 safe (auto-allow), 3 review (approval), 1 destructive (approval)`),
    stating the fail-closed §10.2 policy defaults. No policy rows are written.
 
    - **Credential (optional):** supply it via the `CONDUIT_ADD_SECRET` env
-     var — never a flag (keeps it out of argv and shell history). It is
-     SecretBox-encrypted at rest and never appears in any output. Re-running
-     `add-mcp` without `CONDUIT_ADD_SECRET` PRESERVES an existing credential;
-     `--clear-credential` is the only deliberate deauth.
+     var — never a flag (keeps it out of argv and shell history). It travels
+     once from the CLI to the daemon, which performs the authenticated fetch
+     and seals it at rest; no response field and no log line ever carries it
+     back. Re-running `add-mcp` without `CONDUIT_ADD_SECRET` PRESERVES an
+     existing credential; `--clear-credential` is the only deliberate deauth.
+     A re-sync reuses the stored credential **only when the `--url` is
+     unchanged** — retargeting to a new url while a credential exists is
+     refused outright (see Re-sync below), because a stored secret is bound
+     to the host it was issued for and is never sent to a different one.
    - **Re-sync:** re-running with the same `--url` refreshes the tool catalog
      (upstream adds/removes picked up). Changing `--url` or `--prefix` for an
      existing namespace is refused unless you pass `--replace` — retargeting
@@ -111,6 +124,11 @@ in this package). `--help` and `--version` are available at the top level.
    - If the approved script pauses again on a NEW approval (chained
      `require_approval` calls), the CLI says so, names the tool waiting, and
      points you back to `approvals list`.
+   - **If the daemon connection drops after your decision was sent**, the
+     outcome is genuinely unknown — it may or may not have applied. The CLI
+     says so, prints no `approved`/`denied` line, and exits non-zero. Do not
+     retry it: run `conduit approvals list` to see whether the execution is
+     still awaiting a decision. A retried decision could apply a second time.
 
    This replaces the interim `scripts/approve-demo.mjs` flow.
 
@@ -118,20 +136,26 @@ in this package). `--help` and `--version` are available at the top level.
 
 Shared with `@conduithq/mcp` (one `resolveEnv` implementation).
 
-**Which process reads them depends on the command.** `conduit serve` opens no
-database: the **daemon** owns `~/.conduit/conduit.db` and `serve` reaches it
-over a Unix socket, so on that path these variables belong to the daemon's
-environment (constructed, never inherited — every `CONDUIT_*` is stripped when
-a client auto-starts one). The direct-store commands (`approvals`, `add-mcp`,
-`key`) still read them from their own environment.
+**Which process reads them depends on the command**, and after the daemon
+conversion the answer is simpler than it used to be: **`conduit key` is the
+only command that still reads `CONDUIT_DB` / `CONDUIT_MASTER_KEY` from its own
+environment**, because it is the only one that still opens the database
+directly (deliberately — rotation is stop-first, see below).
+
+`serve`, `approvals` and `add-mcp` are all **daemon clients**: they open no
+store, and the daemon reads these variables instead. A client's environment
+does not reach an auto-started daemon at all — the daemon's environment is
+*constructed*, so every `CONDUIT_*` is stripped. To set one for the daemon,
+start it by hand (`conduit-mcp --daemon`) with the variable in its own
+environment.
 
 | Var | Meaning | Default |
 | --- | --- | --- |
-| `CONDUIT_DB` | Path to the SQLite database file. **Refused by `conduit serve`**: a client whose environment sets it gets a typed `refused-custom-db` handshake refusal and exits non-zero, because the daemon serves exactly the default database (§9.3). Unset it for `serve`; it still applies to `approvals`, `add-mcp` and `key`. Node does not expand `~` — use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
-| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. **Not read by `serve`** — it opens no store, and a client's value never transfers to an auto-started daemon; set it for a daemon you start by hand, or use the key file. Still read by `approvals`, `add-mcp` and `key`. Malformed values fail startup non-zero. | optional when `~/.conduit/master-key` exists (env overrides file) |
-| `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only.** For `serve` it belongs to the **daemon**, which runs the sandbox and makes the upstream calls (a client's value does not transfer; setting it on the client prints a stderr warning saying so). For `approvals approve`, which still resumes in-process, it applies directly. | off (fail-closed; §9.3) |
-| `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. | `259200000` (72 hours) |
-| `CONDUIT_ADD_SECRET` | `add-mcp` only: the upstream credential to store for this source. Read from env, never a flag; never echoed. | none (optional — unauthenticated sources are legitimate) |
+| `CONDUIT_DB` | Path to the SQLite database file. **Read only by `conduit key`.** `serve`/`approvals`/`add-mcp` reach the daemon, which serves exactly the default database (§9.3) and discards any inherited value — a `serve` client whose environment sets it gets a typed `refused-custom-db` handshake refusal and exits non-zero, and `key rotate` refuses outright when it is set. Node does not expand `~` — use an absolute path. | `~/.conduit/conduit.db`, resolved via `homedir()` (created on first run, directory mode `0700`) |
+| `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. **Read by the daemon and by `conduit key`** — not by `serve`, `approvals` or `add-mcp`, none of which open a store. A client's value never transfers to an auto-started daemon; set it for a daemon you start by hand, or use the key file. `key generate` and `key rotate` both refuse when it is set. Malformed values fail startup non-zero. | optional when `~/.conduit/master-key` exists (env overrides file) |
+| `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only.** It belongs to the **daemon**, which runs the sandbox and makes every upstream call — including the replay behind `approvals approve`, which no longer resumes in-process. Setting it on a `serve` client prints a stderr warning saying it does not transfer. | off (fail-closed; §9.3) |
+| `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. Read by whichever process runs the execution — the daemon. | `259200000` (72 hours) |
+| `CONDUIT_ADD_SECRET` | `add-mcp` only: the upstream credential to store for this source. Read from the CLI's env and forwarded to the daemon in the provisioning request — the one secret that legitimately crosses client→daemon, since it is the operator supplying their own data. Never a flag, never echoed back. | none (optional — unauthenticated sources are legitimate) |
 
 ## `conduit key`
 
@@ -169,17 +193,38 @@ Next steps:
 
 ### Rotation walkthrough
 
-Rotation is **stop-first**: every conduit process and MCP client must be
-stopped before you run it. This is an operator obligation, not something
-`rotate` verifies for you — the write-lock preflight refuses an ACTIVELY
-LOCKING process (one mid-transaction against the db right now), but it
-cannot detect an idle client that merely holds a stale in-memory copy of the
-old key and will resume using it after rotation completes. Stopping
-everything first is the only way to guarantee no process is left holding a
-stale key.
+Rotation is **stop-first**, and this is now enforced by the kernel rather
+than merely asked of you. `rotate` takes the **maintenance lock
+exclusively** for its whole run. A live daemon holds that same lock SHARED
+for its entire lifetime, so the two cannot overlap in either order:
 
-1. **Stop clients.** Quit/stop every MCP client and any `conduit serve` /
-   `conduit-mcp` process pointed at the default db.
+- **Daemon running → rotate refuses**, immediately and non-blocking, having
+  read and written nothing:
+
+  ```
+  [ConduitKey] rotate refused: another process owns ~/.conduit — the maintenance lock is held. Last acquired by daemon (pid 4711) at 2026-08-16T12:04:00.000Z (may be stale). rotate is stop-first: stop every conduit process and MCP client (the daemon exits on SIGTERM), then re-run. Nothing was read or written.
+  ```
+
+- **Rotation running → a starting daemon exits** `rotation in progress`
+  (exit code 4), and clients fail fast rather than spinning. Once rotation
+  releases the lock, the next request starts a daemon normally.
+
+The holder line is a lead, not a verdict — hence "may be stale". A daemon
+that was SIGKILLed leaves its row behind, so the pid named may already be
+gone.
+
+This replaces the old write-lock preflight, which asked "is the database
+busy right now?" — a liveness *query*, and one that could not close the
+window in which an unrelated client auto-started a daemon between the check
+and the re-seal. The lock closes it by construction.
+
+What the lock still cannot do is reach *inside* an already-running process:
+an MCP client holding a stale in-memory copy of the old key is not a
+database writer, so stopping your clients remains an operator obligation.
+
+1. **Stop clients and the daemon.** Quit every MCP client, then stop the
+   daemon with SIGTERM (`pkill -f 'bin.js --daemon'`). It drains and exits 0.
+   If you skip this, `rotate` refuses and names the holder — no harm done.
 2. **Rotate:**
 
    ```bash
@@ -190,7 +235,15 @@ stale key.
    transaction, backs up the old key to `master-key.bak`, promotes the new
    key to `master-key` in place, and prints how many secrets were re-sealed.
 3. **Restart clients.** Any process started before rotation still holds the
-   old key in memory and must be restarted.
+   old key in memory and must be restarted. The next client request
+   auto-starts a fresh daemon, which reads the new key.
+
+If rotation reports the database is locked while it holds the maintenance
+lock, the writer is **not** a conduit daemon (no daemon can be running) —
+find and stop that process, then re-run.
+
+`conduit key generate` sits behind the same lock, because its check for
+already-sealed rows inspects the same database.
 
 `rotate` refuses for env-managed keys (`CONDUIT_MASTER_KEY` set) and for
 custom `CONDUIT_DB` paths — see "Env-key and custom-path installs" below.
@@ -271,7 +324,9 @@ sqlite3 ~/.conduit/conduit.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 ```
 
 Only run this against a stopped db — a live writer can make `VACUUM` block or
-contend for the write lock.
+contend for the write lock. Stop the daemon (SIGTERM) first; unlike `rotate`,
+this raw `sqlite3` invocation takes no maintenance lock and nothing will
+refuse on your behalf.
 
 ### Env-key and custom-`CONDUIT_DB` installs
 
@@ -297,14 +352,18 @@ alongside the db.
   normalize. Fix the upstream (or the URL) and re-run; the command is
   idempotent.
 - **Egress blocked on `approve`.** Approvals compose the same fail-closed
-  §9.3 boundary as the server. The agent-visible error deliberately does not
-  name the override. For a local/demo upstream, set
-  `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1` in the env of the process doing the
-  approving (and of `serve`).
-- **Tools don't appear in the client after `add-mcp`.** The server hydrates
-  its catalog per request, but most MCP clients only load servers at startup —
-  restart the client. For deeper checks, `conduit-mcp --doctor` validates the
-  key/db/catalog without a client restart loop.
+  §9.3 boundary as the server, and for the same reason: the resumed replay
+  runs **in the daemon**, not in the `approvals` process. The agent-visible
+  error deliberately does not name the override. For a local/demo upstream,
+  set `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS=1` in the **daemon's** environment
+  and start it by hand — setting it on the `approvals` or `serve` client has
+  no effect.
+- **Tools don't appear in the client after `add-mcp`.** A source added
+  through one daemon client is visible to every other one with no restart —
+  the daemon is the sole owner and caches nothing across requests. So the
+  server itself needs no restart; but most MCP *clients* only load servers at
+  startup, so restart the client. For deeper checks, `conduit-mcp --doctor`
+  asks the running daemon for its source count without a client restart loop.
 - **A call timed out but may have finished.** Pass a `requestKey` to
   `execute` so the outcome is recoverable via `check_execution` even if the
   id delivery was lost (see `packages/mcp/README.md`).
@@ -313,6 +372,7 @@ alongside the db.
   is a loud startup error, not a surprise on the first tool call that
   resolves a credential. See `conduit key` above for rotation and recovery.
 - **Back up the database before upgrading.** The store is a single SQLite
-  file at `CONDUIT_DB` — copy it, and `~/.conduit/master-key` alongside it
-  (see "Backup rule" under `conduit key` above), before upgrading or running
-  a migration.
+  file at `~/.conduit/conduit.db` — copy it, and `~/.conduit/master-key`
+  alongside it (see "Backup rule" under `conduit key` above), before
+  upgrading or running a migration. Stop the daemon first so you copy a
+  quiesced file.

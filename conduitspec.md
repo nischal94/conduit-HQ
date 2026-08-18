@@ -663,11 +663,19 @@ milestone, not deferred with the auth library.
 
 **In v1 (build):**
 
-- **Durable background service** — owns the DB, execution manager, caches, and the
-control API. Decide the process-ownership model first: one daemon owns the store; the stdio
-`/mcp` surface is a thin local client of it (or an explicitly safe shared-store contract).
-A console over a throwaway foreground runtime that dies between agent sessions (and strands §5.5 paused
-approvals) is not a product.
+- **Durable background service. ✅ BUILT** (2026-08-16 design, build sequence step 2 —
+daemon ownership). Owns the DB, execution manager, caches, and the control API. The process-ownership
+model is **decided and shipped**: `conduitd` is the sole writer of
+`~/.conduit/conduit.db`, and every other surface is a thin local client of it over a Unix
+socket — the stdio `/mcp` server (`conduit serve`), `conduit approvals`,
+`conduit add-mcp`, and the default `--doctor`. The shared-store alternative was
+rejected: singleton enforcement, the crash-terminal sweep, and the credential boundary are all
+kernel-lock properties a shared store cannot provide. Clients auto-start a daemon when none is running
+(spawn budget of one, environment constructed rather than inherited); stopping is SIGTERM. Exclusion
+with `conduit key rotate` is the kernel maintenance lock rather than a liveness probe (§3.4
+exception: rotate stays direct-db). The §17 startup-reload caveat closes here — a source added through
+one client is visible to another with no restart. Pinned by the §17 rows in
+`INVARIANTS.md`.
 - **Typed control-plane API + hot-reload** — the console's own local HTTP API (distinct
 from the `/mcp` transport). It MUST invalidate/reload so a source saved in the console is
 visible to the running server without a restart (the §17 startup-reload caveat becomes a product bug
@@ -699,10 +707,10 @@ hosted/remote-agent need — keep its route stack independent so building the co
 **auth library** (§18 — moves to Phase 4/Cloud); input-aware policy rules (Phase 2, §10.3);
 trace export + retention/GC (Phase 2/4); desktop (Phase 3, cut); Cloud (4); self-host (5).
 
-**Build sequence:** (1) verify credential key lifecycle → (2) decide daemon ownership →
+**Build sequence:** (1) verify credential key lifecycle ✅ → (2) decide daemon ownership ✅ →
 (3) typed control API + hot-reload → (4) request-authenticity floor → (5) console onboarding /
 connections / policy / approvals / Connect → (6) read-only trace viewer → (7) service install / restart
-/ upgrade / recovery. Each piece is load-bearing.
+/ upgrade / recovery. Each piece is load-bearing. **Next: step 3.**
 
 **Phase 1 — Local runtime + CLI + MCP**
 
