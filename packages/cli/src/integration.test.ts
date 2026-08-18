@@ -6,7 +6,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { EXIT_ALREADY_RUNNING } from "@conduithq/mcp";
-import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
+import { type ConduitStore, normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
@@ -475,16 +475,50 @@ describe("ring-2: conduit serve (spawned CLI bin)", () => {
 });
 
 describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
-  const addMcpDbPath = join(scratch, "add-mcp-it.db"); // cleaned with scratch in afterAll
+  /**
+   * Its own state directory, and therefore its own daemon and database.
+   *
+   * Since Task 8 `add-mcp` opens no database: it is a daemon client on the
+   * `add-mcp` capability row, and the daemon performs the credential-bearing
+   * onboarding fetch on its behalf (§3.3.1). So the fixture selects a DAEMON
+   * — via `--state-dir` — rather than a db path via `CONDUIT_DB`, which a
+   * client is refused for outright at handshake (§9.3 item 3). The db path
+   * below is derived the way `daemonPaths` derives it, and is used ONLY for
+   * the post-hoc store reads described on `readAddMcpStore`.
+   */
+  const addMcpStateDir = mkdtempSync(join(tmpdir(), "conduit-cli-it-add-"));
+  chmodSync(addMcpStateDir, 0o700);
+  const addMcpDbPath = join(addMcpStateDir, "conduit.db");
 
+  /** This block's own daemon, stopped before any direct store read. */
+  let addMcpDaemon: ChildProcess | undefined;
+
+  beforeAll(async () => {
+    addMcpDaemon = await startDaemonAt(addMcpStateDir);
+  }, 30_000);
+
+  afterAll(() => {
+    rmSync(addMcpStateDir, { recursive: true, force: true });
+  });
+
+  /**
+   * Runs `conduit add-mcp` against this block's daemon.
+   *
+   * `serveEnv()` for the same reason `runApprovals` uses it: it is
+   * `baseEnv()` minus `CONDUIT_DB`, and a client carrying that variable is
+   * refused at handshake rather than served against a database it did not
+   * choose.
+   */
   async function runAddMcp(
     args: string[],
     env: Record<string, string> = {},
   ): Promise<{ stdout: string; stderr: string; exitCode: number }> {
     try {
-      const { stdout, stderr } = await execFileAsync("node", [cliBinPath, "add-mcp", ...args], {
-        env: { ...process.env, ...baseEnv(), CONDUIT_DB: addMcpDbPath, ...env },
-      });
+      const { stdout, stderr } = await execFileAsync(
+        "node",
+        [cliBinPath, "add-mcp", ...args, "--state-dir", addMcpStateDir],
+        { env: { ...process.env, ...serveEnv(), ...env } },
+      );
       return { stdout, stderr, exitCode: 0 };
     } catch (error) {
       const err = error as { stdout?: string; stderr?: string; code?: number };
@@ -492,13 +526,47 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
     }
   }
 
-  async function openAddMcpDb() {
+  /**
+   * Reads this block's store directly, AFTER stopping the daemon that owns
+   * it — the assertions below are about rows that must (or must not) exist,
+   * and there is no RPC that reports "no source was written under this
+   * namespace" as such. (`catalog.listing` reports advertised connections,
+   * which cannot distinguish "nothing was written" from "written but not
+   * advertisable", so it would weaken the zero-rows assertion.)
+   *
+   * The stop is not incidental. Opening the database beside a live daemon
+   * would make this test the SECOND writer against a path the daemon holds
+   * — precisely the dual ownership §17 exists to eliminate, and something a
+   * test must not model just because it is convenient. SIGTERM rather than
+   * SIGKILL: the daemon drains, releases both locks and removes its
+   * endpoint, so what is read here is a settled database rather than one
+   * abandoned mid-transaction.
+   *
+   * Idempotent, and it RESTARTS the daemon afterwards, so each test can
+   * call it at its own end without ordering itself against its neighbours.
+   * The restart is what keeps these cases independent: `startDaemonAt`
+   * against a released lifecycle lock is an ordinary cold start.
+   *
+   * Called at the END of a test — every daemon-mediated command it needs
+   * must already have run.
+   */
+  async function readAddMcpStore<T>(read: (store: ConduitStore) => Promise<T>): Promise<T> {
+    const daemon = addMcpDaemon;
+    if (daemon !== undefined && daemon.exitCode === null) {
+      const exited = new Promise<void>((resolve) => daemon.once("exit", () => resolve()));
+      daemon.kill("SIGTERM");
+      await exited;
+    }
+    addMcpDaemon = undefined;
     const client = createClient({ url: `file:${addMcpDbPath}` });
-    const store = await openSqliteStore({
-      client,
-      secretBox: await SecretBox.fromKeyBytes(masterKey),
-    });
-    return { store, close: () => client.close() };
+    try {
+      return await read(
+        await openSqliteStore({ client, secretBox: await SecretBox.fromKeyBytes(masterKey) }),
+      );
+    } finally {
+      client.close();
+      addMcpDaemon = await startDaemonAt(addMcpStateDir);
+    }
   }
 
   it("writes rows against a stub upstream, and re-syncs on a second run against the same url", async () => {
@@ -517,16 +585,10 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
       /seeded \d+ tools for connection github\.acme\.add \(namespace ghadd\):/,
     );
 
-    {
-      const { store, close } = await openAddMcpDb();
-      const source = await store.sources.get("src_ghadd");
-      expect(source?.location).toBe(upstreamUrl);
-      const tools = await store.tools.list("ghadd");
-      expect(tools.length).toBeGreaterThan(0);
-      close();
-    }
-
     // Second run against the SAME url: idempotent re-sync, still 0-exit.
+    // Both runs go through the daemon, so this also exercises the Task 8
+    // path where the daemon reveals and reuses whatever credential it holds
+    // for an unchanged url — without that plaintext ever reaching the CLI.
     const second = await runAddMcp([
       "--url",
       upstreamUrl,
@@ -536,13 +598,20 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
       "github.acme.add",
     ]);
     expect(second.exitCode).toBe(0);
+    expect(second.stdout).toMatch(
+      /seeded \d+ tools for connection github\.acme\.add \(namespace ghadd\):/,
+    );
 
-    {
-      const { store, close } = await openAddMcpDb();
-      const tools = await store.tools.list("ghadd");
-      expect(tools.length).toBeGreaterThan(0);
-      close();
-    }
+    // BOTH runs' effects, read once at the end. The original test read the
+    // store between the two runs; since Task 8 the database belongs to a
+    // daemon, so the read happens after it settles rather than beside it.
+    // The assertion is unchanged: the source points at the real upstream and
+    // the namespace carries tools fetched from it, after the re-sync.
+    await readAddMcpStore(async (store) => {
+      const source = await store.sources.get("src_ghadd");
+      expect(source?.location).toBe(upstreamUrl);
+      expect((await store.tools.list("ghadd")).length).toBeGreaterThan(0);
+    });
   });
 
   it("INVARIANT /cli add-mcp: a dead url exits non-zero and writes 0 rows", async () => {
@@ -556,12 +625,21 @@ describe("ring-2: conduit add-mcp (spawned CLI bin)", () => {
     ]);
 
     expect(result.exitCode).not.toBe(0);
+    // The daemon performs the fetch since Task 8, but the operator-facing
+    // line is unchanged: the refusal travels back as an `invalid` error
+    // frame and the CLI prints its message verbatim.
     expect(result.stderr).toMatch(/upstream unreachable/);
 
-    const { store, close } = await openAddMcpDb();
-    const source = await store.sources.get("src_ghdead");
-    expect(source).toBeUndefined();
-    close();
+    await readAddMcpStore(async (store) => {
+      // Zero rows — the point of the invariant. Checked at every table
+      // `provisionSource` touches, not just `sources`: the guarantee is that
+      // the atomic chain left NOTHING behind, and a source-only check would
+      // pass against a partially-applied write.
+      expect(await store.sources.get("src_ghdead")).toBeUndefined();
+      expect(await store.integrations.getByNamespace("ghdead")).toBeUndefined();
+      expect(await store.connections.getByPrefix("github.acme.dead")).toBeUndefined();
+      expect(await store.tools.list("ghdead")).toEqual([]);
+    });
   });
 });
 
