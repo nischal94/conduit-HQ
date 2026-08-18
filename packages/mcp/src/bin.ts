@@ -3,11 +3,11 @@ import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
 import { takeStateDir } from "./args.js";
-import { DaemonUnavailable, daemonRequest } from "./daemon/client.js";
+import { DaemonUnavailable, daemonRequest, isDefaultStateDir } from "./daemon/client.js";
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
-import { DEFAULT_CONDUIT_DIR, DEFAULT_KEY_FILE, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
+import { DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
 import { READ_DEADLINE_MS } from "./server.js";
 
@@ -30,10 +30,13 @@ Env: CONDUIT_DB — REFUSED by the daemon-backed server AND by --doctor (both
   execution (the daemon, on the server path).
 Flags: --version · --help · --daemon (run the store-owning daemon; stop with
   SIGTERM/SIGINT)
-· --doctor — ask the running daemon for its health (auto-starts one if absent)
-· --doctor --offline — diagnose a SICK install: takes the maintenance lock
-  exclusively (so it refuses beside a live daemon or a rotation) and inspects
-  key + files WITHOUT opening the database`;
+· --doctor — ask the running daemon for its health (auto-starts one if absent);
+  targets the DEFAULT state directory only (an auto-started daemon runs against
+  it), so it refuses a custom --state-dir — use --offline for that
+· --doctor --offline [--state-dir <path>] — diagnose a SICK install: takes the
+  maintenance lock exclusively (so it refuses beside a live daemon or a
+  rotation) and inspects key + files WITHOUT opening the database; honors
+  --state-dir since it is dir-scoped and never spawns`;
 
 /**
  * The default `--doctor`: ask the DAEMON about its own health (§9 item 1).
@@ -58,7 +61,26 @@ Flags: --version · --help · --daemon (run the store-owning daemon; stop with
  * takes. A daemon that cannot start fails here loudly, which is the
  * finding.
  */
-async function doctor(): Promise<number> {
+async function doctor(stateDir: string): Promise<number> {
+  // `--state-dir` is REFUSED on the daemon-backed doctor, and the refusal is
+  // the same F5 boundary the client enforces (Codex ARC F5). This path
+  // auto-starts a daemon when none is running, and the production spawn can
+  // only ever start the DEFAULT-dir daemon — so honoring a custom dir here
+  // would auto-start a default daemon while querying the custom directory,
+  // reporting on a daemon nobody asked about. A custom-dir diagnosis is
+  // exactly what `--offline` is for (it is dir-scoped and never spawns), or
+  // the operator can ask a by-hand daemon directly. Decided coherently with
+  // the auto-start rule: the one command that spawns refuses a custom dir.
+  if (!isDefaultStateDir(stateDir)) {
+    console.error(
+      `[conduitd] --doctor cannot target a custom state directory (${stateDir}): the daemon-backed ` +
+        "doctor auto-starts a daemon, and an auto-started daemon runs against the DEFAULT directory, " +
+        "not this one. Diagnose the custom directory offline (no daemon, no spawn): " +
+        `conduit-mcp --doctor --offline --state-dir ${stateDir} — or start a daemon there by hand ` +
+        `(conduit-mcp --daemon --state-dir ${stateDir}) and inspect it directly.`,
+    );
+    return 1;
+  }
   try {
     // Captured from the handshake, which is where the daemon reports its
     // effective non-secret configuration (§9 item 3). The egress setting
@@ -67,7 +89,10 @@ async function doctor(): Promise<number> {
     // likely things an operator is actually debugging.
     let daemonConfig: { dbPath: string; allowPrivateEgress: boolean } | undefined;
     const response = await daemonRequest({
-      stateDir: DEFAULT_CONDUIT_DIR,
+      // Guaranteed the canonical default by the refusal above; passed
+      // through rather than re-deriving the constant so the one source of
+      // the directory is the parsed argument.
+      stateDir,
       onHandshake: (info) => {
         daemonConfig = info;
       },
@@ -94,7 +119,7 @@ async function doctor(): Promise<number> {
       // side effects to duplicate), but it is still a failed diagnosis.
       console.error(
         "daemon health could not be determined: the connection dropped before the daemon answered. " +
-          `Re-run; if it persists, see ${join(DEFAULT_CONDUIT_DIR, "conduitd.log")}`,
+          `Re-run; if it persists, see ${join(stateDir, "conduitd.log")}`,
       );
       return 1;
     }
@@ -163,8 +188,14 @@ async function doctor(): Promise<number> {
  * output: it cannot verify the key actually DECRYPTS the database,
  * because proving that requires opening the store and checking the canary.
  */
-async function doctorOffline(): Promise<number> {
-  const paths = daemonPaths(DEFAULT_CONDUIT_DIR);
+async function doctorOffline(stateDir: string): Promise<number> {
+  const paths = daemonPaths(stateDir);
+  // The key file is a property of the state directory, exactly as the db and
+  // the locks are (`daemonPaths`). Honoring `--state-dir` here means
+  // inspecting THAT directory's key, not the default's — the whole point of
+  // an offline, dir-scoped diagnosis. On the default directory this equals
+  // `DEFAULT_KEY_FILE`.
+  const keyFile = join(stateDir, "master-key");
   // One reading of "the state directory isn't there", shared with the two
   // `key` subcommands: nothing can hold a lock in a directory that does
   // not exist, so `no-state-dir` proceeds to report on the fresh install
@@ -190,7 +221,7 @@ async function doctorOffline(): Promise<number> {
     // opens no database and creates nothing.
     let keyOk = false;
     try {
-      const resolved = resolveEnv(process.env);
+      const resolved = resolveEnv(process.env, { keyFilePath: keyFile });
       console.error(`ok: key decodes (32 bytes), source: ${resolved.keySource}`);
       console.error(
         `egress opt-in: ${resolved.allowPrivateEgress ? "ENABLED (unsafe — dev/demo only)" : "off (fail-closed default)"}`,
@@ -214,7 +245,7 @@ async function doctorOffline(): Promise<number> {
     let missing = false;
 
     for (const [label, path] of [
-      ["key file", DEFAULT_KEY_FILE],
+      ["key file", keyFile],
       ["database", paths.db],
     ] as const) {
       if (!existsSync(path)) {
@@ -266,9 +297,27 @@ async function main(): Promise<void> {
     return;
   }
   if (arg === "--doctor") {
+    // `--state-dir <path>` is parsed on the doctor path too, through the
+    // SAME shared parser both bins use (`args.ts`) — a second, textually
+    // different reading of the flag is exactly the drift that parser
+    // exists to remove. Before this, `--doctor --state-dir /custom`
+    // silently IGNORED the flag and diagnosed (and auto-started) the
+    // default, the F5 gap on the doctor path.
+    const parsed = takeStateDir("[conduitd]", process.argv);
+    if ("error" in parsed) {
+      console.error(parsed.error.trimEnd());
+      process.exitCode = 1;
+      return;
+    }
+    const stateDir = parsed.stateDir ?? DEFAULT_CONDUIT_DIR;
     // `--offline` is scanned rather than positionally required so
-    // `--doctor --offline` reads naturally in either order.
-    process.exitCode = process.argv.includes("--offline") ? await doctorOffline() : await doctor();
+    // `--doctor --offline` reads naturally in either order. Offline is
+    // dir-scoped and never spawns, so it HONORS a custom `--state-dir`;
+    // the daemon-backed doctor auto-starts and therefore REFUSES one (see
+    // `doctor`), keeping the boundary coherent with the client's F5 gate.
+    process.exitCode = parsed.rest.includes("--offline")
+      ? await doctorOffline(stateDir)
+      : await doctor(stateDir);
     return;
   }
   if (arg === "--daemon") {

@@ -200,10 +200,13 @@ describe("daemonRequest — the §3.5 decision table", () => {
   );
 
   it(
-    "autoStart defaults to on — an unset autoStart still spawns for the default path (F5 regression guard)",
+    "autoStart defaults to on — an injected spawn seam auto-starts without an explicit autoStart (F5 regression guard)",
     async () => {
-      // The boundary must not accidentally disable the common path: leaving
-      // autoStart unset (the default-dir caller) still auto-starts.
+      // The boundary must not accidentally disable the common path. An
+      // injected `spawn` seam is a caller that has taken explicit ownership
+      // of WHERE the daemon starts (production's zero-arg `spawnDaemon`
+      // reaches this only for the default dir), so a spawn is permitted
+      // through it with autoStart left unset.
       const stateDir = newStateDir();
       const response = await daemonRequest({
         stateDir,
@@ -213,6 +216,57 @@ describe("daemonRequest — the §3.5 decision table", () => {
         spawn: testSpawn(),
       });
       expect(response.kind).toBe("result");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: auto-start targets only the canonical default state directory — a production request (no injected spawn) on a CUSTOM dir REFUSES and spawns nothing (F5 structural)",
+    async () => {
+      // The structural half of F5: the boundary is a property of
+      // `daemonRequest`, not of caller discipline. With NO injected spawn
+      // seam (the production path) and a custom `stateDir`, the request must
+      // refuse at row 4 with the by-hand command — even with autoStart unset
+      // and even with autoStart:true, because the zero-argument production
+      // `spawnDaemon` can only ever start the DEFAULT-dir daemon, which would
+      // answer nobody. The refusal is checked for EVERY client role, since a
+      // new caller in any role must be safe without reasoning about the gate.
+      for (const role of ["serve", "approvals", "add-mcp"] as const) {
+        const stateDir = newStateDir();
+        // Row 4: nothing running, no lock held.
+        expect(await probeShared(daemonPaths(stateDir).lifecycleLockDb)).toBe("free");
+
+        // autoStart deliberately UNSET — the default must be safe.
+        const err = await daemonRequest({
+          stateDir,
+          role,
+          request: { kind: "search", query: "anything" },
+          deadlineMs: 30_000,
+          // No `spawn` seam: this is the production path.
+        }).catch((e: unknown) => e);
+
+        expect(err).toBeInstanceOf(DaemonUnavailable);
+        const message = (err as DaemonUnavailable).message;
+        expect(message).toContain(`conduit-mcp --daemon --state-dir ${stateDir}`);
+        expect(message).toContain("auto-start is disabled for custom directories");
+        // No daemon was ever started against this custom dir — no socket
+        // appeared, and no default-dir daemon was misdirected here.
+        expect(existsSync(daemonPaths(stateDir).socket)).toBe(false);
+
+        // And autoStart:true cannot OPEN a spawn the gate forbids for a
+        // custom production dir — the child would still derive the wrong dir.
+        const errForced = await daemonRequest({
+          stateDir,
+          role,
+          request: { kind: "search", query: "anything" },
+          deadlineMs: 30_000,
+          autoStart: true,
+        }).catch((e: unknown) => e);
+        expect(errForced).toBeInstanceOf(DaemonUnavailable);
+        expect(existsSync(daemonPaths(stateDir).socket)).toBe(false);
+
+        rmSync(stateDir, { recursive: true, force: true });
+      }
     },
     TIMEOUT,
   );

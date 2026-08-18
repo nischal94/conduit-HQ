@@ -1,10 +1,16 @@
-import { buildExecuteTool } from "@conduithq/sdk";
+import { buildExecuteTool, type ExecutionOutcome } from "@conduithq/sdk";
 import { describe, expect, it } from "vitest";
 import {
+  CHECK_BODY_STATUSES,
   CHECK_EXECUTION_TOOL,
+  EXECUTE_STATUSES,
+  type ExecuteStatus,
   estimateDefinitionTokens,
   executionToCheckPayload,
   extendExecuteDefinition,
+  isCheckPayloadShape,
+  isExecutePayloadShape,
+  isResumePayloadShape,
   outcomeToPayload,
   pausedToListRow,
   resumeToPayload,
@@ -246,5 +252,99 @@ describe("pausedToListRow (the approvals.list projection)", () => {
 
   it("returns undefined for a corrupt paused row with no pausedOn (caller logs, never silently drops)", () => {
     expect(pausedToListRow({ ...base, status: "paused" })).toBeUndefined();
+  });
+});
+
+/**
+ * F6 — the predicates are the SINGLE SOURCE OF TRUTH the sender projections
+ * and the client guard both read.
+ *
+ * The point of these tests is not that a given arm renders some fields —
+ * that is covered above — but that EVERY status arm a sender can produce
+ * passes the SAME shape predicate the client (`client.ts`) refuses on. If a
+ * projection ever emitted an arm the guard would reject, this fails; that is
+ * what makes "single source of truth" a checked property rather than a
+ * claim. The status-set exhaustiveness (each legal member is exercised) is
+ * asserted alongside, so an added union member with no covering arm is
+ * caught here too.
+ */
+describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the client guard uses", () => {
+  const base = { id: "e", code: "1", seeds, startedAt: 1 } as const;
+
+  // One representative outcome per execute status. Every member of
+  // EXECUTE_STATUSES must appear as a key, or the set-coverage check fails.
+  const executeOutcomes = {
+    completed: { status: "completed", executionId: "e", value: { ok: true } },
+    failed: { status: "failed", executionId: "e", error: { name: "E", message: "m" } },
+    paused: {
+      status: "paused",
+      executionId: "e",
+      pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
+    },
+    expired: {
+      status: "expired",
+      executionId: "e",
+      pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
+    },
+    conflict: { status: "conflict", executionId: "e" },
+  } satisfies Record<ExecuteStatus, ExecutionOutcome>;
+
+  it("every EXECUTE_STATUSES arm of outcomeToPayload passes isExecutePayloadShape", () => {
+    // Set coverage: the fixtures name exactly the legal members.
+    expect(Object.keys(executeOutcomes).sort()).toEqual([...EXECUTE_STATUSES].sort());
+    for (const status of EXECUTE_STATUSES) {
+      const payload = outcomeToPayload(executeOutcomes[status]);
+      expect(payload.status).toBe(status);
+      expect(isExecutePayloadShape(payload)).toBe(true);
+    }
+  });
+
+  it("every EXECUTE_STATUSES arm of resumeToPayload passes isResumePayloadShape (and carries decisionApplied)", () => {
+    for (const status of EXECUTE_STATUSES) {
+      for (const decisionApplied of [true, false]) {
+        const payload = resumeToPayload({ ...executeOutcomes[status], decisionApplied });
+        expect(payload.status).toBe(status);
+        expect(payload.decisionApplied).toBe(decisionApplied);
+        expect(isResumePayloadShape(payload)).toBe(true);
+      }
+    }
+  });
+
+  it("every CHECK_BODY_STATUSES arm of executionToCheckPayload — plus not_found — passes isCheckPayloadShape", () => {
+    // not_found is the id-less arm the predicate accepts specially.
+    expect(isCheckPayloadShape(executionToCheckPayload(undefined, 10))).toBe(true);
+
+    const checkExecutions = {
+      running: { ...base, status: "running" },
+      completed: { ...base, status: "completed", endedAt: 2 },
+      failed: { ...base, status: "failed", endedAt: 2, error: { name: "E", message: "m" } },
+      // A future expiresAt keeps this arm PAUSED (a past one would present as
+      // expired — covered by the expired key below via the store status).
+      paused: {
+        ...base,
+        status: "paused",
+        pausedOn: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 5_000 },
+      },
+      expired: { ...base, status: "expired", endedAt: 2 },
+    } as const;
+    expect(Object.keys(checkExecutions).sort()).toEqual([...CHECK_BODY_STATUSES].sort());
+
+    for (const status of CHECK_BODY_STATUSES) {
+      const payload = executionToCheckPayload(checkExecutions[status], 10);
+      expect(payload.status).toBe(status);
+      expect(isCheckPayloadShape(payload)).toBe(true);
+    }
+  });
+
+  it("a representative ILLEGAL status is rejected by each predicate (the guard is membership, not merely a string)", () => {
+    const bogusExecute = { status: "bogus", executionId: "e" };
+    expect(isExecutePayloadShape(bogusExecute)).toBe(false);
+    expect(isResumePayloadShape({ ...bogusExecute, decisionApplied: true })).toBe(false);
+    expect(isCheckPayloadShape(bogusExecute)).toBe(false);
+    // A legal execute status that is NOT a legal check body status is also
+    // rejected by the check predicate — the sets are genuinely distinct.
+    expect(isCheckPayloadShape({ status: "conflict", executionId: "e" })).toBe(false);
+    // And a legal status missing the mandatory executionId is rejected.
+    expect(isExecutePayloadShape({ status: "completed" })).toBe(false);
   });
 });

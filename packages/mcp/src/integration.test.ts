@@ -817,6 +817,87 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     expect(stderr).toMatch(/--doctor/);
   });
 
+  it("INVARIANT §17: `--doctor --state-dir <custom>` REFUSES with an actionable message and never spawns (F5, doctor path)", async () => {
+    // The doctor-path half of F5. The default `--doctor` auto-starts a
+    // daemon, and the production spawn can only ever start the DEFAULT-dir
+    // daemon — so honoring a custom `--state-dir` here would diagnose (and
+    // spawn against) the wrong directory. It must refuse, pointing at the
+    // dir-scoped `--offline` mode instead. A fresh empty HOME guarantees no
+    // real daemon is anywhere near this.
+    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-doctor-custom-"));
+    const customDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-doctor-sd-"));
+    try {
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        ...baseEnv(),
+        HOME: emptyHome,
+      };
+      const failed = await execFileAsync("node", [binPath, "--doctor", "--state-dir", customDir], {
+        env,
+      }).then(
+        (ok) => ({ code: 0 as number | null, ...ok }),
+        (err: { code: number | null; stdout: string; stderr: string }) => err,
+      );
+      expect(failed.code).toBe(1);
+      expect(failed.stdout).toBe("");
+      expect(failed.stderr).toMatch(/cannot target a custom state directory/);
+      // Names the dir-scoped alternative and the custom dir itself.
+      expect(failed.stderr).toContain(`--doctor --offline --state-dir ${customDir}`);
+      // No daemon was started against the custom dir.
+      expect(existsSync(join(customDir, "conduitd.sock"))).toBe(false);
+    } finally {
+      rmSync(emptyHome, { recursive: true, force: true });
+      rmSync(customDir, { recursive: true, force: true });
+    }
+  });
+
+  it("INVARIANT §17: `--doctor --offline --state-dir <custom>` HONORS the dir — inspects THAT directory's key and db (F5, offline is dir-scoped)", async () => {
+    // Offline mode never spawns and is dir-scoped, so it honors
+    // `--state-dir`: a valid key file placed under the CUSTOM directory is
+    // resolved from there, and the db-missing finding is reported against
+    // that directory. This is the coherent counterpart to the refusal above.
+    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-offline-custom-"));
+    const customDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-offline-sd-"));
+    try {
+      chmodSync(customDir, 0o700);
+      const keyBytes = SecretBox.generateKeyBytes();
+      writeFileSync(
+        join(customDir, "master-key"),
+        `${Buffer.from(keyBytes).toString("base64")}\n`,
+        {
+          mode: 0o600,
+        },
+      );
+      const env: Record<string, string | undefined> = {
+        ...process.env,
+        // A DIFFERENT HOME with no ~/.conduit, so a resolution from the
+        // default path (the bug) would find no key and report "Missing" —
+        // the custom-dir key proves the flag was honored.
+        HOME: emptyHome,
+      };
+      delete env.CONDUIT_MASTER_KEY;
+      delete env.CONDUIT_DB;
+      const failed = await execFileAsync(
+        "node",
+        [binPath, "--doctor", "--offline", "--state-dir", customDir],
+        { env },
+      ).then(
+        (ok) => ({ code: 0 as number | null, ...ok }),
+        (err: { code: number | null; stdout: string; stderr: string }) => err,
+      );
+      // Exits 1: key resolves from the custom dir, but there is no database
+      // there — a finding, not a success.
+      expect(failed.code).toBe(1);
+      expect(failed.stderr).toMatch(/ok: key decodes \(32 bytes\), source: file/);
+      // The key file and the missing-db finding both name the CUSTOM dir.
+      expect(failed.stderr).toContain(`ok: key file present at ${join(customDir, "master-key")}`);
+      expect(failed.stderr).toContain(`missing: database at ${join(customDir, "conduit.db")}`);
+    } finally {
+      rmSync(emptyHome, { recursive: true, force: true });
+      rmSync(customDir, { recursive: true, force: true });
+    }
+  });
+
   // env.ts's resolveEnv falls back to reading `${HOME}/.conduit/master-key`
   // when CONDUIT_MASTER_KEY is absent — so a spawn env that merely deletes
   // the var still leaks the REAL key on any machine that has one. These

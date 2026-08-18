@@ -24,8 +24,27 @@ export interface PendingView {
   expiresAt: number;
 }
 
+/**
+ * The legal `status` value-sets, in ONE place and DERIVED-FROM rather than
+ * merely checked-against (Codex ARC F6). Every payload union's status field
+ * is `typeof <CONST>[number]`, so the constant is the single source of truth
+ * that BOTH ends read: the daemon's projections build these members and the
+ * client's guard (`client.ts`, via the `is*PayloadShape` predicates below)
+ * validates them. Adding a member to the union now means adding it to the
+ * constant, which the guard reads automatically — there is no second list to
+ * forget. Removing this indirection (re-inlining the literals in the
+ * interface) is what let a sender grow a new status the guard silently
+ * accepted; the `satisfies` bindings on the projection functions below make
+ * the reverse — a sender emitting a status NOT in the set — a compile error.
+ */
+export const EXECUTE_STATUSES = ["completed", "failed", "paused", "expired", "conflict"] as const;
+export type ExecuteStatus = (typeof EXECUTE_STATUSES)[number];
+
+export const CHECK_BODY_STATUSES = ["running", "completed", "failed", "paused", "expired"] as const;
+export type CheckBodyStatus = (typeof CHECK_BODY_STATUSES)[number];
+
 export interface ExecutePayload {
-  status: "completed" | "failed" | "paused" | "expired" | "conflict";
+  status: ExecuteStatus;
   executionId: string;
   result?: unknown;
   error?: ErrorEnvelope;
@@ -60,7 +79,7 @@ export type ResumePayload = ExecutePayload & { decisionApplied: boolean };
 
 /** Independent of ExecutePayload — check adds "running"/"not_found" states. */
 export interface CheckPayloadBody {
-  status: "running" | "completed" | "failed" | "paused" | "expired";
+  status: CheckBodyStatus;
   executionId: string;
   result?: unknown;
   error?: ErrorEnvelope;
@@ -254,32 +273,67 @@ function toPendingView(pending: PendingApproval): PendingView {
   return { toolName: pending.toolName, reason: pending.reason, expiresAt: pending.expiresAt };
 }
 
-export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
-  switch (outcome.status) {
-    case "completed":
-      return {
-        status: "completed",
-        executionId: outcome.executionId,
-        result: outcome.value ?? null,
-      };
-    case "failed":
-      return {
-        status: "failed",
-        executionId: outcome.executionId,
-        error: toErrorEnvelope(outcome.error),
-      };
-    case "paused":
-      return {
-        status: "paused",
-        executionId: outcome.executionId,
-        pending: toPendingView(outcome.pending),
-        message: PAUSE_MESSAGE,
-      };
-    case "expired":
-      return { status: "expired", executionId: outcome.executionId, message: EXPIRED_MESSAGE };
-    case "conflict":
-      return { status: "conflict", executionId: outcome.executionId, message: CONFLICT_MESSAGE };
+/**
+ * The runtime half of "single source of truth" (Codex ARC F6): each sender
+ * projection asserts its own output against the SAME predicate the client
+ * guard uses before returning it. The type system already makes an illegal
+ * `status` literal a compile error (the status fields derive from the
+ * constants, so a projection cannot even name a member outside the set), but
+ * that is a claim about the STATIC code; this is the dynamic invariant that
+ * the value the sender actually built passes the shape the receiver actually
+ * checks. If a future projection arm drops `executionId` or is otherwise
+ * malformed, this fails LOUDLY here — inside the daemon, at construction —
+ * rather than silently on the wire as a client-side refusal an operator must
+ * diagnose. It is a real internal-error-if-violated, never a silent pass.
+ *
+ * `guard` is passed rather than closed-over so this helper is agnostic to
+ * which predicate binds which projection; the call sites name the pairing,
+ * which is the thing under test.
+ */
+function assertProjection<T>(
+  payload: T,
+  guard: (value: unknown) => boolean,
+  projection: string,
+): T {
+  if (!guard(payload)) {
+    throw new Error(
+      `[payloads] ${projection} produced a payload its own shape predicate rejects. ` +
+        `Context: {payload: ${JSON.stringify(payload)?.slice(0, 200)}} — this is an internal ` +
+        "sender/predicate drift, not a client fault.",
+    );
   }
+  return payload;
+}
+
+export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
+  const payload = ((): ExecutePayload => {
+    switch (outcome.status) {
+      case "completed":
+        return {
+          status: "completed",
+          executionId: outcome.executionId,
+          result: outcome.value ?? null,
+        };
+      case "failed":
+        return {
+          status: "failed",
+          executionId: outcome.executionId,
+          error: toErrorEnvelope(outcome.error),
+        };
+      case "paused":
+        return {
+          status: "paused",
+          executionId: outcome.executionId,
+          pending: toPendingView(outcome.pending),
+          message: PAUSE_MESSAGE,
+        };
+      case "expired":
+        return { status: "expired", executionId: outcome.executionId, message: EXPIRED_MESSAGE };
+      case "conflict":
+        return { status: "conflict", executionId: outcome.executionId, message: CONFLICT_MESSAGE };
+    }
+  })();
+  return assertProjection(payload, isExecutePayloadShape, "outcomeToPayload");
 }
 
 /**
@@ -291,73 +345,59 @@ export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
  * `ResumePayload` for why that field is on the wire.
  */
 export function resumeToPayload(outcome: ResumeOutcome): ResumePayload {
-  return { ...outcomeToPayload(outcome), decisionApplied: outcome.decisionApplied };
+  const payload = { ...outcomeToPayload(outcome), decisionApplied: outcome.decisionApplied };
+  return assertProjection(payload, isResumePayloadShape, "resumeToPayload");
 }
 
 export function executionToCheckPayload(
   execution: Execution | undefined,
   now: number,
 ): CheckPayload {
-  if (execution === undefined) {
-    return { status: "not_found" };
-  }
-  switch (execution.status) {
-    case "running":
-      return { status: "running", executionId: execution.id };
-    case "paused": {
-      const pending = execution.pausedOn;
-      if (pending !== undefined && now > pending.expiresAt) {
-        // Read-only expired presentation (design M1): the durable lazy
-        // expiry-on-resume transition is untouched; we only present.
-        return { status: "expired", executionId: execution.id, message: EXPIRED_MESSAGE };
-      }
-      return {
-        status: "paused",
-        executionId: execution.id,
-        ...(pending !== undefined
-          ? { pending: toPendingView(pending), message: PAUSE_MESSAGE }
-          : {}),
-      };
+  const payload = ((): CheckPayload => {
+    if (execution === undefined) {
+      return { status: "not_found" };
     }
-    case "completed":
-      return { status: "completed", executionId: execution.id, result: execution.result ?? null };
-    case "failed":
-      return {
-        status: "failed",
-        executionId: execution.id,
-        error: toErrorEnvelope(
-          execution.error ?? {
-            name: "ConduitUnknownError",
-            message: "failed with no recorded error (legacy row)",
-          },
-        ),
-      };
-    case "expired":
-      return { status: "expired", executionId: execution.id, message: EXPIRED_MESSAGE };
-  }
+    switch (execution.status) {
+      case "running":
+        return { status: "running", executionId: execution.id };
+      case "paused": {
+        const pending = execution.pausedOn;
+        if (pending !== undefined && now > pending.expiresAt) {
+          // Read-only expired presentation (design M1): the durable lazy
+          // expiry-on-resume transition is untouched; we only present.
+          return { status: "expired", executionId: execution.id, message: EXPIRED_MESSAGE };
+        }
+        return {
+          status: "paused",
+          executionId: execution.id,
+          ...(pending !== undefined
+            ? { pending: toPendingView(pending), message: PAUSE_MESSAGE }
+            : {}),
+        };
+      }
+      case "completed":
+        return { status: "completed", executionId: execution.id, result: execution.result ?? null };
+      case "failed":
+        return {
+          status: "failed",
+          executionId: execution.id,
+          error: toErrorEnvelope(
+            execution.error ?? {
+              name: "ConduitUnknownError",
+              message: "failed with no recorded error (legacy row)",
+            },
+          ),
+        };
+      case "expired":
+        return { status: "expired", executionId: execution.id, message: EXPIRED_MESSAGE };
+    }
+  })();
+  return assertProjection(payload, isCheckPayloadShape, "executionToCheckPayload");
 }
 
 export function toTextResult(payload: unknown): { content: [{ type: "text"; text: string }] } {
   return { content: [{ type: "text", text: JSON.stringify(payload) }] };
 }
-
-/**
- * The legal `status` value-sets, in ONE place — the single source of truth
- * the daemon's PROJECTIONS above produce and the client's payload GUARD
- * (`client.ts`) checks against (Codex ARC F6).
- *
- * Before this, the guard checked only that `status` was a string, which let
- * `{status: "bogus"}` and arm-incomplete payloads (a `completed` with no
- * `executionId`, a resume that "settled as bogus") pass a completed exchange
- * as a well-formed answer. A projection is a discriminated union — its
- * validity is the status being a legal MEMBER, not merely a string — so the
- * guard must know the members. Keeping the sets and the arm-shape predicates
- * here, beside the senders that build them, is what stops the guard from
- * being a second, drifting copy of the contract.
- */
-export const EXECUTE_STATUSES = ["completed", "failed", "paused", "expired", "conflict"] as const;
-
-export const CHECK_BODY_STATUSES = ["running", "completed", "failed", "paused", "expired"] as const;
 
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;

@@ -27,6 +27,7 @@ import { spawn } from "node:child_process";
 import { closeSync, mkdirSync, openSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { DEFAULT_CONDUIT_DIR } from "../env.js";
 
 /**
  * The daemon's `PATH`, fixed here rather than reused from the client. An
@@ -71,7 +72,26 @@ export function daemonSpawnEnv(): NodeJS.ProcessEnv {
 }
 
 /**
- * Starts a detached daemon against `stateDir` and returns immediately.
+ * Starts a detached daemon against the DEFAULT state directory and returns
+ * immediately.
+ *
+ * **Zero-argument by construction (Codex ARC F5 — the structural half).**
+ * The spawned child receives only `--daemon` and derives the default state
+ * directory from its own uid (`bin.ts`: no `--state-dir`, so `runDaemon`
+ * falls back to `DEFAULT_CONDUIT_DIR`). A client cannot select the daemon's
+ * state directory, so this function must not be able to be HANDED one
+ * either: taking a `stateDir` parameter would let a caller spawn a child
+ * whose cwd and log sit under a directory the child then never serves —
+ * the "default daemon running, client polling a custom dir" split F5
+ * closes. The directory is hardcoded here, matching what the child derives,
+ * so the cwd/log and the served database can never diverge.
+ *
+ * The one path that legitimately spawns against a non-default directory is
+ * a TEST injecting its own spawn seam (`DaemonRequestOptions.spawn`); that
+ * seam takes the dir it targets. Production auto-start (`daemonRequest`
+ * with no injected seam) reaches this function and only ever for the
+ * default directory — see the auto-start gate in `client.ts`.
+ *
  * Deliberately returns `void`: §3.5 step 2 is explicit that the spawning
  * client never acquires a lock or otherwise coordinates with the child —
  * it spawns and then re-probes like any other client. There is no
@@ -82,7 +102,8 @@ export function daemonSpawnEnv(): NodeJS.ProcessEnv {
  * lock and the other exits `already running`. That is the designed
  * outcome, not a race to prevent.
  */
-export function spawnDaemon(stateDir: string): void {
+export function spawnDaemon(): void {
+  const stateDir = DEFAULT_CONDUIT_DIR;
   // On a fresh install the state directory does not exist yet, and the
   // log below is opened INSIDE it — so the directory has to exist before
   // the very first daemon can be started. `recursive: true` makes this

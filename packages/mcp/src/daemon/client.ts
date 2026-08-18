@@ -29,7 +29,8 @@
  */
 
 import { connect, type Socket } from "node:net";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import { DEFAULT_CONDUIT_DIR } from "../env.js";
 import {
   isCheckPayloadShape,
   isExecutePayloadShape,
@@ -42,6 +43,23 @@ import { describeHolder, probeShared, readLockHolder } from "./locks.js";
 import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
 import { DAEMON_LOG, spawnDaemon } from "./spawn.js";
 import { assertStateDir, StateDirError } from "./state-dir.js";
+
+/**
+ * True iff `stateDir` names the canonical default state directory — the
+ * ONE directory a production auto-start may target (Codex ARC F5).
+ *
+ * `spawnDaemon` is zero-argument and derives the default directory from the
+ * child's own uid, so an auto-start is only ever correct when the client is
+ * itself pointed at that same default. A `resolve` on both sides collapses
+ * the trivial spellings (a trailing slash, a `.`) that would otherwise let
+ * a textually-different-but-equal path slip past — it is NOT a security
+ * boundary (a client cannot reach this with a hostile symlinked dir; the
+ * daemon holds the at-rest boundary), only a correctness guard against a
+ * default path that does not string-compare equal to itself.
+ */
+export function isDefaultStateDir(stateDir: string): boolean {
+  return resolve(stateDir) === resolve(DEFAULT_CONDUIT_DIR);
+}
 
 export interface DaemonRequestOptions<K extends RpcRequest["kind"] = RpcRequest["kind"]> {
   stateDir: string;
@@ -61,26 +79,35 @@ export interface DaemonRequestOptions<K extends RpcRequest["kind"] = RpcRequest[
    */
   deadlineMs: number;
   /**
-   * Whether this request may AUTO-START a daemon when it finds none (Codex
-   * ARC F5). Defaults to `true`.
+   * An explicit OFF switch for auto-start (Codex ARC F5).
    *
-   * `spawnDaemon` passes only `--daemon` to the child, which then derives
-   * the DEFAULT state directory from its own uid — it does NOT and MUST NOT
-   * receive a client-chosen `stateDir` (the §3.1 spawn boundary: a client
-   * cannot smuggle a state-directory choice into a long-lived daemon serving
-   * every client). So auto-start is only ever CORRECT for the default state
-   * directory: a request against an explicitly-selected custom `--state-dir`
-   * that auto-started would spawn a default-dir daemon and then poll the
-   * custom dir forever, contacting a daemon it never started while a
-   * default-dir daemon it did start answers nobody.
+   * The auto-start boundary is now STRUCTURAL, not a value a caller must
+   * remember to set: a production request (one with no injected `spawn`
+   * seam) auto-starts a daemon ONLY when its `stateDir` is the canonical
+   * default (`isDefaultStateDir`), because the production `spawnDaemon` is
+   * zero-argument and derives that default — a spawn against any other
+   * directory would start a default-dir daemon while this loop polls the
+   * custom dir forever. A caller need do nothing to be safe: omitting this
+   * on a custom directory refuses rather than misdirecting a spawn.
    *
-   * Callers on an operator-selected custom state directory therefore pass
-   * `false`: finding no daemon becomes an actionable refusal naming the
-   * exact by-hand start command, rather than a misdirected spawn. Callers on
-   * the default directory (or leaving this unset) keep auto-start.
+   * This flag remains only as an EXPLICIT suppression even on the default
+   * directory (a caller that wants a hard "never spawn, just report if
+   * absent"). It cannot ENABLE a spawn the structural gate forbids —
+   * `autoStart: true` against a custom production dir still refuses, because
+   * the child would still derive the wrong directory. So it is honored in
+   * one direction only: `false` always suppresses; unset/`true` permits a
+   * spawn only where the gate already allows one.
    */
   autoStart?: boolean;
-  /** Injectable for tests; production spawns the real daemon. */
+  /**
+   * Injectable spawn seam for tests, which run daemons against throwaway
+   * custom state directories. When present, this caller has taken explicit
+   * ownership of WHERE the daemon starts, so the auto-start gate permits a
+   * spawn against a non-default directory THROUGH THIS SEAM — the seam
+   * receives the dir it must target. Production leaves this unset and
+   * reaches the zero-argument `spawnDaemon`, which can only ever start the
+   * default-dir daemon; the gate then permits it only for the default dir.
+   */
   spawn?: (stateDir: string) => void;
   /**
    * Observes the daemon's `handshake.ok` when one is received.
@@ -232,7 +259,35 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
   opts: DaemonRequestOptions<K>,
 ): Promise<RpcResponseFor<K>> {
   const paths = daemonPaths(opts.stateDir);
-  const spawnChild = opts.spawn ?? spawnDaemon;
+
+  // The auto-start gate, decided HERE rather than trusted from the caller
+  // (Codex ARC F5 — the structural half). Two independent facts permit a
+  // spawn against this `stateDir`:
+  //
+  //  - a TEST injected its own `spawn` seam, taking explicit ownership of
+  //    where the daemon starts (the seam receives the dir); or
+  //  - this is PRODUCTION (no injected seam) AND `stateDir` is the canonical
+  //    default, the only directory the zero-argument `spawnDaemon` can
+  //    start.
+  //
+  // A production request on a CUSTOM directory falls through to neither and
+  // refuses at row 4 with the by-hand command — even if the caller passed
+  // `autoStart: true`, because the child would still derive the DEFAULT dir
+  // and answer nobody. `autoStart: false` suppresses in every case. This is
+  // what makes the boundary a property of the code, not of caller
+  // discipline: a new caller that forgets to reason about it is safe by
+  // default.
+  const spawnChild: (stateDir: string) => void =
+    opts.spawn ??
+    (() => {
+      // The production seam is zero-argument by construction; it always
+      // starts the default-dir daemon regardless of any argument, so the
+      // gate below is the thing that guarantees it is only reached for the
+      // default dir.
+      spawnDaemon();
+    });
+  const spawnPermitted =
+    opts.autoStart !== false && (opts.spawn !== undefined || isDefaultStateDir(opts.stateDir));
 
   // The floor, refused explicitly rather than discovered as a silent
   // no-probe. Below it the loop below is never entered even once, so the
@@ -402,12 +457,15 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
 
     // Row 4 — neither lock held: no daemon and no rotation.
     //
-    // Auto-start is disabled for an operator-selected custom state directory
-    // (F5): `spawnDaemon` cannot be handed a client-chosen dir (§3.1), so a
-    // spawn here would start a DEFAULT-dir daemon while this loop polls the
-    // custom dir — a daemon that answers nobody. Refuse with the exact
-    // by-hand start command instead of misdirecting a spawn.
-    if (opts.autoStart === false) {
+    // Auto-start is gated STRUCTURALLY (F5): a production request may spawn
+    // only for the canonical default directory, because the zero-argument
+    // `spawnDaemon` can start nothing else — a spawn for a custom dir would
+    // start a DEFAULT-dir daemon while this loop polls the custom dir, a
+    // daemon that answers nobody. `spawnPermitted` folds that gate together
+    // with the explicit `autoStart: false` off switch (see its computation
+    // above). When a spawn is not permitted, refuse with the exact by-hand
+    // start command instead of misdirecting one.
+    if (!spawnPermitted) {
       throw new DaemonUnavailable(
         "unavailable",
         `[conduit] Daemon unavailable: no daemon is running for the custom state directory ` +

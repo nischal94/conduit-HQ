@@ -308,10 +308,6 @@ export interface AddMcpOptions {
 /** Production entrypoint wired into the CLI dispatch (bin.ts). */
 export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<number> {
   const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
-  // Auto-start only for the default directory (F5): an explicit custom
-  // `--state-dir` must be started by hand, since a spawned daemon derives
-  // the default dir. `opts.stateDir !== undefined` is exactly that choice.
-  const autoStart = opts.stateDir === undefined;
   const args = parseAddMcpArgs(argv);
   const result = await runAddMcp(args, {
     daemon: (request) =>
@@ -323,7 +319,10 @@ export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<
         // onboarding fetch daemon-side, so it carries the derived provision
         // budget rather than a plain read's.
         deadlineMs: deadlineForRequest(request),
-        autoStart,
+        // Auto-start is gated STRUCTURALLY inside `daemonRequest` (F5): it
+        // spawns only for the canonical default directory. A custom
+        // `--state-dir` is refused with the by-hand start command — this
+        // command no longer computes that boundary.
       }),
     env: process.env,
     stdout: (line) => process.stdout.write(line),
