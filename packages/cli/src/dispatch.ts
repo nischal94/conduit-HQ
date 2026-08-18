@@ -13,7 +13,7 @@ Usage: conduit <command> [options]
 
 Commands:
   serve      Run the Conduit MCP server (stdio transport)
-  add-mcp    Register conduit-mcp with an MCP client
+  add-mcp    Onboard or re-sync an upstream MCP source
              (--namespace <ns> --url <url> --prefix <prefix> [--replace] [--clear-credential] [--json])
   approvals  Manage pending tool-call approvals
   key        Manage the master key (generate | rotate)

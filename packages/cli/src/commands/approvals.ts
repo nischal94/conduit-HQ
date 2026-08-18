@@ -3,11 +3,11 @@ import {
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
   deadlineForRequest,
+  type PausedListRow,
   type ResumePayload,
   type RpcRequest,
   type RpcResponse,
 } from "@conduithq/mcp";
-import type { PendingApproval } from "@conduithq/sdk";
 
 /**
  * `conduit approvals list|approve|deny` — the human approval queue (design
@@ -74,15 +74,17 @@ function prodDeps(stateDir: string): ApprovalsDeps {
 }
 
 /**
- * The daemon's `approvals.list` projection — the rows `connection.ts` sends.
- * Structurally narrower than a stored `Execution`: three fields, and
- * `pausedOn` explicitly nullable because the daemon projects it that way.
+ * The daemon's `approvals.list` projection — the rows `connection.ts` sends,
+ * imported from the daemon side (`PausedListRow`) so the two ends of the
+ * socket cannot drift apart on this shape.
+ *
+ * Structurally FLAT and narrower than a stored `Execution`: the daemon
+ * projects the five fields this command renders and drops the raw
+ * `pausedOn`, whose `input` is the paused call's arguments. A corrupt row
+ * (paused with no `pausedOn`) is omitted and logged daemon-side, so nothing
+ * here has to defend against it.
  */
-interface PausedRowWire {
-  executionId: string;
-  startedAt: number;
-  pausedOn: PendingApproval | null;
-}
+type PausedRowWire = PausedListRow;
 
 /**
  * One daemon round trip, reduced to either a payload or an operator-facing
@@ -166,21 +168,14 @@ interface PausedRow {
 }
 
 function toPausedRow(row: PausedRowWire, now: number): PausedRow {
-  const pausedOn = row.pausedOn;
-  if (pausedOn === null || pausedOn === undefined) {
-    // Defensive — the daemon projects only status:"paused" rows, which
-    // always carry pausedOn (manager.ts invariant). A row without it is
-    // corrupt state; surface it rather than silently drop the row.
-    throw new Error(
-      `[conduit approvals] the daemon returned a paused row with no pausedOn. Context: { executionId: ${row.executionId} }`,
-    );
-  }
   return {
     executionId: row.executionId,
-    tool: pausedOn.toolName,
+    tool: row.toolName,
     waitingSince: row.startedAt,
-    expiresAt: pausedOn.expiresAt,
-    expired: pausedOn.expiresAt < now,
+    expiresAt: row.expiresAt,
+    // The only DISPLAY-time derivation: `list` never writes, so expiry is
+    // computed against the caller's clock rather than read from a row.
+    expired: row.expiresAt < now,
   };
 }
 

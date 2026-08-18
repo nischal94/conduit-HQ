@@ -669,11 +669,15 @@ model is **decided and shipped**: `conduitd` is the sole writer of
 `~/.conduit/conduit.db`, and every other surface is a thin local client of it over a Unix
 socket — the stdio `/mcp` server (`conduit serve`), `conduit approvals`,
 `conduit add-mcp`, and the default `--doctor`. The shared-store alternative was
-rejected: singleton enforcement, the crash-terminal sweep, and the credential boundary are all
-kernel-lock properties a shared store cannot provide. Clients auto-start a daemon when none is running
-(spawn budget of one, environment constructed rather than inherited); stopping is SIGTERM. Exclusion
-with `conduit key rotate` is the kernel maintenance lock rather than a liveness probe (§3.4
-exception: rotate stays direct-db). The §17 startup-reload caveat closes here — a source added through
+rejected on **simplicity and single-authority** grounds, not impossibility: a shared store
+is technically viable — the same kernel locks work for N processes as for one — but it buys N caches
+that can individually go stale, write serialization as an emergent property rather than a program
+invariant, and N independent lifetimes to reason about. And keeping approvals resumable across agent
+sessions requires some process to be durable, which is the daemon again. Clients auto-start a daemon
+when none is running (spawn budget of one, environment constructed rather than inherited); stopping is
+SIGTERM. Exclusion with `conduit key rotate` is the kernel maintenance lock rather than a
+liveness probe (rotate stays a direct-db operation, outside the daemon — the one deliberate exception
+to sole-writer ownership, since rotation must re-seal the database no daemon may be holding). The §17 startup-reload caveat closes here — a source added through
 one client is visible to another with no restart. Pinned by the §17 rows in
 `INVARIANTS.md`.
 - **Typed control-plane API + hot-reload** — the console's own local HTTP API (distinct

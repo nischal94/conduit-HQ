@@ -32,7 +32,7 @@ import { connect, type Socket } from "node:net";
 import { join } from "node:path";
 import { type DaemonPaths, daemonPaths } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
-import { probeShared } from "./locks.js";
+import { describeHolder, probeShared, readLockHolder } from "./locks.js";
 import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
 import { DAEMON_LOG, spawnDaemon } from "./spawn.js";
 import { assertStateDir, StateDirError } from "./state-dir.js";
@@ -203,10 +203,18 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
     // now would only exit "rotation in progress" itself, and spinning
     // would starve the rotation this refusal exists to let finish.
     if ((await probeShared(paths.maintenanceLockDb)) === "busy") {
+      // Name the holder, exactly as `key rotate`'s own refusal does: the
+      // operator gets told WHO to wait on rather than only that something
+      // is in the way. Read only AFTER the kernel refused — the row is a
+      // companion to that verdict, never a substitute — and hedged,
+      // because a SIGKILLed holder leaves its row behind. An EXCLUSIVE
+      // holder blocks the read, in which case `readLockHolder` answers
+      // null and the clause is simply absent; it never fails the refusal.
+      const holder = describeHolder(await readLockHolder(paths.maintenanceLockDb));
       throw new DaemonUnavailable(
         "rotation-in-progress",
         "[conduit] Daemon unavailable: key rotation is in progress. Context: {stateDir: " +
-          `${opts.stateDir}} — retry once rotation finishes`,
+          `${opts.stateDir}}${holder} — retry once rotation finishes`,
       );
     }
 

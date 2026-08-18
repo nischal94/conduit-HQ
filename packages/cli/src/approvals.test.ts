@@ -4,7 +4,12 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import type { RpcRequest, RpcResponse } from "@conduithq/mcp";
-import { createApprovalRuntime, DaemonUnavailable, resumeToPayload } from "@conduithq/mcp";
+import {
+  createApprovalRuntime,
+  DaemonUnavailable,
+  pausedToListRow,
+  resumeToPayload,
+} from "@conduithq/mcp";
 import type { ConduitStore, ResumeOutcome } from "@conduithq/sdk";
 import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
@@ -144,13 +149,10 @@ function realDaemon(opts: {
   return async (request) => {
     if (request.kind === "approvals.list") {
       const paused = await opts.store.executions.listPaused();
-      return result(
-        paused.map((execution) => ({
-          executionId: execution.id,
-          startedAt: execution.startedAt,
-          pausedOn: execution.pausedOn ?? null,
-        })),
-      );
+      // The REAL daemon-side projection (`pausedToListRow`), not a
+      // hand-written echo of it — so this fixture cannot drift into
+      // asserting a wire shape the daemon no longer sends.
+      return result(paused.map((execution) => pausedToListRow(execution)));
     }
     if (request.kind === "approvals.resume") {
       if (opts.live !== true) throw new Error("approvals.resume not stubbed for this test");

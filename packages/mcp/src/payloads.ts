@@ -93,6 +93,49 @@ export interface ConnectionListingView {
   label: string;
 }
 
+/**
+ * The `approvals.list` projection — one row per paused execution.
+ *
+ * A PROJECTION for the same §3.3 reason as `ResumePayload`: the stored
+ * `Execution.pausedOn` is a raw `PendingApproval`, and `PendingApproval.input`
+ * is the paused call's ARGUMENTS — agent-supplied values that can carry
+ * whatever the tool call was given. The operator-facing `conduit approvals
+ * list` reads only the tool name and the expiry, so shipping the raw row would
+ * put sensitive call arguments on the socket to buy nothing. The field list
+ * here IS the boundary and stays explicit.
+ *
+ * `reason` is included because it is the approval's human-facing WHY — the
+ * one thing an operator deciding on a paused call needs beyond its name — and
+ * it is authored by the policy layer, not by the agent's arguments.
+ */
+export interface PausedListRow {
+  executionId: string;
+  startedAt: number;
+  toolName: string;
+  reason: string;
+  expiresAt: number;
+}
+
+/**
+ * Projects one paused `Execution` for the `approvals.list` response.
+ *
+ * Returns `undefined` for a row with no `pausedOn`. The daemon lists only
+ * `status: "paused"` rows, which always carry it (manager.ts invariant), so
+ * this is defensive — but dropping such a row silently would tell an operator
+ * that nothing awaits them, so the caller logs it rather than swallowing it.
+ */
+export function pausedToListRow(execution: Execution): PausedListRow | undefined {
+  const pausedOn = execution.pausedOn;
+  if (pausedOn === undefined) return undefined;
+  return {
+    executionId: execution.id,
+    startedAt: execution.startedAt,
+    toolName: pausedOn.toolName,
+    reason: pausedOn.reason,
+    expiresAt: pausedOn.expiresAt,
+  };
+}
+
 /** ~4 chars/token heuristic, same shape as the sdk's estimateTokens. */
 export function estimateDefinitionTokens(definition: unknown): number {
   return Math.ceil(JSON.stringify(definition).length / 4);

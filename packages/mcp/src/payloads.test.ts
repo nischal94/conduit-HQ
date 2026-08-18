@@ -6,6 +6,7 @@ import {
   executionToCheckPayload,
   extendExecuteDefinition,
   outcomeToPayload,
+  pausedToListRow,
   resumeToPayload,
 } from "./payloads.js";
 
@@ -207,5 +208,43 @@ describe("executionToCheckPayload (check_execution)", () => {
     if (p.status === "failed") {
       expect(p.error?.code).toBe("ConduitPersistError");
     }
+  });
+});
+
+describe("pausedToListRow (the approvals.list projection)", () => {
+  const base = { id: "e", code: "1", seeds, startedAt: 1_000 } as const;
+
+  it("INVARIANT §17: the paused call's ARGUMENTS never cross the socket on approvals.list", () => {
+    // The stored `pausedOn` is a raw `PendingApproval` whose `input` is the
+    // agent-supplied call arguments. `conduit approvals list` reads only the
+    // tool name and the expiry, so shipping the raw row would put sensitive
+    // arguments on the socket to buy nothing. Same discipline, and the same
+    // assertion shape, as `resumeToPayload`'s paused arm.
+    const row = pausedToListRow({
+      ...base,
+      status: "paused",
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.delete_repo",
+        input: { token: "should-never-cross-the-socket" },
+        reason: "requires approval",
+        expiresAt: 9,
+      },
+    });
+
+    expect(row).toEqual({
+      executionId: "e",
+      startedAt: 1_000,
+      toolName: "github.delete_repo",
+      reason: "requires approval",
+      expiresAt: 9,
+    });
+    // The whole serialized row, not just the fields named above: a field
+    // added later that reintroduced the arguments would fail here.
+    expect(JSON.stringify(row)).not.toContain("should-never-cross-the-socket");
+  });
+
+  it("returns undefined for a corrupt paused row with no pausedOn (caller logs, never silently drops)", () => {
+    expect(pausedToListRow({ ...base, status: "paused" })).toBeUndefined();
   });
 });

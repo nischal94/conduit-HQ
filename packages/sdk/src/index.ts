@@ -38,7 +38,7 @@ export type {
 } from "./normalize/openapi.js";
 export { normalizeOpenApi } from "./normalize/openapi.js";
 export type { EgressOptions } from "./pipeline/egress.js";
-export { assertEgressAllowed, isPrivateAddress } from "./pipeline/egress.js";
+export { assertEgressAllowed, createPinnedLookup, isPrivateAddress } from "./pipeline/egress.js";
 export type { CallErrorKind, GuestErrorName } from "./pipeline/errors.js";
 export {
   ConduitCallError,

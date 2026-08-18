@@ -22,6 +22,8 @@ import {
   buildCatalogListing,
   executionToCheckPayload,
   outcomeToPayload,
+  type PausedListRow,
+  pausedToListRow,
   resumeToPayload,
 } from "../payloads.js";
 import type { createApprovalRuntime } from "../runtime.js";
@@ -654,45 +656,37 @@ async function handleRequest(
     }
     case "search": {
       const catalog = await snapshotCatalog(store);
-      send(
-        ctx.socket,
-        {
-          kind: "result",
-          requestId,
-          payload: catalog.search({ query: request.query }),
-        },
-        log,
-      );
+      // Through `sendResult`, not a raw `send`: an oversized catalog answer
+      // must surface as the same actionable "too large for the IPC frame"
+      // refusal `execute` gives, rather than escaping the encode as an
+      // opaque `internal daemon error`.
+      sendResult(ctx, requestId, catalog.search({ query: request.query }), log);
       return;
     }
     case "describe": {
       const catalog = await snapshotCatalog(store);
-      send(
-        ctx.socket,
-        {
-          kind: "result",
-          requestId,
-          payload: catalog.describe(request.toolName) ?? null,
-        },
-        log,
-      );
+      sendResult(ctx, requestId, catalog.describe(request.toolName) ?? null, log);
       return;
     }
     case "approvals.list": {
       const paused = await store.executions.listPaused();
-      send(
-        ctx.socket,
-        {
-          kind: "result",
-          requestId,
-          payload: paused.map((execution) => ({
-            executionId: execution.id,
-            startedAt: execution.startedAt,
-            pausedOn: execution.pausedOn ?? null,
-          })),
-        },
-        log,
-      );
+      // Projected like every other answer: the raw row's `pausedOn` is a
+      // `PendingApproval` whose `input` is the paused call's ARGUMENTS, which
+      // the operator-facing list never reads. See `PausedListRow`.
+      const rows: PausedListRow[] = [];
+      for (const execution of paused) {
+        const row = pausedToListRow(execution);
+        if (row === undefined) {
+          // Defensive: a paused row with no pausedOn is corrupt state. Log it
+          // rather than silently shrinking the queue an operator is reading.
+          log(
+            `[conduitd] Paused execution has no pausedOn; omitted from approvals.list. Context: {executionId: ${execution.id}}`,
+          );
+          continue;
+        }
+        rows.push(row);
+      }
+      sendResult(ctx, requestId, rows, log);
       return;
     }
     case "approvals.resume": {

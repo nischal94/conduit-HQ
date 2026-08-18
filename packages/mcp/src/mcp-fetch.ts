@@ -1,4 +1,4 @@
-import { createMcpClient } from "@conduithq/sdk";
+import { createMcpClient, createPinnedLookup } from "@conduithq/sdk";
 
 /** Hard cap on the cumulative response bytes across the whole onboarding
  * fetch, enforced DURING ingestion by the shared client's capped reader: raw
@@ -32,10 +32,24 @@ export const ONBOARDING_DEADLINE_MS = 5000;
  * from the client, or a plain Error); the caller (add-mcp.ts) maps the throw
  * to a specific fail-loud line and writes nothing.
  *
- * Egress is NOT pinned here (design §18-C4 D2, "Egress is a per-call option"):
- * the URL is operator-typed at the terminal, so onboarding uses plain DNS (no
- * pinned `lookup`) — the SSRF protections target agent-driven URLs, not an
- * operator's own upstream. Serve-time (`upstream.ts`) always pins.
+ * **Egress IS pinned, with `allowPrivate: true`** (design §18-C4 D2,
+ * "`add-mcp` passes `allowPrivate: true`"; daemon-ownership design §3.3.1,
+ * "the §9.3 egress guard and its pinned lookup still apply on every hop").
+ * The two halves are independent and both are load-bearing here:
+ *
+ * - **Pinned** (`createPinnedLookup`) closes DNS rebinding. Since Task 8 this
+ *   fetch runs inside the long-lived, credential-holding daemon, and
+ *   `source.revalidate` re-fetches a STORED url with the stored credential
+ *   attached — so the URL is client-supplied or replayed from the store, not
+ *   "operator-typed at the terminal". A hostname that resolves benignly on one
+ *   hop and to a link-local/metadata address on the next would otherwise carry
+ *   the `Authorization` header to the rebound target. Pinning resolves once and
+ *   forces the socket to that vetted address, so the address the guard checked
+ *   IS the address connected to.
+ * - **`allowPrivate: true`** keeps onboarding able to reach a local upstream
+ *   (`http://127.0.0.1:…/mcp`, a LAN MCP server) — a legitimate and common
+ *   onboarding target, and the documented §18-C4 D2 posture. The private-address
+ *   *filter* is what onboarding waives; the *pinning* is not waived.
  */
 export async function fetchToolsList(
   url: string,
@@ -50,7 +64,11 @@ export async function fetchToolsList(
       // never interpolated or logged. Omitted entirely when no auth is
       // resolved (an unauthenticated onboarding fetch is legitimate — §9.1).
       headers: opts?.authorization !== undefined ? { authorization: opts.authorization } : {},
-      // No `lookup`: onboarding does not pin egress (design §18-C4 D2).
+      // §9.3 pinning on every hop (design §3.3.1). `allowPrivate` waives the
+      // private-address filter — local upstreams are legitimate onboarding
+      // targets — and nothing else: the lookup still resolves once and forces
+      // the connect to that address, so no hop can be rebound after vetting.
+      lookup: createPinnedLookup({ allowPrivate: true }),
     },
     {
       deadline: () => Math.max(0, ONBOARDING_DEADLINE_MS - (Date.now() - startedAt)),

@@ -60,6 +60,8 @@ export {
   executionToCheckPayload,
   extendExecuteDefinition,
   outcomeToPayload,
+  type PausedListRow,
+  pausedToListRow,
   type ResumePayload,
   resumeToPayload,
 } from "./payloads.js";

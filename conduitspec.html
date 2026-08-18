@@ -909,11 +909,15 @@ model is <strong>decided and shipped</strong>: <code>conduitd</code> is the sole
 <code>~/.conduit/conduit.db</code>, and every other surface is a thin local client of it over a Unix
 socket — the stdio <code>/mcp</code> server (<code>conduit serve</code>), <code>conduit approvals</code>,
 <code>conduit add-mcp</code>, and the default <code>--doctor</code>. The shared-store alternative was
-rejected: singleton enforcement, the crash-terminal sweep, and the credential boundary are all
-kernel-lock properties a shared store cannot provide. Clients auto-start a daemon when none is running
-(spawn budget of one, environment constructed rather than inherited); stopping is SIGTERM. Exclusion
-with <code>conduit key rotate</code> is the kernel maintenance lock rather than a liveness probe (§3.4
-exception: rotate stays direct-db). The §17 startup-reload caveat closes here — a source added through
+rejected on <strong>simplicity and single-authority</strong> grounds, not impossibility: a shared store
+is technically viable — the same kernel locks work for N processes as for one — but it buys N caches
+that can individually go stale, write serialization as an emergent property rather than a program
+invariant, and N independent lifetimes to reason about. And keeping approvals resumable across agent
+sessions requires some process to be durable, which is the daemon again. Clients auto-start a daemon
+when none is running (spawn budget of one, environment constructed rather than inherited); stopping is
+SIGTERM. Exclusion with <code>conduit key rotate</code> is the kernel maintenance lock rather than a
+liveness probe (rotate stays a direct-db operation, outside the daemon — the one deliberate exception
+to sole-writer ownership, since rotation must re-seal the database no daemon may be holding). The §17 startup-reload caveat closes here — a source added through
 one client is visible to another with no restart. Pinned by the §17 rows in
 <code>INVARIANTS.md</code>.</li>
 <li><strong>Typed control-plane API + hot-reload</strong> — the console's own local HTTP API (distinct
