@@ -3,7 +3,12 @@ import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
 import { takeStateDir } from "./args.js";
-import { DaemonUnavailable, daemonRequest, isDefaultStateDir } from "./daemon/client.js";
+import {
+  DaemonUnavailable,
+  daemonRequest,
+  isDefaultStateDir,
+  resolveEffectiveStateDir,
+} from "./daemon/client.js";
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
@@ -188,7 +193,18 @@ async function doctor(stateDir: string): Promise<number> {
  * output: it cannot verify the key actually DECRYPTS the database,
  * because proving that requires opening the store and checking the canary.
  */
-async function doctorOffline(stateDir: string): Promise<number> {
+async function doctorOffline(rawStateDir: string): Promise<number> {
+  // Resolve the ONE effective base (§17 §2, consumer 3) — the same
+  // kernel-faithful resolver the client and the daemon run, over the same
+  // operator argument, so the doctor inspects the object a real daemon would
+  // bind under, not whatever a lexical `join` of the raw argv points at. The
+  // EXCEPTION to the §5 refusal: offline never spawns and its whole job is
+  // inspecting a sick, not-yet-healthy install, so it resolves and then
+  // REPORTS — it does NOT apply the custom-NOT_FOUND refusal the auto-starting
+  // client does. `canonicalOfMissing` (inside the resolver) already walks a
+  // partly- or not-yet-existent dir faithfully, so a broken install is
+  // described rather than refused.
+  const stateDir = resolveEffectiveStateDir(rawStateDir);
   const paths = daemonPaths(stateDir);
   // The key file is a property of the state directory, exactly as the db and
   // the locks are (`daemonPaths`). Honoring `--state-dir` here means
@@ -336,8 +352,17 @@ async function main(): Promise<void> {
       return;
     }
     const override = parsed.stateDir;
+    // Resolve the ONE effective base at the daemon entry point (§17 §2,
+    // consumer 2 — closes P2-lexical), BEFORE `runDaemon`. `runDaemon` /
+    // `daemonPaths` / `ensureStateDir` then all derive from THIS resolved
+    // object, so a by-hand `--state-dir <attacker>/link/../custom` binds the
+    // socket + locks under the SAME kernel-faithful object a client resolving
+    // the same argv reaches — instead of the lexically-collapsed
+    // `<attacker>/custom` that `path.join` would produce from the raw
+    // spelling. Client and by-hand daemon meet at one filesystem object.
+    const resolvedStateDir = resolveEffectiveStateDir(override ?? DEFAULT_CONDUIT_DIR);
     try {
-      await runDaemon({ stateDir: override ?? DEFAULT_CONDUIT_DIR, sweep: sweepDaemonStore });
+      await runDaemon({ stateDir: resolvedStateDir, sweep: sweepDaemonStore });
     } catch (error) {
       // The two refusal paths carry their own exit codes (§3.5's client
       // decision table) — a client branches on the code, not on prose.

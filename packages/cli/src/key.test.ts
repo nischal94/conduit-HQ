@@ -17,6 +17,7 @@ import {
   EXIT_ROTATION_IN_PROGRESS,
   MAINTENANCE_ROLE_ROTATE,
   openStoreClientFromEnv,
+  resolveEffectiveStateDir,
 } from "@conduithq/mcp";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { runKey } from "./commands/key.js";
@@ -637,7 +638,11 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
     });
     expect(result.exitCode).toBe(0);
     // ensureStateDir ran for generate's own dir — the create-then-lock order.
-    expect(ensureCalls).toEqual([fresh]);
+    // `runKey` normalizes `conduitDir` through the shared resolver (§17 §2,
+    // consumer 4), so the dir it hands `ensureStateDir` is the CANONICAL form
+    // of `fresh` (on macOS the temp dir under /var canonicalizes to
+    // /private/var); a no-op on an already-canonical path, but exact here.
+    expect(ensureCalls).toEqual([resolveEffectiveStateDir(fresh)]);
 
     // The lock is a real, releasable EXCLUSIVE: free and re-acquirable now
     // that generate finished (not a no-op that never held anything).

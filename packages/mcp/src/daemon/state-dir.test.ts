@@ -1,10 +1,16 @@
 import { execFile } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
 import { afterEach, describe, expect, it } from "vitest";
-import { assertStateDir, isNonOwnerAclLine } from "./state-dir.js";
+import {
+  assertSafeAncestorChain,
+  assertStateDir,
+  isNonOwnerAclLine,
+  StateDirError,
+} from "./state-dir.js";
+import { canonicalOfMissing } from "./state-dir-resolve.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -132,4 +138,90 @@ describe("assertStateDir (design §3.2 — state-directory boundary)", () => {
       await expect(assertStateDir(target, "connect")).rejects.toThrow();
     });
   }
+});
+
+/**
+ * The ancestor-chain rule (design §17 §3.2, closes P1). `assertStateDir`
+ * proves the LEAF is a self-owned 0700 non-symlink, but a different uid that
+ * owns a directory the path TRAVERSES can rename the validated leaf out and
+ * drop a replacement before the client connects. `assertSafeAncestorChain`
+ * refuses a base whose canonical form has any existing ancestor owned by
+ * another uid, or group/world-writable-and-not-sticky.
+ *
+ * A non-root test process cannot chown a directory to a foreign uid, so the
+ * foreign-owner clause is a documented simulation gap (as elsewhere in this
+ * file). The WRITABLE-non-sticky clause needs no privilege and is exercised
+ * for real: a 0777 ancestor is a genuine "any uid can rename the next
+ * component" hazard, and the sticky exemption (`/tmp`-shaped) is checked too.
+ */
+describe("assertSafeAncestorChain (design §17 §3.2 — ancestor-chain rule)", () => {
+  it("INVARIANT §17: accepts a base whose whole existing chain is self-owned", () => {
+    const parent = newTempParent();
+    const leaf = join(parent, "state");
+    mkdirSync(leaf, { mode: 0o700 });
+    // The temp parent and leaf are ours; every prefix up to the trusted
+    // root-owned system dirs is self-owned. No throw.
+    expect(() => assertSafeAncestorChain(canonicalOfMissing(leaf))).not.toThrow();
+  });
+
+  it("INVARIANT §17: attacker-owned ancestor refused — a world-writable non-sticky parent (any uid can rename the next component) → UNSAFE_ANCESTOR", () => {
+    const parent = newTempParent();
+    // A directory anyone can write to and NOT sticky: any uid can rename or
+    // replace an entry inside it, so a leaf reached through it is not safe —
+    // the stand-in for an attacker-owned traversal point that needs no chown.
+    const openParent = join(parent, "open");
+    mkdirSync(openParent, { mode: 0o777 });
+    chmodSync(openParent, 0o777); // defeat umask
+    const leaf = join(openParent, "state");
+    mkdirSync(leaf, { mode: 0o700 });
+
+    let caught: unknown;
+    try {
+      assertSafeAncestorChain(canonicalOfMissing(leaf));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(StateDirError);
+    expect((caught as StateDirError).code).toBe("UNSAFE_ANCESTOR");
+  });
+
+  it("INVARIANT §17: a STICKY world-writable ancestor is NOT disqualifying (the /tmp shape) — only the entry's owner can rename it", () => {
+    const parent = newTempParent();
+    // Sticky + world-writable, exactly like /tmp: any uid may CREATE an entry,
+    // but only that entry's owner may rename/replace it. So a self-owned 0700
+    // leaf created under it is safe on its own terms.
+    const stickyParent = join(parent, "sticky");
+    mkdirSync(stickyParent, { mode: 0o1777 });
+    chmodSync(stickyParent, 0o1777); // defeat umask; sticky bit + 0777
+    const leaf = join(stickyParent, "state");
+    mkdirSync(leaf, { mode: 0o700 });
+
+    expect(() => assertSafeAncestorChain(canonicalOfMissing(leaf))).not.toThrow();
+  });
+
+  it("INVARIANT §17: a group-writable non-sticky ancestor is also refused", () => {
+    const parent = newTempParent();
+    const groupWritable = join(parent, "grp");
+    mkdirSync(groupWritable, { mode: 0o770 });
+    chmodSync(groupWritable, 0o770); // group-writable, not sticky
+    const leaf = join(groupWritable, "state");
+    mkdirSync(leaf, { mode: 0o700 });
+
+    let caught: unknown;
+    try {
+      assertSafeAncestorChain(canonicalOfMissing(leaf));
+    } catch (err) {
+      caught = err;
+    }
+    expect(caught).toBeInstanceOf(StateDirError);
+    expect((caught as StateDirError).code).toBe("UNSAFE_ANCESTOR");
+  });
+
+  it("INVARIANT §17: a not-yet-existent leaf under a safe chain is accepted (fresh install — the tail has no inode to own)", () => {
+    const parent = newTempParent();
+    // The leaf does not exist; only its existing prefix (the self-owned temp
+    // parent and up) is walked. A fresh install must not be a dead end.
+    const leaf = join(parent, "not-created-yet", "state");
+    expect(() => assertSafeAncestorChain(canonicalOfMissing(leaf))).not.toThrow();
+  });
 });

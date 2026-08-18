@@ -22,6 +22,7 @@ import {
   MAINTENANCE_ROLE_ROTATE,
   openStoreClientFromEnv,
   readLockHolder,
+  resolveEffectiveStateDir,
 } from "@conduithq/mcp";
 import { ReencryptError, reencryptSecrets, SecretBox } from "@conduithq/sdk";
 import { writeAllAndFsync } from "./key-fs.js";
@@ -69,7 +70,19 @@ export interface KeyResult {
 }
 
 export async function runKey(args: string[], overrides?: Partial<KeyDeps>): Promise<KeyResult> {
-  const deps: KeyDeps = { ...PROD_DEPS, ...overrides };
+  const merged: KeyDeps = { ...PROD_DEPS, ...overrides };
+  // Derive `key`'s base through the SAME single resolver every other consumer
+  // runs (§17 §2, consumer 4). `key` has no custom `--state-dir` surface, so
+  // no attacker-supplied spelling reaches it and the classifier is not needed;
+  // what it needs is to never DRIFT from the daemon it shares a directory
+  // with. On the production `DEFAULT_CONDUIT_DIR` constant this is an
+  // idempotent no-op; the guarantee is that it is the identical no-op the
+  // daemon and client perform, so a poisoned-HOME default (now closed at the
+  // source in `env.ts`) could never again put `key`'s files under one dir
+  // while the auto-started daemon serves another. Tests that inject a temp
+  // `conduitDir` get its own canonical form, keeping every `key` path
+  // consistent with what a daemon in that temp dir would bind.
+  const deps: KeyDeps = { ...merged, conduitDir: resolveEffectiveStateDir(merged.conduitDir) };
   const [sub] = args;
   if (sub === "generate") {
     return generateUnderMaintenance(deps);

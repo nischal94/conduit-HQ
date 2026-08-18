@@ -128,15 +128,18 @@ export function spawnDaemon(): void {
       // session ever resolves.
       cwd: stateDir,
       // The allowlist. `PATH` is the daemon-owned constant; every
-      // `CONDUIT_*` variable is absent, and so is `HOME`. The daemon
-      // resolves its state directory through `os.homedir()` (`env.ts`:
-      // `join(homedir(), ".conduit")`), and on POSIX `homedir()` returns
-      // `$HOME` when it is set and falls back to the passwd entry for
-      // the real uid when it is not. Omitting `HOME` from this env is
-      // therefore precisely what forces that fallback — the uid the
-      // kernel authenticated, not a string the client chose. A hostile
-      // `HOME` is inert because it is absent, not because `homedir()`
-      // ignores it.
+      // `CONDUIT_*` variable is absent, and so is `HOME`. Since §17 §4 the
+      // default state directory is anchored on BOTH sides to the passwd
+      // entry for the real uid (`env.ts`: `join(userInfo().homedir,
+      // ".conduit")`), which does NOT consult `$HOME` at all — so the CLIENT
+      // (full environment) and this HOME-stripped child compute the SAME
+      // `~/.conduit` string whether `HOME` is set or not. Stripping `HOME`
+      // here is now belt-and-braces rather than the sole guarantee: a hostile
+      // `HOME` is doubly inert — absent from the child, and unread by the
+      // resolver on either side. (Before §17 §4 the default used
+      // `os.homedir()`, which honors `$HOME`; that made the client and this
+      // child agree only because the child's `HOME` was stripped, and left
+      // the client itself honoring a poisoned `HOME` — the P2-HOME hole.)
       env: daemonSpawnEnv(),
       // stdin closed; stdout and stderr to the daemon's own log. No other
       // descriptor is inherited — in particular no lock-db descriptor,

@@ -15,8 +15,9 @@
  * by absolute path — never a PATH lookup.
  */
 import { execFile } from "node:child_process";
-import type { Stats } from "node:fs";
+import { lstatSync, type Stats } from "node:fs";
 import { lstat, mkdir } from "node:fs/promises";
+import { dirname } from "node:path";
 import { promisify } from "node:util";
 
 const execFileAsync = promisify(execFile);
@@ -29,7 +30,8 @@ export type StateDirErrorCode =
   | "NOT_DIRECTORY"
   | "WRONG_OWNER"
   | "WRONG_MODE"
-  | "EXTENDED_ACL";
+  | "EXTENDED_ACL"
+  | "UNSAFE_ANCESTOR";
 
 export class StateDirError extends Error {
   readonly code: StateDirErrorCode;
@@ -108,6 +110,136 @@ export async function assertStateDir(dir: string, mode: StateDirMode): Promise<v
     await assertNoDarwinAcl(dir);
   } else if (process.platform === "linux") {
     await assertNoLinuxAcl(dir);
+  }
+}
+
+/**
+ * The `(device, inode)` identity of `path`'s OWN directory entry, via
+ * `lstatSync` (which does NOT follow a final symlink). Used to pin "the leaf
+ * I validated is the leaf I connect to" (design §17 §3.3): captured after
+ * `assertStateDir` blesses the leaf, re-checked after `connect()` succeeds
+ * and before the first request byte. A `bigint` `ino` is exact above 2^53,
+ * so two distinct inodes can never collide into a false match.
+ *
+ * `assertStateDir` has already proven the leaf is a non-symlink self-owned
+ * 0700 directory, so `lstatSync` here reads that same object; the re-check's
+ * job is only to detect that the ENTRY was swapped (a parent-owner rename
+ * dropping a different inode at the same name) between the two moments.
+ */
+export interface DirectoryIdentity {
+  dev: bigint;
+  ino: bigint;
+}
+
+export function leafIdentity(path: string): DirectoryIdentity {
+  const s = lstatSync(path, { bigint: true });
+  return { dev: s.dev, ino: s.ino };
+}
+
+/**
+ * True iff `a` and `b` name the same on-disk object by `(dev, ino)`.
+ * A cross-device hard link to a directory is impossible on our platforms,
+ * so `(dev, ino)` is a total identity for directories.
+ */
+export function sameLeaf(a: DirectoryIdentity, b: DirectoryIdentity): boolean {
+  return a.dev === b.dev && a.ino === b.ino;
+}
+
+/**
+ * Refuses a canonical base whose ancestor chain a DIFFERENT uid could rename
+ * or replace (design §17 §3.2, closes P1). `assertStateDir` proves the LEAF
+ * is a self-owned 0700 non-symlink, but says nothing about the chain of
+ * ancestors the path traverses to reach it — and the threat model grants the
+ * attacker ownership of a directory that chain crosses. A parent owner can
+ * `rename()` the validated leaf out and drop a replacement (their own 0700
+ * dir holding a fake socket) at the same path before the client connects; the
+ * 0700 mode on the original leaf never stopped that, because renaming the
+ * entry is the parent's right, not the leaf's.
+ *
+ * `canonicalBase` MUST be the kernel-faithful resolved path
+ * (`canonicalOfMissing` in `state-dir-resolve.ts`) — the canonicalize half of
+ * canonicalize-then-check. Do NOT pass a raw caller spelling: a symlink in it
+ * would make the walk check the wrong chain. Only the EXISTING prefix is
+ * walked (a not-yet-existent tail has no inode to own and, being purely
+ * lexical past the last real component, cannot alias anything).
+ *
+ * A component is disqualifying when EITHER (§3.2):
+ *   1. it is owned by a uid that is neither ours NOR root. Under the same-UID
+ *      threat model the only adversary shares neither our uid nor root, so a
+ *      ROOT-owned ancestor is trusted (it is exactly the `/`, `/Users`,
+ *      `/home`, `/private`, `/var`, `/private/tmp` chain every home path
+ *      necessarily traverses) while any other foreign owner is an
+ *      attacker-owned traversal point → refuse. Ownership is the trust
+ *      criterion, not a hardcoded name set — a uid comparison converges where
+ *      an enumerated denylist of paths never could.
+ *   2. it is group- or world-WRITABLE (`mode & 0o022`) and NOT sticky
+ *      (`mode & 0o1000`) — a writable non-sticky ancestor lets any uid
+ *      rename/replace the next component, EVEN IF it is root-owned. (A sticky
+ *      world-writable dir like `/tmp` only lets an entry's OWNER rename it, so
+ *      `/tmp` itself is not disqualifying; the self-owned 0700 leaf under it is
+ *      checked on its own terms by `assertStateDir`.) Clause 2 is applied
+ *      independently of clause 1, so a root-owned but world-writable-non-sticky
+ *      dir is still refused.
+ *
+ * `lstatSync` (bigint) is used on each existing prefix: a symlink component
+ * would already have been followed by the canonical walk, so a symlink still
+ * present at a canonical prefix is itself suspect and its own lstat'd owner is
+ * what we judge.
+ */
+export function assertSafeAncestorChain(canonicalBase: string): void {
+  const ourUid = process.getuid?.();
+  // No uid concept (non-POSIX): the same-UID boundary this rule enforces is
+  // not meaningful, so there is nothing to check. Every other consumer of
+  // this module already assumes POSIX ownership semantics.
+  if (ourUid === undefined) return;
+
+  // Walk from the leaf up to the root, checking every EXISTING component.
+  let current = canonicalBase;
+  while (true) {
+    let stat: Stats;
+    try {
+      stat = lstatSync(current);
+    } catch (err) {
+      // A not-yet-existent component (the fresh-install tail) has no inode to
+      // own — skip it and keep walking toward the root, where existing
+      // ancestors live. Any non-ENOENT fault is a real inability to vouch for
+      // the chain and must not read as "safe".
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") {
+        const parent = dirname(current);
+        if (parent === current) break;
+        current = parent;
+        continue;
+      }
+      throw new StateDirError(
+        "UNSAFE_ANCESTOR",
+        `state directory ancestor could not be checked: ${current}: ${String(err)}`,
+      );
+    }
+
+    const uid = stat.uid;
+    const mode = stat.mode;
+    // Root-owned ancestors are trusted (root is not the same-UID adversary);
+    // only a foreign NON-root owner is an attacker-owned traversal point.
+    if (uid !== ourUid && uid !== 0) {
+      throw new StateDirError(
+        "UNSAFE_ANCESTOR",
+        `state directory ancestor ${current} is owned by uid ${uid}, neither this process nor root — a ` +
+          `different uid that owns a traversed directory can rename or replace the state directory: ${canonicalBase}`,
+      );
+    }
+    const worldOrGroupWritable = (mode & 0o022) !== 0;
+    const sticky = (mode & 0o1000) !== 0;
+    if (worldOrGroupWritable && !sticky) {
+      throw new StateDirError(
+        "UNSAFE_ANCESTOR",
+        `state directory ancestor ${current} is group/world-writable and not sticky (mode ` +
+          `${(mode & 0o7777).toString(8)}) — any uid can rename or replace the next path component: ${canonicalBase}`,
+      );
+    }
+
+    const parent = dirname(current);
+    if (parent === current) break; // reached the filesystem root
+    current = parent;
   }
 }
 

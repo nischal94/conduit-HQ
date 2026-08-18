@@ -6,12 +6,14 @@ import {
   mkdtempSync,
   openSync,
   readFileSync,
+  renameSync,
   rmSync,
+  statSync,
   symlinkSync,
 } from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { createClient } from "@libsql/client";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_CONDUIT_DIR } from "../env.js";
@@ -21,6 +23,7 @@ import {
   isDefaultStateDir,
   LIFECYCLE_WAIT_POLL_MS_FOR_TEST,
   MIN_PASS_BUDGET_MS,
+  resolveEffectiveStateDir,
   sameDirectoryIdentity,
   UNCORRELATED,
 } from "./client.js";
@@ -29,6 +32,7 @@ import { encodeFrame, FRAME_CAP, FrameTooLarge } from "./frames.js";
 import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
 import { acquireExclusive, type HeldLock, probeShared } from "./locks.js";
 import { DAEMON_LOG, daemonEntryPoint, daemonSpawnEnv, PLATFORM_PATH } from "./spawn.js";
+import { StateDirError } from "./state-dir.js";
 
 /**
  * Real-process client tests (design §3.5 decision table, §5 retry rule,
@@ -1634,6 +1638,294 @@ describe("the §3.1 spawn boundary", () => {
       const reported = `${errOut}${readFileSync(logPath, "utf8")}`;
       expect(reported).toContain("Daemon spawn failed");
       expect(reported).toContain("ENOENT");
+    },
+    TIMEOUT,
+  );
+});
+
+/**
+ * The §17 state-directory boundary at the PROCESS level (the five-consumer
+ * unification). The deterministic unit halves live in state-dir-resolve.test.ts
+ * (reverse-alias derivation) and state-dir.test.ts (ancestor-chain rule); these
+ * are the missing REAL-process halves — where pass 4's scope error hid — that
+ * prove a client and a by-hand daemon resolving the same operator argv MEET at
+ * one filesystem object, that a leaf swap sends zero bytes, that a poisoned
+ * HOME cannot desynchronize client and daemon, and that a custom NOT_FOUND is
+ * refused.
+ */
+describe("daemonRequest — §17 one-effective-base boundary (process level)", () => {
+  it(
+    "INVARIANT §17: reverse-alias client and by-hand daemon meet at one object — client and daemon each resolve the SAME `<attacker>/link/../custom` argv and round-trip succeeds",
+    async () => {
+      // The attacker owns a traversable dir holding a symlink `link` -> the
+      // real custom state dir. Both the client and the (by-hand) daemon are
+      // pointed at `<attacker>/link/../custom` — the raw argv, NOT path.join'd.
+      // OLD behavior: `daemonPaths` lexically strips `link/..` and derives the
+      // socket/locks under `<attacker>/custom`, so a client and a daemon on the
+      // same argv could land in different dirs. The fix threads the ONE
+      // kernel-faithful resolver into both processes, so both reach the real
+      // custom object and the round-trip completes.
+      const root = newStateDir();
+      const home = join(root, "home");
+      const custom = join(home, "custom");
+      const attacker = join(root, "attacker");
+      mkdirSync(custom, { recursive: true, mode: 0o700 });
+      mkdirSync(attacker, { recursive: true, mode: 0o700 });
+      // `link` -> the real custom dir. `<attacker>/link` resolves to custom;
+      // `/..` pops to custom's parent (home); `/custom` re-descends to custom.
+      symlinkSync(custom, join(attacker, "link"));
+      const attackArgv = `${attacker}${sep}link${sep}..${sep}custom`;
+
+      // Sanity: the raw spelling kernel-resolves (by INODE — statSync follows
+      // symlinks + `..` in the kernel) to the real custom object, which is why
+      // it passes validation. `realpathSync` is deliberately NOT used: on macOS
+      // it returns the lexically-collapsed `<attacker>/custom` string (the very
+      // bug the fix closes), so inode identity is the faithful check.
+      const inoOf = (p: string): bigint => statSync(p, { bigint: true }).ino;
+      expect(inoOf(attackArgv)).toBe(inoOf(custom));
+
+      // A spawn seam that hands the daemon helper the RAW attack argv (not a
+      // pre-resolved dir): the daemon must resolve it ITSELF, exactly as the
+      // production `--daemon` entry does, so this pins the cross-PROCESS
+      // agreement rather than a value passed between them.
+      const spawnAtRawArgv = (_resolved: string): void => {
+        const child = spawn(process.execPath, [HELPER, attackArgv], {
+          stdio: ["ignore", "ignore", "inherit"],
+          env: { ...process.env, CONDUIT_MASTER_KEY: TEST_KEY },
+        });
+        children.push(child);
+      };
+
+      const response = await daemonRequest({
+        stateDir: attackArgv,
+        role: "serve",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 45_000,
+        spawn: spawnAtRawArgv,
+      });
+
+      expect(response.kind).toBe("result");
+      // The socket the client reached lives inside the REAL custom object —
+      // never the attacker's lexical `<attacker>/custom` sibling (which does
+      // not even exist). Compared by inode, not by realpath string.
+      const effective = resolveEffectiveStateDir(attackArgv);
+      expect(inoOf(effective)).toBe(inoOf(custom));
+      expect(existsSync(daemonPaths(effective).socket)).toBe(true);
+      expect(existsSync(join(attacker, "custom"))).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a leaf swapped between validation and connect sends ZERO request bytes",
+    async () => {
+      // Drive the client's REAL post-READY (dev,ino) re-check end-to-end. The
+      // client validates the leaf (row 4: nothing running), captures its
+      // identity, then spawns. We use the spawn seam — invoked AFTER validation
+      // — to perform the parent-owner swap: rename the validated leaf out and
+      // recreate a fresh same-named 0700 dir (a NEW inode), then start a real
+      // daemon in the swapped-in dir so a socket exists and the client reaches
+      // READY. At READY the client re-lstats the leaf, finds a different
+      // (dev,ino) than it validated, and MUST abort before writing a byte.
+      const stateDir = newStateDir();
+      // Materialize the (soon-to-be-validated) leaf as a real 0700 dir under a
+      // self-owned chain, so validation passes and captures its identity.
+      mkdirSync(join(stateDir, "leaf"), { mode: 0o700 });
+      const leaf = join(stateDir, "leaf");
+      const validatedIno = statSync(leaf, { bigint: true }).ino;
+
+      const swapThenSpawn = (resolved: string): void => {
+        // The swap: the validated leaf is renamed away and a fresh inode is
+        // dropped at the same path — exactly what a parent-owner rename does.
+        renameSync(leaf, `${leaf}.evicted`);
+        mkdirSync(leaf, { mode: 0o700 });
+        // Confirm the inode genuinely changed (else the test proves nothing).
+        expect(statSync(leaf, { bigint: true }).ino).not.toBe(validatedIno);
+        // Start a real daemon in the swapped-in dir so the client can connect
+        // and reach READY — the window in which the re-check must fire.
+        const child = spawn(process.execPath, [HELPER, resolved], {
+          stdio: ["ignore", "ignore", "inherit"],
+          env: { ...process.env, CONDUIT_MASTER_KEY: TEST_KEY },
+        });
+        children.push(child);
+      };
+
+      const err = await daemonRequest({
+        stateDir: leaf,
+        role: "add-mcp", // the role whose request carries the add secret
+        request: { kind: "search", query: "swap-should-block-this" },
+        deadlineMs: 45_000,
+        spawn: swapThenSpawn,
+      }).catch((e: unknown) => e);
+
+      // The client aborted on the detected swap with the typed refusal, in the
+      // retryable (pre-write) zone — never an outcome-unknown, which would mean
+      // a byte had gone out.
+      expect(err).toBeInstanceOf(StateDirError);
+      expect((err as StateDirError).code).toBe("UNSAFE_ANCESTOR");
+      expect((err as StateDirError).message).toContain("No bytes were written");
+
+      rmSync(`${leaf}.evicted`, { recursive: true, force: true });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: an attacker-owned (world-writable non-sticky) ancestor is REFUSED — no spawn, no connect",
+    async () => {
+      // A custom base whose existing parent is world-writable and NOT sticky:
+      // any uid can rename/replace the leaf, so the client must refuse before
+      // it ever spawns or connects. (Foreign-uid ownership cannot be simulated
+      // without root; the writable-non-sticky clause is the real, unprivileged
+      // half of §3.2 and the one an unprivileged attacker actually exploits.)
+      const root = newStateDir();
+      const openParent = join(root, "open");
+      mkdirSync(openParent, { mode: 0o777 });
+      // chmod again to defeat umask so the mode is genuinely 0777.
+      const { chmodSync } = await import("node:fs");
+      chmodSync(openParent, 0o777);
+      const custom = join(openParent, "state");
+      mkdirSync(custom, { mode: 0o700 });
+
+      let spawnCalls = 0;
+      const err = await daemonRequest({
+        stateDir: custom,
+        role: "add-mcp",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 30_000,
+        spawn: () => {
+          spawnCalls += 1;
+        },
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(StateDirError);
+      expect((err as StateDirError).code).toBe("UNSAFE_ANCESTOR");
+      expect(spawnCalls).toBe(0);
+      expect(existsSync(daemonPaths(custom).socket)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: poisoned-HOME auto-start — client and the HOME-stripped daemon derive the SAME passwd-anchored default, unaffected by HOME",
+    async () => {
+      // The auto-started daemon child is HOME-stripped and derives the default
+      // from the passwd entry; the client runs with a full environment. Before
+      // §4 the default used `os.homedir()`, which honors $HOME, so a poisoned
+      // client HOME desynchronized them. This pins the §4.3 proof at the
+      // PROCESS boundary with a real spawned child: `DEFAULT_CONDUIT_DIR` is
+      // `join(userInfo().homedir, ".conduit")`, and the child — spawned with a
+      // hostile HOME — computes the SAME `userInfo().homedir` this process
+      // does, while `os.homedir()` (the OLD source) diverges to the poison.
+      // That divergence is exactly the hole the fix closes, so the test asserts
+      // both: the passwd home matches across the boundary, and the HOME-honoring
+      // primitive would NOT have.
+      const { DEFAULT_CONDUIT_DIR } = await import("../env.js");
+      const probeResult = await new Promise<{ passwd: string; homeEnv: string }>((res, rej) => {
+        const probe = spawn(
+          process.execPath,
+          [
+            "-e",
+            "const os=require('node:os');console.log(JSON.stringify({passwd:os.userInfo().homedir,homeEnv:os.homedir()}))",
+          ],
+          {
+            stdio: ["ignore", "pipe", "inherit"],
+            env: { PATH: process.env.PATH, HOME: "/tmp/poison-home-does-not-exist" },
+          },
+        );
+        let buf = "";
+        probe.stdout?.on("data", (c: Buffer) => {
+          buf += c.toString("utf8");
+        });
+        probe.once("error", rej);
+        probe.once("exit", (code) =>
+          code === 0 ? res(JSON.parse(buf.trim())) : rej(new Error(`probe exited ${code}: ${buf}`)),
+        );
+      });
+      // The child's passwd home (the source `DEFAULT_CONDUIT_DIR` now uses)
+      // equals this process's — HOME changed nothing. So both sides bind the
+      // same `~/.conduit`.
+      expect(join(probeResult.passwd, ".conduit")).toBe(DEFAULT_CONDUIT_DIR);
+      // And the OLD source (`os.homedir()`) WOULD have desynchronized: with a
+      // poisoned HOME it returns the poison, which is precisely the P2-HOME
+      // hole the fix removes.
+      expect(probeResult.homeEnv).toBe("/tmp/poison-home-does-not-exist");
+      expect(join(probeResult.passwd, ".conduit")).not.toContain("poison-home");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a custom state dir whose canonical form does not exist is REFUSED with the by-hand start command (production cannot auto-start a custom daemon), and spawns nothing",
+    async () => {
+      // A custom dir that does not exist yet. Production (no injected spawn
+      // seam) cannot auto-start a custom daemon, so accepting NOT_FOUND as
+      // "fresh install, proceed" would only open the ancestor-swap window. The
+      // refusal names the by-hand command. This is the PRODUCTION path — no
+      // `spawn` seam — so the §5 custom-NOT_FOUND refusal applies.
+      const root = newStateDir();
+      const custom = join(root, "does-not-exist-yet");
+      expect(existsSync(custom)).toBe(false);
+
+      const err = await daemonRequest({
+        stateDir: custom,
+        role: "add-mcp",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 30_000,
+        // No spawn seam: production path.
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(DaemonUnavailable);
+      const message = (err as DaemonUnavailable).message;
+      expect(message).toContain(`conduit-mcp --daemon --state-dir ${custom}`);
+      expect(message).toContain("does not exist");
+      expect(existsSync(daemonPaths(resolveEffectiveStateDir(custom)).socket)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17 / §9.1: the default --doctor's report comes from the DAEMON — handshake config (db path, egress) and the daemon's own source count arrive over the socket via the serve-role catalog.listing read, not a private store open",
+    async () => {
+      // The substance of the daemon-backed `--doctor` (bin.ts `doctor()`): it
+      // reaches the daemon over the socket using the `serve` role's existing
+      // `catalog.listing` read (no new capability row), reads the db path and
+      // effective egress from `handshake.ok` (§9 item 3), and reports the
+      // daemon's OWN source count — never re-deriving health from a private
+      // store open. This is the EXACT mechanism `doctor()` runs; pinning it at
+      // the client level keeps the invariant isolable now that §4 makes the
+      // default dir passwd-anchored (a `bin.js --doctor` cannot be redirected
+      // to a temp dir: HOME no longer moves the default, and the daemon-backed
+      // doctor REFUSES a custom `--state-dir` by design — invariant §17/§3.1).
+      const stateDir = newStateDir();
+      // A real daemon seeded with exactly one source (the `--seed-catalog`
+      // helper upserts one source/integration/connection/secret before bind).
+      await runningDaemon(stateDir, ["--seed-catalog"]);
+
+      let handshake: { dbPath: string; allowPrivateEgress: boolean } | undefined;
+      const response = await daemonRequest({
+        stateDir,
+        role: "serve", // doctor deliberately reuses the serve read role
+        request: { kind: "catalog.listing" },
+        deadlineMs: 30_000,
+        autoStart: false, // the daemon is already running; never spawn
+        onHandshake: (info) => {
+          handshake = info;
+        },
+      });
+
+      // The handshake carried the daemon's effective non-secret config — the
+      // db path under THIS daemon's state dir and the fail-closed egress
+      // default — exactly what `doctor()` prints. The daemon resolves its base
+      // through the shared resolver (§17 §2), so its db path is the CANONICAL
+      // form (on macOS /var → /private/var); compare against the resolved base.
+      expect(handshake).toBeDefined();
+      expect(handshake?.dbPath).toBe(daemonPaths(resolveEffectiveStateDir(stateDir)).db);
+      expect(handshake?.allowPrivateEgress).toBe(false);
+      // The source count is the daemon's own, counted over the socket.
+      expect(response.kind).toBe("result");
+      if (response.kind !== "result") throw new Error("expected a result");
+      expect(response.payload.sourceCount).toBe(1);
     },
     TIMEOUT,
   );

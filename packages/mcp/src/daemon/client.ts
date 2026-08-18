@@ -41,7 +41,14 @@ import { encodeFrame, FrameDecoder } from "./frames.js";
 import { describeHolder, probeShared, readLockHolder } from "./locks.js";
 import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
 import { DAEMON_LOG, spawnDaemon } from "./spawn.js";
-import { assertStateDir, StateDirError } from "./state-dir.js";
+import {
+  assertSafeAncestorChain,
+  assertStateDir,
+  type DirectoryIdentity,
+  leafIdentity,
+  StateDirError,
+  sameLeaf,
+} from "./state-dir.js";
 import { isDefaultStateDir, resolveEffectiveStateDir } from "./state-dir-resolve.js";
 
 // Re-exported so the historical import site (`./client.js`) keeps working
@@ -267,6 +274,24 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
   const effectiveStateDir = resolveEffectiveStateDir(opts.stateDir);
   const paths = daemonPaths(effectiveStateDir);
 
+  // Whether the caller named the canonical default. Read from the RAW input —
+  // "is this the default?" is a question about what the caller named, and
+  // `isDefaultStateDir` answers it by filesystem identity, not by string. It
+  // decides the two base-kind-dependent behaviours below: the §5 NOT_FOUND
+  // classification and (indirectly, via `spawnPermitted`) the auto-start gate.
+  const isDefault = isDefaultStateDir(opts.stateDir);
+
+  // The §17 §3.2 ancestor-chain rule (closes P1). A leaf that is itself a
+  // self-owned 0700 directory is still unsafe if a DIFFERENT uid owns a
+  // directory the path traverses to reach it — that uid can rename the
+  // validated leaf out and drop a replacement before the client connects.
+  // Checked against the RESOLVED canonical base (the canonicalize-then-check
+  // shape), on the existing prefix of its walk, and reported as a boundary
+  // break — never swallowed as "fresh install". The default base is
+  // UID-anchored and its chain is us/root-owned, so this is a no-op there;
+  // it is the defense for any custom directory the client proceeds to use.
+  assertSafeAncestorChain(effectiveStateDir);
+
   // The auto-start gate, decided HERE rather than trusted from the caller
   // (Codex ARC F5 — the structural half). Two independent facts permit a
   // spawn against this `stateDir`:
@@ -352,14 +377,56 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
   // open is a lock nobody holds), lands on row 4, and spawns; the
   // daemon's own `ensureStateDir` then creates it under the same
   // mkdir-then-assert boundary that governs every other start.
+  // The identity of the validated leaf, captured when it EXISTS so the
+  // post-connect re-check (§17 §3.3) can prove the leaf the socket lives in
+  // is the same object this validated. `undefined` when the leaf did not
+  // exist at validation (a genuine fresh install — see the NOT_FOUND branch):
+  // there is no object to pin, and the daemon's own `ensureStateDir` creates
+  // and re-asserts the leaf under the same boundary before it binds.
+  let validatedLeaf: DirectoryIdentity | undefined;
+
   try {
     // Validated against the SAME resolved base the socket/lock paths are
     // derived from (`effectiveStateDir`), never the raw spelling — that
     // equality is the whole point of the pass-4 fix: the dir this blesses is
     // exactly the dir the endpoint lives in.
     await assertStateDir(effectiveStateDir, "connect");
+    // Existed and validated: pin its identity for the leaf-swap re-check.
+    validatedLeaf = leafIdentity(effectiveStateDir);
   } catch (err) {
     if (!(err instanceof StateDirError) || err.code !== "NOT_FOUND") throw err;
+    // NOT_FOUND is classified by BASE KIND (§17 §5), because the default and a
+    // custom dir have OPPOSITE safe responses:
+    //
+    //  - CUSTOM dir, canonical form absent → REFUSE. Production auto-start is
+    //    zero-argument and can only ever start the DEFAULT-dir daemon, so a
+    //    custom dir that does not yet exist can never be SERVED by an
+    //    auto-start; accepting it as "fresh install, proceed" would only open
+    //    the P1 ancestor-swap window (the attacker creates the leaf in the
+    //    gap). There is no legitimate auto-start outcome to protect, so the
+    //    safe answer is the same refusal the auto-start gate gives — with the
+    //    by-hand start command.
+    //
+    //  - DEFAULT dir absent → PROCEED. A genuine fresh install has not created
+    //    `~/.conduit` yet; the base is the UID-anchored `DEFAULT_CONDUIT_DIR`
+    //    (not attacker-chosen) and its existing ancestor prefix was just
+    //    vouched for above, so both probes read "free", the loop lands on row
+    //    4, and the daemon materializes the leaf 0700 and re-asserts under the
+    //    same boundary. `validatedLeaf` stays `undefined` — nothing existed to
+    //    pin — and the leaf-swap re-check is correctly skipped.
+    //
+    // An injected `spawn` seam is a TEST that has taken explicit ownership of
+    // where the daemon starts (it can start one against this very custom dir),
+    // so a not-yet-existent custom dir is a legitimate fresh install for it,
+    // exactly as the default is for production — it proceeds, not refuses.
+    if (!isDefault && opts.spawn === undefined) {
+      throw new DaemonUnavailable(
+        "unavailable",
+        `[conduit] Daemon unavailable: the custom state directory ${opts.stateDir} does not exist, ` +
+          `and auto-start cannot create one (a spawned daemon runs against the DEFAULT directory, ` +
+          `not this one). Start it by hand: conduit-mcp --daemon --state-dir ${opts.stateDir}`,
+      );
+    }
   }
 
   let spawned = false;
@@ -431,6 +498,28 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
 
       const ready = await awaitReady(socket, remaining(expiry));
       if (ready.ready) {
+        // The leaf-swap re-check (§17 §3.3), run AFTER connect+READY and
+        // BEFORE the first byte, while still in the retryable zone. If the
+        // leaf we validated existed, re-`lstat` it now and confirm its
+        // `(dev, ino)` is unchanged: a parent-owner who renamed the validated
+        // leaf out and dropped a replacement (holding this very socket) in the
+        // window between validation and connect is caught here. A mismatch is
+        // a boundary break — destroy the socket and abort with ZERO bytes
+        // written, so the request (for `add-mcp`, the add secret) never
+        // reaches the swapped-in endpoint. Nothing has been written, so this
+        // throw is in the retryable zone; it is a refusal, not an ambiguity.
+        if (
+          validatedLeaf !== undefined &&
+          !sameLeaf(leafIdentity(effectiveStateDir), validatedLeaf)
+        ) {
+          socket.destroy();
+          throw new StateDirError(
+            "UNSAFE_ANCESTOR",
+            `state directory leaf changed identity between validation and connect (a parent-owner ` +
+              `swap): ${effectiveStateDir} — refusing to send the request to a possibly-replaced ` +
+              `endpoint. No bytes were written.`,
+          );
+        }
         // Past this point the request bytes go out and the retryable
         // zone ends. The READY gate's decoder and any frames it already
         // read past READY travel into the exchange — see `awaitReady`

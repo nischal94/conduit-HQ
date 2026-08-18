@@ -47,6 +47,21 @@ export type { Capability, RpcRequest, RpcResponse } from "./daemon/rpc.js";
  * `mkdirSync`.
  */
 export { assertStateDir, ensureStateDir, StateDirError } from "./daemon/state-dir.js";
+/**
+ * `key` (in the `cli` package) derives its paths from `deps.conduitDir`
+ * (`DEFAULT_CONDUIT_DIR` in production, a temp dir in tests). It has no custom
+ * `--state-dir` surface, so it does not need the classifier — it needs the
+ * SAME single resolver every other consumer runs, applied to its own base, so
+ * it can never drift from the daemon it shares a directory with (§17 §2,
+ * consumer 4). On the default constant this resolve is a no-op; the value is
+ * that it is the SAME no-op the daemon and client perform.
+ */
+export {
+  canonicalOfMissing,
+  isDefaultStateDir,
+  resolveEffectiveStateDir,
+  sameDirectoryIdentity,
+} from "./daemon/state-dir-resolve.js";
 export {
   DEFAULT_CONDUIT_DIR,
   DEFAULT_KEY_FILE,

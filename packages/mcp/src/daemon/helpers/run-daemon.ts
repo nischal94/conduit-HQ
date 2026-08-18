@@ -28,14 +28,22 @@ import { writeFileSync } from "node:fs";
 import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
 import { FRAME_CAP } from "../frames.ts";
+import { resolveEffectiveStateDir } from "../state-dir-resolve.ts";
 import { sweepOrphanedExecutions } from "../sweep.ts";
 
-const [, , stateDir, ...rest] = process.argv;
+const [, , rawStateDir, ...rest] = process.argv;
 
-if (!stateDir) {
+if (!rawStateDir) {
   console.error("run-daemon: missing stateDir argument");
   process.exit(1);
 }
+
+// Mirror the production `--daemon` entry (`bin.ts`): resolve the ONE effective
+// base at the entry point (§17 §2, consumer 2) so a by-hand daemon started
+// with a reverse-alias spelling binds under the SAME kernel-faithful object a
+// client resolving the same argv reaches. A no-op for an already-canonical
+// temp dir, which is what every other test passes.
+const stateDir = resolveEffectiveStateDir(rawStateDir);
 
 const markerFlag = rest.indexOf("--sweep-marker");
 const sweepMarker = markerFlag === -1 ? undefined : rest[markerFlag + 1];

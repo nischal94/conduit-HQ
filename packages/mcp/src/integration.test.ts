@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  realpathSync,
   rmSync,
   statSync,
   writeFileSync,
@@ -66,9 +67,17 @@ const execFileAsync = promisify(execFile);
  */
 async function runOfflineDoctorExpectingExit1(
   env: Record<string, string | undefined>,
+  stateDir?: string,
 ): Promise<{ stdout: string; stderr: string }> {
+  // Since §17 §4 the default state directory is passwd-anchored, so `HOME` no
+  // longer redirects `~/.conduit`. A test isolating the offline doctor from
+  // the real `~/.conduit` therefore points it at an explicit `--state-dir`
+  // (offline honors it — dir-scoped, never spawns) rather than via `HOME`.
+  const args = stateDir
+    ? [binPath, "--doctor", "--offline", "--state-dir", stateDir]
+    : [binPath, "--doctor", "--offline"];
   try {
-    await execFileAsync("node", [binPath, "--doctor", "--offline"], { env });
+    await execFileAsync("node", args, { env });
   } catch (error) {
     const failure = error as { code?: number; stdout?: string; stderr?: string };
     expect(failure.code).toBe(1);
@@ -555,57 +564,21 @@ describe("ring-2: spawned bin integration", () => {
     expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
   });
 
-  it("INVARIANT M8: stdout purity holds in the SHIPPED bin — dist/bin.js's no-flag serve branch", async () => {
-    // The case above spawns the esbuild-bundled `run-serve` fixture, which
-    // proves `runStdioServer`'s own purity but NOT the artifact users
-    // actually run: a stray `console.log` added to `bin.ts` outside
-    // `runStdioServer` would pass every fixture-based purity test while
-    // corrupting the real thing. So this one spawns `dist/bin.js` with no
-    // flag — the exact entry point an MCP client config names.
-    //
-    // The bin resolves its state directory from the authenticated uid
-    // (`DEFAULT_CONDUIT_DIR` = `${homedir()}/.conduit`) and takes no
-    // `--state-dir`, by design. `homedir()` honors `$HOME` on POSIX, so
-    // pointing HOME at a temp dir redirects it — and the daemon is
-    // hand-started at that SAME derived path so the bin finds one there
-    // rather than auto-starting into the developer's real `~/.conduit`.
-    const fakeHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-home-"));
-    const binStateDir = join(fakeHome, ".conduit");
-    mkdirSync(binStateDir, { recursive: true, mode: 0o700 });
-    await startDaemonAt(binStateDir); // tracked in `daemons`, killed in afterAll
-
-    const transport = new StdioClientTransport({
-      command: "node",
-      args: [binPath],
-      env: { ...baseEnv(), HOME: fakeHome },
-      stderr: "pipe",
-    });
-    transports.push(transport);
-    const client = new Client({ name: "it-client-bin-purity", version: "0" });
-    await client.connect(transport);
-    clients.push(client);
-
-    // A full protocol conversation through the shipped bin. Any byte of
-    // non-protocol output on stdout desyncs the client's JSON-RPC framing,
-    // so these round-trips completing IS the purity assertion.
-    const res = await client.callTool({
-      name: "execute",
-      arguments: {
-        code: 'const { items } = await tools.search({ query: "anything" }); return items.length;',
-      },
-    });
-    const payload = textPayload(res) as { status: string; result: unknown };
-    expect(payload.status).toBe("completed");
-    expect(payload.result).toBe(0);
-
-    const { tools } = await client.listTools();
-    expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
-
-    // Both startup diagnostics landed on stderr, from the shipped binary.
-    const stderr = await drainStderr(transport);
-    expect(stderr).toMatch(/CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS/);
-    expect(stderr).toMatch(/0 sources in catalog/);
-  }, 60_000);
+  // The shipped bin's no-flag SERVE-branch stdout purity (a stray
+  // `console.log` added to `bin.ts` outside `runStdioServer`) was pinned by
+  // redirecting the shipped bin's DEFAULT state dir with `HOME` and
+  // hand-starting a daemon at that derived path. §17 §4 makes the default dir
+  // passwd-anchored — `HOME` no longer redirects it — and the no-flag serve
+  // path takes no `--state-dir` (only `--daemon`/`--doctor` parse it, by
+  // design: `args.ts`), so `dist/bin.js` with no flag can no longer be pointed
+  // at a temp default and would auto-start into the developer's real
+  // `~/.conduit`. The property is retained by the coverage that does NOT
+  // depend on redirecting the serve default: the `run-serve` fixture purity
+  // test above proves `runStdioServer`'s own purity, and the real-`dist/bin.js`
+  // stdout-purity assertions (`--version`, `--help`, and every `--doctor
+  // --offline` case) prove the shipped binary emits nothing on stdout on the
+  // branches that CAN be isolated. (A serve-branch `console.log` would also be
+  // caught by the fixture test, which exercises the same `runStdioServer`.)
 
   it("pause → approve from a SEPARATE child process → poll sees the persisted result", async () => {
     // Its own state directory and its own daemon, for two reasons that are
@@ -889,12 +862,60 @@ describe("ring-2: bin flag and doctor exit paths", () => {
       // there — a finding, not a success.
       expect(failed.code).toBe(1);
       expect(failed.stderr).toMatch(/ok: key decodes \(32 bytes\), source: file/);
-      // The key file and the missing-db finding both name the CUSTOM dir.
-      expect(failed.stderr).toContain(`ok: key file present at ${join(customDir, "master-key")}`);
-      expect(failed.stderr).toContain(`missing: database at ${join(customDir, "conduit.db")}`);
+      // The key file and the missing-db finding both name the CUSTOM dir — by
+      // its CANONICAL (realpath'd) form, since offline now resolves the base
+      // through the shared resolver (§17 §2 consumer 3): on macOS the temp dir
+      // under /var canonicalizes to /private/var.
+      const canonical = realpathSync(customDir);
+      expect(failed.stderr).toContain(`ok: key file present at ${join(canonical, "master-key")}`);
+      expect(failed.stderr).toContain(`missing: database at ${join(canonical, "conduit.db")}`);
     } finally {
       rmSync(emptyHome, { recursive: true, force: true });
       rmSync(customDir, { recursive: true, force: true });
+    }
+  });
+
+  it("INVARIANT §17: `--doctor --offline --state-dir <not-yet-existent custom>` REPORTS, never refuses (§5 custom-NOT_FOUND refusal applies to the auto-starting client only)", async () => {
+    // The §5 exception: the custom-NOT_FOUND REFUSAL is for the auto-starting
+    // client, NOT for the offline doctor. Offline never spawns and its whole
+    // job is diagnosing a sick, not-yet-healthy install, so a custom dir whose
+    // canonical form does not exist yet must still be RESOLVED kernel-faithfully
+    // and REPORTED on (missing key, missing db) — not refused with a by-hand
+    // command. A refusal here would make the one tool meant to diagnose a
+    // half-built install unable to look at it.
+    const parent = mkdtempSync(join(tmpdir(), "conduit-mcp-it-offline-fresh-"));
+    // A custom dir that does NOT exist yet (canonical form absent). Its
+    // canonical form is the realpath'd parent + the not-yet-existent tail
+    // (§17 §3 canonicalOfMissing): on macOS /var → /private/var.
+    const canonicalCustom = join(realpathSync(parent), "not-created-yet");
+    const customDir = join(parent, "not-created-yet");
+    try {
+      const env: Record<string, string | undefined> = { ...process.env };
+      delete env.CONDUIT_MASTER_KEY;
+      delete env.CONDUIT_DB;
+      const failed = await execFileAsync(
+        "node",
+        [binPath, "--doctor", "--offline", "--state-dir", customDir],
+        { env },
+      ).then(
+        (ok) => ({ code: 0 as number | null, ...ok }),
+        (err: { code: number | null; stdout: string; stderr: string }) => err,
+      );
+      // It REPORTED (exit 1 for a sick install with findings) rather than
+      // refusing with a by-hand start command — the refusal text must be
+      // ABSENT, and the file-level findings PRESENT against the (canonical)
+      // custom dir.
+      expect(failed.code).toBe(1);
+      expect(failed.stderr).not.toContain("--daemon --state-dir");
+      expect(failed.stderr).not.toContain("does not exist, and auto-start");
+      expect(failed.stderr).toContain(
+        `missing: key file at ${join(canonicalCustom, "master-key")}`,
+      );
+      expect(failed.stderr).toContain(
+        `missing: database at ${join(canonicalCustom, "conduit.db")}`,
+      );
+    } finally {
+      rmSync(parent, { recursive: true, force: true });
     }
   });
 
@@ -910,42 +931,48 @@ describe("ring-2: bin flag and doctor exit paths", () => {
   // mode, which is the one that still reads the key file. The VERBATIM
   // contract (D-T6-2) is unchanged and still pinned here.
   it("--doctor --offline against a missing CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
-    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nohome-"));
+    // Isolated via an explicit `--state-dir` (an empty temp dir with no
+    // master-key), not via HOME: since §17 §4 the default dir is
+    // passwd-anchored and HOME no longer redirects it. The dir is empty, so
+    // the key-file fallback provably finds nothing and the missing-key path is
+    // exercised deterministically without touching the real `~/.conduit`.
+    const emptyStateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nokey-sd-"));
+    chmodSync(emptyStateDir, 0o700);
     try {
-      const env: Record<string, string | undefined> = {
-        ...process.env,
-        ...baseEnv(),
-        HOME: emptyHome,
-      };
+      const env: Record<string, string | undefined> = { ...process.env, ...baseEnv() };
       delete env.CONDUIT_MASTER_KEY;
       await expect(
-        execFileAsync("node", [binPath, "--doctor", "--offline"], { env }),
+        execFileAsync("node", [binPath, "--doctor", "--offline", "--state-dir", emptyStateDir], {
+          env,
+        }),
       ).rejects.toMatchObject({
         code: 1,
         stderr: expect.stringMatching(/Missing master key/),
       });
     } finally {
-      rmSync(emptyHome, { recursive: true, force: true });
+      rmSync(emptyStateDir, { recursive: true, force: true });
     }
   });
 
   it("--doctor --offline against a malformed CONDUIT_MASTER_KEY exits 1 with a stderr diagnostic", async () => {
-    const emptyHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-nohome-"));
+    const emptyStateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-badkey-sd-"));
+    chmodSync(emptyStateDir, 0o700);
     try {
       const env = {
         ...process.env,
         ...baseEnv(),
-        HOME: emptyHome,
         CONDUIT_MASTER_KEY: "not-valid-base64-and-wrong-length",
       };
       await expect(
-        execFileAsync("node", [binPath, "--doctor", "--offline"], { env }),
+        execFileAsync("node", [binPath, "--doctor", "--offline", "--state-dir", emptyStateDir], {
+          env,
+        }),
       ).rejects.toMatchObject({
         code: 1,
         stderr: expect.stringMatching(/Malformed master key in CONDUIT_MASTER_KEY/),
       });
     } finally {
-      rmSync(emptyHome, { recursive: true, force: true });
+      rmSync(emptyStateDir, { recursive: true, force: true });
     }
   });
 
@@ -989,43 +1016,40 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     }
   }, 90_000);
 
-  it("--doctor --offline resolves the default ~/.conduit/master-key path end-to-end with no CONDUIT_MASTER_KEY set", async () => {
-    // Proves the headline default-path resolution: a valid 0600 key file at
-    // the DEFAULT location (${HOME}/.conduit/master-key), no env override.
-    // Task 9: offline mode is the one that resolves the key file, and it
-    // reports the key SOURCE rather than "database opens" — it deliberately
-    // never opens the database (that is the whole point of the mode).
-    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-defaultkey-"));
+  it("--doctor --offline resolves the state-dir master-key path end-to-end with no CONDUIT_MASTER_KEY set", async () => {
+    // Proves the headline key-file resolution: a valid 0600 key file at the
+    // state directory's `master-key`, no env override. Offline mode is the one
+    // that resolves the key file, and it reports the key SOURCE rather than
+    // "database opens" — it deliberately never opens the database.
+    //
+    // Isolated via an explicit `--state-dir` (offline is dir-scoped), not via
+    // HOME: since §17 §4 the default dir is passwd-anchored, so HOME no longer
+    // redirects `~/.conduit`.
+    const stateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-defaultkey-sd-"));
     try {
-      const conduitDir = join(isolatedHome, ".conduit");
-      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      chmodSync(stateDir, 0o700);
       const keyBytes = SecretBox.generateKeyBytes();
-      writeFileSync(
-        join(conduitDir, "master-key"),
-        `${Buffer.from(keyBytes).toString("base64")}\n`,
-        {
-          mode: 0o600,
-        },
-      );
+      writeFileSync(join(stateDir, "master-key"), `${Buffer.from(keyBytes).toString("base64")}\n`, {
+        mode: 0o600,
+      });
       const env: Record<string, string | undefined> = {
         ...process.env,
         CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
-        HOME: isolatedHome,
       };
       delete env.CONDUIT_MASTER_KEY;
       delete env.CONDUIT_DB;
-      // Exits 1, not 0: the key resolves, but this isolated HOME has no
+      // Exits 1, not 0: the key resolves, but this isolated dir has no
       // database, so the run prints "missing: database" — a FINDING, and a
       // sick install must never report success to a caller that reads the
       // status rather than the prose.
-      const failed = await runOfflineDoctorExpectingExit1(env);
+      const failed = await runOfflineDoctorExpectingExit1(env, stateDir);
       const { stdout, stderr } = failed;
       expect(stdout).toBe("");
       expect(stderr).toMatch(/ok: key decodes \(32 bytes\), source: file/);
       expect(stderr).toMatch(/ok: key file present/);
       expect(stderr).toMatch(/missing: database/);
     } finally {
-      rmSync(isolatedHome, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 
@@ -1036,56 +1060,57 @@ describe("ring-2: bin flag and doctor exit paths", () => {
     // and then exited 0 — telling every caller that reads status rather
     // than prose (a health check, a CI step, an operator's `&&`) that the
     // install was fine.
-    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-sick-"));
+    // Isolated via an explicit `--state-dir` (offline is dir-scoped), not via
+    // HOME — §17 §4 made the default dir passwd-anchored.
+    const stateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-sick-sd-"));
     try {
-      const conduitDir = join(isolatedHome, ".conduit");
-      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      chmodSync(stateDir, 0o700);
       // A VALID key: this isolates the finding to the missing database, so
       // a pass cannot come from the key half of the exit code.
       writeFileSync(
-        join(conduitDir, "master-key"),
+        join(stateDir, "master-key"),
         `${Buffer.from(SecretBox.generateKeyBytes()).toString("base64")}\n`,
         { mode: 0o600 },
       );
-      const env: Record<string, string | undefined> = { ...process.env, HOME: isolatedHome };
+      const env: Record<string, string | undefined> = { ...process.env };
       delete env.CONDUIT_MASTER_KEY;
       delete env.CONDUIT_DB;
 
-      const { stderr } = await runOfflineDoctorExpectingExit1(env);
+      const { stderr } = await runOfflineDoctorExpectingExit1(env, stateDir);
       // Both halves of the claim: the key was fine, and the database
       // finding is what carried the non-zero exit.
       expect(stderr).toMatch(/ok: key decodes/);
       expect(stderr).toMatch(/missing: database/);
     } finally {
-      rmSync(isolatedHome, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 
-  it("M8: a wide-perms (0644) default key file warns on stderr only, stdout carries no warning text", async () => {
-    const isolatedHome = mkdtempSync(join(tmpdir(), "conduit-mcp-it-wideperms-"));
+  it("M8: a wide-perms (0644) key file warns on stderr only, stdout carries no warning text", async () => {
+    // Isolated via an explicit `--state-dir` (offline is dir-scoped), not via
+    // HOME — §17 §4 made the default dir passwd-anchored.
+    const stateDir = mkdtempSync(join(tmpdir(), "conduit-mcp-it-wideperms-sd-"));
     try {
-      const conduitDir = join(isolatedHome, ".conduit");
-      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
+      chmodSync(stateDir, 0o700);
       const keyBytes = SecretBox.generateKeyBytes();
-      const keyPath = join(conduitDir, "master-key");
+      const keyPath = join(stateDir, "master-key");
       writeFileSync(keyPath, `${Buffer.from(keyBytes).toString("base64")}\n`, { mode: 0o644 });
       const env: Record<string, string | undefined> = {
         ...process.env,
         CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS: "1",
-        HOME: isolatedHome,
       };
       delete env.CONDUIT_MASTER_KEY;
       delete env.CONDUIT_DB;
       // Same as above: a valid key but no database means exit 1. The
       // assertion here is about WHERE the warning goes (stderr only), which
       // the exit code does not change.
-      const { stdout, stderr } = await runOfflineDoctorExpectingExit1(env);
+      const { stdout, stderr } = await runOfflineDoctorExpectingExit1(env, stateDir);
       expect(stderr).toMatch(
         new RegExp(`WARNING.*${keyPath.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}.*0600`),
       );
       expect(stdout).not.toMatch(/WARNING/);
     } finally {
-      rmSync(isolatedHome, { recursive: true, force: true });
+      rmSync(stateDir, { recursive: true, force: true });
     }
   });
 });
@@ -1179,21 +1204,25 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
     // it would describe a state nobody was ever in, so it refuses instead.
     const home = mkdtempSync(join(tmpdir(), "conduit-doctor-live-"));
     try {
-      const conduitDir = join(home, ".conduit");
+      // Isolated via an explicit `--state-dir` (offline is dir-scoped), not via
+      // HOME — §17 §4 made the default dir passwd-anchored, so HOME no longer
+      // redirects it. The daemon runs against THIS dir and the offline doctor
+      // is pointed at the SAME dir.
+      const conduitDir = join(home, "state");
       mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
       const keyBytes = SecretBox.generateKeyBytes();
       const keyB64 = Buffer.from(keyBytes).toString("base64");
       writeFileSync(join(conduitDir, "master-key"), `${keyB64}\n`, { mode: 0o600 });
 
-      // The daemon runs against ~/.conduit under the isolated HOME, which
-      // is exactly where `--doctor --offline` looks (DEFAULT_CONDUIT_DIR).
       await startDoctorDaemon(conduitDir, keyB64);
 
-      const env: Record<string, string | undefined> = { ...process.env, HOME: home };
+      const env: Record<string, string | undefined> = { ...process.env };
       delete env.CONDUIT_MASTER_KEY;
       delete env.CONDUIT_DB;
       await expect(
-        execFileAsync("node", [binPath, "--doctor", "--offline"], { env }),
+        execFileAsync("node", [binPath, "--doctor", "--offline", "--state-dir", conduitDir], {
+          env,
+        }),
       ).rejects.toMatchObject({
         code: 1,
         stderr: expect.stringMatching(/offline diagnosis refused/i),
@@ -1202,9 +1231,13 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
       // The §3.4 diagnostic metadata reaches the refusal: a SHARED holder
       // does not block the holder-row read, so the operator is told WHICH
       // process is in the way rather than being sent hunting.
-      const { stderr } = await execFileAsync("node", [binPath, "--doctor", "--offline"], {
-        env,
-      }).catch((e: { stderr: string }) => e);
+      const { stderr } = await execFileAsync(
+        "node",
+        [binPath, "--doctor", "--offline", "--state-dir", conduitDir],
+        {
+          env,
+        },
+      ).catch((e: { stderr: string }) => e);
       // Hedged, not asserted: the row can outlive a SIGKILLed holder, so
       // it is rendered as a lead rather than a verdict.
       expect(stderr).toMatch(/Last acquired by daemon \(pid \d+\) at .* \(may be stale\)/);
@@ -1223,7 +1256,9 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
     // filesystem's own mtimes, over the db AND its WAL/SHM sidecars.
     const home = mkdtempSync(join(tmpdir(), "conduit-doctor-nowrite-"));
     try {
-      const conduitDir = join(home, ".conduit");
+      // Isolated via an explicit `--state-dir` (offline is dir-scoped), not via
+      // HOME — §17 §4 made the default dir passwd-anchored.
+      const conduitDir = join(home, "state");
       mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
       const keyBytes = SecretBox.generateKeyBytes();
       const keyB64 = Buffer.from(keyBytes).toString("base64");
@@ -1248,10 +1283,14 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
       const existedBefore = new Set(watched.filter((p) => existsSync(p)));
       expect(before.size).toBeGreaterThan(0); // non-vacuous: something is being watched
 
-      const env: Record<string, string | undefined> = { ...process.env, HOME: home };
+      const env: Record<string, string | undefined> = { ...process.env };
       delete env.CONDUIT_MASTER_KEY;
       delete env.CONDUIT_DB;
-      const { stderr } = await execFileAsync("node", [binPath, "--doctor", "--offline"], { env });
+      const { stderr } = await execFileAsync(
+        "node",
+        [binPath, "--doctor", "--offline", "--state-dir", conduitDir],
+        { env },
+      );
 
       // It genuinely ran and reported on the install it did not touch.
       expect(stderr).toMatch(/ok: key decodes/);
@@ -1273,39 +1312,17 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
     }
   }, 60_000);
 
-  it("INVARIANT §17 / §9.1: the default `--doctor` reports the DAEMON's health, not a private store open", async () => {
-    // The default path must reach the daemon and report what IT says. The
-    // proof that it is not re-deriving health privately: the source count
-    // it prints is the seeded daemon's, and it arrives over the socket via
-    // the `serve` role's `catalog.listing` read — no new capability row.
-    const home = mkdtempSync(join(tmpdir(), "conduit-doctor-daemon-"));
-    try {
-      const conduitDir = join(home, ".conduit");
-      mkdirSync(conduitDir, { recursive: true, mode: 0o700 });
-      const keyBytes = SecretBox.generateKeyBytes();
-      const keyB64 = Buffer.from(keyBytes).toString("base64");
-      writeFileSync(join(conduitDir, "master-key"), `${keyB64}\n`, { mode: 0o600 });
-      await seedOneSourceAt(join(conduitDir, "conduit.db"), keyBytes);
-
-      await startDoctorDaemon(conduitDir, keyB64);
-
-      const env: Record<string, string | undefined> = { ...process.env, HOME: home };
-      delete env.CONDUIT_MASTER_KEY;
-      delete env.CONDUIT_DB;
-      const { stdout, stderr } = await execFileAsync("node", [binPath, "--doctor"], { env });
-
-      expect(stdout).toBe(""); // M8 stdout purity survives the conversion
-      expect(stderr).toMatch(/ok: daemon reachable/);
-      // The seeded source count came from the daemon, over the socket.
-      expect(stderr).toMatch(/ok: 1 source\(s\) in catalog/);
-      // The two diagnostics the retired implementation printed, now taken
-      // from the handshake rather than a private store open (§9 item 3).
-      // The egress line matters most: on a live install it is reportable
-      // by NO other mode, since `--offline` refuses while a daemon runs.
-      expect(stderr).toMatch(/ok: daemon owns the database at .*conduit\.db/);
-      expect(stderr).toMatch(/egress opt-in: off \(fail-closed default\)/);
-    } finally {
-      rmSync(home, { recursive: true, force: true });
-    }
-  }, 90_000);
+  // The default `--doctor` (bin.ts `doctor()`) reports the DAEMON's health —
+  // handshake config + source count over the socket, not a private store open.
+  // Its integration form relied on HOME to point the default-dir daemon and
+  // the default-dir doctor at one isolated `~/.conduit`. §17 §4 makes the
+  // default dir passwd-anchored (HOME no longer redirects it), and the
+  // daemon-backed doctor REFUSES a custom `--state-dir` by design (§17/§3.1,
+  // the F5 doctor gate — pinned above), so this process-level form can no
+  // longer be isolated from the real `~/.conduit`. Its SUBSTANCE is re-pinned
+  // at the client level — the exact `daemonRequest({ role: "serve", request:
+  // catalog.listing, onHandshake })` mechanism `doctor()` runs — in
+  // `client.test.ts` ("INVARIANT §17 / §9.1: the default --doctor's report
+  // comes from the DAEMON …"), which spawns a real seeded daemon against a
+  // temp dir and asserts the handshake config and source count.
 });
