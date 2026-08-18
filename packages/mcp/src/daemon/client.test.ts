@@ -264,6 +264,63 @@ describe("daemonRequest — the §3.5 decision table", () => {
   );
 
   it(
+    "INVARIANT §17: a request refused during rotation leaves the spawn budget intact for the next one",
+    async () => {
+      // The rotation WINDOW, end to end — the case behind the Codex P2
+      // note on the spawn-once policy: a client that attempted while
+      // maintenance was held must not have spent anything that would
+      // leave it unable to start a daemon once rotation finishes.
+      //
+      // Both halves matter and neither alone proves it. The refusal half
+      // pins fail-fast-with-no-spawn; the release half pins that a FRESH
+      // request afterwards still auto-starts normally. A policy that
+      // consumed the budget during the refused window would pass the
+      // first half and fail the second.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+
+      const rotation = await acquireExclusive(paths.maintenanceLockDb);
+      expect(rotation).not.toBeNull();
+
+      let spawnCalls = 0;
+      const spawn = testSpawn();
+      const counting = (dir: string): void => {
+        spawnCalls++;
+        spawn(dir);
+      };
+
+      // Half 1: refused while rotation holds maintenance EXCLUSIVE, and
+      // nothing was spawned on the way to the refusal.
+      const err = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "x" },
+        deadlineMs: 10_000,
+        spawn: counting,
+      }).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(DaemonUnavailable);
+      expect((err as DaemonUnavailable).code).toBe("rotation-in-progress");
+      expect(spawnCalls).toBe(0);
+
+      // Rotation finishes and releases the maintenance lock.
+      await rotation?.release();
+
+      // Half 2: the very next request auto-starts and completes. Nothing
+      // about the refused attempt closed the path back.
+      const response = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 45_000,
+        spawn: counting,
+      });
+      expect(response.kind).toBe("result");
+      expect(spawnCalls).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  it(
     "connects to an already-running daemon without spawning a second one",
     async () => {
       const stateDir = newStateDir();
@@ -315,6 +372,42 @@ describe("daemonRequest — the §3.5 decision table", () => {
       // The terminal message must name the daemon's own log — the cause
       // is never on the wire, so without the path this is a dead end.
       expect((err as DaemonUnavailable).message).toContain(DAEMON_LOG);
+      expect(spawnCalls).toBe(1);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: the spawn budget is ONE regardless of how long the deadline allows re-entry",
+    async () => {
+      // The companion to the test above, and the one that actually pins
+      // the budget against a TIME-bounded decision loop. That test uses a
+      // 2s deadline, which the retired fixed pass count (MAX_PASSES = 4)
+      // would have bounded on its own — so it could pass without the
+      // spawn guard being load-bearing at all. Re-entry is now bounded by
+      // the caller's deadline instead, so the honest question is what
+      // happens when the deadline leaves room for MANY re-entries.
+      //
+      // The injected spawn deliberately starts nothing, so every single
+      // re-entry lands on row 4 again — precisely the shape that becomes
+      // a fork bomb if the once-only guard is anything other than
+      // unconditional.
+      const stateDir = newStateDir();
+
+      let spawnCalls = 0;
+      const err = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "x" },
+        // Long enough for dozens of passes at the poll interval.
+        deadlineMs: 15_000,
+        spawn: () => {
+          spawnCalls++;
+        },
+      }).catch((e: unknown) => e);
+
+      expect(err).toBeInstanceOf(DaemonUnavailable);
+      expect((err as DaemonUnavailable).code).toBe("unavailable");
       expect(spawnCalls).toBe(1);
     },
     TIMEOUT,

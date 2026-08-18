@@ -85,16 +85,41 @@ export const UNCORRELATED = "uncorrelated";
 const LIFECYCLE_WAIT_POLL_MS = 50;
 
 /**
- * How many times the top of the decision table may be re-entered. Each
- * pass corresponds to a state transition the design names (rotation
- * clears, a starting daemon finishes, a spawn lands), and every pass is
- * additionally bounded by `deadlineMs`. The count exists so a pathological
- * flapping daemon produces a typed refusal rather than spinning until the
- * deadline: §3.5 says spawn-then-re-probe happens ONCE, and the wait path
- * re-probes from the top, so a small fixed bound covers every legitimate
- * sequence.
+ * How long a re-entry of the decision table must be able to make progress
+ * in before the loop stops re-entering. Re-entry is bounded by TIME, not
+ * by a fixed count of iterations.
+ *
+ * The count this replaced (`MAX_PASSES = 4`) conflated two different
+ * things: OBSERVATION passes (a probe re-read, a wait that ended, a
+ * connect that never reached READY) and the one SPEND action the design
+ * actually rations (spawn — still exactly once, tracked by `spawned`
+ * below). Every legitimate state transition burned a unit of the same
+ * small budget, so a daemon that merely transitioned more often than the
+ * budget allowed — a slow start under load, a drain followed by a
+ * restart — produced a terminal `unavailable` with the deadline barely
+ * touched. The failure was budget exhaustion reported as unavailability,
+ * which sent operators to a daemon log describing a daemon that was
+ * coming up fine.
+ *
+ * Time is the honest bound because it is the one the caller actually
+ * expressed: `deadlineMs` is documented as "one bounded budget for the
+ * WHOLE attempt, waits and spawn included", and it composes with the
+ * deadline plumbing the request path already carries rather than adding
+ * a second, invisible limit on top of it.
+ *
+ * The pathological case the count existed to stop — a flapping daemon
+ * spun on forever — is still covered, and covered better: a pass that
+ * observes no change and consumes no time cannot repeat, because each
+ * re-entry must leave at least this much of the budget for the work it is
+ * re-entering to do. A loop with less than this remaining stops and
+ * reports, rather than issuing probes it has no time to act on.
+ *
+ * Normative-local, derived from the poll interval: one re-entry needs
+ * room for at least a couple of `LIFECYCLE_WAIT_POLL_MS` polls plus the
+ * probe round-trips between them, so the floor sits a small multiple
+ * above that interval rather than at an independently-chosen number.
  */
-const MAX_PASSES = 4;
+const MIN_PASS_BUDGET_MS = LIFECYCLE_WAIT_POLL_MS * 4;
 
 export class DaemonUnavailable extends Error {
   readonly code: "rotation-in-progress" | "unavailable";
@@ -164,9 +189,13 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
 
   let spawned = false;
 
-  for (let pass = 0; pass < MAX_PASSES; pass++) {
-    if (Date.now() >= expiry) break;
-
+  // Re-entry is bounded by TIME (see MIN_PASS_BUDGET_MS): the loop keeps
+  // re-reading the table for as long as the caller's own deadline leaves
+  // room to act on what it reads. The one rationed action inside remains
+  // rationed by COUNT — `spawned` below still permits exactly one spawn,
+  // because "how many daemons may this client start" is a question about
+  // the action, not about how long the client is willing to wait.
+  while (remaining(expiry) >= MIN_PASS_BUDGET_MS) {
     // Row 1 — rotation. Checked FIRST and every pass, including after a
     // wait: §3.5 step 5 is explicit that a client's view is stale the
     // moment it is taken, so the branch is revalidated rather than
@@ -219,6 +248,16 @@ export async function daemonRequest(opts: DaemonRequestOptions): Promise<RpcResp
       // Identical to a refused connect, and crucially NOTHING was
       // written, so the next attempt is still a first attempt.
       socket.destroy();
+      // Paced before re-entering. This is the ONE re-entry path that can
+      // complete without having waited on anything: a daemon that accepts
+      // and immediately closes makes both `tryConnect` and `awaitReady`
+      // return at once, so an unpaced `continue` would spin the table hot
+      // until the deadline instead of waiting for the drain to finish.
+      // Every other path either sleeps (`waitForStartOrRelease`,
+      // `waitForLifecycleHeld`) or terminates. Under the old fixed pass
+      // count this spin was capped by the count itself; with a
+      // time-bounded loop the pacing has to be explicit.
+      await sleep(Math.min(LIFECYCLE_WAIT_POLL_MS, remaining(expiry)));
       continue;
     }
 

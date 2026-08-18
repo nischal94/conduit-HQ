@@ -52,6 +52,21 @@ const stallSandbox = rest.includes("--stall-sandbox");
 const stallRunning = rest.includes("--stall-running");
 /** manager.start rejects — the store-fault path that must not kill the daemon. */
 const throwExecute = rest.includes("--throw-execute");
+/**
+ * The secret material the `--throw-execute` fault carries.
+ *
+ * A real store fault embeds exactly this kind of thing in its message —
+ * the absolute db path it failed to open, and whatever key-source context
+ * the layer that threw happened to interpolate. §9.2/§11 say none of it
+ * may reach the client, and the client-side assertion is only load-bearing
+ * if the error genuinely contains something that must not appear.
+ *
+ * Duplicated as a literal in `conduitd.test.ts` rather than imported: this
+ * file is spawned as a standalone process and is excluded from the package
+ * tsconfig, so the test cannot import from it. Same arrangement as the
+ * test key.
+ */
+const FAULT_SECRET = "Bearer thrown_fault_secret_do_not_leak";
 /** manager.start returns a legal result too large for one IPC frame. */
 const hugeExecute = rest.includes("--huge-execute");
 /** Delays the bind so a client sees a healthy STARTING daemon. */
@@ -213,9 +228,20 @@ const createRuntime = pauseExecute
               // queue's run closure, which is invoked as `void dispatch(...)`
               // — so before the fix this became an unhandled rejection and
               // took the whole daemon down with it.
+              //
+              // The message carries REAL secret material (and the absolute
+              // state-dir path), because that is what a genuine store fault
+              // embeds and what §9.2/§11 forbid reaching the client. The
+              // daemon logs this cause deliberately — the operator needs it
+              // — so the invariant is specifically that the CLIENT frame
+              // carries none of it.
               start: () => {
                 console.log("throwing execute");
-                return Promise.reject(new Error("simulated store fault"));
+                return Promise.reject(
+                  new Error(
+                    `simulated store fault: ${FAULT_SECRET} opening ${stateDir}/conduit.db`,
+                  ),
+                );
               },
             },
           };

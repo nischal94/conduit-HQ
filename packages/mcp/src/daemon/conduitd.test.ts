@@ -99,6 +99,15 @@ interface Daemon {
  */
 const TEST_KEY = Buffer.alloc(32, 7).toString("base64");
 
+/**
+ * The secret the `--throw-execute` fault embeds in its error message.
+ *
+ * Must stay in sync with the literal of the same name in
+ * `helpers/run-daemon.ts` — that file is spawned as a standalone process
+ * and excluded from the package tsconfig, so it cannot be imported here.
+ */
+const FAULT_SECRET = "Bearer thrown_fault_secret_do_not_leak";
+
 function spawnDaemon(stateDir: string, extraArgs: string[] = []): Daemon {
   const child = spawn(process.execPath, [HELPER, stateDir, ...extraArgs], {
     stdio: ["ignore", "pipe", "inherit"],
@@ -805,8 +814,36 @@ describe("conduitd lifecycle", () => {
         message:
           "internal daemon error; see the daemon log for the cause, correlated by this error's requestId",
       });
-      expect(reply.message).not.toContain(stateDir);
-      expect(reply.message).not.toContain(".db");
+
+      // The redaction assertions scan the WHOLE serialized frame, not
+      // `reply.message`. Asserting against `message` was decorative: the
+      // `toMatchObject` above already pins it to an exact constant, so a
+      // `not.toContain` on that same field could never fail whatever the
+      // daemon did — and it would keep passing if a future change added a
+      // `cause` or `detail` field carrying the raw error. The frame-wide
+      // scan is what actually pins §9.2, in the same shape
+      // `source-invariants.test.ts` uses for stored credentials.
+      //
+      // Load-bearing because the fault genuinely carries the material: the
+      // `--throw-execute` fixture rejects with an error embedding
+      // FAULT_SECRET and the absolute state-dir path (see run-daemon.ts).
+      const wire = JSON.stringify(reply);
+      expect(wire).not.toContain(FAULT_SECRET);
+      expect(wire).not.toContain(stateDir);
+      expect(wire).not.toContain(".db");
+      expect(wire).not.toContain("simulated store fault");
+
+      // The daemon's OWN log, by contrast, MUST carry the cause — that is
+      // the whole bargain the client-facing message strikes ("see the
+      // daemon log for the cause"). Asserting it here proves the secret
+      // was genuinely in play, so the frame scan above is not vacuous: a
+      // fixture that silently stopped throwing would fail this line rather
+      // than pass the redaction checks trivially.
+      // "Queued request failed" — this fault is raised inside the queue's
+      // run closure, so it takes the queued-dispatch reporting path rather
+      // than the direct one.
+      await waitFor(() => daemon.lines.some((l) => l.includes("Queued request failed: execute")));
+      expect(daemon.lines.join("\n")).toContain(FAULT_SECRET);
     },
     TIMEOUT,
   );

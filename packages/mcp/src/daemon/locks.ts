@@ -20,9 +20,9 @@
  * message, but the lock provides the exclusion") and nothing branches on
  * it; it is advisory text for a human reading an error.
  */
-import { existsSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { dirname } from "node:path";
-import { type Client, createClient, LibsqlError } from "@libsql/client";
+import { type Client, createClient } from "@libsql/client";
 
 export interface HeldLock {
   /**
@@ -71,8 +71,30 @@ function heldLock(client: Client, stamped: boolean): HeldLock {
   };
 }
 
+/**
+ * True when the failure is "someone else holds this lock right now".
+ *
+ * Deliberately NOT keyed on the error's CLASS. libsql raises BUSY as a
+ * `LibsqlError` from some call sites and as a PLAIN `Error` from others —
+ * both carrying `code === "SQLITE_BUSY"` and `rawCode === 5`, and the
+ * plain-`Error` shape is what `client.execute("SELECT count(*) FROM
+ * sqlite_schema")` throws when a second PROCESS holds the file lock.
+ * An `instanceof LibsqlError` guard therefore let genuine BUSY answers
+ * escape `acquireShared`/`acquireExclusive` as raw throws whenever the
+ * contention was cross-process, which is the only kind that matters here:
+ * `probeShared` would reject instead of returning "busy", and a client
+ * polling a daemon through its startup window died on the poll rather
+ * than reading the lock state it asked for.
+ *
+ * The code is the decision because the code is what SQLite defines.
+ * `rawCode === 5` is accepted alongside the string so a future libsql that
+ * drops the textual `code` still classifies correctly — same reasoning as
+ * `isMissingDirectory` below, which refuses to trust libsql's error prose.
+ */
 function isBusy(err: unknown): boolean {
-  return err instanceof LibsqlError && err.code === "SQLITE_BUSY";
+  if (!(err instanceof Error)) return false;
+  const { code, rawCode } = err as { code?: unknown; rawCode?: unknown };
+  return code === "SQLITE_BUSY" || rawCode === 5;
 }
 
 /**
@@ -372,8 +394,9 @@ export async function acquireExclusiveIfPresent(
 }
 
 /**
- * True when the failure is "this lock db could not be opened because its
- * directory isn't there".
+ * True when the failure is "this lock db could not be opened because
+ * nothing had created it yet" — the fresh-install reading, where a lock
+ * file nobody can open is a lock nobody can be holding.
  *
  * The shape is awkward, and deliberately not trusted. libsql surfaces
  * this as a PLAIN `Error` — not a `LibsqlError`, and with an empty
@@ -381,16 +404,52 @@ export async function acquireExclusiveIfPresent(
  * `SQLITE_CANTOPEN`). There is no typed field to branch on, so the
  * message is only a HINT here, never the decision.
  *
- * The decision is made against the filesystem: this returns true only
- * when the lock db's parent directory genuinely does not exist. That
- * matters because `SQLITE_CANTOPEN` also covers permission denials and
- * I/O faults, and reading either as "free" would let a client spawn a
- * daemon against a state directory it cannot actually use. Checking the
- * directory directly makes the answer true or false for a reason that
- * does not depend on libsql's error prose staying stable.
+ * The decision is made against the filesystem, and it is made about the
+ * LOCK DB FILE rather than only its parent directory. The parent-only
+ * check this replaced was a TOCTOU: a client polling a daemon through its
+ * startup window opens the lock db BEFORE the daemon's `ensureStateDir`
+ * runs and re-checks AFTER it lands, finds the directory now present, and
+ * rethrows the raw `ConnectionFailed("… : 14")` at a caller that was only
+ * asking whether anyone held the lock. Reproduced at ~11 escapes per 60
+ * real spawns against a missing state dir.
+ *
+ * Both readings below are the same truthful answer — "no holder could
+ * have existed at open time":
+ *
+ * - the parent directory is absent, so nothing can be inside it; or
+ * - the parent exists (the daemon may have just created it) but the lock
+ *   db FILE does not, so no fcntl range on it can be held.
+ *
+ * The security property is preserved, and it is why the file check uses
+ * `statSync` errnos rather than `existsSync`. `SQLITE_CANTOPEN` also
+ * covers permission denials and I/O faults, and reading either as "free"
+ * would let a client spawn a daemon against a state directory it cannot
+ * actually use. `existsSync` collapses "absent" and "cannot determine"
+ * into the same `false` — under an untraversable parent directory it
+ * reports a lock db that DOES exist as absent, turning a permission
+ * denial into "free". Only a literal `ENOENT` proves absence; `EACCES`
+ * and every other errno mean the question could not be answered, so the
+ * raw error still throws. Checking the filesystem directly keeps the
+ * answer true or false for a reason that does not depend on libsql's
+ * error prose.
  */
 function isMissingDirectory(err: unknown, lockDbPath: string): boolean {
   if ((err as NodeJS.ErrnoException | undefined)?.code === "ENOENT") return true;
   if (!(err instanceof Error) || !err.message.includes("ConnectionFailed")) return false;
-  return !existsSync(dirname(lockDbPath));
+  return isAbsent(dirname(lockDbPath)) || isAbsent(lockDbPath);
+}
+
+/**
+ * True only when the path is PROVABLY not there. An `EACCES` (or any
+ * other errno) means "could not determine", which is deliberately not
+ * absence — see `isMissingDirectory` for why conflating the two would
+ * turn a permission denial into a "free" lock reading.
+ */
+function isAbsent(path: string): boolean {
+  try {
+    statSync(path);
+    return false;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code === "ENOENT";
+  }
 }
