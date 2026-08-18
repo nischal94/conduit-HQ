@@ -132,7 +132,17 @@ export function parseAddMcpArgs(argv: string[]): AddMcpArgs {
   return args;
 }
 
-/** True iff `value` parses as a URL with an http: or https: protocol. */
+/**
+ * True iff `value` parses as an http(s) URL that carries NO credential in
+ * itself — no `user:pass@` userinfo (F3).
+ *
+ * A url with a credential in it is an operator error caught at intake: the
+ * secret belongs in `CONDUIT_ADD_SECRET` (a request-scoped header the daemon
+ * reveals and forgets), never in the url, which is persisted as the source's
+ * `location` and can resurface in a later refusal frame. The daemon
+ * re-validates this too (`provision.ts`) — it is the authorization boundary
+ * — but rejecting here keeps the typo a local, FLAG-shaped error.
+ */
 function isValidHttpUrl(value: string): boolean {
   let parsed: URL;
   try {
@@ -140,7 +150,21 @@ function isValidHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
-  return parsed.protocol === "http:" || parsed.protocol === "https:";
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return false;
+  }
+  return parsed.username === "" && parsed.password === "";
+}
+
+/** True iff `value` parses as a URL carrying `user`/`pass` userinfo (F3). */
+function urlHasUserinfo(value: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return false;
+  }
+  return parsed.username !== "" || parsed.password !== "";
 }
 
 /**
@@ -197,6 +221,13 @@ export async function runAddMcp(args: AddMcpArgs, deps: AddMcpDeps): Promise<Add
   }
   if (args.url === undefined || args.url.trim() === "") {
     missing.push("--url");
+  } else if (urlHasUserinfo(args.url)) {
+    // A distinct, actionable message for the credential-in-url case (F3):
+    // the operator put a secret in the url, and the fix is a different flag,
+    // not a re-spelling of the url.
+    missing.push(
+      "--url (a credential in the url is not allowed: put the secret in CONDUIT_ADD_SECRET, not the url)",
+    );
   } else if (!isValidHttpUrl(args.url)) {
     missing.push("--url (must be a valid http(s) URL)");
   }
@@ -277,6 +308,10 @@ export interface AddMcpOptions {
 /** Production entrypoint wired into the CLI dispatch (bin.ts). */
 export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<number> {
   const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
+  // Auto-start only for the default directory (F5): an explicit custom
+  // `--state-dir` must be started by hand, since a spawned daemon derives
+  // the default dir. `opts.stateDir !== undefined` is exactly that choice.
+  const autoStart = opts.stateDir === undefined;
   const args = parseAddMcpArgs(argv);
   const result = await runAddMcp(args, {
     daemon: (request) =>
@@ -288,6 +323,7 @@ export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<
         // onboarding fetch daemon-side, so it carries the derived provision
         // budget rather than a plain read's.
         deadlineMs: deadlineForRequest(request),
+        autoStart,
       }),
     env: process.env,
     stdout: (line) => process.stdout.write(line),

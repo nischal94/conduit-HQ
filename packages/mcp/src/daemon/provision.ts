@@ -43,10 +43,43 @@
  * `ProvisionPayload` — counts and a credential PRESENCE flag. Never a
  * repository row, never the secret, never a header, never a credentialRef.
  */
-import { type ConduitStore, McpClientError, normalizeMcp, type RiskClass } from "@conduithq/sdk";
+import {
+  type ConduitStore,
+  McpClientError,
+  normalizeMcp,
+  type RiskClass,
+  redactionTokens,
+  redactTokens,
+} from "@conduithq/sdk";
 import { fetchToolsList } from "../mcp-fetch.js";
 
 const NAMESPACE_PATTERN = /^[a-z0-9_-]+$/;
+
+/**
+ * Reduces a URL to the operator-safe form `origin + path`: userinfo,
+ * query, and fragment are all stripped.
+ *
+ * Every one of those three can carry a credential — `user:pass@host`,
+ * `?token=…`, `#access_token=…` — and a stored url reaches an
+ * operator-facing refusal frame verbatim on a later revalidation failure.
+ * A refusal must never be the channel that echoes a secret an operator once
+ * put in a url (§9.2). Intake rejects userinfo outright (see
+ * `isValidHttpUrl`), so on the happy path there is nothing to strip; this is
+ * the belt-and-braces render used wherever a url — stored or supplied —
+ * crosses into a message a human reads.
+ *
+ * Falls back to the fixed placeholder when the value does not parse as a
+ * URL at all, rather than interpolating raw unparseable bytes.
+ */
+function sanitizeUrlForOperator(value: string): string {
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return "<unparseable url>";
+  }
+  return `${parsed.origin}${parsed.pathname}`;
+}
 
 /**
  * The `source.provision` / `source.revalidate` response projection.
@@ -91,9 +124,12 @@ export interface ProvisionPayload {
  *
  * `connection.ts` turns this into an `error` frame with code `invalid`, and
  * the CLI prints `.message` unchanged. Nothing constructed here ever
- * interpolates a secret: the only fields that reach a message are the
- * namespace, the prefix, the url, and the shared client's own error text
- * (which carries no header material — see `mcp-client.ts`).
+ * interpolates a secret OR any upstream-controlled text: the only fields
+ * that reach a message are the namespace, the prefix, and the url rendered
+ * origin+path (`sanitizeUrlForOperator`). The upstream's own error text — the
+ * one place a hostile server could echo a credential we sent (F1) — is
+ * NEVER forwarded; it is logged daemon-side, credential-redacted, and the
+ * client is told a fixed category instead (`mapFetchError`).
  */
 export class ProvisionRefused extends Error {
   constructor(message: string) {
@@ -107,6 +143,14 @@ export interface ProvisionDeps {
   store: ConduitStore;
   /** Defaults to the real onboarding fetch; mocked in tests. */
   fetchTools?: (url: string, opts?: { authorization?: string }) => Promise<unknown[]>;
+  /**
+   * DAEMON-side operator log. The onboarding fetch failure detail — which is
+   * upstream-controlled text (§9.2, F1) — is written here, credential-
+   * redacted, and NEVER forwarded to the client. Absent in unit tests that
+   * do not assert on the log; present on the real connection path where
+   * `connection.ts` supplies the daemon's own `log`.
+   */
+  log?: (line: string) => void;
 }
 
 /**
@@ -166,7 +210,23 @@ function countsByRiskClass(tools: readonly { riskClass: RiskClass }[]): {
   return counts;
 }
 
-/** True iff `value` parses as a URL with an http: or https: protocol. */
+/**
+ * True iff `value` parses as an http(s) URL that carries NO credential in
+ * itself — no `user:pass@` userinfo.
+ *
+ * A url with userinfo is an operator error worth a clear refusal, not a
+ * value to accept and later echo: the secret belongs in
+ * `CONDUIT_ADD_SECRET`, which travels as a request-scoped header the daemon
+ * reveals and forgets, never in the url, which is stored as the source's
+ * `location` and reappears verbatim in a later revalidation-failure frame.
+ * Rejecting it at intake is both the §9.2 credential-in-url defense and the
+ * more correct behavior — a url is an address, not a place to hide a token.
+ *
+ * `username`/`password` are checked rather than a substring scan for `@`:
+ * the WHATWG URL parser has already located the authority's userinfo
+ * component, so this asks the parsed structure the exact question instead of
+ * pattern-matching the raw string.
+ */
 function isValidHttpUrl(value: string): boolean {
   let parsed: URL;
   try {
@@ -174,46 +234,120 @@ function isValidHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
-  return parsed.protocol === "http:" || parsed.protocol === "https:";
+  if (parsed.protocol !== "http:" && parsed.protocol !== "https:") {
+    return false;
+  }
+  return parsed.username === "" && parsed.password === "";
 }
 
 /**
- * Maps a `fetchTools` rejection to the operator-facing refusal line.
+ * Maps a `fetchTools` rejection to the operator-facing refusal line —
+ * a FIXED category per error kind, never the upstream's own message text.
  *
- * Unchanged in wording from the pre-Task-8 CLI-side mapping, so the
- * conversion is invisible in the terminal. An `McpClientError` routes by
- * `kind`; anything else falls back to the unreachable line. **Never
- * interpolates the secret** — the shared client's messages carry no header
- * material by construction (`mcp-client.ts` builds headers from
- * `endpoint.headers` verbatim and never renders them into an error).
+ * ## Why the upstream text can never reach the client (F1, the §9.2 line)
+ *
+ * The `cap` and `protocol` arms used to interpolate `cause.message`. That
+ * message is an `McpClientError` whose text embeds the upstream server's own
+ * JSON-RPC error string (`mcp-client.ts`'s `describeRpcError` on the
+ * `initialize` and `tools/list` rejection paths). On THIS onboarding path
+ * the daemon has already revealed the stored credential and sent it upstream
+ * (`fetchAndProvision` below), so a malicious upstream that echoes the
+ * `Authorization` value back inside its error message would have that value
+ * flow verbatim into the `ProvisionRefused` frame and out to the add-mcp
+ * client — a stored-credential exfiltration.
+ *
+ * `mcp-client.ts`'s own comment notes that upstream text is only made safe
+ * by `upstream.ts`'s serve-time sanitization, and Task 8 moved this fetch
+ * daemon-side where that sanitization does NOT run. The fix is not to
+ * re-run a redaction over the client-bound text (a denylist over unbounded
+ * upstream output never converges — see
+ * `~/.claude/rules/adversarial-convergence.md`) but to STOP forwarding it:
+ * the client is told a fixed category naming its next move, and no byte of
+ * upstream-controlled text crosses to it.
+ *
+ * The operator who runs the daemon still gets the detail — logged
+ * daemon-side and credential-redacted (`logRedactedDetail`), correlated by
+ * the namespace and url the refusal already names — so nothing debuggable is
+ * lost; it is simply disclosed to the daemon's own log rather than to an
+ * arbitrary add-mcp caller.
+ *
+ * The url is rendered origin+path (`sanitizeUrlForOperator`) as a second
+ * belt to the intake userinfo rejection.
  */
 function mapFetchError(cause: unknown, url: string): string {
-  const unreachable = `[conduit add-mcp] upstream unreachable at ${url}; nothing was written. Re-run when reachable.`;
+  const safeUrl = sanitizeUrlForOperator(url);
+  const unreachable = `[conduit add-mcp] upstream unreachable at ${safeUrl}; nothing was written. Re-run when reachable.`;
   if (!(cause instanceof McpClientError)) {
     return unreachable;
   }
-  const clientMessage = `[conduit add-mcp] ${cause.message}; nothing was written.`;
   switch (cause.kind) {
     case "http_status":
       if (cause.status === 401 || cause.status === 403) {
         return `[conduit add-mcp] upstream requires authorization (HTTP ${cause.status}): set CONDUIT_ADD_SECRET; nothing was written.`;
       }
-      return clientMessage;
+      // Fixed category — the upstream's status is a small integer we chose to
+      // surface, never its free-text body.
+      return `[conduit add-mcp] the upstream rejected the request during onboarding (HTTP ${cause.status ?? "error"}); nothing was written. See the daemon log for the upstream's detail.`;
     case "cap":
+      // The upstream's response exceeded the onboarding size/tool cap. Fixed
+      // wording — cause.message would carry upstream-echoed text (F1).
+      return `[conduit add-mcp] the upstream's onboarding response exceeded a size/tool limit; nothing was written. See the daemon log for the upstream's detail.`;
     case "protocol":
-      return clientMessage;
+      // A malformed/hostile JSON-RPC exchange. cause.message embeds the
+      // server's own error string, which is where a credential echo would
+      // ride (F1) — so it is logged daemon-side, never returned.
+      return `[conduit add-mcp] the upstream returned an invalid MCP handshake or tools/list during onboarding (protocol error); nothing was written. See the daemon log for the upstream's detail.`;
     case "timeout":
       return `[conduit add-mcp] upstream did not complete within the onboarding budget; nothing was written.`;
     case "network":
       return unreachable;
     default: {
       // Exhaustiveness: a future sixth kind is a COMPILE error here. The
-      // runtime return stays the prefixed fallback so a stale build still
-      // emits a self-describing line.
+      // runtime return stays the fixed fallback so a stale build still
+      // emits a self-describing line — and, being fixed, still forwards no
+      // upstream text.
       const _exhaustive: never = cause.kind;
       void _exhaustive;
       return unreachable;
     }
+  }
+}
+
+/**
+ * Writes the onboarding-failure detail to the DAEMON's log, credential-
+ * redacted (F1). This is the ONLY place the upstream's own error text is
+ * disclosed — to the operator who runs the daemon, never to the add-mcp
+ * client — and even here every token derivable from the credential that was
+ * sent upstream is replaced with `[redacted]` first, because a hostile
+ * upstream echoes what we sent.
+ *
+ * `onboardingAuth` is the exact value put on the request's `authorization`
+ * header, so its redaction tokens are precisely what a reflecting upstream
+ * could have bounced back into `cause.message`. When no credential was sent
+ * (unauthenticated onboarding) there is nothing to redact and the detail is
+ * logged as-is — still only to the daemon log.
+ *
+ * Best-effort and total: a `log` sink is absent in some unit tests, and a
+ * failure to write a diagnostic must never turn a clean refusal into a
+ * throw.
+ */
+function logRedactedDetail(
+  log: ((line: string) => void) | undefined,
+  namespace: string,
+  url: string,
+  onboardingAuth: string | undefined,
+  cause: unknown,
+): void {
+  if (log === undefined) return;
+  const raw = cause instanceof Error ? cause.message : String(cause);
+  const tokens = onboardingAuth !== undefined ? redactionTokens(onboardingAuth) : [];
+  const detail = redactTokens(raw, tokens);
+  try {
+    log(
+      `[conduitd] Onboarding fetch failed: upstream detail withheld from client. Context: {namespace: ${namespace}, url: ${sanitizeUrlForOperator(url)}, cause: ${detail}}`,
+    );
+  } catch {
+    // A diagnostic write must never fail the refusal it is describing.
   }
 }
 
@@ -350,6 +484,7 @@ export async function provisionSourceRequest(
   const payload = await fetchAndProvision({
     store,
     fetchTools,
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
     namespace,
     url,
     prefix,
@@ -422,6 +557,7 @@ export async function revalidateSourceRequest(
   return fetchAndProvision({
     store,
     fetchTools,
+    ...(deps.log !== undefined ? { log: deps.log } : {}),
     namespace,
     url,
     prefix: connection.prefix,
@@ -454,6 +590,7 @@ export async function revalidateSourceRequest(
 async function fetchAndProvision(args: {
   store: ConduitStore;
   fetchTools: (url: string, opts?: { authorization?: string }) => Promise<unknown[]>;
+  log?: (line: string) => void;
   namespace: string;
   url: string;
   prefix: string;
@@ -470,6 +607,7 @@ async function fetchAndProvision(args: {
   clearCredential: boolean;
 }): Promise<ProvisionPayload> {
   const { store, namespace, url, prefix, ids } = args;
+  const safeUrl = sanitizeUrlForOperator(url);
 
   let rawTools: unknown[];
   try {
@@ -478,6 +616,10 @@ async function fetchAndProvision(args: {
       args.onboardingAuth !== undefined ? { authorization: args.onboardingAuth } : undefined,
     );
   } catch (cause) {
+    // F1: the upstream's own error text is disclosed to the DAEMON log
+    // (credential-redacted), never to the client; the client gets a fixed
+    // category from `mapFetchError`.
+    logRedactedDetail(args.log, namespace, url, args.onboardingAuth, cause);
     throw new ProvisionRefused(mapFetchError(cause, url));
   }
 
@@ -485,10 +627,15 @@ async function fetchAndProvision(args: {
   try {
     tools = normalizeMcp({ namespace, tools: rawTools });
   } catch (cause) {
-    const detail = cause instanceof Error ? cause.message : String(cause);
+    // F1: `normalizeMcp`'s detail is derived from the upstream's tools/list
+    // BODY — upstream-controlled text that could echo the credential we sent
+    // (a reflecting server can put it in a tool description). So it is
+    // withheld from the client and logged daemon-side, redacted, exactly
+    // like the fetch-failure detail above.
+    logRedactedDetail(args.log, namespace, url, args.onboardingAuth, cause);
     throw new ProvisionRefused(
-      `[conduit add-mcp] upstream at ${url} returned an invalid tools/list; nothing was written. ` +
-        `Re-run when the upstream is fixed. Context: { cause: ${JSON.stringify(detail)} }`,
+      `[conduit add-mcp] upstream at ${safeUrl} returned an invalid tools/list; nothing was ` +
+        `written. Re-run when the upstream is fixed. See the daemon log for the upstream's detail.`,
     );
   }
 

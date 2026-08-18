@@ -95,6 +95,15 @@ export interface ConnectionDeps {
   queueStats: () => { depth: number; maxObservedDepth: number; activeCount: number };
   /** Refusal message for a full queue — carries the normative caps. */
   busyMessage: string;
+  /**
+   * Per-namespace serialization for source provisioning (F2). Both
+   * `source.provision` and `source.revalidate` run their full
+   * read→reveal→fetch→commit through this so two requests naming one
+   * namespace cannot interleave — see `source-lock.ts` for the anti-oracle
+   * race it closes. Daemon-scoped: built once and shared across every
+   * connection, because the race is between connections against one store.
+   */
+  withSourceLock: <T>(namespace: string, fn: () => Promise<T>) => Promise<T>;
 }
 
 export type QueueOutcome = "ran" | "expired" | "abandoned";
@@ -778,24 +787,32 @@ async function handleRequest(
      * `PROVISION_CLIENT_DEADLINE_MS` in `server.ts`.
      */
     case "source.provision": {
+      // Serialized per namespace (F2): the full read→reveal→fetch→commit
+      // must not interleave with a concurrent provision/revalidate of the
+      // same namespace, or a stale commit could pair a fresh secret with a
+      // stale destination. See `withSourceLock`.
       await runSourceRequest(ctx, requestId, deps, () =>
-        provisionSourceRequest(
-          {
-            namespace: request.namespace,
-            url: request.url,
-            prefix: request.prefix,
-            replace: request.replace,
-            clearCredential: request.clearCredential,
-            ...(request.secret !== undefined ? { secret: request.secret } : {}),
-          },
-          { store },
+        deps.withSourceLock(request.namespace, () =>
+          provisionSourceRequest(
+            {
+              namespace: request.namespace,
+              url: request.url,
+              prefix: request.prefix,
+              replace: request.replace,
+              clearCredential: request.clearCredential,
+              ...(request.secret !== undefined ? { secret: request.secret } : {}),
+            },
+            { store, log },
+          ),
         ),
       );
       return;
     }
     case "source.revalidate": {
       await runSourceRequest(ctx, requestId, deps, () =>
-        revalidateSourceRequest(request.namespace, { store }),
+        deps.withSourceLock(request.namespace, () =>
+          revalidateSourceRequest(request.namespace, { store, log }),
+        ),
       );
       return;
     }

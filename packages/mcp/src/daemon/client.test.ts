@@ -157,6 +157,67 @@ describe("daemonRequest — the §3.5 decision table", () => {
   );
 
   it(
+    "INVARIANT §17 / §3.1: autoStart:false on a custom state dir REFUSES with the by-hand command and spawns NO daemon (F5)",
+    async () => {
+      // The §3.1 spawn boundary: `spawnDaemon` receives only `--daemon` and
+      // derives the DEFAULT state dir — it cannot be handed a client-chosen
+      // dir. So auto-starting for a custom `--state-dir` would spawn a
+      // default-dir daemon while this call polls the custom dir forever. A
+      // caller on a custom dir passes autoStart:false, and finding no daemon
+      // becomes an actionable refusal, not a misdirected spawn.
+      const stateDir = newStateDir();
+      // Row 4: nothing running, no lock held — the spawn case.
+      expect(await probeShared(daemonPaths(stateDir).lifecycleLockDb)).toBe("free");
+
+      let spawnCalls = 0;
+      let caught: unknown;
+      try {
+        await daemonRequest({
+          stateDir,
+          role: "serve",
+          request: { kind: "search", query: "anything" },
+          deadlineMs: 30_000,
+          autoStart: false,
+          spawn: () => {
+            spawnCalls++;
+          },
+        });
+        throw new Error("expected a DaemonUnavailable");
+      } catch (err) {
+        caught = err;
+      }
+
+      expect(caught).toBeInstanceOf(DaemonUnavailable);
+      const message = (caught as DaemonUnavailable).message;
+      // Names the exact by-hand start command for THIS custom dir.
+      expect(message).toContain(`conduit-mcp --daemon --state-dir ${stateDir}`);
+      expect(message).toContain("auto-start is disabled for custom directories");
+      // And crucially: NO default-dir daemon was spawned.
+      expect(spawnCalls).toBe(0);
+      expect(existsSync(daemonPaths(stateDir).socket)).toBe(false);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "autoStart defaults to on — an unset autoStart still spawns for the default path (F5 regression guard)",
+    async () => {
+      // The boundary must not accidentally disable the common path: leaving
+      // autoStart unset (the default-dir caller) still auto-starts.
+      const stateDir = newStateDir();
+      const response = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 45_000,
+        spawn: testSpawn(),
+      });
+      expect(response.kind).toBe("result");
+    },
+    TIMEOUT,
+  );
+
+  it(
     "INVARIANT §17: a client auto-starts against a state directory that does not exist yet",
     async () => {
       // A fresh install: nothing has created `~/.conduit`. The client
@@ -997,6 +1058,105 @@ describe("the result-payload seam", () => {
         payload,
       );
       expect(response).toMatchObject({ kind: "result", payload });
+    },
+    TIMEOUT,
+  );
+
+  // --- F6: the guard checks status is a LEGAL MEMBER, not merely a string,
+  // and that arm-mandatory fields are present. Before F6 these all passed the
+  // seam as well-formed answers and produced wrong output ("settled as
+  // bogus", a completed execute with no executionId to look up).
+
+  it(
+    "INVARIANT §17: an execute payload with an ILLEGAL status value is REFUSED (not just a string)",
+    async () => {
+      const response = await askWithPayload(
+        { kind: "execute", code: "x", deadlineMs: 1000 },
+        { status: "bogus", executionId: "exec_1" },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("no legal execution status");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: an execute payload with a legal status but NO executionId is REFUSED",
+    async () => {
+      // {status:"completed"} with no executionId used to pass — the agent
+      // could not then look the execution up. executionId is the arm-mandatory
+      // field on every non-not_found arm.
+      const response = await askWithPayload(
+        { kind: "execute", code: "x", deadlineMs: 1000 },
+        { status: "completed" },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("no legal execution status");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: an approvals.resume payload with an ILLEGAL status settles nothing — REFUSED, never 'settled as bogus'",
+    async () => {
+      // {status:"bogus",decisionApplied:true} used to pass the seam and let
+      // the deny arm print "settled as bogus". A legal status member is
+      // required.
+      const response = await askWithPayload(
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        { status: "bogus", executionId: "exec_1", decisionApplied: true },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("Do NOT assume it was not");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a check payload with an ILLEGAL body status is REFUSED",
+    async () => {
+      const response = await askWithPayload(
+        { kind: "execution.get", executionId: "exec_1" },
+        { status: "bogus", executionId: "exec_1" },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("no legal execution status");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a check payload with the legal 'running' status passes untouched (the check set is wider than execute)",
+    async () => {
+      // `running` is legal for check but NOT for execute — proving the two
+      // predicates carry their own value-sets rather than sharing execute's.
+      const payload = { status: "running", executionId: "exec_1" };
+      const response = await askWithPayload(
+        { kind: "execution.get", executionId: "exec_1" },
+        payload,
+      );
+      expect(response).toMatchObject({ kind: "result", payload });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "an execute payload with the legal 'running' status is REFUSED (running is NOT an execute status)",
+    async () => {
+      // The converse of the above: `running` is a check-only status. An
+      // execute answer claiming it is malformed, and the shared predicates
+      // are what make execute reject exactly what check accepts.
+      const response = await askWithPayload(
+        { kind: "execute", code: "x", deadlineMs: 1000 },
+        { status: "running", executionId: "exec_1" },
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("no legal execution status");
     },
     TIMEOUT,
   );

@@ -30,7 +30,12 @@
 
 import { connect, type Socket } from "node:net";
 import { join } from "node:path";
-import type { RpcPayloadFor } from "../payloads.js";
+import {
+  isCheckPayloadShape,
+  isExecutePayloadShape,
+  isResumePayloadShape,
+  type RpcPayloadFor,
+} from "../payloads.js";
 import { type DaemonPaths, daemonPaths } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { describeHolder, probeShared, readLockHolder } from "./locks.js";
@@ -55,6 +60,26 @@ export interface DaemonRequestOptions<K extends RpcRequest["kind"] = RpcRequest[
    * silent no-probe "unavailable".
    */
   deadlineMs: number;
+  /**
+   * Whether this request may AUTO-START a daemon when it finds none (Codex
+   * ARC F5). Defaults to `true`.
+   *
+   * `spawnDaemon` passes only `--daemon` to the child, which then derives
+   * the DEFAULT state directory from its own uid — it does NOT and MUST NOT
+   * receive a client-chosen `stateDir` (the §3.1 spawn boundary: a client
+   * cannot smuggle a state-directory choice into a long-lived daemon serving
+   * every client). So auto-start is only ever CORRECT for the default state
+   * directory: a request against an explicitly-selected custom `--state-dir`
+   * that auto-started would spawn a default-dir daemon and then poll the
+   * custom dir forever, contacting a daemon it never started while a
+   * default-dir daemon it did start answers nobody.
+   *
+   * Callers on an operator-selected custom state directory therefore pass
+   * `false`: finding no daemon becomes an actionable refusal naming the
+   * exact by-hand start command, rather than a misdirected spawn. Callers on
+   * the default directory (or leaving this unset) keep auto-start.
+   */
+  autoStart?: boolean;
   /** Injectable for tests; production spawns the real daemon. */
   spawn?: (stateDir: string) => void;
   /**
@@ -375,10 +400,25 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
       continue;
     }
 
-    // Row 4 — neither lock held: no daemon and no rotation. Spawn, then
-    // probe again. Once only: a second spawn after a failed re-probe
-    // would mean something is wrong that another process cannot fix, and
-    // spawn loops are how fork bombs happen.
+    // Row 4 — neither lock held: no daemon and no rotation.
+    //
+    // Auto-start is disabled for an operator-selected custom state directory
+    // (F5): `spawnDaemon` cannot be handed a client-chosen dir (§3.1), so a
+    // spawn here would start a DEFAULT-dir daemon while this loop polls the
+    // custom dir — a daemon that answers nobody. Refuse with the exact
+    // by-hand start command instead of misdirecting a spawn.
+    if (opts.autoStart === false) {
+      throw new DaemonUnavailable(
+        "unavailable",
+        `[conduit] Daemon unavailable: no daemon is running for the custom state directory ` +
+          `${opts.stateDir}, and auto-start is disabled for custom directories (a spawned daemon ` +
+          `would run against the DEFAULT directory, not this one). Start it by hand: ` +
+          `conduit-mcp --daemon --state-dir ${opts.stateDir}`,
+      );
+    }
+    // Spawn, then probe again. Once only: a second spawn after a failed
+    // re-probe would mean something is wrong that another process cannot
+    // fix, and spawn loops are how fork bombs happen.
     if (spawned) {
       break;
     }
@@ -731,7 +771,7 @@ function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcRe
     }
 
     case "approvals.resume": {
-      // TWO fields, because `runDecide` branches on both and a break in
+      // TWO axes, because `runDecide` branches on both and a break in
       // either produces the SAME false negative.
       //
       // `decisionApplied` carries the OPERATOR'S VERB truth (§17 D-T7-2):
@@ -740,21 +780,15 @@ function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcRe
       // deny as "never applied" (exit 1), sending the operator to re-issue
       // a decision the execution already consumed.
       //
-      // `status` selects the command's ENTIRE output path: the deny arm
-      // reads it to describe what the drive then did, and every arm below
-      // that dispatches on it. Guarding `decisionApplied` alone left a
-      // payload with `decisionApplied: false` and no `status` passing the
-      // seam — printing "settled as undefined" and then falling through to
-      // the never-applied arm, which is the identical wrong answer reached
-      // by omitting the other field. Both are structural here, so both are
-      // refusals rather than hedges.
-      const payload = response.payload;
-      if (
-        typeof payload !== "object" ||
-        payload === null ||
-        typeof (payload as { decisionApplied?: unknown }).decisionApplied !== "boolean" ||
-        typeof (payload as { status?: unknown }).status !== "string"
-      ) {
+      // `status` selects the command's ENTIRE output path, and it must be a
+      // LEGAL member of the resume status set — not merely a string (F6). A
+      // guard that accepted any string let `{status: "bogus",
+      // decisionApplied: true}` through, and the deny arm would then print
+      // "settled as bogus"; the never-applied arm reached the same false
+      // answer for a payload missing `status` entirely. `isResumePayloadShape`
+      // (payloads.ts, shared with the sender) checks BOTH: a legal status,
+      // an `executionId`, and the boolean `decisionApplied`.
+      if (!isResumePayloadShape(response.payload)) {
         return refuse(
           "the daemon's approvals.resume answer did not report the decision's fate " +
             "(whether it was applied, and what the execution then settled as). Do NOT assume " +
@@ -766,26 +800,36 @@ function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcRe
       return response;
     }
 
-    case "execute":
+    case "execute": {
+      // Handed to the AGENT verbatim (`toTextResult` JSON-stringifies it), so
+      // no client field access can throw — but the agent-facing contract
+      // dispatches on `status`, and a payload whose `status` is absent OR an
+      // illegal value (F6) is a frame the agent cannot act on. Validated to
+      // the STRUCTURAL floor `isExecutePayloadShape` defines — a legal status
+      // member plus the `executionId` `check_execution` needs — and no
+      // deeper: field-by-field validation of `result`/`error`/`pending`
+      // would be a second copy of the daemon's projection, the drift this
+      // seam's docblock rules out.
+      if (!isExecutePayloadShape(response.payload)) {
+        return refuse(
+          `the daemon's ${kind} answer carried no legal execution status. ` +
+            "The execution's fate is NOT being reported here — do NOT assume it did not run. " +
+            "Look it up with check_execution before re-issuing anything.",
+        );
+      }
+      return response;
+    }
+
     case "execution.get":
     case "execution.getByRequestKey": {
-      // These payloads are handed to the AGENT verbatim (`toTextResult`
-      // JSON-stringifies them), so no client field access can throw. What
-      // the agent-facing contract does rely on is `status` — every
-      // documented branch of the execute/check protocol keys on it, and a
-      // payload without one is a frame the agent cannot act on at all.
-      // Checked to exactly that depth and no further: adding field-by-field
-      // validation of `result`/`error`/`pending` here would be a second
-      // copy of the daemon's projection, which is the drift this seam's
-      // docblock rules out.
-      const payload = response.payload;
-      if (
-        typeof payload !== "object" ||
-        payload === null ||
-        typeof (payload as { status?: unknown }).status !== "string"
-      ) {
+      // The check projection adds `running`/`not_found` to the execute set,
+      // so it has its OWN legal-status predicate (`isCheckPayloadShape`): a
+      // body status must be a legal member with an `executionId`, and the
+      // bare `not_found` is accepted with no id (there is no execution to
+      // name). Same membership-not-just-string floor as execute.
+      if (!isCheckPayloadShape(response.payload)) {
         return refuse(
-          `the daemon's ${kind} answer carried no execution status. ` +
+          `the daemon's ${kind} answer carried no legal execution status. ` +
             "The execution's fate is NOT being reported here — do NOT assume it did not run. " +
             "Look it up with check_execution before re-issuing anything.",
         );

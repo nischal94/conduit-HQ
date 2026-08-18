@@ -561,11 +561,15 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
     expect(all).not.toContain(readFileSync(keyPath, "utf8").trim()); // key never printed
   });
 
-  it("INVARIANT §17 / §3.4: fresh install — rotate fails on its OWN terms, never a raw lock error", async () => {
-    // The other half of the missing-directory reading. A dirless install
-    // has no key to rotate, so rotate must reach its own typed refusal
-    // rather than dying inside the lock acquisition — a lock error would
-    // tell the operator nothing about what is actually wrong.
+  it("INVARIANT §17 / §3.4: fresh install — rotate refuses IMMEDIATELY on a dir-less install, with NO unlocked-proceed window (F4)", async () => {
+    // The F4 TOCTOU fix. Rotate previously PROCEEDED UNLOCKED on
+    // `no-state-dir` (falling through to its preflight, which then failed
+    // "Missing master key"). But proceeding unlocked at all is the hole: a
+    // daemon could create the directory and take the maintenance lock in the
+    // window, and rotate would re-encrypt the live daemon's db with no
+    // EXCLUSIVE hold. A dir-less install genuinely has nothing to rotate, so
+    // rotate now refuses OUTRIGHT — before any preflight, before any lock
+    // acquisition proceeds unlocked — with the keyless diagnosis.
     const fresh = join(dir, "also-not-created");
     expect(existsSync(fresh)).toBe(false);
 
@@ -575,10 +579,14 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
     expect(result.exitCode).toBe(1);
     const err = io.err.join("\n");
     expect(err).not.toMatch(/ConnectionFailed|SQLITE_CANTOPEN/);
-    // Its own diagnosis: preflight cannot resolve a key that isn't there.
-    expect(err).toMatch(/\[ConduitKey\] rotate preflight failed/);
-    expect(err).toMatch(/Missing master key/);
-    // And it created nothing on the way to refusing.
+    // The new refusal: nothing to rotate, run generate first. NOT the old
+    // "preflight failed / Missing master key" — rotate never reaches
+    // preflight on a dir-less install now.
+    expect(err).toMatch(/rotate refused: no Conduit state directory/);
+    expect(err).toMatch(/nothing to rotate/);
+    expect(err).toMatch(/conduit key generate/);
+    expect(err).not.toMatch(/preflight/);
+    // And it created nothing on the way to refusing — no unlocked proceed.
     expect(existsSync(fresh)).toBe(false);
   });
 
@@ -595,5 +603,80 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
     const after = await acquireExclusive(daemonPaths(dir).maintenanceLockDb);
     expect(after).not.toBeNull();
     await after?.release();
+  }, 30_000);
+
+  it("INVARIANT §17 / §3.4: generate CREATES the dir under the §3.2 boundary BEFORE acquiring, and holds a REAL releasable EXCLUSIVE (F4)", async () => {
+    // The F4 TOCTOU fix's positive half. Generate used to acquire the lock
+    // FIRST, get `no-state-dir` on a fresh install, and then run UNLOCKED
+    // while it created the directory and inspected the db — a window an
+    // env-key daemon could start inside. Now generate creates + validates the
+    // directory (0700) via ensureStateDir and only THEN takes the maintenance
+    // lock EXCLUSIVE, so the acquire is against a directory that now exists
+    // (never `no-state-dir`) and the db inspection + key publication run under
+    // a real hold.
+    //
+    // Proven three ways: ensureStateDir is called with generate's dir (create
+    // BEFORE lock); the dir is 0700 and the key minted (the acquire succeeded
+    // because the dir existed); and the maintenance lock is FREE and
+    // re-acquirable afterwards (a real releasable EXCLUSIVE, not a no-op skip).
+    const fresh = join(dir, "gen-creates-then-locks");
+    expect(existsSync(fresh)).toBe(false);
+
+    const { ensureStateDir } = await import("@conduithq/mcp");
+    const ensureCalls: string[] = [];
+
+    const io = makeIo();
+    const result = await runKey(["generate"], {
+      env: {},
+      conduitDir: fresh,
+      ...io,
+      ensureStateDir: async (d: string) => {
+        ensureCalls.push(d);
+        await ensureStateDir(d);
+      },
+    });
+    expect(result.exitCode).toBe(0);
+    // ensureStateDir ran for generate's own dir — the create-then-lock order.
+    expect(ensureCalls).toEqual([fresh]);
+
+    // The lock is a real, releasable EXCLUSIVE: free and re-acquirable now
+    // that generate finished (not a no-op that never held anything).
+    const afterRun = await acquireExclusive(daemonPaths(fresh).maintenanceLockDb);
+    expect(afterRun).not.toBeNull();
+    await afterRun?.release();
+
+    // The key was minted and the dir is 0700 — the acquire succeeded because
+    // generate created the dir BEFORE acquiring (never `no-state-dir`).
+    expect(statSync(join(fresh, "master-key")).mode & 0o777).toBe(0o600);
+    expect(statSync(fresh).mode & 0o777).toBe(0o700);
+  }, 30_000);
+
+  it("INVARIANT §17 / §3.4: generate does NOT proceed unlocked — a held maintenance lock blocks it even mid-onboarding (F4)", async () => {
+    // The decisive proof that generate acquires-then-works rather than
+    // proceeding unlocked: hold maintenance EXCLUSIVE externally, then run
+    // generate against the SAME (existing, empty-of-key) directory. Generate
+    // creates/validates the dir (idempotent), tries to acquire, reads BUSY,
+    // and refuses — it never runs its db inspection or mints a key against a
+    // directory another holder owns. Before F4, a fresh-dir generate skipped
+    // the lock entirely; this pins that it no longer can.
+    const held = await acquireExclusive(daemonPaths(dir).maintenanceLockDb, {
+      role: MAINTENANCE_ROLE_ROTATE,
+    });
+    expect(held).not.toBeNull();
+    try {
+      const io = makeIo();
+      const result = await runKey(["generate"], { env: {}, conduitDir: dir, ...io });
+      expect(result.exitCode).toBe(1);
+      // Refused for the lock, and minted no key while another holder owned it.
+      expect(existsSync(join(dir, "master-key"))).toBe(false);
+    } finally {
+      await held?.release();
+    }
+
+    // Once the lock frees, generate works — the refusal was the lock, not a
+    // poisoned directory.
+    const io2 = makeIo();
+    expect((await runKey(["generate"], { env: {}, conduitDir: dir, ...io2 })).exitCode).toBe(0);
+    expect(statSync(join(dir, "master-key")).mode & 0o777).toBe(0o600);
   }, 30_000);
 });

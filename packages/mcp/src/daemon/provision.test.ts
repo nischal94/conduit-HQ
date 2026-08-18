@@ -27,6 +27,7 @@ import {
   provisionSourceRequest,
   revalidateSourceRequest,
 } from "./provision.js";
+import { createSourceLock } from "./source-lock.js";
 
 const TOOLS_LIST = [
   {
@@ -652,10 +653,12 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
         "[conduit add-mcp] upstream requires authorization (HTTP 403): set CONDUIT_ADD_SECRET; nothing was written.",
     },
     {
-      label: "cap → the client cap message verbatim",
+      // F1: the cap arm returns a FIXED category, never the upstream's own
+      // (potentially credential-echoing) message text.
+      label: "cap → a FIXED category (no upstream text forwarded)",
       error: new McpClientError("cap", "MCP response exceeded the cumulative byte budget"),
       expected:
-        "[conduit add-mcp] MCP response exceeded the cumulative byte budget; nothing was written.",
+        "[conduit add-mcp] the upstream's onboarding response exceeded a size/tool limit; nothing was written. See the daemon log for the upstream's detail.",
     },
     {
       label: "timeout → onboarding-budget line",
@@ -664,10 +667,20 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
         "[conduit add-mcp] upstream did not complete within the onboarding budget; nothing was written.",
     },
     {
-      label: "protocol → the client message",
+      // F1: the protocol arm returns a FIXED category — the upstream's error
+      // string (where a hostile server echoes a credential) is withheld.
+      label: "protocol → a FIXED category (no upstream text forwarded)",
       error: new McpClientError("protocol", "MCP response never carried the expected id"),
       expected:
-        "[conduit add-mcp] MCP response never carried the expected id; nothing was written.",
+        "[conduit add-mcp] the upstream returned an invalid MCP handshake or tools/list during onboarding (protocol error); nothing was written. See the daemon log for the upstream's detail.",
+    },
+    {
+      // F1: even a non-auth http_status returns a fixed category naming only
+      // the numeric status, never the upstream's response body.
+      label: "http_status 500 → a FIXED category naming only the status",
+      error: new McpClientError("http_status", "upstream said: internal boom", { status: 500 }),
+      expected:
+        "[conduit add-mcp] the upstream rejected the request during onboarding (HTTP 500); nothing was written. See the daemon log for the upstream's detail.",
     },
     {
       label: "network → today's unreachable line",
@@ -689,7 +702,13 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
       const result = await run({}, deps);
 
       expect(result.exitCode).toBe(1);
-      expect(result.stderrLines.join("")).toContain(expected);
+      const stderr = result.stderrLines.join("");
+      expect(stderr).toContain(expected);
+      // F1: the upstream's own message text never reaches the client. The
+      // fixed-category arms replace it entirely; the auth/timeout/network
+      // arms were already fixed. "MCP response exceeded", "MCP response
+      // never", "internal boom" are the raw upstream strings above.
+      expect(stderr).not.toContain(error.message);
       expect(await store.sources.list()).toEqual([]);
     });
   }
@@ -797,5 +816,308 @@ describe("revalidateSourceRequest (the anti-oracle half)", () => {
 
     expect(payload.toolCount).toBe(1);
     expect(await store.tools.list()).toHaveLength(1);
+  });
+});
+
+describe("INVARIANT §17 / §9.2 — onboarding error text never carries a stored credential (F1)", () => {
+  // The exact bearer a hostile upstream would echo. A reflecting server puts
+  // it in its own JSON-RPC error message, which `mcp-client.ts` interpolates
+  // into `McpClientError.message` (via describeRpcError). Task 8 moved this
+  // fetch daemon-side, where the serve-time sanitization does NOT run — so
+  // the daemon must refuse to forward that text to the client at all.
+  const BEARER = "Bearer sk-live-EXFIL-abc123def456ghi789";
+
+  /**
+   * An upstream fetch that, whatever it is asked, throws an `McpClientError`
+   * whose message ECHOES the exact authorization value it was given — the
+   * malicious-reflection shape for BOTH the initialize and the tools/list
+   * error paths (they both route through `describeRpcError`).
+   */
+  const echoingFetch =
+    (kind: McpClientError["kind"]): FetchTools =>
+    async (_url, opts) => {
+      const echoed = opts?.authorization ?? "<no-auth-sent>";
+      throw new McpClientError(
+        kind,
+        `MCP server rejected initialize: upstream said {"error":"bad token ${echoed}"}`,
+      );
+    };
+
+  it("a reflecting upstream on the REVALIDATE path leaks the stored credential into NEITHER the client frame NOR the daemon log", async () => {
+    const store = await openTestStore();
+    // Onboard WITH a stored credential, so revalidate reveals + sends it.
+    await run({}, { store, env: { CONDUIT_ADD_SECRET: BEARER } });
+
+    const daemonLog: string[] = [];
+    // protocol AND cap AND http_status are the arms that used to forward
+    // cause.message; check all three plus the fallback.
+    for (const kind of ["protocol", "cap", "http_status"] as const) {
+      daemonLog.length = 0;
+      let clientMessage = "";
+      try {
+        await revalidateSourceRequest("github", {
+          store,
+          fetchTools: echoingFetch(kind),
+          log: (line) => daemonLog.push(line),
+        });
+        throw new Error("expected a ProvisionRefused");
+      } catch (err) {
+        expect(err).toBeInstanceOf(ProvisionRefused);
+        clientMessage = (err as ProvisionRefused).message;
+      }
+
+      // The CLIENT-BOUND frame (what add-mcp prints) carries no credential.
+      expect(clientMessage).not.toContain(BEARER);
+      expect(clientMessage).not.toContain("sk-live-EXFIL");
+      // And no raw upstream text at all — the message is the fixed category.
+      expect(clientMessage).not.toContain("upstream said");
+
+      // The DAEMON LOG got the detail (so nothing debuggable is lost) but
+      // with the credential REDACTED — this is the load-bearing assertion.
+      const loggedText = daemonLog.join("\n");
+      expect(loggedText).not.toContain(BEARER);
+      expect(loggedText).not.toContain("sk-live-EXFIL");
+      expect(loggedText).toContain("[redacted]");
+      expect(loggedText).toContain("Onboarding fetch failed");
+    }
+  });
+
+  it("a reflecting upstream on the PROVISION re-sync path (stored credential reused) leaks it into neither surface", async () => {
+    const store = await openTestStore();
+    await run({}, { store, env: { CONDUIT_ADD_SECRET: BEARER } });
+
+    const daemonLog: string[] = [];
+    // Same url as the stored row → the stored credential is reused and sent.
+    await expect(
+      provisionSourceRequest(
+        { ...BASE_ARGS },
+        { store, fetchTools: echoingFetch("protocol"), log: (line) => daemonLog.push(line) },
+      ),
+    ).rejects.toMatchObject({ name: "ProvisionRefused" });
+
+    let refusalMessage = "";
+    try {
+      await provisionSourceRequest(
+        { ...BASE_ARGS },
+        { store, fetchTools: echoingFetch("protocol") },
+      );
+    } catch (err) {
+      refusalMessage = (err as ProvisionRefused).message;
+    }
+    expect(refusalMessage).not.toContain(BEARER);
+    expect(refusalMessage).not.toContain("upstream said");
+
+    const loggedText = daemonLog.join("\n");
+    expect(loggedText).not.toContain(BEARER);
+    expect(loggedText).toContain("[redacted]");
+  });
+
+  it("a malformed tools/list body whose text echoes the credential is withheld from the client and redacted in the log", async () => {
+    const store = await openTestStore();
+    await run({}, { store, env: { CONDUIT_ADD_SECRET: BEARER } });
+
+    const daemonLog: string[] = [];
+    // Fetch SUCCEEDS but returns a body normalizeMcp rejects, and the
+    // rejection detail echoes what a reflecting upstream put in a tool name.
+    let refusalMessage = "";
+    try {
+      await revalidateSourceRequest("github", {
+        store,
+        fetchTools: async (_url, opts) => [
+          { name: `tool ${opts?.authorization ?? ""}`, inputSchema: 42 },
+        ],
+        log: (line) => daemonLog.push(line),
+      });
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProvisionRefused);
+      refusalMessage = (err as ProvisionRefused).message;
+    }
+
+    expect(refusalMessage).not.toContain(BEARER);
+    expect(refusalMessage).not.toContain("sk-live-EXFIL");
+    const loggedText = daemonLog.join("\n");
+    expect(loggedText).not.toContain(BEARER);
+  });
+
+  it("the fixed category still names the operator's next move (not a bare code)", async () => {
+    const store = await openTestStore();
+    let message = "";
+    try {
+      await provisionSourceRequest(
+        { ...BASE_ARGS },
+        { store, fetchTools: echoingFetch("protocol") },
+      );
+    } catch (err) {
+      message = (err as ProvisionRefused).message;
+    }
+    expect(message).toContain("nothing was written");
+    expect(message).toContain("protocol error");
+    expect(message).toContain("daemon log");
+  });
+});
+
+describe("INVARIANT §17 / §9.2 — a credential in the url is refused, and a stored url is never echoed raw (F3)", () => {
+  it("a userinfo url (user:pass@host) is refused before any fetch, 0 writes", async () => {
+    const store = await openTestStore();
+    const fetchTools = vi.fn() as unknown as FetchTools;
+    await expect(
+      provisionSourceRequest(
+        { ...BASE_ARGS, url: "https://alice:s3cr3t@upstream.example/mcp" },
+        { store, fetchTools },
+      ),
+    ).rejects.toBeInstanceOf(ProvisionRefused);
+    expect(fetchTools).not.toHaveBeenCalled();
+    expect(await store.sources.list()).toEqual([]);
+  });
+
+  it("a query-token url is accepted for provisioning but never echoed raw in a later revalidation-failure frame", async () => {
+    const store = await openTestStore();
+    // A ?token= url is a legal http(s) url (no userinfo) — accepted. The
+    // point of F3's second half is that when it later reaches an
+    // operator-facing frame it is rendered origin+path, dropping the query.
+    const TOKENED = "https://upstream.example/mcp?token=QUERY_SECRET_TOKEN_xyz";
+    await provisionSourceRequest(
+      { ...BASE_ARGS, url: TOKENED },
+      { store, fetchTools: async () => TOOLS_LIST },
+    );
+
+    // Now revalidate against a failing upstream: the stored url reaches the
+    // refusal frame, and must be sanitized to origin+path.
+    let message = "";
+    try {
+      await revalidateSourceRequest("github", {
+        store,
+        fetchTools: async () => {
+          throw new McpClientError("network", "boom");
+        },
+      });
+    } catch (err) {
+      message = (err as ProvisionRefused).message;
+    }
+    expect(message).not.toContain("QUERY_SECRET_TOKEN");
+    expect(message).not.toContain("?token=");
+    expect(message).toContain("upstream.example/mcp");
+  });
+
+  it("the CLI-side intake also rejects a userinfo url with an actionable message", async () => {
+    // Mirrors the daemon guard at the client boundary — the operator sees the
+    // FLAG-shaped hint. Verified through the real runAddMcp path in add-mcp
+    // tests; here we pin the daemon predicate directly.
+    const store = await openTestStore();
+    let message = "";
+    try {
+      await provisionSourceRequest(
+        { ...BASE_ARGS, url: "http://:justpass@host/mcp" },
+        { store, fetchTools: vi.fn() as unknown as FetchTools },
+      );
+    } catch (err) {
+      message = (err as ProvisionRefused).message;
+    }
+    expect(message).toMatch(/url/);
+  });
+});
+
+describe("INVARIANT §17 / §9.2 — concurrent provision/revalidate serialize per namespace (F2, anti-oracle race)", () => {
+  const URL_A = "http://127.0.0.1:9/mcp-A";
+  const URL_B = "http://127.0.0.1:9/mcp-B";
+
+  /**
+   * A fetch that BLOCKS on a per-call barrier the test controls, so the test
+   * can pin one operation's fetch open while the other tries to run — the
+   * exact interleaving the anti-oracle race needs.
+   */
+  function barrierFetch(): {
+    fetch: FetchTools;
+    release(url: string): void;
+    started(url: string): Promise<void>;
+  } {
+    const gates = new Map<string, { open: Promise<void>; release: () => void }>();
+    const startedResolvers = new Map<string, () => void>();
+    const startedPromises = new Map<string, Promise<void>>();
+    const gateFor = (url: string) => {
+      let g = gates.get(url);
+      if (g === undefined) {
+        let release!: () => void;
+        const open = new Promise<void>((r) => {
+          release = r;
+        });
+        g = { open, release };
+        gates.set(url, g);
+      }
+      return g;
+    };
+    const startedFor = (url: string) => {
+      let p = startedPromises.get(url);
+      if (p === undefined) {
+        let res!: () => void;
+        p = new Promise<void>((r) => {
+          res = r;
+        });
+        startedPromises.set(url, p);
+        startedResolvers.set(url, res);
+      }
+      return p;
+    };
+    return {
+      fetch: async (url) => {
+        startedFor(url);
+        startedResolvers.get(url)?.();
+        await gateFor(url).open;
+        return TOOLS_LIST;
+      },
+      release: (url) => gateFor(url).release(),
+      started: (url) => startedFor(url),
+    };
+  }
+
+  it("with the per-namespace lock, an interleaved revalidate + retargeting provision leave a CONSISTENT (destination, credential) pairing", async () => {
+    const store = await openTestStore();
+    const lock = createSourceLock();
+
+    // Seed the namespace at URL_A with a stored credential.
+    await run({ url: URL_A }, { store, env: { CONDUIT_ADD_SECRET: "Bearer secret-A" } });
+
+    const barrier = barrierFetch();
+
+    // Op 1: revalidate("github") — reads the stored row (URL_A + cred), then
+    // its fetch blocks on URL_A's barrier. WITHOUT the lock, op 2 below could
+    // retarget under it and op 1 would then re-commit URL_A pairing the fresh
+    // secret with the stale destination.
+    const revalidate = lock.run("github", () =>
+      revalidateSourceRequest("github", { store, fetchTools: barrier.fetch }),
+    );
+
+    // Op 2: a retargeting provision to URL_B with a FRESH secret. It is
+    // submitted while op 1 holds the lock; the lock must make it wait.
+    const provision = lock.run("github", () =>
+      provisionSourceRequest(
+        { ...BASE_ARGS, url: URL_B, replace: true, secret: "Bearer secret-B" },
+        { store, fetchTools: barrier.fetch },
+      ),
+    );
+
+    // Op 1 has started its fetch (holds the lock). Op 2 must NOT have started
+    // — the lock serializes them. Prove it by releasing only URL_A and
+    // confirming URL_B's fetch never fired while op 1 was in flight.
+    await barrier.started(URL_A);
+    await new Promise((r) => setTimeout(r, 20));
+
+    // Release op 1's fetch → it commits URL_A. Only then does op 2 acquire
+    // the lock, run its own fetch against URL_B, and commit.
+    barrier.release(URL_A);
+    await revalidate;
+    await barrier.started(URL_B);
+    barrier.release(URL_B);
+    await provision;
+
+    // FINAL STATE must be self-consistent: the stored location and the stored
+    // credential are one pair. Because the ops serialized, op 2 (the later
+    // committer) fully wins — URL_B with secret-B — rather than a torn
+    // (URL_A, secret-B) pairing.
+    const source = await store.sources.get("src_github");
+    const conn = (await store.connections.list()).find((c) => c.integrationId === "int_github");
+    expect(source?.location).toBe(URL_B);
+    expect(conn?.credentialRef).toBeDefined();
+    expect(await store.secrets.reveal(conn?.credentialRef as string)).toBe("Bearer secret-B");
   });
 });

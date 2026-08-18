@@ -56,7 +56,7 @@ export interface ApprovalsResult {
  * `serve` takes, and for the same reason: the state directory selects which
  * daemon, and therefore which database, this command decides against.
  */
-function prodDeps(stateDir: string): ApprovalsDeps {
+function prodDeps(stateDir: string, autoStart: boolean): ApprovalsDeps {
   return {
     daemon: (request) =>
       daemonRequest({
@@ -66,6 +66,10 @@ function prodDeps(stateDir: string): ApprovalsDeps {
         // Per-kind, via the shared table: a resume is queued and then RUNS,
         // so it carries the derived resume budget rather than a read's.
         deadlineMs: deadlineForRequest(request),
+        // Auto-start only for the default directory (F5): a custom
+        // `--state-dir` is started by hand, never auto-started against the
+        // default dir a spawned daemon would derive.
+        autoStart,
       }),
     now: () => Date.now(),
     stdout: (line) => process.stdout.write(line),
@@ -351,7 +355,7 @@ export async function approvals(argv: string[], opts: ApprovalsOptions = {}): Pr
   // Since Task 7 this process runs no sandbox at all: a resumed execution
   // replays inside the daemon, so a sink installed here could never fire,
   // and leaving one would imply this process still executes guest code.
-  const deps = prodDeps(opts.stateDir ?? DEFAULT_CONDUIT_DIR);
+  const deps = prodDeps(opts.stateDir ?? DEFAULT_CONDUIT_DIR, opts.stateDir === undefined);
   const [sub, ...rest] = argv;
   switch (sub) {
     case "list": {

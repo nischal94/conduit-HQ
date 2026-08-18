@@ -40,6 +40,13 @@ export {
   revalidateSourceRequest,
 } from "./daemon/provision.js";
 export type { Capability, RpcRequest, RpcResponse } from "./daemon/rpc.js";
+/**
+ * `key generate` creates its own state directory under the §3.2 boundary
+ * BEFORE taking the maintenance lock (F4: creates-then-locks), so it needs
+ * the same mkdir-then-assert primitive the daemon uses rather than a bare
+ * `mkdirSync`.
+ */
+export { assertStateDir, ensureStateDir, StateDirError } from "./daemon/state-dir.js";
 export {
   DEFAULT_CONDUIT_DIR,
   DEFAULT_KEY_FILE,
@@ -61,6 +68,9 @@ export {
   estimateDefinitionTokens,
   executionToCheckPayload,
   extendExecuteDefinition,
+  isCheckPayloadShape,
+  isExecutePayloadShape,
+  isResumePayloadShape,
   outcomeToPayload,
   type PausedListRow,
   pausedToListRow,

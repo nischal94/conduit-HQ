@@ -62,7 +62,7 @@ export type {
   UpstreamOutcome,
   UpstreamRequest,
 } from "./pipeline/upstream.js";
-export { createMcpUpstreamCaller } from "./pipeline/upstream.js";
+export { createMcpUpstreamCaller, redactionTokens, redactTokens } from "./pipeline/upstream.js";
 export type {
   PolicyEngine,
   PolicyEvaluationRequest,

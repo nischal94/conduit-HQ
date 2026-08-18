@@ -342,6 +342,75 @@ export function toTextResult(payload: unknown): { content: [{ type: "text"; text
 }
 
 /**
+ * The legal `status` value-sets, in ONE place — the single source of truth
+ * the daemon's PROJECTIONS above produce and the client's payload GUARD
+ * (`client.ts`) checks against (Codex ARC F6).
+ *
+ * Before this, the guard checked only that `status` was a string, which let
+ * `{status: "bogus"}` and arm-incomplete payloads (a `completed` with no
+ * `executionId`, a resume that "settled as bogus") pass a completed exchange
+ * as a well-formed answer. A projection is a discriminated union — its
+ * validity is the status being a legal MEMBER, not merely a string — so the
+ * guard must know the members. Keeping the sets and the arm-shape predicates
+ * here, beside the senders that build them, is what stops the guard from
+ * being a second, drifting copy of the contract.
+ */
+export const EXECUTE_STATUSES = ["completed", "failed", "paused", "expired", "conflict"] as const;
+
+export const CHECK_BODY_STATUSES = ["running", "completed", "failed", "paused", "expired"] as const;
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null;
+}
+
+/**
+ * True iff `payload` is a well-formed `ExecutePayload`: a LEGAL `status`
+ * member (not merely a string) and the fields every arm carries. The
+ * per-arm mandatory field is `executionId` — a string on every arm, and the
+ * one thing `check_execution` needs to look the execution up — so a
+ * `completed`/`failed`/`paused` payload missing it is rejected here rather
+ * than handed to the agent as a settled outcome it cannot act on.
+ *
+ * `result`/`error`/`pending`/`message` are deliberately NOT validated: they
+ * are handed to the agent verbatim (JSON-stringified), so no client field
+ * access can throw on them, and validating them here would be the drifting
+ * second copy of the projection the guard's docblock rules out. The status
+ * membership + `executionId` are the STRUCTURAL floor a consumer relies on.
+ */
+export function isExecutePayloadShape(payload: unknown): payload is ExecutePayload {
+  if (!isRecord(payload)) return false;
+  if (!(EXECUTE_STATUSES as readonly string[]).includes(payload.status as string)) return false;
+  return typeof payload.executionId === "string";
+}
+
+/**
+ * True iff `payload` is a well-formed `ResumePayload`: an `ExecutePayload`
+ * plus a boolean `decisionApplied`. Both axes are load-bearing — `status`
+ * selects the CLI's entire output path and `decisionApplied` carries the
+ * operator's verb truth (see `ResumePayload`) — so a break in either is a
+ * false answer, and both are required here.
+ */
+export function isResumePayloadShape(payload: unknown): payload is ResumePayload {
+  if (!isRecord(payload)) return false;
+  const hasDecision = typeof payload.decisionApplied === "boolean";
+  return hasDecision && isExecutePayloadShape(payload);
+}
+
+/**
+ * True iff `payload` is a well-formed `CheckPayload`: either the bare
+ * `{status: "not_found"}` (which carries no `executionId` — there is no
+ * execution to name), or a body with a LEGAL body status and an
+ * `executionId` string. Same membership-not-just-string reasoning as
+ * `isExecutePayloadShape`.
+ */
+export function isCheckPayloadShape(payload: unknown): payload is CheckPayload {
+  if (!isRecord(payload)) return false;
+  if (payload.status === "not_found") return true;
+  if (!(CHECK_BODY_STATUSES as readonly string[]).includes(payload.status as string)) return false;
+  return typeof payload.executionId === "string";
+}
+
+/**
  * Builds the `catalog.listing` projection from a live store. Runs
  * DAEMON-SIDE (D-B1) — it moved here from `server.ts` when the stdio
  * server stopped holding a store of its own, and this is now the only

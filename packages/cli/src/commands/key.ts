@@ -4,7 +4,6 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
-  mkdirSync,
   openSync,
   readdirSync,
   renameSync,
@@ -18,6 +17,7 @@ import {
   describeHolder,
   type ExclusiveAcquisition,
   ensureDbFile,
+  ensureStateDir,
   MAINTENANCE_ROLE_GENERATE,
   MAINTENANCE_ROLE_ROTATE,
   openStoreClientFromEnv,
@@ -47,6 +47,12 @@ export interface KeyDeps {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
   openStoreClient: typeof openStoreClientFromEnv;
+  /**
+   * Creates + validates the state directory under the §3.2 boundary. Used by
+   * `generate` to create-then-lock (F4) before taking the maintenance lock.
+   * Injectable so a test can point generate at a temp dir.
+   */
+  ensureStateDir: typeof ensureStateDir;
 }
 
 const PROD_DEPS: KeyDeps = {
@@ -55,6 +61,7 @@ const PROD_DEPS: KeyDeps = {
   stdout: (line) => process.stdout.write(line),
   stderr: (line) => process.stderr.write(line),
   openStoreClient: openStoreClientFromEnv,
+  ensureStateDir,
 };
 
 export interface KeyResult {
@@ -65,62 +72,102 @@ export async function runKey(args: string[], overrides?: Partial<KeyDeps>): Prom
   const deps: KeyDeps = { ...PROD_DEPS, ...overrides };
   const [sub] = args;
   if (sub === "generate") {
-    return underMaintenance(deps, MAINTENANCE_ROLE_GENERATE, "generate", runKeyGenerate);
+    return generateUnderMaintenance(deps);
   }
   if (sub === "rotate") {
-    return underMaintenance(deps, MAINTENANCE_ROLE_ROTATE, "rotate", runKeyRotate);
+    return rotateUnderMaintenance(deps);
   }
   deps.stderr(`${KEY_USAGE}\n`);
   return { exitCode: 1 };
 }
 
 /**
- * Runs a key subcommand while holding the §3.4 maintenance lock.
+ * `key generate` while holding the §3.4 maintenance lock — CREATES the state
+ * directory FIRST, then locks (Codex ARC F4).
  *
- * The hold spans the ENTIRE subcommand, which is what makes it worth
- * anything: §3.4 requires rotate to hold it "through key promotion,
- * directory fsync, checkpoint, and hygiene", not merely across the
- * re-seal. Releasing early would reopen the window a daemon can start in
- * while `.next` is still unpromoted — the exact race the lock exists to
- * close. `generate` is covered for the same reason: its `countSealedRows`
- * inspection (§2.1's second direct `createClient`) reads a db the daemon
- * may otherwise be writing, and its refusal-on-sealed-rows is a
- * documented guarantee that a concurrent write could invalidate.
+ * The order is a TOCTOU fix. The previous shape acquired the lock first, and
+ * on a fresh install the acquisition returned `no-state-dir` — the directory
+ * did not exist yet — so `generate` ran UNLOCKED for its whole duration and
+ * created the directory itself moments later. That left a window: between
+ * "observe no state dir" and "create it", an env-key daemon (which needs no
+ * key file to start) could create the directory, take the maintenance lock
+ * SHARED, and open the db — and `generate`'s unlocked `countSealedRows`
+ * inspection would then race the daemon's writes, its refusal-on-sealed-rows
+ * guarantee reading a db under concurrent mutation.
  *
- * Release rides in `finally` so it happens on every path, including a
- * throw. The kernel dropping the lock at process death is the backstop,
- * but an explicit release makes the lock free PROMPTLY — the next command
- * should not have to wait for process teardown.
+ * Observation-of-absence is not a held lock. So `generate` now CREATES and
+ * validates the state directory under the §3.2 boundary (`ensureStateDir`:
+ * mkdir 0700 then assert ownership/mode/ACL), and only THEN acquires the
+ * maintenance lock — which, the directory now existing, resolves to a real
+ * EXCLUSIVE hold rather than `no-state-dir`. A daemon racing to start is now
+ * excluded by the kernel lock for `generate`'s whole run, exactly as §3.4
+ * requires.
+ *
+ * The hold still spans the ENTIRE subcommand (the `countSealedRows`
+ * inspection and the key publication both run under it), released in
+ * `finally` on every path.
  */
-async function underMaintenance(
-  deps: KeyDeps,
-  role: string,
-  verb: string,
-  run: (deps: KeyDeps) => Promise<KeyResult>,
-): Promise<KeyResult> {
-  const acquisition = await acquireMaintenance(deps, role, verb);
-  if (acquisition.outcome === "busy") return { exitCode: 1 };
-
-  // `no-state-dir`: the state directory does not exist yet, so nothing can
-  // be holding a lock inside it and the subcommand PROCEEDS unlocked. This
-  // is the fresh-install path — `generate` is the documented first
-  // onboarding step and creates the directory itself moments later, so
-  // refusing here (or throwing a raw libsql open error) would break the
-  // very first command a new user runs. `rotate` also proceeds, and then
-  // fails on its OWN terms — a keyless install has nothing to rotate,
-  // which is a far better diagnosis than a lock error.
-  //
-  // Proceeding unlocked is not a hole: a directory that does not exist
-  // holds no db for a daemon to own, so there is no second writer to
-  // exclude. The window between this check and the mkdir is the same one
-  // `generate`'s own `link()`-based publication already resolves — it
-  // never overwrites, so a racing generate loses on EEXIST rather than
-  // clobbering a key.
-  const lock = acquisition.outcome === "acquired" ? acquisition.lock : null;
+async function generateUnderMaintenance(deps: KeyDeps): Promise<KeyResult> {
+  // Create + validate the state directory BEFORE the lock. A create failure
+  // (an unsafe pre-existing directory, an un-strippable ACL) is generate's
+  // own refusal, not a lock error.
   try {
-    return await run(deps);
+    await deps.ensureStateDir(deps.conduitDir);
+  } catch (cause) {
+    deps.stderr(
+      `[ConduitKey] generate refused: the state directory ${deps.conduitDir} could not be ` +
+        `created or validated (§3.2 ownership/mode/ACL boundary). Fix its ownership and ` +
+        `permissions, then re-run. Context: { cause: ${String(cause)} }\n`,
+    );
+    return { exitCode: 1 };
+  }
+
+  const acquisition = await acquireMaintenance(deps, MAINTENANCE_ROLE_GENERATE, "generate");
+  // `no-state-dir` is now unreachable — `ensureStateDir` above created it.
+  // Treated as a refusal rather than an unlocked proceed if it ever occurs
+  // (a directory removed in the microsecond between create and acquire),
+  // because proceeding unlocked is exactly the window this fix closes.
+  if (acquisition.outcome !== "acquired") return { exitCode: 1 };
+
+  try {
+    return await runKeyGenerate(deps);
   } finally {
-    await lock?.release();
+    await acquisition.lock.release();
+  }
+}
+
+/**
+ * `key rotate` while holding the §3.4 maintenance lock — refuses OUTRIGHT on
+ * a keyless / dir-less install (Codex ARC F4).
+ *
+ * The previous shape let `no-state-dir` PROCEED UNLOCKED, on the reasoning
+ * that rotate would then fail "on its own terms". But proceeding unlocked at
+ * all is the hole: a daemon could create the directory and take the
+ * maintenance lock in the window, and rotate would re-encrypt the live
+ * daemon's db with no EXCLUSIVE hold — breaking stop-first and the
+ * two-openers guarantee. A keyless / dir-less install genuinely has nothing
+ * to rotate, so refusing immediately is both safe and the more correct
+ * diagnosis; there is no legitimate case in which rotate should run without
+ * the lock.
+ *
+ * `busy` and `no-state-dir` both refuse; only a real EXCLUSIVE hold proceeds.
+ */
+async function rotateUnderMaintenance(deps: KeyDeps): Promise<KeyResult> {
+  const acquisition = await acquireMaintenance(deps, MAINTENANCE_ROLE_ROTATE, "rotate");
+  if (acquisition.outcome === "busy") return { exitCode: 1 };
+  if (acquisition.outcome === "no-state-dir") {
+    deps.stderr(
+      `[ConduitKey] rotate refused: no Conduit state directory at ${deps.conduitDir} — there is ` +
+        "nothing to rotate. Run `conduit key generate` to create a key first. (Rotation never " +
+        "proceeds without the maintenance lock, and a dir-less install has no lock to take.)\n",
+    );
+    return { exitCode: 1 };
+  }
+
+  try {
+    return await runKeyRotate(deps);
+  } finally {
+    await acquisition.lock.release();
   }
 }
 
@@ -248,7 +295,10 @@ async function runKeyGenerate(deps: KeyDeps): Promise<KeyResult> {
   // heal them now. No-op on a fresh/nonexistent db (nothing to heal yet).
   if (existsSync(dbPath)) ensureDbFile(dbPath);
 
-  mkdirSync(deps.conduitDir, { recursive: true, mode: 0o700 });
+  // The state directory already exists and was validated 0700 by
+  // `generateUnderMaintenance`'s `ensureStateDir` (F4: create-then-lock), so
+  // there is no directory to create here — this function runs only under the
+  // held maintenance lock.
   const stale = readdirSync(deps.conduitDir).filter((f) => f.startsWith("master-key.tmp-"));
   if (stale.length > 0) {
     deps.stderr(

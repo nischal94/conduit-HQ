@@ -69,12 +69,19 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
    * path (design §3.3: "daemon absent at boot is a first-class path").
    */
   const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
+  // Auto-start is only correct for the DEFAULT directory (F5): a spawned
+  // daemon derives the default dir, so an operator-selected custom
+  // `--state-dir` must be started by hand, not auto-started against the
+  // wrong directory. `opts.stateDir !== undefined` is exactly "the operator
+  // chose a custom directory".
+  const autoStart = opts.stateDir === undefined;
   const daemon: DaemonCall = (request: RpcRequest): Promise<RpcResponse> =>
     daemonRequest({
       stateDir,
       role: "serve",
       request,
       deadlineMs: deadlineForRequest(request),
+      autoStart,
     });
 
   // Startup diagnostics come from the daemon's own handshake-backed view,
@@ -95,6 +102,7 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
       role: "serve",
       request: { kind: "catalog.listing" },
       deadlineMs: deadlineForRequest({ kind: "catalog.listing" }),
+      autoStart,
     });
     if (response.kind !== "result") {
       // A refusal here is terminal and worth the daemon's own words:

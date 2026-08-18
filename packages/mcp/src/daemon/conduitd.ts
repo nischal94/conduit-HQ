@@ -41,6 +41,7 @@ import {
   EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS,
   type HeldLock,
 } from "./locks.js";
+import { createSourceLock } from "./source-lock.js";
 import { ensureStateDir } from "./state-dir.js";
 
 /**
@@ -663,6 +664,11 @@ async function serve(opts: ServeOptions): Promise<void> {
   // `isDraining` is a getter, not a snapshot: the drain block below flips
   // `draining` long after these deps are built, and the READY gate must
   // observe the live value.
+  // Daemon-scoped per-namespace source lock (F2): built once, shared by
+  // every connection, so provision/revalidate against one namespace
+  // serialize even across connections.
+  const sourceLock = createSourceLock();
+
   const connectionDeps: ConnectionDeps = {
     store,
     allowPrivateEgress,
@@ -678,6 +684,7 @@ async function serve(opts: ServeOptions): Promise<void> {
       activeCount: queue.activeCount,
     }),
     busyMessage: `daemon busy: ${QUEUE_CAPACITY} requests queued behind ${CONCURRENCY_CAP} active`,
+    withSourceLock: (namespace, fn) => sourceLock.run(namespace, fn),
   };
 
   server.on("connection", (socket) => {
