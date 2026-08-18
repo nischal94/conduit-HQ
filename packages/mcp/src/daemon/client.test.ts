@@ -1,15 +1,27 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { closeSync, existsSync, mkdtempSync, openSync, readFileSync, rmSync } from "node:fs";
+import {
+  closeSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  openSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+} from "node:fs";
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import { createClient } from "@libsql/client";
-import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
+import { DEFAULT_CONDUIT_DIR } from "../env.js";
 import {
   DaemonUnavailable,
   daemonRequest,
+  isDefaultStateDir,
   LIFECYCLE_WAIT_POLL_MS_FOR_TEST,
   MIN_PASS_BUDGET_MS,
+  sameDirectoryIdentity,
   UNCORRELATED,
 } from "./client.js";
 import { daemonPaths } from "./conduitd.js";
@@ -613,6 +625,117 @@ describe("daemonRequest — the §3.5 decision table", () => {
     },
     TIMEOUT,
   );
+});
+
+describe("the auto-start default-dir gate — filesystem identity (Codex ARC pass 3)", () => {
+  // A scaffold whose layout the identity check must see through. `base`
+  // stands in for the parent of a canonical default; every path below is
+  // built relative to a THROWAWAY default so no test touches the real
+  // `~/.conduit`. The gate compares against a passed-in `defaultDir` via
+  // `sameDirectoryIdentity` — the exact function `isDefaultStateDir` calls
+  // with `DEFAULT_CONDUIT_DIR`, so this exercises the production predicate,
+  // not a re-implementation of it.
+  let base: string;
+
+  beforeEach(() => {
+    base = mkdtempSync(join(tmpdir(), "cdc-idgate-"));
+  });
+
+  afterEach(() => {
+    rmSync(base, { recursive: true, force: true });
+  });
+
+  it("INVARIANT §17: auto-start targets only the canonical default state dir, by filesystem identity — a symlink+`..` into a custom 0700 dir does NOT classify as default", () => {
+    // THE ATTACK. `<default>/link` is a symlink into a custom directory,
+    // and the client is pointed at `<default>/link/..`. `path.resolve`
+    // (the OLD gate) collapses `link/..` LEXICALLY to `<default>` and would
+    // classify it as the default — but a real filesystem operation
+    // resolves `link` through the symlink first, so `assertStateDir` /
+    // `daemonPaths` operate on a DIFFERENT directory than the lexical
+    // default. The identity gate compares the object the kernel actually
+    // lands on, so the spoof is refused.
+    const defaultDir = join(base, "default");
+    const custom = join(base, "custom");
+    mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
+    mkdirSync(custom, { recursive: true, mode: 0o700 });
+    symlinkSync(custom, join(defaultDir, "link"));
+
+    const attack = `${defaultDir}/link/..`;
+
+    // The old lexical check WOULD have accepted this — the exact bug.
+    expect(resolve(attack)).toBe(resolve(defaultDir));
+    // The identity check refuses it: a real fs op on `attack` does not land
+    // on the default directory's inode.
+    expect(sameDirectoryIdentity(attack, defaultDir)).toBe(false);
+  });
+
+  it("INVARIANT §17: a genuine default still classifies as default — the legitimate auto-start path is not over-tightened (existing dir, and not-yet-existing fresh install)", () => {
+    // An existing real default is default.
+    const existingDefault = join(base, "default-exists");
+    mkdirSync(existingDefault, { recursive: true, mode: 0o700 });
+    expect(sameDirectoryIdentity(existingDefault, existingDefault)).toBe(true);
+
+    // A FRESH INSTALL: the default does not exist yet. The gate must still
+    // classify the default constant as default (both genuinely absent,
+    // identical canonical form) so a first-run auto-start is not broken.
+    const freshDefault = join(base, "nested", "default-fresh");
+    expect(existsSync(freshDefault)).toBe(false);
+    expect(sameDirectoryIdentity(freshDefault, freshDefault)).toBe(true);
+  });
+
+  it("INVARIANT §17: a plain custom dir (no symlink trick) is still refused — no regression", () => {
+    const defaultDir = join(base, "default");
+    const custom = join(base, "custom");
+    mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
+    mkdirSync(custom, { recursive: true, mode: 0o700 });
+    expect(sameDirectoryIdentity(custom, defaultDir)).toBe(false);
+  });
+
+  it("INVARIANT §17: a trailing slash and a `.` spelling of the REAL default still classify default — identity, not string", () => {
+    const defaultDir = join(base, "default");
+    mkdirSync(defaultDir, { recursive: true, mode: 0o700 });
+    expect(sameDirectoryIdentity(`${defaultDir}/`, defaultDir)).toBe(true);
+    expect(sameDirectoryIdentity(join(defaultDir, "."), defaultDir)).toBe(true);
+    // A symlink whose target IS the default is a legitimate alias — same
+    // inode, so it classifies default (unlike the symlink-to-CUSTOM above).
+    const aliasToDefault = join(base, "alias");
+    symlinkSync(defaultDir, aliasToDefault);
+    expect(sameDirectoryIdentity(aliasToDefault, defaultDir)).toBe(true);
+  });
+
+  it("INVARIANT §17: fresh-install reasoning is not spoofable — a symlinked existing ancestor with `..` cannot forge the default, and a dangling symlink is not 'absent'", () => {
+    // Default absent (fresh install). `lk` is a symlink into a SIBLING
+    // subtree; `lk/../default` filesystem-resolves to that subtree's
+    // sibling, NOT to the intended default. The kernel-faithful canonical
+    // walk exposes the divergence a lexical `resolve` would hide.
+    const freshDefault = join(base, "default");
+    const sub = join(base, "sub", "custom");
+    mkdirSync(sub, { recursive: true, mode: 0o700 });
+    symlinkSync(join(base, "sub", "custom"), join(base, "lk"));
+    const spoof = `${join(base, "lk")}/../default`;
+    expect(sameDirectoryIdentity(spoof, freshDefault)).toBe(false);
+
+    // A DANGLING symlink at the candidate is NOT a genuine absence: it is a
+    // symlink entry that could be retargeted, so it must not be admitted to
+    // the fresh-install (tail-is-lexical) branch.
+    const dangling = join(base, "dangling");
+    symlinkSync(join(base, "no-such-target"), dangling);
+    expect(sameDirectoryIdentity(dangling, freshDefault)).toBe(false);
+  });
+
+  it("isDefaultStateDir routes through the identity check against the real DEFAULT_CONDUIT_DIR — a custom temp dir is never the default", () => {
+    // The production entry point: no temp `defaultDir` seam. A throwaway
+    // temp directory can never share an inode with the real
+    // `DEFAULT_CONDUIT_DIR`, so the public gate every role uses refuses it.
+    const custom = mkdtempSync(join(tmpdir(), "cdc-notdefault-"));
+    try {
+      expect(isDefaultStateDir(custom)).toBe(false);
+      // And it agrees with the seam it delegates to.
+      expect(isDefaultStateDir(custom)).toBe(sameDirectoryIdentity(custom, DEFAULT_CONDUIT_DIR));
+    } finally {
+      rmSync(custom, { recursive: true, force: true });
+    }
+  });
 });
 
 describe("the READY-gate decoder handoff", () => {
