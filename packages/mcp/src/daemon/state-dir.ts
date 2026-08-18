@@ -164,14 +164,17 @@ export function sameLeaf(a: DirectoryIdentity, b: DirectoryIdentity): boolean {
  * lexical past the last real component, cannot alias anything).
  *
  * A component is disqualifying when EITHER (§3.2):
- *   1. it is owned by a uid that is neither ours NOR root. Under the same-UID
- *      threat model the only adversary shares neither our uid nor root, so a
- *      ROOT-owned ancestor is trusted (it is exactly the `/`, `/Users`,
- *      `/home`, `/private`, `/var`, `/private/tmp` chain every home path
- *      necessarily traverses) while any other foreign owner is an
- *      attacker-owned traversal point → refuse. Ownership is the trust
- *      criterion, not a hardcoded name set — a uid comparison converges where
- *      an enumerated denylist of paths never could.
+ *   1. it is owned by a uid that is neither ours NOR root. The trust criterion
+ *      is OWNERSHIP, decided by a `uid` comparison — NOT a set of blessed path
+ *      names. Under the same-UID threat model the only adversary shares neither
+ *      our uid nor root, so a self-owned OR root-owned ancestor is trusted and
+ *      any other (foreign non-root) owner is an attacker-owned traversal point
+ *      → refuse. The root-owned case is what lets a legitimate `~/.conduit`
+ *      resolve: the chain above the home directory (e.g. `/`, `/Users` or
+ *      `/home`, `/private`, `/var`, `/private/tmp`) is root-owned — those names
+ *      are ILLUSTRATIONS of that root-owned chain, never a list the code
+ *      matches against. A uid comparison converges; an enumerated denylist of
+ *      paths never could.
  *   2. it is group- or world-WRITABLE (`mode & 0o022`) and NOT sticky
  *      (`mode & 0o1000`) — a writable non-sticky ancestor lets any uid
  *      rename/replace the next component, EVEN IF it is root-owned. (A sticky

@@ -49,7 +49,11 @@ import {
   StateDirError,
   sameLeaf,
 } from "./state-dir.js";
-import { isDefaultStateDir, resolveEffectiveStateDir } from "./state-dir-resolve.js";
+import {
+  canonicalOfMissing,
+  isDefaultStateDir,
+  resolveEffectiveStateDir,
+} from "./state-dir-resolve.js";
 
 // Re-exported so the historical import site (`./client.js`) keeps working
 // for callers and tests written before these moved to their own module.
@@ -285,12 +289,18 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
   // self-owned 0700 directory is still unsafe if a DIFFERENT uid owns a
   // directory the path traverses to reach it — that uid can rename the
   // validated leaf out and drop a replacement before the client connects.
-  // Checked against the RESOLVED canonical base (the canonicalize-then-check
-  // shape), on the existing prefix of its walk, and reported as a boundary
-  // break — never swallowed as "fresh install". The default base is
-  // UID-anchored and its chain is us/root-owned, so this is a no-op there;
-  // it is the defense for any custom directory the client proceeds to use.
-  assertSafeAncestorChain(effectiveStateDir);
+  // Checked against the KERNEL-FAITHFUL canonical form (the canonicalize half
+  // of canonicalize-then-check, per §3.3), on the existing prefix of its walk,
+  // and reported as a boundary break — never swallowed as "fresh install".
+  //
+  // `canonicalOfMissing` is applied even to the default branch's
+  // `effectiveStateDir` (`DEFAULT_CONDUIT_DIR`, the passwd `~/.conduit`, which
+  // the resolver returns un-realpath'd): on a standard install the passwd home
+  // has no symlinked ancestors so it is already canonical and this is a no-op,
+  // but on a symlinked-home install it makes the walk operate on the resolved
+  // chain exactly as §3.3 specifies rather than on a spelling with an
+  // unfollowed symlink. Idempotent on an already-canonical custom base.
+  assertSafeAncestorChain(canonicalOfMissing(effectiveStateDir));
 
   // The auto-start gate, decided HERE rather than trusted from the caller
   // (Codex ARC F5 — the structural half). Two independent facts permit a
