@@ -127,6 +127,17 @@ const countRuntimeBuilds = rest.includes("--count-runtime-builds");
  * before the socket binds, so no client can race it.
  */
 const plantCatalogTool = rest.includes("--plant-catalog-tool");
+/**
+ * Makes the catalog throw on its FIRST `removeNamespace` — the call the
+ * provisioning tail's refresh makes — and behave normally thereafter.
+ *
+ * One call, not all of them: the recovery ladder's first rung is a full
+ * rehydrate that must succeed, so a permanently poisoned catalog would test
+ * the second rung instead. The line printed on the injected throw is what
+ * keeps the parent's assertion non-vacuous — without it, a refresh that
+ * never ran would look identical to one that failed and recovered.
+ */
+const poisonCatalogRefresh = rest.includes("--poison-catalog-refresh");
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
@@ -373,7 +384,22 @@ const createRuntime = pauseExecute
                     console.log("planted catalog tool");
                     return built;
                   }
-                : undefined;
+                : poisonCatalogRefresh
+                  ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                      const built = await createApprovalRuntime(runtimeOpts);
+                      const realRemove = built.catalog.removeNamespace.bind(built.catalog);
+                      let poisoned = true;
+                      built.catalog.removeNamespace = (ns: string) => {
+                        if (poisoned) {
+                          poisoned = false;
+                          console.log("poisoned catalog refresh");
+                          throw new Error("injected refresh failure");
+                        }
+                        realRemove(ns);
+                      };
+                      return built;
+                    }
+                  : undefined;
 
 try {
   await runDaemon({

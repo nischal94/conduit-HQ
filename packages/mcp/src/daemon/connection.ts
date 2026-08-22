@@ -637,6 +637,47 @@ async function runSourceRequest(
   sendResult(ctx, requestId, payload, log);
 }
 
+/**
+ * Refreshes the shared catalog after a provisioning commit (spec §2.2).
+ *
+ * Runs INSIDE the held per-namespace source lock, so catalog publication
+ * order matches commit order. The store read happens FIRST; the two
+ * catalog mutations then run synchronously in one tick, so no request can
+ * observe the removed-but-not-upserted state.
+ *
+ * NEVER throws: a refresh failure after a committed write must not turn
+ * the operator's successful provisioning into an error answer. Recovery
+ * ladder: full rehydrate from the store; failing that, keep serving the
+ * previous catalog (stale-but-consistent — repaired by the next
+ * provision or restart), with both failures logged.
+ */
+async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promise<void> {
+  const { log } = deps;
+  try {
+    const tools = await deps.store.tools.list();
+    deps.runtime.catalog.removeNamespace(namespace);
+    deps.runtime.catalog.upsert(tools);
+  } catch (err) {
+    log(
+      `[conduitd] Catalog refresh failed after commit: attempting full rehydrate. Context: {namespace: ${namespace}, cause: ${
+        err instanceof Error ? err.message : String(err)
+      }}`,
+    );
+    try {
+      deps.runtime.catalog.upsert(await deps.store.tools.list());
+      log(
+        `[conduitd] Catalog rehydrated after refresh failure. Context: {namespace: ${namespace}}`,
+      );
+    } catch (err2) {
+      log(
+        `[conduitd] Catalog rehydrate failed: serving the previous catalog until the next provision or restart. Context: {namespace: ${namespace}, cause: ${
+          err2 instanceof Error ? err2.message : String(err2)
+        }}`,
+      );
+    }
+  }
+}
+
 async function handleRequest(
   ctx: ConnectionContext,
   request: RpcRequest,
@@ -805,8 +846,8 @@ async function handleRequest(
       // same namespace, or a stale commit could pair a fresh secret with a
       // stale destination. See `withSourceLock`.
       await runSourceRequest(ctx, requestId, deps, () =>
-        deps.withSourceLock(request.namespace, () =>
-          provisionSourceRequest(
+        deps.withSourceLock(request.namespace, async () => {
+          const payload = await provisionSourceRequest(
             {
               namespace: request.namespace,
               url: request.url,
@@ -816,16 +857,22 @@ async function handleRequest(
               ...(request.secret !== undefined ? { secret: request.secret } : {}),
             },
             { store, log },
-          ),
-        ),
+          );
+          // Hot-reload hook (spec §2.2): after the commit, still inside the
+          // source lock. Never throws.
+          await refreshNamespace(deps, request.namespace);
+          return payload;
+        }),
       );
       return;
     }
     case "source.revalidate": {
       await runSourceRequest(ctx, requestId, deps, () =>
-        deps.withSourceLock(request.namespace, () =>
-          revalidateSourceRequest(request.namespace, { store, log }),
-        ),
+        deps.withSourceLock(request.namespace, async () => {
+          const payload = await revalidateSourceRequest(request.namespace, { store, log });
+          await refreshNamespace(deps, request.namespace);
+          return payload;
+        }),
       );
       return;
     }

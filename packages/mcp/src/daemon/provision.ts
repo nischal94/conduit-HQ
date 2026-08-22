@@ -56,6 +56,57 @@ import { fetchToolsList } from "../mcp-fetch.js";
 const NAMESPACE_PATTERN = /^[a-z0-9_-]+$/;
 
 /**
+ * Hard cap on the UTF-8 bytes of any ONE tool's name or description, checked
+ * before the atomic write (spec §2.2's bounded-input requirement).
+ *
+ * The other two onboarding bounds live in `mcp-fetch.ts`: `MAX_RESPONSE_BYTES`
+ * bounds the whole response off the wire, and `MAX_TOOLS` bounds the tool
+ * count. Neither bounds ONE tool's text, so an upstream advertising a single
+ * tool with a multi-megabyte description passes both and lands that text in
+ * the store — from where it is hydrated into the shared catalog, returned by
+ * `describe`, and rendered into an agent's prompt. This cap closes that gap
+ * at the same boundary as the other two: refuse, write nothing.
+ *
+ * Normative-local, chosen here. 16 KiB is far above any legitimate tool's
+ * text (the largest real MCP descriptions run to hundreds of bytes) and far
+ * below a size that matters to a prompt budget.
+ */
+export const MAX_TOOL_TEXT_BYTES = 16 * 1024;
+
+/**
+ * Refuses a `tools/list` whose per-tool text exceeds `MAX_TOOL_TEXT_BYTES`.
+ *
+ * Reads the RAW upstream entries rather than the normalized tools: the check
+ * has to happen on what arrived, and `normalizeMcp` rewrites the name while
+ * carrying the description through unchanged. Entries that are not
+ * object-shaped are left alone — `normalizeMcp`'s own envelope validation
+ * rejects those, and duplicating its verdict here would give one malformed
+ * body two different refusals.
+ *
+ * Returns the offending tool's INDEX, never its text: the message crosses to
+ * the client, and upstream-controlled text is exactly what must not ride
+ * along (see `mapFetchError`'s F1 note — the same reflecting upstream that
+ * echoes a credential in an error message can echo one in a description).
+ */
+function findOversizeToolText(rawTools: readonly unknown[]): number | undefined {
+  for (let i = 0; i < rawTools.length; i++) {
+    const entry = rawTools[i];
+    if (typeof entry !== "object" || entry === null) continue;
+    const { name, description } = entry as { name?: unknown; description?: unknown };
+    if (typeof name === "string" && Buffer.byteLength(name, "utf8") > MAX_TOOL_TEXT_BYTES) {
+      return i;
+    }
+    if (
+      typeof description === "string" &&
+      Buffer.byteLength(description, "utf8") > MAX_TOOL_TEXT_BYTES
+    ) {
+      return i;
+    }
+  }
+  return undefined;
+}
+
+/**
  * Reduces a URL to the operator-safe form `origin + path`: userinfo,
  * query, and fragment are all stripped.
  *
@@ -621,6 +672,19 @@ async function fetchAndProvision(args: {
     // category from `mapFetchError`.
     logRedactedDetail(args.log, namespace, url, args.onboardingAuth, cause);
     throw new ProvisionRefused(mapFetchError(cause, url));
+  }
+
+  // The third onboarding bound (§2.2), alongside `MAX_RESPONSE_BYTES` and
+  // `MAX_TOOLS` in `mcp-fetch.ts`: neither of those bounds ONE tool's text,
+  // so this is checked here, still BEFORE any write. The index localizes the
+  // fault for the operator without forwarding a byte of upstream text.
+  const oversizeIndex = findOversizeToolText(rawTools);
+  if (oversizeIndex !== undefined) {
+    throw new ProvisionRefused(
+      `[conduit add-mcp] upstream at ${safeUrl} advertised a tool whose name or description ` +
+        `exceeds the ${MAX_TOOL_TEXT_BYTES}-byte per-tool limit (tool index ${oversizeIndex}); ` +
+        `nothing was written.`,
+    );
   }
 
   let tools: Awaited<ReturnType<typeof normalizeMcp>>;

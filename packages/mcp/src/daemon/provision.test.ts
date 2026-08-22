@@ -22,6 +22,7 @@ import { type ConduitStore, McpClientError, openSqliteStore, SecretBox } from "@
 import { createClient } from "@libsql/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_TOOL_TEXT_BYTES,
   type ProvisionInput,
   ProvisionRefused,
   provisionSourceRequest,
@@ -262,6 +263,78 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
 
     expect(result.exitCode).not.toBe(0);
     expect(await store.sources.list()).toEqual([]);
+  });
+
+  it("a tool whose DESCRIPTION exceeds the per-tool text cap is refused with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = {
+      store,
+      // Passes both of the other onboarding bounds — one tool, well under
+      // MAX_RESPONSE_BYTES — and is refused solely on its per-tool text.
+      fetchTools: vi.fn(async () => [
+        {
+          name: "list_issues",
+          description: "x".repeat(MAX_TOOL_TEXT_BYTES + 1),
+          inputSchema: { type: "object", properties: {} },
+        },
+      ]),
+    };
+
+    const result = await run({}, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderrLines.join("")).toContain(
+      `exceeds the ${MAX_TOOL_TEXT_BYTES}-byte per-tool limit (tool index 0)`,
+    );
+    // The refusal names the limit and the position, and forwards no byte of
+    // the upstream's own text (F1 — a reflecting upstream can put a
+    // credential in a description).
+    expect(result.stderrLines.join("")).not.toContain("xxxx");
+    expect(await store.sources.list()).toEqual([]);
+    expect(await store.tools.list()).toEqual([]);
+  });
+
+  it("a tool whose NAME exceeds the per-tool text cap is refused with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = {
+      store,
+      // A legitimate first tool, an oversize second: the reported index
+      // must localize the fault rather than always naming position 0.
+      fetchTools: vi.fn(async () => [
+        { name: "list_issues", description: "List open issues" },
+        { name: "a".repeat(MAX_TOOL_TEXT_BYTES + 1), description: "fine" },
+      ]),
+    };
+
+    const result = await run({}, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderrLines.join("")).toContain(
+      `exceeds the ${MAX_TOOL_TEXT_BYTES}-byte per-tool limit (tool index 1)`,
+    );
+    expect(await store.sources.list()).toEqual([]);
+    expect(await store.tools.list()).toEqual([]);
+  });
+
+  it("a tool exactly AT the per-tool text cap is accepted — the bound is inclusive", async () => {
+    const store = await openTestStore();
+    const deps = {
+      store,
+      // Not vacuous: without an exact-boundary case an off-by-one that
+      // refuses at the cap itself would pass every test above.
+      fetchTools: vi.fn(async () => [
+        {
+          name: "list_issues",
+          description: "x".repeat(MAX_TOOL_TEXT_BYTES),
+          inputSchema: { type: "object", properties: {} },
+        },
+      ]),
+    };
+
+    const result = await run({}, deps);
+
+    expect(result.exitCode).toBe(0);
+    expect((await store.tools.list()).map((tool) => tool.name)).toEqual(["github.list_issues"]);
   });
 
   it("duplicate-after-namespacing tool names (normalizeMcp throws) also fail loud with 0 writes", async () => {

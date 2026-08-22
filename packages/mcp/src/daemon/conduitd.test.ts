@@ -1,5 +1,6 @@
 import { type ChildProcess, spawn } from "node:child_process";
 import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -18,6 +19,7 @@ import {
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
 import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
+import { MAX_TOOL_TEXT_BYTES } from "./provision.js";
 
 /**
  * Real-process daemon tests (design §3.5, §7 — normative: "the
@@ -54,6 +56,8 @@ let dir: string | undefined;
 const children: ChildProcess[] = [];
 const sockets: Socket[] = [];
 const locks: HeldLock[] = [];
+/** Stub MCP upstreams started by a test; closed in afterEach. */
+const servers: Server[] = [];
 
 afterEach(async () => {
   for (const socket of sockets) socket.destroy();
@@ -70,6 +74,10 @@ afterEach(async () => {
     }),
   );
   children.length = 0;
+  await Promise.all(
+    servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+  );
+  servers.length = 0;
   for (const lock of locks) await lock.release();
   locks.length = 0;
   if (dir) {
@@ -244,6 +252,104 @@ async function handshake(client: Client, capability = "serve"): Promise<unknown>
   expect(await client.next()).toEqual({ kind: "ready" });
   client.send({ kind: "handshake", protocol: 1, capability });
   return client.next();
+}
+
+// --- A stub MCP upstream, re-armable ------------------------------------
+//
+// Speaks just enough streamable-HTTP MCP for `fetchToolsList` to complete
+// (initialize → notifications/initialized → tools/list). The advertised tool
+// set is MUTABLE via `setTools`: `source.revalidate` re-fetches the SAME
+// stored url, so the only way to prove a revalidate republished the catalog
+// is to change what the upstream answers between the two fetches.
+
+interface Upstream {
+  origin: string;
+  /** Re-arms the `tools/list` answer for every subsequent fetch. */
+  setTools(tools: unknown[]): void;
+}
+
+/** One tool as an upstream advertises it, before namespacing. */
+function upstreamTool(name: string, description: string): unknown {
+  return {
+    name,
+    description,
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true },
+  };
+}
+
+async function startUpstream(initial: unknown[]): Promise<Upstream> {
+  let tools = initial;
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += String(chunk);
+    });
+    req.on("end", () => {
+      let parsed: { id?: string; method?: string } = {};
+      try {
+        parsed = JSON.parse(body) as typeof parsed;
+      } catch {
+        // Non-JSON body (the DELETE teardown): fall through to 202.
+      }
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: {} },
+              serverInfo: { name: "fixture", version: "1" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "tools/list") {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { tools } }));
+        return;
+      }
+      res.writeHead(202);
+      res.end();
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    setTools: (next: unknown[]) => {
+      tools = next;
+    },
+  };
+}
+
+/** Sends a `source.provision` and returns the daemon's answer frame. */
+function provision(
+  client: Client,
+  args: { namespace: string; url: string; prefix: string },
+): Promise<unknown> {
+  client.send({
+    kind: "source.provision",
+    namespace: args.namespace,
+    url: args.url,
+    prefix: args.prefix,
+    replace: true,
+    clearCredential: false,
+  });
+  return client.next();
+}
+
+/** The tool paths a `search` answered with, in rank order. */
+async function searchPaths(client: Client, query: string): Promise<string[]> {
+  client.send({ kind: "search", query });
+  const answer = (await client.next()) as { kind: string; payload: { path: string }[] };
+  expect(answer.kind).toBe("result");
+  return answer.payload.map((hit) => hit.path);
 }
 
 describe("conduitd lifecycle", () => {
@@ -1271,6 +1377,189 @@ describe("conduitd lifecycle", () => {
       });
 
       client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a source added via one client is visible to another with no restart",
+    async () => {
+      // The §17 startup-reload caveat closing, at the CATALOG. The
+      // source-invariants.test.ts test of the same name asserts the
+      // store-backed half (`catalog.listing` counts a new source); this one
+      // asserts the half that governs what an agent can actually reach —
+      // `search`, which reads the daemon's SHARED catalog. Before the
+      // provisioning tail refreshed that catalog, a source added against a
+      // running daemon stayed invisible to search until restart.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      // Client A: a long-lived `serve` connection opened BEFORE the source
+      // exists, and never reconnected.
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      expect(await searchPaths(serve, "issues")).toEqual([]);
+
+      // Client B: a separate `add-mcp` connection provisions the upstream.
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+
+      // THE ASSERTION: the SAME still-connected serve client — no restart,
+      // no reconnect, no new handshake — finds the new tool.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+      // `describe` shares the catalog, so it answers for the same tool.
+      serve.send({ kind: "describe", toolName: "github.list_issues" });
+      expect(await serve.next()).toMatchObject({
+        kind: "result",
+        payload: { path: "github.list_issues", namespace: "github" },
+      });
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "refreshes the shared catalog on source.revalidate too (the shared-tail hook)",
+    async () => {
+      // Both provisioning handlers run the SAME tail, so revalidate must
+      // republish exactly as provision does. `source.revalidate` re-fetches
+      // the STORED url, so the only way to tell a refresh from a no-op is to
+      // change what the upstream advertises between the two fetches — which
+      // also proves the refresh REPLACES the namespace rather than merging
+      // into it: the retired tool must disappear, not linger.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      // The upstream retires one tool and advertises another.
+      upstream.setTools([upstreamTool("list_releases", "List published releases")]);
+      adder.send({ kind: "source.revalidate", namespace: "github" });
+      expect(await adder.next()).toMatchObject({ kind: "result" });
+
+      expect(await searchPaths(serve, "releases")).toContain("github.list_releases");
+      expect(await searchPaths(serve, "issues")).not.toContain("github.list_issues");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "recovers by rehydrating when the catalog refresh throws after commit",
+    async () => {
+      // The refresh runs AFTER a committed write, so its failure must never
+      // turn a landed provisioning into an error answer, and must not strand
+      // the catalog behind the store. The fixture poisons
+      // `catalog.removeNamespace` for exactly ONE call — the refresh's — so
+      // the recovery ladder's first rung (full rehydrate from the store) is
+      // what publishes the new tools.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--poison-catalog-refresh"]);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      // The commit landed, so the answer is a success result — the refusal
+      // shape a thrown refresh would otherwise produce is exactly the bug.
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+
+      // Non-vacuous: the fixture reports that its injected failure fired.
+      expect(daemon.lines.some((line) => line.includes("poisoned catalog refresh"))).toBe(true);
+
+      // The rehydrate fallback ran, so the new tools are still reachable.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "an oversize per-tool description is refused and the shared catalog is untouched",
+    async () => {
+      // The bounded-input check runs BEFORE the commit, so a refused
+      // provisioning must leave both the store and the shared catalog exactly
+      // as they were — the refusal path never reaches the refresh at all.
+      const upstream = await startUpstream([
+        upstreamTool("list_issues", "x".repeat(MAX_TOOL_TEXT_BYTES + 1)),
+      ]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      const refusal = (await provision(adder, {
+        namespace: "github",
+        url: `${upstream.origin}/mcp`,
+        prefix: "github.acme.prod",
+      })) as { kind: string; code?: string; message?: string };
+      expect(refusal.kind).toBe("error");
+      expect(refusal.code).toBe("invalid");
+      expect(refusal.message).toContain(`${MAX_TOOL_TEXT_BYTES}-byte per-tool limit`);
+      // No byte of the upstream's own text crosses back with the refusal.
+      expect(refusal.message).not.toContain("xxxx");
+
+      // Nothing landed: the catalog has no tool, and the store no source.
+      expect(await searchPaths(serve, "issues")).toEqual([]);
+      serve.send({ kind: "catalog.listing" });
+      expect(await serve.next()).toMatchObject({ kind: "result", payload: { sourceCount: 0 } });
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
       daemon.child.kill("SIGTERM");
       await daemon.waitForExit();
     },
