@@ -10,14 +10,14 @@
  * order, bind, the drain, signals, the ExecutionQueue. This one owns
  * everything whose lifetime is a single CONNECTION's, and reaches the
  * daemon only through the explicit `ConnectionDeps` it is handed: the
- * queue's `submit`, the runtime handles (`store`, `createRuntime`), and
+ * queue's `submit`, the runtime handles (`store`, `runtime`), and
  * the drain state. Nothing here reads daemon-scope mutable state
  * directly, which is why `isDraining` is a getter rather than a boolean
  * snapshot — the drain flips it after these handlers are already
  * installed.
  */
 import type { Socket } from "node:net";
-import { type ConduitStore, InMemoryCatalog } from "@conduithq/sdk";
+import type { ConduitStore } from "@conduithq/sdk";
 import {
   buildCatalogListing,
   executionToCheckPayload,
@@ -26,7 +26,7 @@ import {
   pausedToListRow,
   resumeToPayload,
 } from "../payloads.js";
-import type { createApprovalRuntime } from "../runtime.js";
+import type { ApprovalRuntime } from "../runtime.js";
 import {
   DepthExceeded,
   encodeFrame,
@@ -91,7 +91,14 @@ export interface ConnectionDeps {
    */
   agentVersion: string;
   log: (line: string) => void;
-  createRuntime: typeof createApprovalRuntime;
+  /**
+   * The daemon's ONE execution runtime (spec §2.1), built in `serve()`
+   * before the socket binds and shared by every connection. Handed over
+   * as a built value rather than a factory: a per-connection build would
+   * be the M6 workaround again, and the catalog it carries has to be the
+   * same object the provisioning tail refreshes.
+   */
+  runtime: ApprovalRuntime;
   /** The daemon's admission queue, reached only through submit. */
   submit: (run: () => Promise<void>, deadlineMs: number) => Admission;
   /** Live drain state — read per connection, never snapshotted. */
@@ -410,13 +417,6 @@ function handleHandshake(
   );
 }
 
-/** Fresh catalog snapshot per call (M6) — never cached across requests. */
-async function snapshotCatalog(store: ConduitStore): Promise<InMemoryCatalog> {
-  const catalog = new InMemoryCatalog();
-  catalog.upsert(await store.tools.list());
-  return catalog;
-}
-
 /**
  * Runs one unit of sandbox work and writes its reply, converting EVERY
  * failure into a typed error frame rather than a rejected promise.
@@ -643,7 +643,7 @@ async function handleRequest(
   requestId: string,
   deps: ConnectionDeps,
 ): Promise<void> {
-  const { store, allowPrivateEgress, log, createRuntime } = deps;
+  const { store, log } = deps;
   switch (request.kind) {
     case "execute": {
       // deadlineMs bounds ADMISSION, not execution: §16's wall-clock
@@ -654,8 +654,7 @@ async function handleRequest(
         request.kind,
         request.deadlineMs,
         async () => {
-          // M6: a fresh runtime per unit of work — never cached.
-          const { manager } = await createRuntime({ store, allowPrivateEgress, log });
+          const { manager } = deps.runtime;
           // requestKey is forwarded only when the client sent one — the
           // manager persists it BEFORE the sandbox runs, which is what
           // makes a reissue return `conflict` rather than starting a
@@ -710,17 +709,20 @@ async function handleRequest(
       return;
     }
     case "search": {
-      const catalog = await snapshotCatalog(store);
+      // The daemon's SHARED catalog (spec §2.1), not a per-call store
+      // snapshot: the daemon owns the store, so its catalog is
+      // authoritative and rebuilding one per request only paid for a
+      // hydration the daemon had already done.
+      //
       // Through `sendResult`, not a raw `send`: an oversized catalog answer
       // must surface as the same actionable "too large for the IPC frame"
       // refusal `execute` gives, rather than escaping the encode as an
       // opaque `internal daemon error`.
-      sendResult(ctx, requestId, catalog.search({ query: request.query }), log);
+      sendResult(ctx, requestId, deps.runtime.catalog.search({ query: request.query }), log);
       return;
     }
     case "describe": {
-      const catalog = await snapshotCatalog(store);
-      sendResult(ctx, requestId, catalog.describe(request.toolName) ?? null, log);
+      sendResult(ctx, requestId, deps.runtime.catalog.describe(request.toolName) ?? null, log);
       return;
     }
     case "approvals.list": {
@@ -769,7 +771,7 @@ async function handleRequest(
         request.kind,
         RESUME_ADMISSION_DEADLINE_MS,
         async () => {
-          const { manager } = await createRuntime({ store, allowPrivateEgress, log });
+          const { manager } = deps.runtime;
           // Projected like every other answer (`ResumePayload`): the raw
           // `ResumeOutcome` carries the paused call's ARGUMENTS in
           // `pending.input`, and the projection also pins `decisionApplied`

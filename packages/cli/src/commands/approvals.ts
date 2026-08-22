@@ -25,8 +25,9 @@ import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answ
  *
  * `list` still NEVER writes: it renders the daemon's paused-row projection
  * and computes the expiry label at DISPLAY time. `approve`/`deny` drive
- * `manager.resume` inside the daemon — including the M6 fresh-runtime rule,
- * which now holds daemon-side where the store lives.
+ * `manager.resume` inside the daemon, against the one long-lived runtime
+ * the daemon builds at startup (spec §2.1) — the M6 fresh-runtime rule is
+ * gone, because the daemon owns the store it reads.
  *
  * The single injectable dep is the daemon call itself (the DI seam that
  * replaced `openStore`/`createRuntime`): tests drive the whole command
@@ -263,8 +264,8 @@ export async function runDecide(
     return { exitCode: 1 };
   }
 
-  // The daemon drives the resume — including the M6 fresh-runtime-per-call
-  // rule, which now holds on the side that owns the store.
+  // The daemon drives the resume, through the one long-lived runtime it
+  // built at startup (spec §2.1).
   const answer = await ask(deps, { kind: "approvals.resume", executionId, decision: kind }, kind);
   if (!answer.ok) {
     deps.stderr(answer.line);

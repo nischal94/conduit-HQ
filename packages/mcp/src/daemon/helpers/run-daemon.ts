@@ -105,6 +105,28 @@ const seedCatalog = rest.includes("--seed-catalog");
 const pauseExecute = rest.includes("--pause-execute");
 const ttlFlag = rest.indexOf("--approval-ttl-ms");
 const approvalTtlMs = ttlFlag === -1 ? 60_000 : Number(rest[ttlFlag + 1] ?? 60_000);
+/**
+ * Counts how many times the daemon builds a runtime and prints the running
+ * total, so the parent test can assert ONE per process (spec §2.1) across
+ * many requests. The daemon under test is the real one — the seam only
+ * wraps the real `createApprovalRuntime` and logs.
+ *
+ * The count must travel as a stdout line rather than an in-process
+ * counter: the daemon is a genuine spawned child, so nothing in the test
+ * process can observe its variables.
+ */
+const countRuntimeBuilds = rest.includes("--count-runtime-builds");
+/**
+ * Plants a tool DIRECTLY into the daemon's shared catalog, writing nothing
+ * to the store, then prints a line once it is in place.
+ *
+ * This is the only way to tell the two designs apart from outside: a tool
+ * that exists solely in the daemon's catalog is invisible to any per-call
+ * store snapshot, so a `search` that finds it proves the search path reads
+ * the SHARED catalog. Planting happens after the runtime is built and
+ * before the socket binds, so no client can race it.
+ */
+const plantCatalogTool = rest.includes("--plant-catalog-tool");
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
@@ -173,6 +195,8 @@ const sweep: CrashTerminalSweep | undefined = seedCatalog
  * Supplied through the daemon's own `createRuntime` seam, so the daemon
  * under test is the real one with only this collaborator replaced.
  */
+let runtimeBuilds = 0;
+
 const createRuntime = pauseExecute
   ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
       const built = await createApprovalRuntime(runtimeOpts);
@@ -322,7 +346,34 @@ const createRuntime = pauseExecute
                   },
                 };
               }
-            : undefined;
+            : countRuntimeBuilds
+              ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                  runtimeBuilds += 1;
+                  const built = await createApprovalRuntime(runtimeOpts);
+                  // Printed on EVERY build, so the parent asserts on the
+                  // highest count it ever saw rather than on one line that
+                  // could have been emitted before a second build happened.
+                  console.log(`runtime builds=${runtimeBuilds}`);
+                  return built;
+                }
+              : plantCatalogTool
+                ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                    const built = await createApprovalRuntime(runtimeOpts);
+                    // Store-invisible on purpose: nothing writes this tool
+                    // to `store.tools`, so only a reader of THIS catalog can
+                    // ever see it.
+                    built.catalog.upsert([
+                      {
+                        name: "planted.tool",
+                        namespace: "planted",
+                        description: "planted directly",
+                        riskClass: "safe",
+                      },
+                    ]);
+                    console.log("planted catalog tool");
+                    return built;
+                  }
+                : undefined;
 
 try {
   await runDaemon({

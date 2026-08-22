@@ -148,10 +148,12 @@ export interface RunDaemonOptions {
   /** Structured lifecycle lines; default stderr. */
   log?: (line: string) => void;
   /**
-   * Builds the execution runtime per unit of work (M6). Defaults to
-   * `createApprovalRuntime`; overridable so a test can substitute a
-   * collaborator that stalls in a layer §16's budgets do not bound,
-   * without the daemon under test being anything other than the real one.
+   * Builds the daemon's ONE execution runtime (spec §2.1) — called
+   * exactly once per daemon, in `serve()` before the socket binds.
+   * Defaults to `createApprovalRuntime`; overridable so a test can
+   * substitute a collaborator that stalls in a layer §16's budgets do not
+   * bound, without the daemon under test being anything other than the
+   * real one.
    */
   createRuntime?: typeof createApprovalRuntime;
 }
@@ -632,6 +634,13 @@ async function serve(opts: ServeOptions): Promise<void> {
   const queue = new ExecutionQueue();
   const connections = new Set<ConnectionContext>();
 
+  // ONE runtime for the daemon's whole life (spec §2.1). Built after the
+  // store opened, before the socket binds: hydration failure is fail-closed
+  // — the throw propagates out of serve(), the socket never binds, and the
+  // locks release through startDaemon's finally. A credential boundary
+  // does not limp.
+  const runtime = await createRuntime({ store, allowPrivateEgress, log });
+
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
     server.once("error", reject);
@@ -679,7 +688,7 @@ async function serve(opts: ServeOptions): Promise<void> {
     // from an older build. Fixed at build time — nothing runtime-configures it.
     agentVersion: AGENT_VERSION,
     log,
-    createRuntime,
+    runtime,
     submit: (run, deadlineMs): Admission => queue.submit(run, deadlineMs),
     isDraining: () => draining,
     connections,

@@ -1176,6 +1176,149 @@ describe("conduitd lifecycle", () => {
     },
     TIMEOUT,
   );
+
+  it(
+    "builds ONE runtime per daemon process and reuses it across requests",
+    async () => {
+      // The M6 per-call rehydration was the no-owner workaround: every
+      // execute and resume built a whole composition — sandbox, policy
+      // engine, credential resolver, a full catalog hydration off the
+      // store — and threw it away. The daemon OWNS the store now, so the
+      // runtime is built once in `serve()` and shared (spec §2.1).
+      //
+      // The count travels as a stdout line because the daemon is a real
+      // child process: nothing in this process can read its variables.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--count-runtime-builds"]);
+      await daemon.waitForLine("listening");
+
+      // The one build happens before the socket binds, so it is already
+      // on the wire by the time any client can connect.
+      expect(daemon.lines.filter((l) => l.includes("runtime builds="))).toEqual([
+        "runtime builds=1",
+      ]);
+
+      // Two executes and a search — the three kinds that used to build a
+      // fresh runtime or a fresh store snapshot per call.
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({ kind: "execute", code: "return 1;", deadlineMs: 60_000 });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+      client.send({ kind: "execute", code: "return 2;", deadlineMs: 60_000 });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+      client.send({ kind: "search", query: "anything" });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+
+      // A second connection too: the runtime is daemon-scoped, not
+      // connection-scoped.
+      const second = await connectClient(paths.socket);
+      await handshake(second, "serve");
+      second.send({ kind: "execute", code: "return 3;", deadlineMs: 60_000 });
+      expect(await second.next()).toMatchObject({ kind: "result" });
+
+      // Still exactly one build after all of it.
+      expect(daemon.lines.filter((l) => l.includes("runtime builds="))).toEqual([
+        "runtime builds=1",
+      ]);
+
+      client.socket.destroy(); // see the drain-grace note above
+      second.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: search reads the daemon's shared catalog, not a per-call store snapshot",
+    async () => {
+      // The fixture plants `planted.tool` DIRECTLY into the runtime's
+      // catalog and writes nothing to the store. A per-call snapshot
+      // rebuilds from `store.tools.list()`, so it can never see this tool;
+      // finding it therefore proves the search path reads the shared
+      // catalog the daemon holds. Same for `describe`.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--plant-catalog-tool"]);
+      await daemon.waitForLine("listening");
+      // Planting is ordered before bind, so it has already happened by the
+      // time the endpoint exists — no client can race it.
+      expect(daemon.lines).toContain("planted catalog tool");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      client.send({ kind: "search", query: "planted" });
+      const hits = (await client.next()) as { kind: string; payload: { path: string }[] };
+      expect(hits.kind).toBe("result");
+      expect(hits.payload.map((hit) => hit.path)).toContain("planted.tool");
+
+      // `describe` shares the same catalog, so it answers for the same
+      // store-invisible tool rather than `null`.
+      client.send({ kind: "describe", toolName: "planted.tool" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { path: "planted.tool", namespace: "planted" },
+      });
+
+      // Not vacuous: the store genuinely holds nothing, so a per-call
+      // snapshot would answer empty for both requests above.
+      client.send({ kind: "catalog.listing" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { sourceCount: 0 },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "runs two overlapping executions through the one shared runtime",
+    async () => {
+      // Sharing one manager and one QuickJS module across connections is
+      // the point of the change, and it is also where a shared runtime
+      // could plausibly go wrong: two concurrent executions must not cross
+      // their answers. Fired together on two separate connections, each
+      // returning a distinct literal.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const first = await connectClient(paths.socket);
+      await handshake(first, "serve");
+      const second = await connectClient(paths.socket);
+      await handshake(second, "serve");
+
+      const [a, b] = await Promise.all([
+        (() => {
+          first.send({ kind: "execute", code: "return 'alpha';", deadlineMs: 60_000 });
+          return first.next();
+        })(),
+        (() => {
+          second.send({ kind: "execute", code: "return 'beta';", deadlineMs: 60_000 });
+          return second.next();
+        })(),
+      ]);
+
+      expect(a).toMatchObject({
+        kind: "result",
+        payload: { status: "completed", result: "alpha" },
+      });
+      expect(b).toMatchObject({ kind: "result", payload: { status: "completed", result: "beta" } });
+
+      first.socket.destroy(); // see the drain-grace note above
+      second.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
 });
 
 /**
