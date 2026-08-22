@@ -231,8 +231,9 @@ variant — not load-bearing either way).
 
 - No daemon running: `status` prints "not running", `stop` prints
   "not running" (idempotent — the operator wanted it stopped; it is).
-  Exit codes: `stop` exits 0; `status` exit-code semantics are the
-  one open decision — see §11.
+  Exit codes: `stop` exits 0 (idempotent); `status` exits 0 when a
+  daemon is running and 3 when none is (the systemctl convention, so
+  scripts never read "not running" as healthy).
 - A **draining** daemon is a third observable state: connect may be
   refused while the lifecycle lock is still held, and the client's
   bounded wait can elapse before reporting. `status` may therefore
@@ -502,6 +503,5 @@ same-UID privilege separation (parent design's accepted v1 limit).
   in §10 as future hardening); Linux ACL deferral (human decision);
   wire-compat beyond the existing `protocol` field; JSON output
   contract (deferred, §10).
-- OPEN (one item, for the human): `status` exit code when no daemon
-  runs — 0 (interview default) vs. a distinct nonzero for script
-  friendliness (codex #19). §3.2 carries the placeholder.
+- 2026-08-22 — `status` exit code: 0 running / 3 not running
+  (human-confirmed; codex #19 adopted). No open items remain.
