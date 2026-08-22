@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
@@ -1179,21 +1180,52 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
         env,
       });
       doctorDaemons.push(child);
-      const timer = setTimeout(() => reject(new Error(`daemon timeout: ${seen}`)), 30_000);
       let seen = "";
+      // Daemon diagnostics moved to the owned rotating sink (spec §5): with
+      // piped stdio `bin.ts` writes lifecycle lines into `conduitd.log`
+      // rather than to stderr, so readiness is observed by polling that
+      // file in the state dir this test controls. Stdout/stderr are still
+      // accumulated so a crash before the sink opens is still reportable.
       const watch = (chunk: Buffer): void => {
         seen += chunk.toString("utf8");
-        if (seen.includes("listening")) {
-          clearTimeout(timer);
-          resolve();
-        }
       };
       child.stdout?.on("data", watch);
       child.stderr?.on("data", watch);
-      child.once("error", reject);
-      child.once("exit", (code) => {
+
+      const logPath = join(dir, "conduitd.log");
+      // Only text written AFTER this spawn counts: the sink appends, so a
+      // previous daemon's "listening" line would otherwise report a
+      // non-binding successor as ready.
+      const baseline = ((): number => {
+        try {
+          return readFileSync(logPath, "utf8").length;
+        } catch {
+          return 0;
+        }
+      })();
+      const settle = (fn: () => void): void => {
         clearTimeout(timer);
-        reject(new Error(`daemon exited ${code}: ${seen}`));
+        clearInterval(poll);
+        fn();
+      };
+      const poll = setInterval(() => {
+        let contents = "";
+        try {
+          contents = readFileSync(logPath, "utf8");
+        } catch {
+          return; // not opened yet
+        }
+        if (contents.slice(baseline).includes("listening")) settle(() => resolve());
+      }, 50);
+      const timer = setTimeout(
+        () => settle(() => reject(new Error(`daemon timeout: ${seen}`))),
+        30_000,
+      );
+      child.once("error", (err) => {
+        settle(() => reject(err));
+      });
+      child.once("exit", (code) => {
+        settle(() => reject(new Error(`daemon exited ${code}: ${seen}`)));
       });
     });
   }
