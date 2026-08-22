@@ -156,6 +156,14 @@ export interface RunDaemonOptions {
    * real one.
    */
   createRuntime?: typeof createApprovalRuntime;
+  /**
+   * The daemon's own log file for `daemon.status` to report, or `null`
+   * when it logs to a TTY and there is no file. Defaults to `() => null`:
+   * `runDaemon` does not choose where its log goes — the entry point that
+   * builds the `log` sink does — so the daemon reports "no file" until
+   * that entry point supplies the real accessor.
+   */
+  logInfo?: () => { path: string; sizeBytes: number } | null;
 }
 
 /** Exit codes are part of the client contract (§3.5 decision table). */
@@ -573,6 +581,7 @@ async function startDaemon(
       log,
       stopSignal,
       createRuntime: opts.createRuntime ?? createApprovalRuntime,
+      logInfo: opts.logInfo ?? ((): null => null),
     });
   } finally {
     // §3.5 step 4: maintenance first, lifecycle last. Lifecycle release
@@ -626,11 +635,17 @@ interface ServeOptions {
   log: (line: string) => void;
   stopSignal: StopSignal;
   createRuntime: typeof createApprovalRuntime;
+  logInfo: () => { path: string; sizeBytes: number } | null;
 }
 
 async function serve(opts: ServeOptions): Promise<void> {
   const { paths, store, allowPrivateEgress, dbPath, log, stopSignal, createRuntime } = opts;
   let draining = false;
+  // The uptime origin `daemon.status` reports (§3.1). Taken at the top of
+  // serve rather than at process start: what an operator asks about is how
+  // long this daemon has been SERVING, and startup can spend real time in
+  // lock acquisition and the crash-terminal sweep before it ever binds.
+  const startedAt = Date.now();
   const queue = new ExecutionQueue();
   const connections = new Set<ConnectionContext>();
 
@@ -699,6 +714,12 @@ async function serve(opts: ServeOptions): Promise<void> {
     }),
     busyMessage: `daemon busy: ${QUEUE_CAPACITY} requests queued behind ${CONCURRENCY_CAP} active`,
     withSourceLock: (namespace, fn) => sourceLock.run(namespace, fn),
+    startedAt,
+    // An RPC stop takes the SAME path a SIGTERM does — one `StopSignal`,
+    // one drain. `request` is one-shot, so a second stop, or a signal
+    // racing this one, is a no-op rather than a competing shutdown.
+    requestStop: () => stopSignal.request(),
+    logInfo: opts.logInfo,
   };
 
   server.on("connection", (socket) => {

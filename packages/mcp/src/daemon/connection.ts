@@ -27,6 +27,7 @@ import {
   resumeToPayload,
 } from "../payloads.js";
 import type { ApprovalRuntime } from "../runtime.js";
+import { daemonStatus, daemonStop } from "./control.js";
 import {
   DepthExceeded,
   encodeFrame,
@@ -118,6 +119,26 @@ export interface ConnectionDeps {
    * connection, because the race is between connections against one store.
    */
   withSourceLock: <T>(namespace: string, fn: () => Promise<T>) => Promise<T>;
+  /**
+   * Epoch ms this daemon's serve loop started — the `daemon.status`
+   * uptime origin (§3.1). Daemon-scope and fixed at start, threaded like
+   * `agentVersion` rather than recomputed per connection.
+   */
+  startedAt: number;
+  /**
+   * Asks the daemon to stop. One-shot and idempotent underneath (see
+   * `StopSignal`), so a second call — or a signal racing it — is a no-op
+   * rather than a second drain. Called only AFTER a stop's ack has been
+   * flushed; see the `daemon.stop` arm.
+   */
+  requestStop: () => void;
+  /**
+   * The daemon's own log file, or `null` when it logs to a TTY and there
+   * is no file to report. A closure rather than a value because
+   * `sizeBytes` grows while the daemon runs — a snapshot taken at startup
+   * would report zero forever.
+   */
+  logInfo: () => { path: string; sizeBytes: number } | null;
 }
 
 export type QueueOutcome = "ran" | "expired" | "abandoned";
@@ -907,26 +928,78 @@ async function handleRequest(
       );
       return;
     }
+    /**
+     * The §7 control verbs, answered OUTSIDE the ExecutionQueue exactly
+     * as `approvals.list` is. That is not an optimization here but a
+     * correctness requirement: the queue bounds concurrent SANDBOX
+     * execution, and routing a stop through it would let a daemon that
+     * is busy — the very state an operator most wants to stop — answer
+     * its own stop request with `busy` (§3.1). Neither verb runs guest
+     * code, touches an upstream, or reads a repository row.
+     */
+    case "daemon.status": {
+      sendResult(
+        ctx,
+        requestId,
+        daemonStatus(
+          // Constructed HERE, server-side, never decoded from the
+          // request: `daemon.status` carries no fields at all, and the
+          // §3.2 directory boundary is what authenticates a UDS caller.
+          { kind: "anonymous-local" },
+          {
+            pid: () => process.pid,
+            agentVersion: deps.agentVersion,
+            startedAt: deps.startedAt,
+            dbPath: deps.dbPath,
+            // READY-granted and still open — the same predicate the
+            // drain's grace window uses, so the number an operator reads
+            // means the same thing as the one the drain waits on.
+            connectionCount: () =>
+              [...deps.connections].filter((c) => c.readyGranted && !c.socket.destroyed).length,
+            queueStats: () => {
+              const stats = deps.queueStats();
+              return { depth: stats.depth, activeCount: stats.activeCount };
+            },
+            logInfo: deps.logInfo,
+          },
+        ),
+        log,
+      );
+      return;
+    }
+    case "daemon.stop": {
+      // Flush-then-stop (spec §3.1): the write callback fires once the
+      // frame is handed to the kernel, and only then does the drain begin.
+      // A destroyed peer skips the write; stop still proceeds — the
+      // operator asked for it.
+      const payload = daemonStop({ kind: "anonymous-local" });
+      if (ctx.socket.destroyed) {
+        deps.requestStop();
+        return;
+      }
+      ctx.socket.write(encodeFrame({ kind: "result", requestId, payload }), () =>
+        deps.requestStop(),
+      );
+      return;
+    }
     case "handshake":
       return;
     default: {
-      // Backstop for vocabulary that outpaces dispatch: `RpcRequest` and
-      // the capability gate above already admit `daemon.status` /
-      // `daemon.stop` (control-capability rollout), but this switch has
-      // no arm for either yet — their handlers land with the later
-      // control-handler task. Without this arm, a decoded-but-unhandled
-      // kind would fall through with no response frame at all, hanging
-      // the caller until its own deadline. Deliberately not a `const _:
-      // never = request` exhaustiveness assertion: that would fail
-      // typecheck right now, since these kinds are intentionally
-      // unhandled for the moment.
+      // Compile-time exhaustiveness: every `RpcRequest` kind now has an
+      // arm, so a new one added to the vocabulary breaks the BUILD here
+      // rather than reaching a client as a runtime refusal. The error
+      // answer stays as the runtime safety net — the daemon decodes
+      // frames off a socket, so a kind the type system believes
+      // impossible must still get a response rather than a silent
+      // fall-through that hangs the caller until its own deadline.
+      const unhandled: never = request;
       send(
         ctx.socket,
         {
           kind: "error",
           requestId,
           code: "invalid",
-          message: `request kind "${request.kind}" is not yet handled`,
+          message: `request kind "${(unhandled as RpcRequest).kind}" is not handled`,
         },
         log,
       );

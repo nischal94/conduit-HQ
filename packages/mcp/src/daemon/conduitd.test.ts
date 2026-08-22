@@ -1262,26 +1262,358 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
-    "answers a decoded-but-undispatched control kind with an error, not a hang",
+    "answers daemon.status for a control client with live counts and no credential material",
     async () => {
-      // `daemon.status`/`daemon.stop` are admitted by RpcRequest and the
-      // control capability gate (Task 1), but handleRequest's dispatch
-      // switch has no arm for either yet — the handlers land with a later
-      // task. Without the switch's backstop `default` arm, this request
-      // would fall through with no response frame at all, and the client
-      // would hang until its own deadline instead of seeing a refusal.
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
-      const daemon = spawnDaemon(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--seed-catalog"]);
       await daemon.waitForLine("listening");
 
       const client = await connectClient(paths.socket);
       await handshake(client, "control");
       client.send({ kind: "daemon.status" });
-      expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+      const answer = (await client.next()) as {
+        kind: string;
+        payload: {
+          pid: number;
+          agentVersion: string;
+          startedAt: number;
+          dbPath: string;
+          connections: number;
+          executionsInFlight: number;
+          queueDepth: number;
+          logPath: string | null;
+          logSizeBytes: number | null;
+        };
+      };
+      expect(answer.kind).toBe("result");
+      const status = answer.payload;
+
+      // The daemon's own identity, computed daemon-side — not echoed from
+      // anything the client sent (the request carries no fields at all).
+      expect(status.pid).toBeGreaterThan(0);
+      expect(status.pid).toBe(daemon.child.pid);
+      expect(status.agentVersion).toBe(AGENT_VERSION);
+      expect(status.dbPath.endsWith("conduit.db")).toBe(true);
+      expect(status.startedAt).toBeGreaterThan(0);
+
+      // The asking connection is itself READY-granted, so the count is at
+      // least one — the metric is live state, not a constant.
+      expect(status.connections).toBeGreaterThanOrEqual(1);
+      expect(Number.isFinite(status.queueDepth)).toBe(true);
+      expect(Number.isFinite(status.executionsInFlight)).toBe(true);
+
+      // §9.2/§3.3 pinned on the WIRE: the daemon holds a seeded connection
+      // row carrying a `credentialRef` and a real stored secret, and no
+      // byte of either may appear in a status answer. A future refactor
+      // that widened this projection into a store dump fails here.
+      const wire = JSON.stringify(status);
+      expect(wire).not.toContain("credentialRef");
+      expect(wire).not.toContain("secret");
+      expect(wire).not.toContain("masterKey");
+      expect(wire).not.toContain("cred_gh");
+      expect(Object.keys(status).sort()).toEqual([
+        "agentVersion",
+        "connections",
+        "dbPath",
+        "executionsInFlight",
+        "logPath",
+        "logSizeBytes",
+        "pid",
+        "queueDepth",
+        "startedAt",
+      ]);
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
     },
     TIMEOUT,
   );
+
+  it(
+    "rejects control verbs from serve, and serve/provision verbs from control",
+    async () => {
+      // The capability row is the authorization boundary (§9), and it cuts
+      // BOTH ways: widening `control` with the stop verb must not hand an
+      // agent-facing `serve` client the ability to kill the daemon, and the
+      // operator's control client must not acquire execution or
+      // provisioning reach as a side effect of gaining it.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      for (const request of [{ kind: "daemon.stop" }, { kind: "daemon.status" }]) {
+        serve.send(request);
+        expect(await serve.next()).toMatchObject({
+          kind: "error",
+          code: "invalid",
+          message: expect.stringContaining(`capability "serve" does not permit "${request.kind}"`),
+        });
+      }
+
+      const control = await connectClient(paths.socket);
+      await handshake(control, "control");
+      for (const request of [
+        { kind: "search", query: "x" },
+        {
+          kind: "source.provision",
+          namespace: "github",
+          url: "http://127.0.0.1:1/mcp",
+          prefix: "github.acme.prod",
+          replace: true,
+          clearCredential: false,
+        },
+      ]) {
+        control.send(request);
+        expect(await control.next()).toMatchObject({
+          kind: "error",
+          code: "invalid",
+          message: expect.stringContaining(
+            `capability "control" does not permit "${request.kind}"`,
+          ),
+        });
+      }
+
+      // The refusals are pure authorization verdicts: the daemon is still
+      // serving, so nothing above stopped it as a side effect.
+      expect(daemon.child.exitCode).toBeNull();
+
+      serve.socket.destroy(); // see the drain-grace note above
+      control.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it("daemon.stop drains live work: an active execution and a queued request both resolve", async () => {
+    // §3.3: the drain FINISHES accepted work. A stop that severed live
+    // connections would turn every in-flight request into §5's ambiguous
+    // "outcome unknown" — the exact failure a graceful drain exists to
+    // avoid. Both an ALREADY-RUNNING execution and one still queued
+    // behind it must come back with a real frame.
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const daemon = spawnDaemon(stateDir);
+    await daemon.waitForLine("listening");
+
+    const worker = await connectClient(paths.socket);
+    await handshake(worker, "serve");
+    const second = await connectClient(paths.socket);
+    await handshake(second, "serve");
+
+    // Guest work that genuinely occupies a slot for seconds — long
+    // enough that the stop below lands while it is STILL RUNNING, which
+    // is the precondition under test. Self-bounding rather than an
+    // infinite loop: §16's `wallClockMs` budget is 60s, so spinning to
+    // the sandbox's own cut would outlast the drain deadline and pin a
+    // timeout rather than a drain.
+    worker.send({
+      kind: "execute",
+      code: "let n = 0; for (let i = 0; i < 60000000; i++) { n = (n + i) % 97; } return n;",
+      deadlineMs: 60_000,
+    });
+    const busy = worker.next();
+    // A quick execute behind it, admitted while the first still runs.
+    second.send({ kind: "execute", code: "return 'quick';", deadlineMs: 60_000 });
+    const queued = second.next();
+
+    // Both executes are settled-tracked so the ordering below is an
+    // ASSERTION rather than an assumption about timing.
+    let busySettled = false;
+    let queuedSettled = false;
+    void busy.then(() => {
+      busySettled = true;
+    });
+    void queued.then(() => {
+      queuedSettled = true;
+    });
+
+    const control = await connectClient(paths.socket);
+    await handshake(control, "control");
+    control.send({ kind: "daemon.stop" });
+    // The ack arrives BEFORE the executions settle: a busy daemon must
+    // not answer its own stop with `busy`, and must not wait out the
+    // drain before acknowledging.
+    expect(await control.next()).toEqual({
+      kind: "result",
+      requestId: expect.any(String),
+      payload: { stopping: true },
+    });
+    expect(busySettled).toBe(false);
+    expect(queuedSettled).toBe(false);
+
+    // Both requests get real frames rather than a destroyed socket.
+    expect(await busy).toMatchObject({ kind: "result" });
+    expect(await queued).toMatchObject({
+      kind: "result",
+      payload: { status: "completed", result: "quick" },
+    });
+
+    worker.socket.destroy();
+    second.socket.destroy();
+    control.socket.destroy();
+
+    // The stop was real: the daemon exits and RELEASES the lifecycle
+    // lock, which a successor's acquisition proves — "free" is only
+    // observable by taking it.
+    expect(await daemon.waitForExit(DRAIN_DEADLINE_MS + 15_000)).toBe(0);
+    const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+    expect(lifecycle).not.toBeNull();
+    if (lifecycle) locks.push(lifecycle);
+  }, 120_000);
+
+  it(
+    "stop is prompt when nothing is in flight",
+    async () => {
+      // Pins the one-shot client assumption: a control client disconnects
+      // right after its ack, so an idle daemon has no READY-granted
+      // connection holding the drain grace open and exits at once. Far
+      // below DRAIN_DEADLINE_MS — if this ever approaches the deadline, the
+      // stop path is waiting out the grace window instead of finishing.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const control = await connectClient(paths.socket);
+      await handshake(control, "control");
+      control.send({ kind: "daemon.stop" });
+      expect(await control.next()).toMatchObject({
+        kind: "result",
+        payload: { stopping: true },
+      });
+      // The one-shot disconnect the CLI performs after its ack.
+      control.socket.destroy();
+
+      const ackedAt = Date.now();
+      expect(await daemon.waitForExit()).toBe(0);
+      // The lifecycle lock reads free — measured from the ack, not from
+      // the stop request, so the number is the DRAIN's cost alone.
+      const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+      expect(lifecycle).not.toBeNull();
+      if (lifecycle) locks.push(lifecycle);
+      expect(Date.now() - ackedAt).toBeLessThan(5_000);
+    },
+    TIMEOUT,
+  );
+
+  it("a second daemon.stop and a SIGTERM racing the first are idempotent", async () => {
+    // Stop is a request, not a state transition each caller owns:
+    // `StopSignal.request` is one-shot, and draining is explicitly not
+    // cancellable. Two RPC stops plus a signal must therefore produce one
+    // clean exit, never a double-drain or a crash.
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const daemon = spawnDaemon(stateDir);
+    await daemon.waitForLine("listening");
+
+    const first = await connectClient(paths.socket);
+    await handshake(first, "control");
+    const secondClient = await connectClient(paths.socket);
+    await handshake(secondClient, "control");
+
+    first.send({ kind: "daemon.stop" });
+    secondClient.send({ kind: "daemon.stop" });
+
+    // Each stop is answered OR the connection closes cleanly under it —
+    // both are legitimate, since the second racing request can land
+    // after the drain has already begun ending connections. What must
+    // not happen is a hang or an error frame.
+    const settle = async (client: Client): Promise<void> => {
+      const answer = await Promise.race([
+        client.next(10_000).then((msg) => ({ got: msg })),
+        client.closed.then(() => ({ got: undefined })),
+      ]);
+      if (answer.got !== undefined) {
+        expect(answer.got).toMatchObject({ kind: "result", payload: { stopping: true } });
+      }
+    };
+    await settle(first);
+    await settle(secondClient);
+
+    // A signal racing the RPC drain, delivered while it is under way.
+    if (daemon.child.exitCode === null) daemon.child.kill("SIGTERM");
+
+    first.socket.destroy();
+    secondClient.socket.destroy();
+
+    expect(await daemon.waitForExit(DRAIN_DEADLINE_MS + 15_000)).toBe(0);
+    // Exactly one drain, and a clean one: the lifecycle lines appear
+    // once each and nothing crashed on the way out.
+    expect(daemon.lines.filter((line) => line === "draining")).toHaveLength(1);
+    expect(daemon.lines.filter((line) => line === "stopped")).toHaveLength(1);
+    expect(daemon.lines.some((line) => line.includes("run-daemon:"))).toBe(false);
+    expect(existsSync(paths.socket)).toBe(false);
+  }, 120_000);
+
+  it("a paused approval created before an RPC stop is resumable after the next start", async () => {
+    // Extends the signal-stop invariant above to the RPC path: approvals
+    // are durable data, not daemon state, so the way the daemon was
+    // stopped must not change what survives. A stop that skipped the
+    // drain could strand a half-written pause.
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const first = spawnDaemon(stateDir, ["--pause-execute"]);
+    await first.waitForLine("listening");
+
+    const worker = await connectClient(paths.socket);
+    await handshake(worker, "serve");
+    worker.send({ kind: "execute", code: "return 1;", deadlineMs: 60_000 });
+    const paused = (await worker.next()) as {
+      kind: string;
+      payload: { status: string; executionId: string };
+    };
+    expect(paused.kind).toBe("result");
+    expect(paused.payload.status).toBe("paused");
+    const { executionId } = paused.payload;
+
+    // Stopped over RPC, not by a signal — the whole point of the test.
+    const control = await connectClient(paths.socket);
+    await handshake(control, "control");
+    control.send({ kind: "daemon.stop" });
+    expect(await control.next()).toMatchObject({
+      kind: "result",
+      payload: { stopping: true },
+    });
+    worker.socket.destroy();
+    control.socket.destroy();
+    expect(await first.waitForExit(DRAIN_DEADLINE_MS + 15_000)).toBe(0);
+
+    // A NEW daemon over the same state dir — no cleanup protocol needed
+    // after a clean drain. Real runtime this time: the resume below must
+    // drive the row through the genuine manager.
+    const second = spawnDaemon(stateDir);
+    await second.waitForLine("listening");
+
+    const approver = await connectClient(paths.socket);
+    await handshake(approver, "approvals");
+    approver.send({ kind: "approvals.list" });
+    const listed = (await approver.next()) as {
+      kind: string;
+      payload: { executionId: string }[];
+    };
+    expect(listed.kind).toBe("result");
+    expect(listed.payload.map((row) => row.executionId)).toContain(executionId);
+
+    // The decision lands and the row reaches a TERMINAL status — the
+    // pause survived the RPC stop as resumable work, not as a corpse.
+    approver.send({ kind: "approvals.resume", executionId, decision: "approve" });
+    const resumed = (await approver.next()) as {
+      kind: string;
+      payload: { status: string; decisionApplied: boolean };
+    };
+    expect(resumed.kind).toBe("result");
+    expect(["completed", "failed"]).toContain(resumed.payload.status);
+
+    approver.socket.destroy(); // see the drain-grace note above
+    second.child.kill("SIGTERM");
+    await second.waitForExit();
+  }, 120_000);
 
   it(
     "builds ONE runtime per daemon process and reuses it across requests",
