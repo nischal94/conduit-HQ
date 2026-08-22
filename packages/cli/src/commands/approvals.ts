@@ -6,6 +6,7 @@ import {
   type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
+  skewWarningLine,
 } from "@conduithq/mcp";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
@@ -58,6 +59,11 @@ export interface ApprovalsResult {
  * daemon, and therefore which database, this command decides against.
  */
 function prodDeps(stateDir: string): ApprovalsDeps {
+  // Once per process: a single invocation may issue several daemon calls
+  // (and `daemonRequest` may retry a handshake), and a skew diagnosis is
+  // the same fact every time — repeating it would bury the command's own
+  // output under duplicate warnings.
+  let skewWarned = false;
   return {
     daemon: (request) =>
       daemonRequest({
@@ -72,6 +78,17 @@ function prodDeps(stateDir: string): ApprovalsDeps {
         // production `spawnDaemon` can start nothing else. A custom
         // `--state-dir` is refused with the by-hand command — this command
         // no longer computes that boundary, so it cannot get it wrong.
+        //
+        // Skew WARNS and never blocks (spec §4): the request below proceeds
+        // either way, and nothing here stops or restarts the daemon.
+        onHandshake: (info) => {
+          if (skewWarned) return;
+          const line = skewWarningLine(info.agentVersion);
+          if (line !== null) {
+            skewWarned = true;
+            process.stderr.write(`${line}\n`);
+          }
+        },
       }),
     now: () => Date.now(),
     stdout: (line) => process.stdout.write(line),

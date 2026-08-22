@@ -5,6 +5,7 @@ import {
   type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
+  skewWarningLine,
 } from "@conduithq/mcp";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
@@ -309,6 +310,9 @@ export interface AddMcpOptions {
 export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<number> {
   const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
   const args = parseAddMcpArgs(argv);
+  // Once per process: one onboarding run issues several daemon calls, and a
+  // skew diagnosis is the same fact every time.
+  let skewWarned = false;
   const result = await runAddMcp(args, {
     daemon: (request) =>
       daemonRequest({
@@ -323,6 +327,17 @@ export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<
         // spawns only for the canonical default directory. A custom
         // `--state-dir` is refused with the by-hand start command — this
         // command no longer computes that boundary.
+        //
+        // Skew WARNS and never blocks (spec §4): onboarding proceeds either
+        // way, and nothing here stops or restarts the daemon.
+        onHandshake: (info) => {
+          if (skewWarned) return;
+          const line = skewWarningLine(info.agentVersion);
+          if (line !== null) {
+            skewWarned = true;
+            process.stderr.write(`${line}\n`);
+          }
+        },
       }),
     env: process.env,
     stdout: (line) => process.stdout.write(line),
