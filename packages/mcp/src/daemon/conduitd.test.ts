@@ -1,5 +1,13 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
@@ -890,28 +898,96 @@ describe("conduitd lifecycle", () => {
       // keeps writing to an inherited append fd instead of owning its own
       // (spec §5). So this drives a REAL spawned daemon whose log goes to the
       // sink and samples the file on disk.
+      //
+      // The bound alone would be vacuous at this traffic volume: a few
+      // hundred bytes is under a 5MB cap no matter WHERE it was written, so
+      // the test would pass identically with no sink at all. The two
+      // non-vacuous halves are therefore (a) the file must actually be
+      // written and GROW as the daemon logs, which is what proves the
+      // daemon's own traffic reaches THIS file through the sink, and (b)
+      // `daemon.status` must report that same file — which also closes the
+      // `logInfo` seam end-to-end, since its default is `() => null` until
+      // an entry point wires the real accessor.
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
-      // `--log-sink` wires `createRotatingLog` exactly as `bin.ts` does;
-      // CONDUIT_DAEMON_DEBUG is unset, so the per-admission volume stays
-      // behind the gate.
-      const daemon = spawnDaemon(stateDir, ["--log-sink"]);
+      // `--log-sink` wires the real `createRotatingLog` (see run-daemon.ts
+      // for how it deliberately differs from bin.ts).
+      //
+      // The other two flags are load-bearing for the GROWTH half, and both
+      // were established by measurement rather than assumption:
+      //
+      // `--debug` because the per-admission queue lines are the §5-gated
+      // volume; with the gate shut a healthy request logs nothing at all.
+      //
+      // `--throw-execute` because the queue lines come from
+      // `submitSandboxWork`, which only sandbox work reaches — a
+      // `catalog.listing` is a plain read that never enters the queue, so
+      // read traffic alone leaves the file flat no matter how many rounds
+      // run. An `execute` both traverses the queue (a gated line) and
+      // fails loudly (an ungated error line), so it exercises both routes
+      // into the sink.
+      const daemon = spawnDaemon(stateDir, ["--log-sink", "--debug", "--throw-execute"]);
       await daemon.waitForLine("listening");
 
       const logPath = join(stateDir, "conduitd.log");
       const bound = LOG_MAX_BYTES + LOG_LINE_MAX_BYTES;
-      expect(statSync(logPath).size).toBeLessThan(bound);
+      // Non-empty already: the "listening" line the readiness wait just
+      // observed had to land here too, not only on stdout.
+      const initialSize = statSync(logPath).size;
+      expect(initialSize).toBeGreaterThan(0);
+      expect(initialSize).toBeLessThan(bound);
 
       // Real request traffic through the real dispatch path, sampling the
-      // on-disk size between rounds.
+      // on-disk size between rounds. The execute is REFUSED (the injected
+      // fault) — an error reply is a successful drive of the logging path,
+      // which is what this test is about.
       for (let round = 0; round < 5; round++) {
         const client = await connectClient(paths.socket);
         await handshake(client, "serve");
-        client.send({ kind: "catalog.listing" });
-        expect(await client.next()).toMatchObject({ kind: "result" });
+        client.send({ kind: "execute", code: `${round}`, deadlineMs: 60_000 });
+        expect(await client.next()).toMatchObject({ kind: "error" });
         client.socket.end();
         expect(statSync(logPath).size).toBeLessThan(bound);
       }
+
+      // The file must have GROWN under that traffic. This is the assertion
+      // that fails if the daemon's log goes anywhere other than the sink's
+      // own descriptor — without it the bound below is vacuous, since a few
+      // hundred bytes sit under a 5MB cap however they were written.
+      await waitFor(() => statSync(logPath).size > initialSize);
+
+      // `daemon.status` reports the daemon's OWN view of its log — the
+      // `logInfo` accessor threaded from the sink. A null here means the
+      // seam was never wired; a mismatched path means the daemon is
+      // reporting on a different file than it writes.
+      const control = await connectClient(paths.socket);
+      await handshake(control, "control");
+      control.send({ kind: "daemon.status" });
+      const status = (await control.next()) as {
+        kind: string;
+        payload: { logPath: string | null; logSizeBytes: number | null };
+      };
+      expect(status.kind).toBe("result");
+      // `realpathSync`, because the daemon resolves its state directory
+      // through `resolveEffectiveStateDir` (§17 §2) and therefore reports
+      // the canonical path — on macOS the temp dir is a symlink, so the
+      // raw `tmpdir()` spelling and the daemon's resolved one differ by a
+      // `/private` prefix while naming ONE file. Comparing canonical forms
+      // keeps the assertion about file identity rather than about spelling.
+      expect(status.payload.logPath).toBe(realpathSync(logPath));
+      const onDisk = statSync(logPath).size;
+      expect(status.payload.logSizeBytes).toBeGreaterThan(0);
+      // Approximate, not equal: lines can land between the daemon's own
+      // reading and this one, and a fault line carries a stack trace worth
+      // roughly a kilobyte. What must hold is that the two describe the
+      // SAME file rather than two unrelated counters — an unwired accessor
+      // reports null and a stale snapshot is off by the whole file, so the
+      // failure modes this guards against differ by orders of magnitude,
+      // not by one line's worth of bytes.
+      expect(Math.abs((status.payload.logSizeBytes ?? 0) - onDisk)).toBeLessThan(
+        LOG_LINE_MAX_BYTES,
+      );
+      expect(status.payload.logSizeBytes).toBeLessThan(bound);
     },
     TIMEOUT,
   );

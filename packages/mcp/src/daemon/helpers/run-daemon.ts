@@ -147,10 +147,21 @@ const poisonCatalogRefresh = rest.includes("--poison-catalog-refresh");
 const poisonNthFlag = rest.indexOf("--poison-catalog-refresh-nth");
 const poisonNth = poisonNthFlag === -1 ? 1 : Number(rest[poisonNthFlag + 1] ?? 1);
 /**
- * Wires the REAL owned rotating sink, exactly as `bin.ts` does for a
- * backgrounded daemon, so a test can assert on the ON-DISK log file rather
- * than on a sink object. Lifecycle lines still go to stdout as well —
- * without them the parent's readiness protocol has nothing to wait on.
+ * Wires the REAL owned rotating sink so a test can assert on the ON-DISK
+ * log file rather than on a sink object.
+ *
+ * Deliberately NOT identical to `bin.ts`, in two ways.
+ *
+ * First, `bin.ts` gates the sink on `process.stderr.isTTY` — a hand-started
+ * daemon on a terminal keeps stderr and rotates nothing. This helper skips
+ * that guard: the test harness always spawns it with piped stdio, so
+ * `isTTY` is never true here and the guard would be dead code. Worse than
+ * dead: a test whose whole subject is the on-disk file would silently skip
+ * its assertions if the guard ever DID fire, so the harness makes the
+ * decision explicitly instead of inheriting it from the terminal.
+ *
+ * Second, lifecycle lines go to stdout as well as to the sink — without
+ * them the parent's readiness protocol has nothing to wait on.
  */
 const useLogSink = rest.includes("--log-sink");
 
