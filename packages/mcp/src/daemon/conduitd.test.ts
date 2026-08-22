@@ -19,6 +19,7 @@ import {
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
 import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
+import { LOG_LINE_MAX_BYTES, LOG_MAX_BYTES } from "./log-sink.js";
 import { MAX_TOOL_TEXT_BYTES } from "./provision.js";
 
 /**
@@ -881,6 +882,41 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
+    "bounds the ON-DISK active log under real daemon logging (fd ownership, not just the sink object)",
+    async () => {
+      // The sink unit tests pin the rotation mechanics against a sink OBJECT.
+      // What they cannot pin is that the daemon's own log traffic actually
+      // goes through that object — the property that fails if the daemon
+      // keeps writing to an inherited append fd instead of owning its own
+      // (spec §5). So this drives a REAL spawned daemon whose log goes to the
+      // sink and samples the file on disk.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // `--log-sink` wires `createRotatingLog` exactly as `bin.ts` does;
+      // CONDUIT_DAEMON_DEBUG is unset, so the per-admission volume stays
+      // behind the gate.
+      const daemon = spawnDaemon(stateDir, ["--log-sink"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, "conduitd.log");
+      const bound = LOG_MAX_BYTES + LOG_LINE_MAX_BYTES;
+      expect(statSync(logPath).size).toBeLessThan(bound);
+
+      // Real request traffic through the real dispatch path, sampling the
+      // on-disk size between rounds.
+      for (let round = 0; round < 5; round++) {
+        const client = await connectClient(paths.socket);
+        await handshake(client, "serve");
+        client.send({ kind: "catalog.listing" });
+        expect(await client.next()).toMatchObject({ kind: "result" });
+        client.socket.end();
+        expect(statSync(logPath).size).toBeLessThan(bound);
+      }
+    },
+    TIMEOUT,
+  );
+
+  it(
     "INVARIANT §17: a second handshake cannot widen an established capability",
     async () => {
       const stateDir = newStateDir();
@@ -1076,7 +1112,11 @@ describe("conduitd lifecycle", () => {
     // never reaches the manager while the cap is full.
     const stateDir = newStateDir();
     const paths = daemonPaths(stateDir);
-    const daemon = spawnDaemon(stateDir, ["--stall-sandbox"]);
+    // `--debug` because the queue-depth lines this test asserts on are the
+    // per-admission volume the §5 gate suppresses by default. The gate
+    // changes WHERE those lines are written, not whether the admission
+    // happens, so opening it is the faithful way to observe the wiring.
+    const daemon = spawnDaemon(stateDir, ["--stall-sandbox", "--debug"]);
     await daemon.waitForLine("listening");
 
     // Fill the concurrency cap with stalled executes. Each needs its

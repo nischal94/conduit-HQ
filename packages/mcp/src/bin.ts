@@ -11,6 +11,7 @@ import {
 } from "./daemon/client.js";
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
+import { createRotatingLog } from "./daemon/log-sink.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
@@ -361,17 +362,38 @@ async function main(): Promise<void> {
     // `<attacker>/custom` that `path.join` would produce from the raw
     // spelling. Client and by-hand daemon meet at one filesystem object.
     const resolvedStateDir = resolveEffectiveStateDir(override ?? DEFAULT_CONDUIT_DIR);
+    // The volume gate arrives as argv, never as an inherited environment
+    // variable: the spawn boundary (§3.1) constructs the child's env as
+    // exactly `{PATH}`, so the SPAWNER reads `CONDUIT_DAEMON_DEBUG` and
+    // threads the decision here as a flag.
+    const debug = parsed.rest.includes("--debug");
+    // Spec §5: owned rotating sink when backgrounded; a hand-started
+    // daemon on a terminal keeps stderr and performs no rotation.
+    const sink = process.stderr.isTTY ? null : createRotatingLog(resolvedStateDir);
     try {
-      await runDaemon({ stateDir: resolvedStateDir, sweep: sweepDaemonStore });
+      await runDaemon({
+        stateDir: resolvedStateDir,
+        sweep: sweepDaemonStore,
+        ...(sink !== null ? { log: sink.log, logInfo: sink.info } : {}),
+        ...(debug ? { debug: true } : {}),
+      });
     } catch (error) {
       // The two refusal paths carry their own exit codes (§3.5's client
       // decision table) — a client branches on the code, not on prose.
       if (error instanceof DaemonExit) {
+        // Reaches the log file all the same: under `--daemon` stderr is the
+        // inherited descriptor the spawning client pointed at that file.
         console.error(error.message);
         process.exitCode = error.code;
         return;
       }
       throw error;
+    } finally {
+      // Releases the daemon's own descriptor on every exit path, including
+      // the refusal `return` above. `process.exit` below would drop it
+      // anyway; closing explicitly is what makes that not the reason it is
+      // released.
+      sink?.close();
     }
     // Exit HARD, not by falling off the end of `main`. `runDaemon`
     // resolving means the drain deadline passed and BOTH locks were

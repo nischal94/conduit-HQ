@@ -139,6 +139,15 @@ export interface ConnectionDeps {
    * would report zero forever.
    */
   logInfo: () => { path: string; sizeBytes: number } | null;
+  /**
+   * Per-admission volume, behind the debug gate (spec §5). Every request
+   * produces a queue line, so on a busy daemon these dominate the log and
+   * push the lines that matter — lifecycle transitions and errors — out of
+   * the rotation window. Those stay on `log` unconditionally; only the
+   * per-admission chatter routes here, and `conduitd.ts` wires it to a
+   * no-op unless the daemon was started with `--debug`.
+   */
+  logDebug: (line: string) => void;
 }
 
 export type QueueOutcome = "ran" | "expired" | "abandoned";
@@ -559,13 +568,15 @@ async function submitSandboxWork(
       log,
     );
     const stats = deps.queueStats();
-    log(`queue depth=${stats.depth} max=${stats.maxObservedDepth} refused=busy`);
+    deps.logDebug(`queue depth=${stats.depth} max=${stats.maxObservedDepth} refused=busy`);
     return;
   }
 
   ctx.queued.add(admission.abandon);
   const stats = deps.queueStats();
-  log(`queue depth=${stats.depth} max=${stats.maxObservedDepth} active=${stats.activeCount}`);
+  deps.logDebug(
+    `queue depth=${stats.depth} max=${stats.maxObservedDepth} active=${stats.activeCount}`,
+  );
   const settled = await admission.done;
   ctx.queued.delete(admission.abandon);
   // Exhaustive rather than a single `if`: the three outcomes are three

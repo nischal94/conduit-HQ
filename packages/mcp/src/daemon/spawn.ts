@@ -121,8 +121,16 @@ export function spawnDaemon(): void {
   // protocol stream.
   const logFd = openSync(join(stateDir, DAEMON_LOG), "a", 0o600);
 
+  const argv = [daemonEntryPoint(), "--daemon"];
+  // Volume gate (spec §5): the SPAWNER's environment opts into debug
+  // logging via argv — the child's constructed env stays exactly {PATH},
+  // so the variable is read HERE and never inherited. Reading it in the
+  // child instead would mean either inheriting the environment (which
+  // §3.1 forbids) or adding a second allowlist entry a client could set.
+  if (process.env.CONDUIT_DAEMON_DEBUG === "1") argv.push("--debug");
+
   try {
-    const child = spawn(process.execPath, [daemonEntryPoint(), "--daemon"], {
+    const child = spawn(process.execPath, argv, {
       // Explicit, never inherited (§3.1): an inherited cwd would silently
       // anchor every relative path the daemon, sandbox, or an upstream
       // session ever resolves.

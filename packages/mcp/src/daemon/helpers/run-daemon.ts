@@ -28,6 +28,7 @@ import { writeFileSync } from "node:fs";
 import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
 import { FRAME_CAP } from "../frames.ts";
+import { createRotatingLog } from "../log-sink.ts";
 import { resolveEffectiveStateDir } from "../state-dir-resolve.ts";
 import { sweepOrphanedExecutions } from "../sweep.ts";
 
@@ -145,6 +146,13 @@ const plantCatalogTool = rest.includes("--plant-catalog-tool");
 const poisonCatalogRefresh = rest.includes("--poison-catalog-refresh");
 const poisonNthFlag = rest.indexOf("--poison-catalog-refresh-nth");
 const poisonNth = poisonNthFlag === -1 ? 1 : Number(rest[poisonNthFlag + 1] ?? 1);
+/**
+ * Wires the REAL owned rotating sink, exactly as `bin.ts` does for a
+ * backgrounded daemon, so a test can assert on the ON-DISK log file rather
+ * than on a sink object. Lifecycle lines still go to stdout as well —
+ * without them the parent's readiness protocol has nothing to wait on.
+ */
+const useLogSink = rest.includes("--log-sink");
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
@@ -408,6 +416,8 @@ const createRuntime = pauseExecute
                     }
                   : undefined;
 
+const sink = useLogSink ? createRotatingLog(stateDir) : null;
+
 try {
   await runDaemon({
     stateDir,
@@ -415,13 +425,19 @@ try {
     ...(createRuntime !== undefined ? { createRuntime } : {}),
     // stdout, not stderr: the parent reads these as the readiness
     // protocol, and mixing them with Node's own stderr noise would make
-    // the line-oriented wait fragile.
+    // the line-oriented wait fragile. With `--log-sink` the line ALSO goes
+    // through the real sink, which is what puts it on disk.
     log: (line: string) => {
+      sink?.log(line);
       console.log(line);
     },
+    ...(sink !== null ? { logInfo: sink.info } : {}),
+    ...(rest.includes("--debug") ? { debug: true } : {}),
   });
+  sink?.close();
   process.exit(0);
 } catch (err) {
+  sink?.close();
   if (err instanceof DaemonExit) {
     process.exit(err.code);
   }

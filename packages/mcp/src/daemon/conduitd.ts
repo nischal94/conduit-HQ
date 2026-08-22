@@ -164,6 +164,13 @@ export interface RunDaemonOptions {
    * that entry point supplies the real accessor.
    */
   logInfo?: () => { path: string; sizeBytes: number } | null;
+  /**
+   * Opens the per-admission volume gate (spec §5). Off by default: the
+   * queue lines are one per request, and on a busy daemon they would push
+   * lifecycle and error lines out of the bounded log. The entry point
+   * turns this on from `--debug`.
+   */
+  debug?: boolean;
 }
 
 /** Exit codes are part of the client contract (§3.5 decision table). */
@@ -582,6 +589,7 @@ async function startDaemon(
       stopSignal,
       createRuntime: opts.createRuntime ?? createApprovalRuntime,
       logInfo: opts.logInfo ?? ((): null => null),
+      debug: opts.debug === true,
     });
   } finally {
     // §3.5 step 4: maintenance first, lifecycle last. Lifecycle release
@@ -636,6 +644,7 @@ interface ServeOptions {
   stopSignal: StopSignal;
   createRuntime: typeof createApprovalRuntime;
   logInfo: () => { path: string; sizeBytes: number } | null;
+  debug: boolean;
 }
 
 async function serve(opts: ServeOptions): Promise<void> {
@@ -720,6 +729,9 @@ async function serve(opts: ServeOptions): Promise<void> {
     // racing this one, is a no-op rather than a competing shutdown.
     requestStop: () => stopSignal.request(),
     logInfo: opts.logInfo,
+    // The volume gate (spec §5): without `--debug` the per-admission lines
+    // are dropped at the source rather than written and rotated away.
+    logDebug: opts.debug ? log : (): void => {},
   };
 
   server.on("connection", (socket) => {
