@@ -1,11 +1,11 @@
 import {
+  createSkewReporter,
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
   deadlineForRequest,
   type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
-  skewWarningLine,
 } from "@conduithq/mcp";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
@@ -306,13 +306,20 @@ export interface AddMcpOptions {
   stateDir?: string;
 }
 
+/**
+ * Skew reporting for this process (spec §4), at MODULE scope so "once per
+ * process" is true by construction rather than by `addMcp` happening to be
+ * called once. One onboarding run issues several daemon calls, and a skew
+ * diagnosis is the same fact every time.
+ *
+ * Production-only: tests build their own deps and never reach this path.
+ */
+const reportSkew = createSkewReporter((line) => process.stderr.write(`${line}\n`));
+
 /** Production entrypoint wired into the CLI dispatch (bin.ts). */
 export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<number> {
   const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
   const args = parseAddMcpArgs(argv);
-  // Once per process: one onboarding run issues several daemon calls, and a
-  // skew diagnosis is the same fact every time.
-  let skewWarned = false;
   const result = await runAddMcp(args, {
     daemon: (request) =>
       daemonRequest({
@@ -330,14 +337,7 @@ export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<
         //
         // Skew WARNS and never blocks (spec §4): onboarding proceeds either
         // way, and nothing here stops or restarts the daemon.
-        onHandshake: (info) => {
-          if (skewWarned) return;
-          const line = skewWarningLine(info.agentVersion);
-          if (line !== null) {
-            skewWarned = true;
-            process.stderr.write(`${line}\n`);
-          }
-        },
+        onHandshake: reportSkew,
       }),
     env: process.env,
     stdout: (line) => process.stdout.write(line),

@@ -4,7 +4,7 @@ import type { RpcRequest, RpcResponse } from "./daemon/rpc.js";
 import { DEFAULT_CONDUIT_DIR } from "./env.js";
 import type { CatalogListing } from "./payloads.js";
 import { createConduitMcpServer, type DaemonCall, deadlineForRequest } from "./server.js";
-import { skewWarningLine } from "./version-skew.js";
+import { createSkewReporter } from "./version-skew.js";
 
 // The per-round-trip budget is KIND-DEPENDENT and lives with the
 // constants it must stay ordered against — see `deadlineForRequest` and
@@ -73,25 +73,20 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
   /**
    * Version-skew reporting for this `serve` process (spec §4), warned ONCE
    * across every daemon call it makes — the startup read below and every
-   * later request through the `daemon` seam.
+   * later request through the `daemon` seam. ONE reporter shared by both
+   * call sites is what makes that single latch cover them.
    *
-   * It goes to `console.error`, which the redirect above routes to stderr:
-   * the same diagnostics path this module's other startup warnings use, and
-   * the only safe one here. Stdout carries MCP protocol frames only, so a
-   * skew line must never enter an MCP response (M8).
+   * Deliberately function-scoped rather than module-scoped (the CLI
+   * commands' placement): it must close over `console.error` AFTER the
+   * redirect above rebinds it, and `runStdioServer` is itself the process
+   * entrypoint, so its scope IS the process.
    *
-   * Skew WARNS and never blocks: this reports and returns, and no client
-   * ever stops or restarts the daemon.
+   * `console.error` is this module's existing stderr diagnostics path — the
+   * same one the 0-sources hint and the egress warning use. Stdout carries
+   * MCP protocol frames only, so a skew line must never enter an MCP
+   * response (M8).
    */
-  let skewWarned = false;
-  const warnSkewOnce = (agentVersion: string | undefined): void => {
-    if (skewWarned) return;
-    const line = skewWarningLine(agentVersion);
-    if (line !== null) {
-      skewWarned = true;
-      console.error(line);
-    }
-  };
+  const warnSkewOnce = createSkewReporter((line) => console.error(line));
   // Auto-start is gated STRUCTURALLY inside `daemonRequest` (F5): a spawned
   // daemon derives the default dir from its own uid, so a spawn is only ever
   // correct there. `daemonRequest` spawns only when `stateDir` is the
@@ -104,7 +99,7 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
       role: "serve",
       request,
       deadlineMs: deadlineForRequest(request),
-      onHandshake: (info) => warnSkewOnce(info.agentVersion),
+      onHandshake: warnSkewOnce,
     });
 
   // Startup diagnostics come from the daemon's own handshake-backed view,
@@ -149,7 +144,7 @@ export async function runStdioServer(opts: RunStdioServerOptions = {}): Promise<
         // an operator whose daemon merely lags sees why before anything
         // behaves oddly. When the refusal below turns out to be terminal,
         // its own message is the actionable one and this line preceded it.
-        warnSkewOnce(info.agentVersion);
+        warnSkewOnce(info);
       },
     });
     if (response.kind !== "result") {

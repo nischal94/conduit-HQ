@@ -19,6 +19,12 @@ import { AGENT_VERSION } from "./env.js";
 export function sanitizeVersionForDisplay(v: string): string {
   // An ALLOWLIST, not a denylist of known-bad escapes: everything outside
   // printable ASCII goes, so no encoding of a control character survives.
+  //
+  // The residue of a stripped sequence is left alone DELIBERATELY: removing
+  // the ESC from `<ESC>[2J` leaves the literal text `[2J`, which no terminal
+  // interprets without its introducer. Stripping escape BODIES too would
+  // mean matching known sequence shapes — the denylist-over-unbounded-input
+  // shape that never converges, and the one we refuse.
   return v.replace(/[^\x20-\x7e]/g, "").slice(0, 64);
 }
 
@@ -43,4 +49,36 @@ export function skewWarningLine(daemonVersion: string | undefined): string | nul
     `${AGENT_VERSION} — run \`conduit daemon stop\`; the next command auto-starts a ` +
     `matching daemon.`
   );
+}
+
+/**
+ * A once-per-caller skew reporter: an `onHandshake` callback that emits at
+ * most ONE line, however many daemon calls flow through it.
+ *
+ * The "once" is a property of the RETURNED closure, so the caller decides
+ * the scope by where it holds the result. Every production caller holds one
+ * at MODULE scope, making "once per process" true by construction rather
+ * than by the incidental fact that a command entrypoint runs once — a
+ * per-invocation flag would silently become "once per invocation" the day
+ * anything called the entrypoint twice.
+ *
+ * A MATCHING handshake leaves the latch unset: the null line is not a
+ * report, so a later mismatched daemon (one process outliving a daemon
+ * restart) still gets its warning.
+ *
+ * It reports and returns. Skew never blocks the request that carried the
+ * handshake, and nothing here stops or restarts the daemon (spec §4).
+ */
+export function createSkewReporter(
+  write: (line: string) => void,
+): (info: { agentVersion: string | undefined }) => void {
+  let warned = false;
+  return (info) => {
+    if (warned) return;
+    const line = skewWarningLine(info.agentVersion);
+    if (line !== null) {
+      warned = true;
+      write(line);
+    }
+  };
 }

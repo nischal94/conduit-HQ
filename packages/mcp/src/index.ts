@@ -103,4 +103,8 @@ export {
   RESUME_CLIENT_DEADLINE_MS,
 } from "./server.js";
 export { openStoreClientFromEnv, openStoreFromEnv } from "./store-open.js";
-export { sanitizeVersionForDisplay, skewWarningLine } from "./version-skew.js";
+export {
+  createSkewReporter,
+  sanitizeVersionForDisplay,
+  skewWarningLine,
+} from "./version-skew.js";
