@@ -829,5 +829,28 @@ async function handleRequest(
     }
     case "handshake":
       return;
+    default: {
+      // Backstop for vocabulary that outpaces dispatch: `RpcRequest` and
+      // the capability gate above already admit `daemon.status` /
+      // `daemon.stop` (control-capability rollout), but this switch has
+      // no arm for either yet — their handlers land with the later
+      // control-handler task. Without this arm, a decoded-but-unhandled
+      // kind would fall through with no response frame at all, hanging
+      // the caller until its own deadline. Deliberately not a `const _:
+      // never = request` exhaustiveness assertion: that would fail
+      // typecheck right now, since these kinds are intentionally
+      // unhandled for the moment.
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "invalid",
+          message: `request kind "${request.kind}" is not yet handled`,
+        },
+        log,
+      );
+      return;
+    }
   }
 }

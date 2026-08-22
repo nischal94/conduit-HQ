@@ -1154,6 +1154,28 @@ describe("conduitd lifecycle", () => {
     },
     TIMEOUT,
   );
+
+  it(
+    "answers a decoded-but-undispatched control kind with an error, not a hang",
+    async () => {
+      // `daemon.status`/`daemon.stop` are admitted by RpcRequest and the
+      // control capability gate (Task 1), but handleRequest's dispatch
+      // switch has no arm for either yet — the handlers land with a later
+      // task. Without the switch's backstop `default` arm, this request
+      // would fall through with no response frame at all, and the client
+      // would hang until its own deadline instead of seeing a refusal.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "control");
+      client.send({ kind: "daemon.status" });
+      expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+    },
+    TIMEOUT,
+  );
 });
 
 /**
