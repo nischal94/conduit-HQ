@@ -645,32 +645,63 @@ async function runSourceRequest(
  * catalog mutations then run synchronously in one tick, so no request can
  * observe the removed-but-not-upserted state.
  *
- * NEVER throws: a refresh failure after a committed write must not turn
- * the operator's successful provisioning into an error answer. Recovery
- * ladder: full rehydrate from the store; failing that, keep serving the
- * previous catalog (stale-but-consistent — repaired by the next
- * provision or restart), with both failures logged.
+ * NEVER throws — not for a store fault, not for a catalog fault, and not
+ * for a failing `log`: a refresh failure after a COMMITTED write must not
+ * turn the operator's successful provisioning into an error answer. Every
+ * statement that can throw is therefore inside a `try`, and the only calls
+ * in the `catch` bodies are `safeLog`, which swallows its own failure.
+ *
+ * Recovery ladder, both rungs:
+ *
+ *  1. Retry the same remove-then-upsert against a fresh store read. This
+ *     repeats `store.tools.list()`, the call most likely to have failed —
+ *     deliberately, since a transient store fault is the case worth one
+ *     retry, and a persistent one lands on rung 2 immediately.
+ *  2. Keep serving the previous catalog: stale, but CONSISTENT, and
+ *     repaired by the next provision of this namespace or by a restart.
+ *
+ * Rung 1 removes the namespace before it upserts. `InMemoryCatalog.upsert`
+ * is purely additive (it only ever `set`s), so an upsert alone cannot
+ * retire a tool the upstream dropped — it would leave the retired tool
+ * serving alongside the new ones, which is stale AND inconsistent, and
+ * strictly worse than rung 2. Removing first is safe here because a failed
+ * refresh of THIS namespace never touched any other, so per-namespace
+ * removal is exactly the repair scope.
  */
 async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promise<void> {
-  const { log } = deps;
+  // Even the log is guarded: `deps.log` writes to the daemon's stdout, and a
+  // closed or full pipe throws. An escaping log call would propagate through
+  // `runSourceRequest` and answer a committed provision with an error frame —
+  // precisely the outcome the never-throws contract exists to prevent.
+  const safeLog = (line: string): void => {
+    try {
+      deps.log(line);
+    } catch {
+      // Nothing left to report it to; the daemon's own log is the failing
+      // surface. Dropping the line is the only disposition that keeps the
+      // committed write's success answer intact.
+    }
+  };
   try {
     const tools = await deps.store.tools.list();
     deps.runtime.catalog.removeNamespace(namespace);
     deps.runtime.catalog.upsert(tools);
   } catch (err) {
-    log(
-      `[conduitd] Catalog refresh failed after commit: attempting full rehydrate. Context: {namespace: ${namespace}, cause: ${
+    safeLog(
+      `[conduitd] Catalog refresh failed after commit: retrying the namespace refresh. Context: {namespace: ${namespace}, cause: ${
         err instanceof Error ? err.message : String(err)
       }}`,
     );
     try {
-      deps.runtime.catalog.upsert(await deps.store.tools.list());
-      log(
-        `[conduitd] Catalog rehydrated after refresh failure. Context: {namespace: ${namespace}}`,
+      const tools = await deps.store.tools.list();
+      deps.runtime.catalog.removeNamespace(namespace);
+      deps.runtime.catalog.upsert(tools);
+      safeLog(
+        `[conduitd] Catalog refreshed on retry after an earlier failure. Context: {namespace: ${namespace}}`,
       );
     } catch (err2) {
-      log(
-        `[conduitd] Catalog rehydrate failed: serving the previous catalog until the next provision or restart. Context: {namespace: ${namespace}, cause: ${
+      safeLog(
+        `[conduitd] Catalog refresh retry failed: serving the previous catalog until the next provision or restart. Context: {namespace: ${namespace}, cause: ${
           err2 instanceof Error ? err2.message : String(err2)
         }}`,
       );

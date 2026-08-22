@@ -128,16 +128,23 @@ const countRuntimeBuilds = rest.includes("--count-runtime-builds");
  */
 const plantCatalogTool = rest.includes("--plant-catalog-tool");
 /**
- * Makes the catalog throw on its FIRST `removeNamespace` — the call the
- * provisioning tail's refresh makes — and behave normally thereafter.
+ * Makes the catalog throw on ONE `removeNamespace` — by default the first,
+ * or the Nth with `--poison-catalog-refresh-nth <n>` (1-based) — and behave
+ * normally on every other call.
  *
- * One call, not all of them: the recovery ladder's first rung is a full
- * rehydrate that must succeed, so a permanently poisoned catalog would test
- * the second rung instead. The line printed on the injected throw is what
- * keeps the parent's assertion non-vacuous — without it, a refresh that
- * never ran would look identical to one that failed and recovered.
+ * One call, not all of them: the recovery ladder's first rung retries the
+ * remove-then-upsert, so a permanently poisoned catalog would land on rung 2
+ * and test the wrong thing. Choosing WHICH call is what lets a test poison a
+ * later operation's refresh (a revalidate that retires a tool) rather than
+ * only the first provision's.
+ *
+ * The line printed on the injected throw is what keeps the parent's
+ * assertion non-vacuous — without it, a refresh that never ran would look
+ * identical to one that failed and recovered.
  */
 const poisonCatalogRefresh = rest.includes("--poison-catalog-refresh");
+const poisonNthFlag = rest.indexOf("--poison-catalog-refresh-nth");
+const poisonNth = poisonNthFlag === -1 ? 1 : Number(rest[poisonNthFlag + 1] ?? 1);
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
@@ -388,10 +395,10 @@ const createRuntime = pauseExecute
                   ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
                       const built = await createApprovalRuntime(runtimeOpts);
                       const realRemove = built.catalog.removeNamespace.bind(built.catalog);
-                      let poisoned = true;
+                      let calls = 0;
                       built.catalog.removeNamespace = (ns: string) => {
-                        if (poisoned) {
-                          poisoned = false;
+                        calls += 1;
+                        if (calls === poisonNth) {
                           console.log("poisoned catalog refresh");
                           throw new Error("injected refresh failure");
                         }

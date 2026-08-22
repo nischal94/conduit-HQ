@@ -1512,8 +1512,71 @@ describe("conduitd lifecycle", () => {
       // Non-vacuous: the fixture reports that its injected failure fired.
       expect(daemon.lines.some((line) => line.includes("poisoned catalog refresh"))).toBe(true);
 
-      // The rehydrate fallback ran, so the new tools are still reachable.
+      // The retry rung ran, so the new tools are still reachable.
       expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "the recovery rung RETIRES a dropped tool, rather than leaving it beside the new one",
+    async () => {
+      // `InMemoryCatalog.upsert` only ever `set`s — it never deletes. So a
+      // recovery that upserted the store's tools WITHOUT removing the
+      // namespace first would leave a retired tool serving alongside the new
+      // ones: stale AND inconsistent, and strictly worse than simply keeping
+      // the previous catalog. This pins that the retry removes before it
+      // upserts.
+      //
+      // The poison is armed for the SECOND `removeNamespace` — the provision
+      // below refreshes successfully (call 1), and the revalidate that
+      // retires a tool is the one whose refresh fails (call 2), leaving its
+      // retry as call 3.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, [
+        "--poison-catalog-refresh",
+        "--poison-catalog-refresh-nth",
+        "2",
+      ]);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      // The precondition the retirement is measured against.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      // The upstream retires `list_issues` and advertises `list_releases`.
+      upstream.setTools([upstreamTool("list_releases", "List published releases")]);
+      adder.send({ kind: "source.revalidate", namespace: "github" });
+      expect(await adder.next()).toMatchObject({ kind: "result" });
+
+      // Non-vacuous: the injected failure fired on THIS operation's refresh.
+      expect(daemon.lines.some((line) => line.includes("poisoned catalog refresh"))).toBe(true);
+
+      // THE ASSERTION: after recovery the catalog matches the store — the
+      // new tool is present AND the retired one is gone. An additive-only
+      // recovery passes the first of these and fails the second.
+      expect(await searchPaths(serve, "releases")).toContain("github.list_releases");
+      expect(await searchPaths(serve, "issues")).not.toContain("github.list_issues");
+      serve.send({ kind: "describe", toolName: "github.list_issues" });
+      expect(await serve.next()).toMatchObject({ kind: "result", payload: null });
 
       serve.socket.destroy(); // see the drain-grace note above
       adder.socket.destroy();
