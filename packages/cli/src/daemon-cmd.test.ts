@@ -106,6 +106,23 @@ describe("conduit daemon status", () => {
     expect(rec.requests).toEqual([{ kind: "daemon.status" }]);
   });
 
+  it("sanitizes the daemon-reported version before printing it", async () => {
+    const rec = makeDeps({
+      answer: async () => ({
+        kind: "result",
+        requestId: "r1",
+        payload: { ...STATUS_PAYLOAD, agentVersion: "9.9.9\x1b[2J\x1b[H" },
+      }),
+    });
+
+    expect(await runStatus(rec.deps)).toBe(0);
+    const printed = rec.out.join("");
+    // The version arrives over a socket and lands on a terminal: no
+    // terminal-escape introducer survives the render.
+    expect(printed).not.toContain("\x1b");
+    expect(printed).toContain("9.9.9");
+  });
+
   it("exits 3 with 'not running' when no daemon is up — and never spawns", async () => {
     const rec = makeDeps({
       answer: async () => {

@@ -12,6 +12,7 @@ import {
   type RpcRequest,
   type RpcResponse,
   resolveEffectiveStateDir,
+  sanitizeVersionForDisplay,
 } from "@conduithq/mcp";
 
 /**
@@ -174,7 +175,14 @@ export async function runStatus(deps: DaemonCmdDeps): Promise<number> {
   deps.stdout(
     "running\n" +
       `  pid:         ${status.pid}\n` +
-      `  version:     ${status.agentVersion} (this CLI: ${AGENT_VERSION})\n` +
+      // The daemon's version is UNTRUSTED DISPLAY INPUT — it arrives over a
+      // socket and lands on a terminal, exactly like the skew warning's
+      // copy of it, so it goes through the same allowlist rather than being
+      // printed raw. The `result` payload is `unknown` on the wire and the
+      // client seam validates only the shapes whose MISREADING is
+      // dangerous; a status render is where a stale or hostile daemon's
+      // string would otherwise reach a terminal unfiltered.
+      `  version:     ${sanitizeVersionForDisplay(status.agentVersion)} (this CLI: ${AGENT_VERSION})\n` +
       `  started:     ${new Date(status.startedAt).toISOString()}\n` +
       `  db:          ${status.dbPath}\n` +
       `  connections: ${status.connections}\n` +
