@@ -3,7 +3,7 @@ import { KEY_USAGE } from "./commands/key.js";
 
 export const VERSION = "0.1.0";
 
-export const COMMANDS = ["serve", "add-mcp", "approvals", "key"] as const;
+export const COMMANDS = ["serve", "add-mcp", "approvals", "key", "daemon"] as const;
 
 export type Command = (typeof COMMANDS)[number];
 
@@ -17,6 +17,7 @@ Commands:
              (--namespace <ns> --url <url> --prefix <prefix> [--replace] [--clear-credential] [--json])
   approvals  Manage pending tool-call approvals
   key        Manage the master key (generate | rotate)
+  daemon     Inspect or stop the background daemon (status | stop)
 
 Flags:
   --help     Show this help text

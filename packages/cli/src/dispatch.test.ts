@@ -55,7 +55,7 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("--help → lists all four commands", () => {
+  it("--help → lists all routed commands", () => {
     const result = dispatch(["--help"]);
     expect(result.kind).toBe("help");
     if (result.kind === "help") {
@@ -73,7 +73,7 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("-h → behaves like --help (lists all four commands)", () => {
+  it("-h → behaves like --help (lists all routed commands)", () => {
     const result = dispatch(["-h"]);
     expect(result.kind).toBe("help");
     if (result.kind === "help") {
@@ -83,8 +83,31 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("COMMANDS contains exactly the four routed commands", () => {
-    expect(COMMANDS).toEqual(["serve", "add-mcp", "approvals", "key"]);
+  it("COMMANDS contains exactly the five routed commands", () => {
+    expect(COMMANDS).toEqual(["serve", "add-mcp", "approvals", "key", "daemon"]);
+  });
+
+  it("routes `daemon status` and `daemon stop` with the subcommand passed through", () => {
+    expect(dispatch(["daemon", "status"])).toEqual({
+      kind: "route",
+      command: "daemon",
+      args: ["status"],
+    });
+    expect(dispatch(["daemon", "stop"])).toEqual({
+      kind: "route",
+      command: "daemon",
+      args: ["stop"],
+    });
+  });
+
+  it("--help lists daemon and both its subcommands", () => {
+    const result = dispatch(["--help"]);
+    expect(result.kind).toBe("help");
+    if (result.kind === "help") {
+      expect(result.stdout).toContain("daemon");
+      expect(result.stdout).toContain("status");
+      expect(result.stdout).toContain("stop");
+    }
   });
 
   it("--help mentions add-mcp's flags (D5)", () => {

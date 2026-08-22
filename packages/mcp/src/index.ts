@@ -29,6 +29,13 @@ export {
   type ExclusiveAcquisition,
   type HeldLock,
   type LockHolder,
+  /**
+   * `conduit daemon stop` waits for VERIFIED termination rather than
+   * trusting the daemon's ack: it polls the lifecycle lock until the
+   * daemon has actually released it, because `key rotate` needs the lock
+   * free and not merely a stop acknowledged.
+   */
+  probeShared,
   readLockHolder,
 } from "./daemon/locks.js";
 export {
@@ -63,6 +70,8 @@ export {
   sameDirectoryIdentity,
 } from "./daemon/state-dir-resolve.js";
 export {
+  /** `conduit daemon status` prints the daemon's build beside this CLI's. */
+  AGENT_VERSION,
   DEFAULT_CONDUIT_DIR,
   DEFAULT_KEY_FILE,
   ensureDbDir,
@@ -80,6 +89,10 @@ export {
 } from "./mcp-fetch.js";
 export {
   CHECK_EXECUTION_TOOL,
+  /** The `daemon.status` projection `conduit daemon status` renders. */
+  type DaemonStatusPayload,
+  /** The `daemon.stop` ack — "will stop", which `conduit daemon stop` then verifies. */
+  type DaemonStopPayload,
   estimateDefinitionTokens,
   executionToCheckPayload,
   extendExecuteDefinition,

@@ -14,6 +14,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { AGENT_VERSION } from "../env.js";
+import { DaemonUnavailable, daemonRequest, MIN_PASS_BUDGET_MS } from "./client.js";
 import {
   CONCURRENCY_CAP,
   DRAIN_DEADLINE_MS,
@@ -26,9 +27,10 @@ import {
 } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
-import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
+import { acquireExclusive, acquireShared, type HeldLock, probeShared } from "./locks.js";
 import { LOG_LINE_MAX_BYTES, LOG_MAX_BYTES } from "./log-sink.js";
 import { MAX_TOOL_TEXT_BYTES } from "./provision.js";
+import { DAEMON_LOG } from "./spawn.js";
 
 /**
  * Real-process daemon tests (design §3.5, §7 — normative: "the
@@ -2116,6 +2118,45 @@ describe("conduitd lifecycle", () => {
       second.socket.destroy();
       daemon.child.kill("SIGTERM");
       await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * The `conduit daemon status|stop` suppression, end to end against the
+   * real filesystem (spec §3.2). The DI-seam tests in the cli package pin
+   * what the command PRINTS; only this one can show that the production
+   * options actually start nothing — a spawn is a side effect on disk, so
+   * the evidence has to be on disk.
+   */
+  it(
+    "status/stop with no daemon: no spawn occurs",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+
+      for (const request of [{ kind: "daemon.status" }, { kind: "daemon.stop" }] as const) {
+        // The CLI's exact production options: a control-capability request
+        // with auto-start explicitly off, and NO injected spawn seam.
+        const err = await daemonRequest({
+          stateDir,
+          role: "control",
+          request,
+          deadlineMs: MIN_PASS_BUDGET_MS,
+          autoStart: false,
+        }).then(
+          () => null,
+          (e: unknown) => e,
+        );
+
+        expect(err).toBeInstanceOf(DaemonUnavailable);
+        expect((err as DaemonUnavailable).code).toBe("unavailable");
+      }
+
+      // Nothing started: no lifecycle holder, no socket, no daemon log.
+      expect(await probeShared(paths.lifecycleLockDb)).toBe("free");
+      expect(existsSync(paths.socket)).toBe(false);
+      expect(existsSync(join(stateDir, DAEMON_LOG))).toBe(false);
     },
     TIMEOUT,
   );
