@@ -320,7 +320,7 @@ function toPendingView(pending: PendingApproval): PendingView {
  * which predicate binds which projection; the call sites name the pairing,
  * which is the thing under test.
  */
-function assertProjection<T>(
+export function assertProjection<T>(
   payload: T,
   guard: (value: unknown) => boolean,
   projection: string,
@@ -478,6 +478,51 @@ export function isCheckPayloadShape(payload: unknown): payload is CheckPayload {
   if (payload.status === "not_found") return true;
   if (!(CHECK_BODY_STATUSES as readonly string[]).includes(payload.status as string)) return false;
   return typeof payload.executionId === "string";
+}
+
+/**
+ * True iff `payload` is a well-formed `DaemonStatusPayload`.
+ *
+ * EVERY field is checked, because `conduit daemon status` interpolates every
+ * one of them into the operator's report — this is the `isPausedRowShape`
+ * situation, not the `isExecutePayloadShape` one: nothing here is handed
+ * onward verbatim, so there is no field whose malformation is harmless.
+ *
+ * `startedAt` is checked as a FINITE number specifically: it reaches
+ * `new Date(...).toISOString()`, where a non-finite value throws a
+ * `RangeError` and `undefined` renders "Invalid Date". Either presents a
+ * protocol fault to the operator as a stack trace or as a nonsense report,
+ * instead of as the refusal it is. The remaining counters are finite
+ * numbers for the same reason the paused row's are — they are rendered, not
+ * merely carried.
+ *
+ * `logPath`/`logSizeBytes` are NULLABLE by contract (the daemon logs to a
+ * TTY when hand-started), so `null` is accepted and `undefined` is not: the
+ * renderer's `?? "stderr (hand-started)"` would turn an ABSENT field into a
+ * confident claim that the daemon is hand-started, which is a different
+ * fact from "the daemon told us it has no log file".
+ */
+export function isDaemonStatusShape(payload: unknown): payload is DaemonStatusPayload {
+  if (!isRecord(payload)) return false;
+  if (typeof payload.agentVersion !== "string") return false;
+  if (typeof payload.dbPath !== "string") return false;
+  for (const field of [
+    "pid",
+    "startedAt",
+    "connections",
+    "executionsInFlight",
+    "queueDepth",
+  ] as const) {
+    const value = payload[field];
+    if (typeof value !== "number" || !Number.isFinite(value)) return false;
+  }
+  if (payload.logPath !== null && typeof payload.logPath !== "string") return false;
+  if (payload.logSizeBytes !== null) {
+    if (typeof payload.logSizeBytes !== "number" || !Number.isFinite(payload.logSizeBytes)) {
+      return false;
+    }
+  }
+  return true;
 }
 
 /**

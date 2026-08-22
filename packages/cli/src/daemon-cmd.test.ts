@@ -1,4 +1,9 @@
-import { DaemonUnavailable, type RpcRequest, type RpcResponse } from "@conduithq/mcp";
+import {
+  DaemonUnavailable,
+  DRAIN_DEADLINE_MS,
+  type RpcRequest,
+  type RpcResponse,
+} from "@conduithq/mcp";
 import { describe, expect, it } from "vitest";
 import { type DaemonCmdDeps, runStatus, runStop, STOP_WAIT_MS } from "./commands/daemon.js";
 
@@ -36,10 +41,14 @@ function makeDeps(options: FakeOptions): Recorder {
   let probeCount = 0;
 
   const deps: DaemonCmdDeps = {
-    daemon: (request) => {
+    // The seam is kind-generic, so a fake has to be too. The cast is the
+    // FAKE's, not the command's: this stub answers every kind from one
+    // untyped literal, which is exactly what a fake is for — the command
+    // itself reads its payloads with no cast at all.
+    daemon: ((request: RpcRequest) => {
       requests.push(request);
       return options.answer(request);
-    },
+    }) as DaemonCmdDeps["daemon"],
     probeLifecycle: async () => {
       const reading = probes[Math.min(probeCount, probes.length - 1)] ?? "free";
       probeCount += 1;
@@ -94,15 +103,17 @@ describe("conduit daemon status", () => {
 
     const printed = rec.out.join("");
     expect(printed).toContain("running");
-    expect(printed).toContain("4242");
+    // LABELLED substrings, not bare digits: `toContain("3")` passes on any
+    // output containing a 3 anywhere — including the wrong field.
+    expect(printed).toContain("pid:         4242");
     // Both versions: the daemon's build AND this CLI's, so an operator
     // reading a skew warning can see the two numbers it names.
-    expect(printed).toContain("0.1.0");
-    expect(printed).toContain("/state/conduit.db");
-    expect(printed).toContain("3");
-    expect(printed).toContain("2");
-    expect(printed).toContain("5");
-    expect(printed).toContain("/state/conduitd.log");
+    expect(printed).toContain("version:     0.1.0 (this CLI: 0.1.0)");
+    expect(printed).toContain("db:          /state/conduit.db");
+    expect(printed).toContain("connections: 3");
+    expect(printed).toContain("in flight:   2 running, 5 queued");
+    expect(printed).toContain("log:         /state/conduitd.log (8192 bytes)");
+    expect(printed).toContain("started:     2026-08-22T12:00:00.000Z");
     expect(rec.requests).toEqual([{ kind: "daemon.status" }]);
   });
 
@@ -221,5 +232,14 @@ describe("conduit daemon stop", () => {
     expect(printed).toContain("SIGTERM");
     // Never waits on a lock a pre-control daemon was never asked to drop.
     expect(rec.probes).toBe(0);
+  });
+
+  it("waits longer than the daemon takes to drain", () => {
+    // STOP_WAIT_MS is documented as "the drain deadline plus margin" but
+    // derived from neither constant, and the two live in different
+    // packages — so nothing else fails if the daemon's budget grows. A wait
+    // window BELOW the drain deadline would report "still draining" at an
+    // operator for every daemon that merely used its full budget.
+    expect(STOP_WAIT_MS).toBeGreaterThan(DRAIN_DEADLINE_MS);
   });
 });

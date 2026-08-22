@@ -2134,16 +2134,30 @@ describe("conduitd lifecycle", () => {
     async () => {
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
+      let spawnCalls = 0;
 
       for (const request of [{ kind: "daemon.status" }, { kind: "daemon.stop" }] as const) {
-        // The CLI's exact production options: a control-capability request
-        // with auto-start explicitly off, and NO injected spawn seam.
+        // A RECORDING spawn seam, deliberately: without it, `spawnPermitted`
+        // suppresses the spawn on the custom-state-dir clause alone
+        // (`opts.spawn !== undefined || isDefaultStateDir(...)`), and this
+        // test would pass identically with `autoStart: true` — proving
+        // nothing about the flag. Injecting the seam satisfies that clause,
+        // so `autoStart: false` is the ONLY thing left suppressing a spawn.
         const err = await daemonRequest({
           stateDir,
           role: "control",
           request,
-          deadlineMs: MIN_PASS_BUDGET_MS,
+          // Comfortably ABOVE the floor, not exactly at it: the decision
+          // loop is entered only while `remaining >= MIN_PASS_BUDGET_MS`,
+          // so a budget equal to the floor can exit before the loop body —
+          // where the spawn lives — ever runs. That would make this test
+          // pass because nothing was attempted, not because the flag
+          // suppressed it.
+          deadlineMs: MIN_PASS_BUDGET_MS * 6,
           autoStart: false,
+          spawn: () => {
+            spawnCalls++;
+          },
         }).then(
           () => null,
           (e: unknown) => e,
@@ -2152,6 +2166,9 @@ describe("conduitd lifecycle", () => {
         expect(err).toBeInstanceOf(DaemonUnavailable);
         expect((err as DaemonUnavailable).code).toBe("unavailable");
       }
+
+      // The assertion the flag actually earns.
+      expect(spawnCalls).toBe(0);
 
       // Nothing started: no lifecycle holder, no socket, no daemon log.
       expect(await probeShared(paths.lifecycleLockDb)).toBe("free");

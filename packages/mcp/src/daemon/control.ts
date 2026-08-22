@@ -23,7 +23,12 @@
  * because a handler that never sees its principal cannot later be given
  * one without changing every call site.
  */
-import type { DaemonStatusPayload, DaemonStopPayload } from "../payloads.js";
+import {
+  assertProjection,
+  type DaemonStatusPayload,
+  type DaemonStopPayload,
+  isDaemonStatusShape,
+} from "../payloads.js";
 
 export type Principal = { kind: "anonymous-local" };
 
@@ -40,7 +45,7 @@ export interface ControlDeps {
 export function daemonStatus(_principal: Principal, deps: ControlDeps): DaemonStatusPayload {
   const queue = deps.queueStats();
   const log = deps.logInfo();
-  return {
+  const payload: DaemonStatusPayload = {
     pid: deps.pid(),
     agentVersion: deps.agentVersion,
     startedAt: deps.startedAt,
@@ -51,6 +56,12 @@ export function daemonStatus(_principal: Principal, deps: ControlDeps): DaemonSt
     logPath: log === null ? null : log.path,
     logSizeBytes: log === null ? null : log.sizeBytes,
   };
+  // The runtime half of "single source of truth" (payloads.ts
+  // `assertProjection`): the sender asserts its own output against the SAME
+  // predicate the client guard checks. Every field here comes from a `deps`
+  // callback, so a dep that returns a non-finite counter fails LOUDLY inside
+  // the daemon rather than silently on the wire as a client refusal.
+  return assertProjection(payload, isDaemonStatusShape, "daemonStatus");
 }
 
 /**

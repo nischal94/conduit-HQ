@@ -207,6 +207,18 @@ describe("decodeRequest", () => {
     ).toThrow(InvalidRpcRequest);
   });
 
+  it("the bad-capability message keeps the prefix `conduit daemon` matches on", () => {
+    // `isPreControlRejection` (cli commands/daemon.ts) detects a PRE-CONTROL
+    // daemon by this substring: such a daemon predates the `control`
+    // capability, so its refusal of the handshake is the only signal
+    // available. Rewording this message silently turns that remediation —
+    // the manual SIGTERM path — into a generic "unexpected error", so the
+    // wording is pinned HERE, where the reword would happen.
+    expect(() => decodeRequest({ kind: "handshake", protocol: 1, capability: "root" })).toThrow(
+      "handshake.capability must be one of",
+    );
+  });
+
   it("carries an optional dbPath so the daemon can refuse a custom-db client", () => {
     expect(
       decodeRequest({

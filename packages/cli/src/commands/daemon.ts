@@ -1,8 +1,6 @@
 import {
   AGENT_VERSION,
   createSkewReporter,
-  type DaemonStatusPayload,
-  type DaemonStopPayload,
   DaemonUnavailable,
   DEFAULT_CONDUIT_DIR,
   daemonPaths,
@@ -11,6 +9,7 @@ import {
   probeShared,
   type RpcRequest,
   type RpcResponse,
+  type RpcResponseFor,
   resolveEffectiveStateDir,
   sanitizeVersionForDisplay,
 } from "@conduithq/mcp";
@@ -51,8 +50,21 @@ import {
 export const STOP_WAIT_MS = 35_000;
 const STOP_POLL_MS = 100;
 
+/**
+ * The daemon seam, kind-GENERIC so the `RpcPayloadFor` map survives the
+ * call. Typing this `(request: RpcRequest) => Promise<RpcResponse>` would
+ * widen `payload` back to `unknown` at every call site and force each
+ * reader to re-narrow it by hand — the untyped call sites the map exists to
+ * retire (`RpcResponseFor`'s docblock). With `K` bound by the request, a
+ * `daemon.status` call returns a response whose `result` arm is already
+ * typed to `DaemonStatusPayload`.
+ */
+export type DaemonCmdCall = <K extends RpcRequest["kind"]>(
+  request: Extract<RpcRequest, { kind: K }>,
+) => Promise<RpcResponseFor<K>>;
+
 export interface DaemonCmdDeps {
-  daemon: (request: RpcRequest) => Promise<RpcResponse>;
+  daemon: DaemonCmdCall;
   /** Reads the lifecycle lock: "busy" while a daemon still holds it. */
   probeLifecycle: () => Promise<"free" | "busy">;
   now: () => number;
@@ -77,8 +89,10 @@ function prodDeps(stateDir: string): DaemonCmdDeps {
   // just spoke to holds — the same single resolver every other consumer runs.
   const paths = daemonPaths(resolveEffectiveStateDir(stateDir));
   return {
-    daemon: (request) =>
-      daemonRequest({
+    // `daemonRequest` is generic in the same kind, so the projection is
+    // carried end to end with no annotation of its own.
+    daemon: <K extends RpcRequest["kind"]>(request: Extract<RpcRequest, { kind: K }>) =>
+      daemonRequest<K>({
         stateDir,
         role: "control",
         request,
@@ -116,27 +130,33 @@ const PRE_CONTROL_REMEDIATION =
   "a current daemon.";
 
 /**
- * The refusal arms both verbs share, reduced to either an exit code or the
- * payload the caller may now read.
+ * The REFUSAL arms both verbs share: prints the operator line and answers
+ * whether the response is a usable result.
  *
- * Returning the PAYLOAD rather than a "keep going" signal is what keeps the
- * one unavoidable cast in one place: the wire type says `unknown` for these
- * kinds (correctly — a decoder cannot know which kind it is answering), so
- * a caller that only learned "not refused" would have to re-narrow the
- * response itself, at every call site.
+ * A TYPE PREDICATE rather than an exit-code return, so a `true` narrows the
+ * caller's `response` to the `result` arm — whose `payload` the
+ * `RpcResponseFor<K>` map has already typed to that kind's projection. That
+ * is what lets both verbs read their payload with no cast at all.
+ *
+ * Both refusals exit 1, so the caller needs no code from here: a
+ * pre-control daemon and a desynced frame are each "this did not happen",
+ * distinct from the absent-daemon codes, which are decided before any
+ * response exists.
  */
-type Accepted<P> = { ok: true; payload: P } | { ok: false; exitCode: number };
-
-function acceptResult<P>(verb: string, response: RpcResponse, deps: DaemonCmdDeps): Accepted<P> {
+function isUsableResult<K extends RpcRequest["kind"]>(
+  verb: string,
+  response: RpcResponseFor<K>,
+  deps: DaemonCmdDeps,
+): response is Extract<RpcResponseFor<K>, { kind: "result" }> {
   if (isPreControlRejection(response)) {
     deps.stderr(`${PRE_CONTROL_REMEDIATION}\n`);
-    return { ok: false, exitCode: 1 };
+    return false;
   }
   if (response.kind !== "result") {
     deps.stderr(`[conduit daemon] ${verb} failed: unexpected ${response.kind} answer.\n`);
-    return { ok: false, exitCode: 1 };
+    return false;
   }
-  return { ok: true, payload: response.payload as P };
+  return true;
 }
 
 function unavailableExitCode(
@@ -155,7 +175,7 @@ function unavailableExitCode(
 }
 
 export async function runStatus(deps: DaemonCmdDeps): Promise<number> {
-  let response: RpcResponse;
+  let response: RpcResponseFor<"daemon.status">;
   try {
     response = await deps.daemon({ kind: "daemon.status" });
   } catch (err) {
@@ -166,22 +186,19 @@ export async function runStatus(deps: DaemonCmdDeps): Promise<number> {
     }
     throw err;
   }
-  // Typed by `RpcPayloadFor<"daemon.status">` on the daemon's side; the
-  // client seam types `payload` as `unknown`, so this names the projection
-  // both ends are compiled against.
-  const accepted = acceptResult<DaemonStatusPayload>("status", response, deps);
-  if (!accepted.ok) return accepted.exitCode;
-  const status = accepted.payload;
+  if (!isUsableResult("status", response, deps)) return 1;
+  // Already `DaemonStatusPayload` — the kind-generic seam carried the
+  // projection through. The client guard (`isDaemonStatusShape`) is what
+  // makes that compile-time claim safe to READ: a malformed payload was
+  // refused above as an `error` frame, so no field access here can throw.
+  const status = response.payload;
   deps.stdout(
     "running\n" +
       `  pid:         ${status.pid}\n` +
       // The daemon's version is UNTRUSTED DISPLAY INPUT — it arrives over a
       // socket and lands on a terminal, exactly like the skew warning's
-      // copy of it, so it goes through the same allowlist rather than being
-      // printed raw. The `result` payload is `unknown` on the wire and the
-      // client seam validates only the shapes whose MISREADING is
-      // dangerous; a status render is where a stale or hostile daemon's
-      // string would otherwise reach a terminal unfiltered.
+      // copy of it, so it goes through the same allowlist. The guard proves
+      // it is a STRING; it does not prove the string is printable.
       `  version:     ${sanitizeVersionForDisplay(status.agentVersion)} (this CLI: ${AGENT_VERSION})\n` +
       `  started:     ${new Date(status.startedAt).toISOString()}\n` +
       `  db:          ${status.dbPath}\n` +
@@ -195,7 +212,7 @@ export async function runStatus(deps: DaemonCmdDeps): Promise<number> {
 }
 
 export async function runStop(deps: DaemonCmdDeps): Promise<number> {
-  let response: RpcResponse;
+  let response: RpcResponseFor<"daemon.stop">;
   try {
     response = await deps.daemon({ kind: "daemon.stop" });
   } catch (err) {
@@ -207,9 +224,9 @@ export async function runStop(deps: DaemonCmdDeps): Promise<number> {
   }
   // The ack payload (`{stopping: true}`) carries nothing this command
   // reports: it means "will stop", and the fact worth printing is whether
-  // it DID, which the lock below answers.
-  const accepted = acceptResult<DaemonStopPayload>("stop", response, deps);
-  if (!accepted.ok) return accepted.exitCode;
+  // it DID, which the lock below answers. So the result is checked for the
+  // refusal arms and its payload deliberately never read.
+  if (!isUsableResult("stop", response, deps)) return 1;
 
   // Ack received; wait for VERIFIED termination — see the module docblock.
   const waitUntil = deps.now() + STOP_WAIT_MS;

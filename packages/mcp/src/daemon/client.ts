@@ -32,6 +32,7 @@ import { connect, type Socket } from "node:net";
 import { join } from "node:path";
 import {
   isCheckPayloadShape,
+  isDaemonStatusShape,
   isExecutePayloadShape,
   isResumePayloadShape,
   type RpcPayloadFor,
@@ -1027,6 +1028,22 @@ function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcRe
           `the daemon's ${kind} answer carried no legal execution status. ` +
             "The execution's fate is NOT being reported here — do NOT assume it did not run. " +
             "Look it up with check_execution before re-issuing anything.",
+        );
+      }
+      return response;
+    }
+
+    case "daemon.status": {
+      // Every field is interpolated into the operator's report, and
+      // `startedAt` reaches `new Date(...).toISOString()` — where a
+      // malformed value throws a RangeError at the operator as a stack
+      // trace rather than as a refusal, the same failure the
+      // `approvals.list` row guard exists to prevent.
+      if (!isDaemonStatusShape(response.payload)) {
+        return refuse(
+          "the daemon's daemon.status answer was not a status projection. " +
+            "Nothing is being reported about the daemon — do NOT assume it is unhealthy or " +
+            'idle. Re-run "conduit daemon status"; if it persists, see the daemon log.',
         );
       }
       return response;

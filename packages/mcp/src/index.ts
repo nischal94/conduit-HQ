@@ -8,6 +8,12 @@ export {
 /** Exit codes are part of the §3.5 client contract — see conduitd.ts. */
 export {
   type DaemonPaths,
+  /**
+   * The daemon's drain budget. `conduit daemon stop`'s own wait window is
+   * sized against it, so the relationship is assertable rather than merely
+   * documented in a comment on the other side of a package boundary.
+   */
+  DRAIN_DEADLINE_MS,
   daemonPaths,
   EXIT_ALREADY_RUNNING,
   EXIT_ROTATION_IN_PROGRESS,
