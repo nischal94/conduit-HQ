@@ -115,6 +115,32 @@ export interface ConnectionListingView {
 }
 
 /**
+ * The `daemon.status` projection (§3.1): a snapshot computed daemon-side,
+ * with defined metric semantics, and no credential-adjacent material —
+ * the same §3.3 boundary `CatalogListing` draws. `logPath`/`logSizeBytes`
+ * are `null` when the daemon logs to a TTY rather than a file.
+ */
+export interface DaemonStatusPayload {
+  pid: number;
+  agentVersion: string;
+  /** Epoch ms the daemon's serve loop started. */
+  startedAt: number;
+  dbPath: string;
+  /** READY-granted open sockets, the asking connection included. */
+  connections: number;
+  /** Queue entries currently running. */
+  executionsInFlight: number;
+  /** Queue entries admitted and waiting. */
+  queueDepth: number;
+  logPath: string | null;
+  logSizeBytes: number | null;
+}
+
+export interface DaemonStopPayload {
+  stopping: true;
+}
+
+/**
  * The `approvals.list` projection — one row per paused execution.
  *
  * A PROJECTION for the same §3.3 reason as `ResumePayload`: the stored
@@ -173,7 +199,11 @@ export type RpcPayloadFor<K extends RpcRequest["kind"]> = K extends "catalog.lis
           ? ResumePayload
           : K extends "source.provision" | "source.revalidate"
             ? ProvisionPayload
-            : unknown;
+            : K extends "daemon.status"
+              ? DaemonStatusPayload
+              : K extends "daemon.stop"
+                ? DaemonStopPayload
+                : unknown;
 
 /**
  * Projects one paused `Execution` for the `approvals.list` response.

@@ -297,3 +297,36 @@ describe("CAPABILITIES", () => {
     expect(CAPABILITIES["add-mcp"].has("execute")).toBe(false);
   });
 });
+
+describe("control vocabulary", () => {
+  it("decodes daemon.status and daemon.stop as nullary requests", () => {
+    expect(decodeRequest({ kind: "daemon.status" })).toEqual({ kind: "daemon.status" });
+    expect(decodeRequest({ kind: "daemon.stop" })).toEqual({ kind: "daemon.stop" });
+  });
+
+  it("rejects any field on the nullary control kinds — a client steers nothing", () => {
+    expect(() => decodeRequest({ kind: "daemon.status", verbose: true })).toThrow(
+      InvalidRpcRequest,
+    );
+    expect(() => decodeRequest({ kind: "daemon.stop", force: true })).toThrow(InvalidRpcRequest);
+  });
+
+  it("accepts a control-capability handshake", () => {
+    expect(decodeRequest({ kind: "handshake", protocol: 1, capability: "control" })).toEqual({
+      kind: "handshake",
+      protocol: 1,
+      capability: "control",
+    });
+  });
+
+  it("scopes the control row to exactly handshake + the two daemon verbs", () => {
+    expect([...CAPABILITIES.control].sort()).toEqual(["daemon.status", "daemon.stop", "handshake"]);
+  });
+
+  it("leaves the serve/approvals/add-mcp rows without any control verb", () => {
+    for (const row of ["serve", "approvals", "add-mcp"] as const) {
+      expect(CAPABILITIES[row].has("daemon.status")).toBe(false);
+      expect(CAPABILITIES[row].has("daemon.stop")).toBe(false);
+    }
+  });
+});

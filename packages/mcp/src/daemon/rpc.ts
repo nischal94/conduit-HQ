@@ -120,7 +120,16 @@ export type RpcRequest =
       replace: boolean;
       clearCredential: boolean;
     }
-  | { kind: "source.revalidate"; namespace: string };
+  | { kind: "source.revalidate"; namespace: string }
+  /**
+   * Nullary on purpose (§3.1): the client supplies no parameters, so it
+   * cannot narrow what the daemon reports or which daemon it stops.
+   * Answered outside the execution queue — a busy or unreachable queue
+   * must never delay a status read or a shutdown request. Scoped to the
+   * `control` capability alone: no other row gains either verb.
+   */
+  | { kind: "daemon.status" }
+  | { kind: "daemon.stop" };
 
 export type RpcResponse =
   | { kind: "ready" }
@@ -377,13 +386,21 @@ export function decodeRequest(v: unknown): RpcRequest {
       }
       return { kind: "source.revalidate", namespace: v.namespace };
     }
+    case "daemon.status": {
+      assertNoExtraKeys(v, ["kind"]);
+      return { kind: "daemon.status" };
+    }
+    case "daemon.stop": {
+      assertNoExtraKeys(v, ["kind"]);
+      return { kind: "daemon.stop" };
+    }
     default:
       throw new InvalidRpcRequest(`unknown request kind "${kind}"`);
   }
 }
 
 export const CAPABILITIES: Record<
-  "serve" | "approvals" | "add-mcp",
+  "serve" | "approvals" | "add-mcp" | "control",
   ReadonlySet<RpcRequest["kind"]>
 > = {
   // D-B1 added the three read-only kinds; the row stays free of every
@@ -399,4 +416,10 @@ export const CAPABILITIES: Record<
   ]),
   approvals: new Set(["approvals.list", "approvals.resume", "handshake"]),
   "add-mcp": new Set(["source.provision", "source.revalidate", "handshake"]),
+  // The capability set scopes an HONEST client — it is not a privilege
+  // boundary against a hostile same-UID process, which can already read
+  // and write the UDS socket file directly. That is the parent design's
+  // accepted v1 limit (§3.1); the boundary this row enforces is "a
+  // well-behaved client only ever asks for what its role needs."
+  control: new Set(["handshake", "daemon.status", "daemon.stop"]),
 };
