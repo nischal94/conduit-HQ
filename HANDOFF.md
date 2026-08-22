@@ -31,7 +31,91 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-18 (Lane B MERGED: PR #48 squash → main `f016c8d`; §17 step 2 daemon ownership COMPLETE; next: §17 step 3 [daemon control API / hot-reload])
+## Current handoff — updated 2026-08-22 (§17 step 3 DESIGNED + PLANNED on branch `docs/daemon-control-design`; next: BUILD via SDD)
+
+**DESIGN + PLAN COMPLETE 2026-08-22 — branch `docs/daemon-control-design`
+(pushed, no PR yet; LEARNINGS #21 applies: invisible to the git tripwire,
+pair with `gh pr list`).** Four commits: spec draft → revision 2 (review
+folded) → exit-code decision → implementation plan.
+
+- **Spec:** `docs/superpowers/specs/2026-08-22-daemon-control-hot-reload-design.md`
+  revision 2, CONVERGED after a THREE-PASS review (in-session eng review ·
+  codex cross-model, 36 findings · code-verifying fable audit, 11 findings;
+  ~4 overlapped — adjudication trail in the spec's §11). Human-confirmed
+  decisions: foundations now / HTTP listener ships with step 4 (honors the
+  parent design's "steps 3+4 = one externally-reachable increment");
+  verbs = `daemon.status` + `daemon.stop` only (no restart, no
+  auto-restart — skew warns); deferred items #2 (log bound) + #4
+  (version-sync guard) fold in, #3 (Linux ACL) stays parked; `status`
+  exits 0 running / 3 not running. Load-bearing review catches now IN the
+  spec: the daemon logs through INHERITED stderr so rotation needs a
+  daemon-owned sink (§5); serve `search`/`describe` bypass the runtime via
+  per-call store snapshots and must be rewired or hot-reload ships
+  incomplete with green tests (§2.1 + the §9 mechanism pin); `stop` waits
+  for verified termination so `daemon stop` → `key rotate` works
+  back-to-back (§3.2); a pre-control daemon cannot be RPC-stopped — manual
+  SIGTERM fallback is specced and tested (§3.2/§4).
+- **Plan:** `docs/superpowers/plans/2026-08-22-daemon-control-hot-reload.md`
+  — 9 TDD tasks, ONE PR (`feat/daemon-control`): RPC vocabulary → long-lived
+  runtime → hot-reload hook (+ bounded-input verification) → control
+  handlers → rotating log sink → skew warning → `conduit daemon` CLI →
+  version pins + rotate guidance → docs/ledger closeout. Global constraints
+  in the plan header are binding (zero new deps; no schema changes;
+  serve/approvals/add-mcp capability rows unchanged; no HTTP).
+
+### DEFERRED FOLLOW-UPS (carry; updated 2026-08-22)
+
+1. **§16 flake fix (PR #49)** — holding; consistent-with-fixed. If the CI
+   worker crash EVER recurs: the worker crash is the signal, not the abort
+   stderr; consider lowering maxForks further.
+2. **Unbounded daemon log — IN THE PLAN** (Task 5). No longer parked.
+3. **Linux ACL enforcement untested on CI** — parked by human decision
+   (2026-08-22 review adjudication); its own housekeeping PR when picked up.
+4. **AGENT_VERSION ↔ package.json sync — IN THE PLAN** (Task 8).
+5. **Dependabot: 5 alerts (4 moderate / 1 low), parked.** Pins hold the two
+   HIGHs cleared; retire when @modelcontextprotocol/sdk ships patched
+   transitives.
+6. **NEW — execution-level source/tool revision pinning** (spec §10 future
+   hardening): closes the approve-then-retarget window hot-reload makes more
+   visible. Trigger: revisit at step 5 (console approvals UX) or on the
+   first real multi-operator deployment.
+7. **NEW — source-removal verb** (dogfood friction log wants it; spec §2.2
+   defines its catalog obligation). Trigger: console step 5 or an
+   `add-mcp --remove` request.
+
+### NEXT SESSION — build the plan via SDD
+
+Fresh session: `git fetch origin`, cut the working branch FROM THE DOCS
+BRANCH — `git checkout -b feat/daemon-control origin/docs/daemon-control-design`
+— NOT from origin/main (main lacks the spec/plan; they ride the PR, the
+PR #41/#46 precedent). Run superpowers:subagent-driven-development over
+the plan task-by-task: fresh implementer per task → vitest in the
+FOREGROUND → two-verdict review → ledger under `.superpowers/sdd/`.
+After Task 9: whole-branch review → push → PR with a Deviations section →
+full load-bearing gauntlet (Tier-2 wave, /security-review, code-review
+mechanic, codex arc per codex-one-path.md to convergence) →
+/explain-diff quiz → HUMAN-NAMED merge → post-merge sweep + rebuild +
+real-db canary. Environment quirks unchanged: commits sandbox-disabled,
+never --no-verify; pnpm/npx blocked by sfw (use
+packages/<p>/node_modules/.bin/* directly); the agent never installs;
+gh in background tasks is config-blind (poll unauth via curl).
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: §17 step 3 (daemon control + hot-reload) is DESIGNED and
+> PLANNED — spec revision 2 (three-pass-reviewed, converged) + 9-task plan,
+> both on branch `docs/daemon-control-design`. Do NOT redesign or re-run
+> the design review.** Cut `feat/daemon-control` from
+> origin/docs/daemon-control-design (NOT main) and BUILD via
+> superpowers:subagent-driven-development per the plan. Full load-bearing
+> gauntlet on the PR; HUMAN-NAMED merge. Carry the 7 deferred follow-ups
+> in the DEFERRED section.
+
+---
+
+## Superseded handoff — updated 2026-08-18 (Lane B MERGED: PR #48 squash → main `f016c8d`; §17 step 2 daemon ownership COMPLETE; its NEXT [§17 step 3 design] was completed 2026-08-22 by the section above)
 
 **MERGE + POST-MERGE (2026-08-18):** PR #48 squash → main `f016c8d`
 (human named the merge; agent executed it). Lane B converts every
