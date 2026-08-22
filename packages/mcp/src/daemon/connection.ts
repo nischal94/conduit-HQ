@@ -677,6 +677,15 @@ async function runSourceRequest(
  * catalog mutations then run synchronously in one tick, so no request can
  * observe the removed-but-not-upserted state.
  *
+ * Both mutations are scoped to THIS namespace, which is the scope the held
+ * lock actually covers. `store.tools.list()` returns every namespace's
+ * tools, so upserting it whole would write outside the lock: a concurrent
+ * provision of ANOTHER namespace holds a DIFFERENT lock, and a full-list
+ * snapshot taken before its commit could re-insert tools that namespace's
+ * own refresh just retired. Filtering the snapshot down to `namespace`
+ * makes the write scope match the lock scope, so the two refreshes cannot
+ * overwrite each other regardless of how they interleave.
+ *
  * NEVER throws — not for a store fault, not for a catalog fault, and not
  * for a failing `log`: a refresh failure after a COMMITTED write must not
  * turn the operator's successful provisioning into an error answer. Every
@@ -685,8 +694,9 @@ async function runSourceRequest(
  *
  * Recovery ladder, both rungs:
  *
- *  1. Retry the same remove-then-upsert against a fresh store read. This
- *     repeats `store.tools.list()`, the call most likely to have failed —
+ *  1. Retry the same remove-then-upsert — this namespace refreshed again
+ *     from the store, not the whole catalog rebuilt. It repeats
+ *     `store.tools.list()`, the call most likely to have failed —
  *     deliberately, since a transient store fault is the case worth one
  *     retry, and a persistent one lands on rung 2 immediately.
  *  2. Keep serving the previous catalog: stale, but CONSISTENT, and
@@ -717,7 +727,7 @@ async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promis
   try {
     const tools = await deps.store.tools.list();
     deps.runtime.catalog.removeNamespace(namespace);
-    deps.runtime.catalog.upsert(tools);
+    deps.runtime.catalog.upsert(tools.filter((tool) => tool.namespace === namespace));
   } catch (err) {
     safeLog(
       `[conduitd] Catalog refresh failed after commit: retrying the namespace refresh. Context: {namespace: ${namespace}, cause: ${
@@ -727,7 +737,7 @@ async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promis
     try {
       const tools = await deps.store.tools.list();
       deps.runtime.catalog.removeNamespace(namespace);
-      deps.runtime.catalog.upsert(tools);
+      deps.runtime.catalog.upsert(tools.filter((tool) => tool.namespace === namespace));
       safeLog(
         `[conduitd] Catalog refreshed on retry after an earlier failure. Context: {namespace: ${namespace}}`,
       );

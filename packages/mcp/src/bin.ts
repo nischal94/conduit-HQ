@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, statSync } from "node:fs";
+import { existsSync, mkdirSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
 import { takeStateDir } from "./args.js";
@@ -367,6 +367,18 @@ async function main(): Promise<void> {
     // exactly `{PATH}`, so the SPAWNER reads `CONDUIT_DAEMON_DEBUG` and
     // threads the decision here as a flag.
     const debug = parsed.rest.includes("--debug");
+    // The sink below is opened INSIDE the state directory, so the directory
+    // has to exist before it. The client spawn path already does this
+    // (`spawn.ts`) before opening the inherited log fd; a by-hand
+    // `--daemon --state-dir <fresh>` with non-TTY stderr — nohup or a
+    // redirect, the normal way a hand start is backgrounded — reaches the
+    // open with nothing created yet and would die on a raw ENOENT before
+    // `runDaemon` could create it. `recursive: true` makes this idempotent
+    // for every later start. Like the spawn path's, this create validates
+    // nothing: the boundary check is `ensureStateDir`'s, run over this same
+    // path as the daemon's first act, so a 0700-mode create that loses a
+    // race to a hostile directory is caught there rather than trusted here.
+    mkdirSync(resolvedStateDir, { recursive: true, mode: 0o700 });
     // Spec §5: owned rotating sink when backgrounded; a hand-started
     // daemon on a terminal keeps stderr and performs no rotation.
     const sink = process.stderr.isTTY ? null : createRotatingLog(resolvedStateDir);

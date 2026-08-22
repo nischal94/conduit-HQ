@@ -1230,6 +1230,43 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
     });
   }
 
+  it("`--daemon --state-dir <nonexistent>` with piped stdio STARTS — it creates the dir rather than dying on ENOENT", async () => {
+    // The by-hand daemon start, backgrounded the normal way (nohup or a
+    // redirect), has NO tty on stderr — so `bin.ts` opens its owned rotating
+    // sink INSIDE the state directory. On a directory that does not exist
+    // yet, that open is the first thing to touch it, and without a create
+    // ahead of it the process dies on a raw ENOENT before `ensureStateDir`
+    // ever runs. The client spawn path never hits this because `spawn.ts`
+    // creates the directory before opening its own log fd; a hand start had
+    // no equivalent. Piped stdio here reproduces the non-tty condition.
+    // A SHORT prefix, deliberately: the daemon binds a Unix socket inside
+    // this directory, and `sun_path` caps the whole pathname at ~104 bytes
+    // on macOS. A longer temp prefix binds a silently truncated path and
+    // fails the post-bind identity stat, which would look like this fix
+    // regressing when it is only the test's own path being too long.
+    const home = mkdtempSync(join(tmpdir(), "cd-fresh-"));
+    try {
+      // Deliberately NOT created: the whole point is that the daemon makes
+      // it. Nested one level so the recursive create is exercised too.
+      const freshDir = join(home, "s", "n");
+      expect(existsSync(freshDir)).toBe(false);
+
+      const keyB64 = Buffer.from(SecretBox.generateKeyBytes()).toString("base64");
+      // Readiness by the conduitd.log poll (the sink, not stderr) — the same
+      // observation every other spawned-daemon case in this block makes.
+      await startDoctorDaemon(freshDir, keyB64);
+
+      // It started, so the directory exists and carries the 0700 mode the
+      // boundary requires — proving the create happened here rather than
+      // the process having survived by some other route.
+      expect(existsSync(freshDir)).toBe(true);
+      expect(statSync(freshDir).mode & 0o777).toBe(0o700);
+      expect(existsSync(join(freshDir, "conduitd.log"))).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("INVARIANT §17 / §9.1: `--doctor --offline` REFUSES while a daemon is live, naming the holder", async () => {
     // The offline mode's exclusivity is not caution about reading — it is
     // what makes its report coherent. Beside a live daemon (or a rotation)

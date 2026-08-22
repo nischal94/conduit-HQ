@@ -14,8 +14,10 @@
  * bounded-in-practice best effort rather than claimed as a guarantee.
  *
  * Rotation stays inside the state directory, whose 0700 mode the daemon
- * verified by lstat at startup (`ensureStateDir`), so the rename target is
- * not a path an unprivileged process can interpose on.
+ * verifies by lstat at startup (`ensureStateDir`), so the rename target is
+ * not a path an unprivileged process can interpose on. The sink opens
+ * BEFORE that verification runs, which is why the open itself carries
+ * `O_NOFOLLOW` (see `LOG_OPEN_FLAGS`) rather than resting on it.
  *
  * Concurrent appenders are possible and correct: the spawning client's
  * failure line and a losing auto-start child both hold their own append fds
@@ -23,9 +25,24 @@
  * `.1`. The single-writer claim is deliberately NOT made here — the byte
  * counter below tracks what THIS sink wrote, which is what the cap governs.
  */
-import { closeSync, fstatSync, openSync, renameSync, writeSync } from "node:fs";
+import { closeSync, constants, fstatSync, openSync, renameSync, writeSync } from "node:fs";
 import { join } from "node:path";
 import { DAEMON_LOG } from "./spawn.js";
+
+/**
+ * The append-open, spelled numerically so `O_NOFOLLOW` can join it.
+ *
+ * `"a"` is `O_WRONLY|O_CREAT|O_APPEND`; the added flag refuses to open the
+ * log when the final path component is a symlink. The state directory is a
+ * 0700 boundary (§3.2), but this open happens BEFORE `ensureStateDir` has
+ * lstat-verified it — a daemon started by hand against a directory that is
+ * not yet blessed would otherwise follow a planted `conduitd.log` link and
+ * append daemon diagnostics to a file outside the boundary. Applies to the
+ * post-rotation reopen for the same reason: the rename leaves the name free
+ * for exactly that plant.
+ */
+const LOG_OPEN_FLAGS =
+  constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW;
 
 /** Normative-local (spec §5): active-file cap; worst case on disk ~2x. */
 export const LOG_MAX_BYTES = 5 * 1024 * 1024;
@@ -42,14 +59,14 @@ export interface RotatingLog {
 
 export function createRotatingLog(stateDir: string): RotatingLog {
   const path = join(stateDir, DAEMON_LOG);
-  let fd = openSync(path, "a", 0o600);
+  let fd = openSync(path, LOG_OPEN_FLAGS, 0o600);
   let bytes = fstatSync(fd).size;
   let nextRotateAttempt = LOG_MAX_BYTES;
 
   const rotate = (): void => {
     try {
       renameSync(path, `${path}.1`);
-      const fresh = openSync(path, "a", 0o600);
+      const fresh = openSync(path, LOG_OPEN_FLAGS, 0o600);
       closeSync(fd);
       fd = fresh;
       bytes = 0;

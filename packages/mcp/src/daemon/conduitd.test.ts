@@ -1936,8 +1936,8 @@ describe("conduitd lifecycle", () => {
       // turn a landed provisioning into an error answer, and must not strand
       // the catalog behind the store. The fixture poisons
       // `catalog.removeNamespace` for exactly ONE call — the refresh's — so
-      // the recovery ladder's first rung (full rehydrate from the store) is
-      // what publishes the new tools.
+      // the recovery ladder's first rung (this namespace re-read from the
+      // store) is what publishes the new tools.
       const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
