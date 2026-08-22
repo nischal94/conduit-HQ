@@ -1,5 +1,11 @@
+import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
 import { COMMANDS, dispatch, VERSION } from "./dispatch.js";
+
+it("CLI VERSION matches package.json", () => {
+  const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+  expect(VERSION).toBe(pkg.version);
+});
 
 describe("dispatch (design §6 — pure arg→route function)", () => {
   it("routes a known command to its route decision", () => {
