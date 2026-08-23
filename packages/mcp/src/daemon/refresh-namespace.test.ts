@@ -28,6 +28,8 @@ interface Harness {
   deps: ConnectionDeps;
   calls: CatalogCall[];
   logs: string[];
+  /** Every `tools.list` argument, in call order. Counts the store reads. */
+  listArgs: (string | undefined)[];
 }
 
 function makeDeps(options: {
@@ -43,6 +45,7 @@ function makeDeps(options: {
 }): Harness {
   const calls: CatalogCall[] = [];
   const logs: string[] = [];
+  const listArgs: (string | undefined)[] = [];
   let removes = 0;
   let upserts = 0;
   let lists = 0;
@@ -50,10 +53,18 @@ function makeDeps(options: {
   const deps = {
     store: {
       tools: {
-        list: async (): Promise<Tool[]> => {
+        // Honors the namespace argument, exactly as the real
+        // `store.tools.list(namespace)` does (`sqlite.ts`, indexed with the
+        // same ORDER BY). A fake that ignored it would keep passing after a
+        // regression that dropped the scoping and reinstated a filter — or
+        // dropped both — so the scoping assertion has to bite HERE.
+        list: async (namespace?: string): Promise<Tool[]> => {
           lists += 1;
+          listArgs.push(namespace);
           if (lists === options.failListOn) throw new Error("injected store fault");
-          return options.tools;
+          return namespace === undefined
+            ? options.tools
+            : options.tools.filter((tool) => tool.namespace === namespace);
         },
       },
     },
@@ -80,7 +91,7 @@ function makeDeps(options: {
     // is the FAKE's, narrowing to exactly what refreshNamespace touches.
   } as unknown as ConnectionDeps;
 
-  return { deps, calls, logs };
+  return { deps, calls, logs, listArgs };
 }
 
 const TOOLS: Tool[] = [
@@ -96,8 +107,8 @@ describe("refreshNamespace", () => {
     // writes another namespace's rows under a lock that never covered them,
     // which is how a concurrently-retired tool gets resurrected.
     //
-    // MUTATION CHECK: drop the `.filter(...)` in `refreshNamespace` and the
-    // upsert below carries `jira.list_tickets`, failing this test.
+    // MUTATION CHECK: widen the read to `store.tools.list()` and the upsert
+    // below carries `jira.list_tickets`, failing this test.
     const h = makeDeps({ tools: TOOLS });
 
     await refreshNamespace(h.deps, "github");
@@ -106,6 +117,10 @@ describe("refreshNamespace", () => {
       { op: "remove", detail: ["github"] },
       { op: "upsert", detail: ["github.list_issues", "github.list_releases"] },
     ]);
+    // Scoped at the QUERY, not by a filter over every namespace's rows: the
+    // store is asked for this namespace alone, which is what makes the
+    // scoping hold at the read rather than depending on a later step.
+    expect(h.listArgs).toEqual(["github"]);
     // Stated separately, because THIS is the damaging half: no other
     // namespace's row is ever written.
     const written = h.calls.flatMap((c) => (c.op === "upsert" ? c.detail : []));
@@ -123,17 +138,50 @@ describe("refreshNamespace", () => {
     expect(h.calls.map((c) => c.op)).toEqual(["remove", "upsert"]);
   });
 
-  it("retries the whole materialize-then-mutate body on rung 1", async () => {
-    // The retry re-reads the store rather than reusing the failed attempt's
-    // snapshot: a transient store fault is the case worth one retry.
-    const h = makeDeps({ tools: TOOLS, failRemoveOn: 1 });
+  it("retries a failed MUTATE without a second store read", async () => {
+    // The observable-empty window, closed. A mutate can fail AFTER the
+    // remove has already run, leaving the namespace empty. If the retry
+    // re-read the store it would `await` in exactly that state, handing
+    // control to the event loop with the namespace observably empty — any
+    // concurrent request landing in that window sees a namespace with no
+    // tools, on a provisioning that COMMITTED successfully.
+    //
+    // The retry therefore reuses the array it already holds. `mutate` has no
+    // `await`, so the removed-but-not-upserted state never survives a tick.
+    //
+    // MUTATION CHECK: make the rung-1 retry re-read (`mutate(await read())`
+    // unconditionally) and the read count below goes to 2, failing here.
+    const h = makeDeps({ tools: TOOLS, failUpsertOn: 1 });
 
     await refreshNamespace(h.deps, "github");
 
-    // Rung 1 ran the full body again — remove THEN upsert, not a bare
-    // upsert onto a namespace the failed attempt may have half-cleared.
-    expect(h.calls.map((c) => c.op)).toEqual(["remove", "remove", "upsert"]);
+    // The remove ran, the upsert failed, and the retry re-ran BOTH halves of
+    // the mutation — a bare upsert would leave a retired tool serving.
+    expect(h.calls.map((c) => c.op)).toEqual(["remove", "upsert", "remove", "upsert"]);
+    // ONE store read across the whole ladder. This is the assertion the
+    // window depends on: a second read means a second suspension point.
+    expect(h.listArgs).toEqual(["github"]);
     expect(h.logs.join("\n")).toContain("retrying the namespace refresh");
+    expect(h.logs.join("\n")).toContain("Catalog refreshed on retry");
+    // Recovered to the right contents, not merely to "no error".
+    expect(h.calls.at(-1)).toEqual({
+      op: "upsert",
+      detail: ["github.list_issues", "github.list_releases"],
+    });
+  });
+
+  it("retries the whole read-then-mutate when the READ is what failed", async () => {
+    // The other rung-1 shape. A failed read removed nothing, so no window
+    // was ever opened and repeating the read is both safe and necessary —
+    // the read is the half that failed, and a transient store fault is the
+    // case worth one retry.
+    const h = makeDeps({ tools: TOOLS, failListOn: 1 });
+
+    await refreshNamespace(h.deps, "github");
+
+    // No catalog call at all before the retry: nothing was mutated.
+    expect(h.calls.map((c) => c.op)).toEqual(["remove", "upsert"]);
+    expect(h.listArgs).toEqual(["github", "github"]);
     expect(h.logs.join("\n")).toContain("Catalog refreshed on retry");
   });
 

@@ -243,6 +243,43 @@ const sweep: CrashTerminalSweep | undefined = seedCatalog
       : undefined;
 
 /**
+ * The runtime-selecting flags are MUTUALLY EXCLUSIVE: the `createRuntime`
+ * chain below is a ternary cascade, so it silently picks the first match
+ * and drops every later one. A test that passed two of them would get a
+ * daemon wired for only one and would still PASS — proving nothing about
+ * the behavior it named in its second flag. A misconfigured test must fail
+ * loudly instead.
+ *
+ * The exclusive set, in the cascade's own order:
+ * --pause-execute, --stall-sandbox, --throw-execute, --huge-execute,
+ * --stall-execute, --stall-running, --count-runtime-builds,
+ * --plant-catalog-tool, --poison-catalog-upsert, --poison-catalog-refresh.
+ *
+ * The sweep-selecting flags (--seed-catalog, --sweep-on-start, and the
+ * marker/stall/delay group) are a SEPARATE cascade and are not checked
+ * here.
+ */
+const RUNTIME_FLAGS = [
+  "--pause-execute",
+  "--stall-sandbox",
+  "--throw-execute",
+  "--huge-execute",
+  "--stall-execute",
+  "--stall-running",
+  "--count-runtime-builds",
+  "--plant-catalog-tool",
+  "--poison-catalog-upsert",
+  "--poison-catalog-refresh",
+];
+const selectedRuntimeFlags = RUNTIME_FLAGS.filter((flag) => rest.includes(flag));
+if (selectedRuntimeFlags.length > 1) {
+  console.error(
+    `[run-daemon] Runtime flag selection failed: these flags are mutually exclusive and only the first would take effect. Context: {flags: ${selectedRuntimeFlags.join(", ")}}`,
+  );
+  process.exit(1);
+}
+
+/**
  * Stalls one execution inside the store/manager layer, which §16's
  * sandbox budgets do not bound — the case a bounded drain exists for.
  * Supplied through the daemon's own `createRuntime` seam, so the daemon

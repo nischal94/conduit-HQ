@@ -254,8 +254,16 @@ function startDaemonWith(
       // daemon started BY HAND, which is the supported path (§3.1).
       env: daemonEnv(opts.allowPrivateEgress !== false),
     });
-    const timer = setTimeout(() => reject(new Error("daemon did not report listening")), 30_000);
     let buf = "";
+    // `buf` is the daemon's accumulated stdout. Without it a timeout says
+    // only that 30s elapsed; with it, the reason the readiness line never
+    // arrived — a refusal exit, an early fault — is in the failure message
+    // itself rather than lost with the child. Same shape as the
+    // exited-early rejection just below, and as `key.test.ts`.
+    const timer = setTimeout(
+      () => reject(new Error(`daemon did not report listening. Output: ${buf}`)),
+      30_000,
+    );
     child.stdout?.on("data", (chunk: Buffer) => {
       buf += chunk.toString("utf8");
       if (buf.includes("listening")) {

@@ -224,7 +224,16 @@ function startDaemonAt(dir: string): Promise<ChildProcess> {
       if (contents.slice(baseline).includes("listening")) settle(() => resolve(child));
     }, 50);
     const timer = setTimeout(
-      () => settle(() => reject(new Error("daemon did not report listening"))),
+      () =>
+        settle(() =>
+          // `seen` is every byte of the daemon's stdout+stderr. A timeout
+          // with a bare message tells a CI reader only that 30s elapsed;
+          // the accumulated output is where the actual cause lives — a
+          // crash before the sink opened, a refusal exit, a Node fault —
+          // and it is unrecoverable from the log file in exactly those
+          // cases. Mirrors the shape `key.test.ts` already uses.
+          reject(new Error(`daemon did not report listening. Output: ${seen}`)),
+        ),
       30_000,
     );
     child.once("error", (err) => {
