@@ -22,6 +22,7 @@ import {
   EXIT_ALREADY_RUNNING,
   EXIT_ROTATION_IN_PROGRESS,
   ExecutionQueue,
+  HANDSHAKE_DEADLINE_MS,
   QUEUE_CAPACITY,
   RESUME_ADMISSION_DEADLINE_MS,
 } from "./conduitd.js";
@@ -1579,6 +1580,60 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
+    "ends a connection that takes READY and never handshakes, and drops it from the count",
+    async () => {
+      // READY is granted before the client says anything, so a peer that
+      // connects and then goes silent is READY-granted forever: it inflates
+      // `daemon.status`'s connection number AND holds the §3.3 grace loop,
+      // adding the full DRAIN_DEADLINE_MS to every stop. No hostile client
+      // is needed — a wedged process or a half-open peer does it by
+      // accident.
+      //
+      // Deliberately a RAW connection with no handshake sent, because the
+      // handshake is exactly what the deadline bounds.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const observer = await connectClient(paths.socket);
+      await handshake(observer, "control");
+
+      const silent = await connectClient(paths.socket);
+      // READY, and nothing after it: the connection now counts.
+      expect(await silent.next()).toMatchObject({ kind: "ready" });
+
+      observer.send({ kind: "daemon.status" });
+      const before = (await observer.next()) as { payload: { connections: number } };
+      // Both connections are READY-granted right now — non-vacuous, since a
+      // count that never rose would make the drop below meaningless.
+      expect(before.payload.connections).toBe(2);
+
+      // The daemon says WHY before it closes, so a client that stalled by
+      // accident can tell this apart from a refusal or a crash.
+      expect(await silent.next(HANDSHAKE_DEADLINE_MS * 2)).toMatchObject({
+        kind: "error",
+        code: "invalid",
+        message: expect.stringContaining("handshake"),
+      });
+      await silent.closed;
+
+      // The count returns to the one live handshaked client. This is the
+      // status half of the fix; the drain half follows from the same
+      // predicate — both surfaces count READY-granted live sockets, and the
+      // deadline only bounds how long a silent one can be among them.
+      observer.send({ kind: "daemon.status" });
+      const after = (await observer.next()) as { payload: { connections: number } };
+      expect(after.payload.connections).toBe(1);
+
+      observer.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
     "rejects control verbs from serve, and serve/provision verbs from control",
     async () => {
       // The capability row is the authorization boundary (§9), and it cuts
@@ -1717,11 +1772,14 @@ describe("conduitd lifecycle", () => {
   it(
     "stop is prompt when nothing is in flight",
     async () => {
-      // Pins the one-shot client assumption: a control client disconnects
-      // right after its ack, so an idle daemon has no READY-granted
-      // connection holding the drain grace open and exits at once. Far
-      // below DRAIN_DEADLINE_MS — if this ever approaches the deadline, the
-      // stop path is waiting out the grace window instead of finishing.
+      // Pins that the DAEMON, not the client, keeps stop prompt. The
+      // control connection is deliberately left OPEN after the ack: it is
+      // a READY-granted socket, so if the daemon did not end it server-side
+      // after flushing the ack, the §3.3 grace loop would wait on it and
+      // the stop would ride the full DRAIN_DEADLINE_MS. Adding a
+      // client-side `destroy()` here would hide exactly that defect, which
+      // is why there is none — the assertion below is only meaningful
+      // against a client that behaves badly.
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
       const daemon = spawnDaemon(stateDir);
@@ -1734,9 +1792,6 @@ describe("conduitd lifecycle", () => {
         kind: "result",
         payload: { stopping: true },
       });
-      // The one-shot disconnect the CLI performs after its ack.
-      control.socket.destroy();
-
       const ackedAt = Date.now();
       expect(await daemon.waitForExit()).toBe(0);
       // The lifecycle lock reads free — measured from the ack, not from

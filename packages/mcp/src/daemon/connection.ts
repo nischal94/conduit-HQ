@@ -17,7 +17,7 @@
  * installed.
  */
 import type { Socket } from "node:net";
-import type { ConduitStore } from "@conduithq/sdk";
+import type { ConduitStore, Tool } from "@conduithq/sdk";
 import {
   buildCatalogListing,
   executionToCheckPayload,
@@ -57,6 +57,29 @@ import {
  */
 export const RESUME_ADMISSION_DEADLINE_MS = 60_000;
 
+/**
+ * Normative-local (spec §3.3): how long a connection may hold READY
+ * without completing its handshake.
+ *
+ * READY is granted the moment the socket is accepted, before the client has
+ * said anything. A READY-granted socket counts in `daemon.status`'s
+ * connection number AND holds the §3.3 grace loop open, so without a bound
+ * a peer that connects and then says nothing at all inflates the operator's
+ * status reading indefinitely and adds the full DRAIN_DEADLINE_MS to every
+ * stop. Neither needs a hostile client: a wedged process or a half-open TCP
+ * peer does it by accident.
+ *
+ * The deadline preserves the status↔drain predicate parity by
+ * CONSTRUCTION rather than by changing it: both surfaces still count
+ * exactly the READY-granted live sockets, and this only bounds how long a
+ * never-handshaking one can be among them.
+ *
+ * 10s is far above any real handshake — the client writes it immediately on
+ * connect, and both are local — and far below DRAIN_DEADLINE_MS, so a
+ * stalled peer cannot dominate a drain.
+ */
+export const HANDSHAKE_DEADLINE_MS = 10_000;
+
 export interface ConnectionContext {
   socket: Socket;
   capability: Capability | null;
@@ -72,6 +95,12 @@ export interface ConnectionContext {
   queued: Set<() => void>;
   /** Source of this connection's daemon-assigned correlation ids. */
   requestCounter: { n: number };
+  /**
+   * Cancels the HANDSHAKE_DEADLINE_MS timer. Called on a successful
+   * handshake and on socket close; idempotent, and a no-op once the
+   * deadline has already fired.
+   */
+  clearHandshakeDeadline: () => void;
 }
 
 /**
@@ -226,6 +255,8 @@ export function handleConnection(socket: Socket, deps: ConnectionDeps): void {
     inFlight: new Set(),
     queued: new Set(),
     requestCounter: { n: 0 },
+    // Replaced below, once the timer this cancels exists.
+    clearHandshakeDeadline: () => {},
   };
   connections.add(ctx);
   const decoder = new FrameDecoder();
@@ -272,6 +303,9 @@ export function handleConnection(socket: Socket, deps: ConnectionDeps): void {
   });
 
   socket.on("close", () => {
+    // Cleared on EVERY close, handshaked or not, so a short-lived
+    // connection leaves no pending handle behind.
+    ctx.clearHandshakeDeadline();
     // Queued entries belonging to a gone client are removed here rather
     // than left to expire — they would otherwise hold bounded capacity
     // against clients that are still connected.
@@ -300,6 +334,34 @@ export function handleConnection(socket: Socket, deps: ConnectionDeps): void {
   // here that writes unprompted must keep that decoder-handoff intact.
   send(socket, { kind: "ready" }, log);
   ctx.readyGranted = true;
+
+  // Armed at READY, because READY is what makes this connection count —
+  // toward `daemon.status` and toward the drain's grace window alike. See
+  // HANDSHAKE_DEADLINE_MS.
+  const deadline = setTimeout(() => {
+    log(
+      `[conduitd] Connection closed: no handshake within the deadline. Context: {deadlineMs: ${HANDSHAKE_DEADLINE_MS}}`,
+    );
+    // The file's error-frame convention: `invalid` is the code for a
+    // verdict about the CLIENT'S OWN behavior, and the message names the
+    // deadline so the client can tell this apart from a refusal. `end()`
+    // rather than `destroy()`, so the frame is flushed first.
+    send(
+      ctx.socket,
+      {
+        kind: "error",
+        requestId: "",
+        code: "invalid",
+        message: `no handshake within ${HANDSHAKE_DEADLINE_MS}ms; handshake is required immediately after READY`,
+      },
+      log,
+    );
+    ctx.socket.end();
+  }, HANDSHAKE_DEADLINE_MS);
+  // Never holds the process open on its own: a pending handshake deadline
+  // is not a reason for the daemon (or a test's event loop) to stay alive.
+  deadline.unref();
+  ctx.clearHandshakeDeadline = () => clearTimeout(deadline);
 }
 
 async function dispatch(ctx: ConnectionContext, msg: unknown, deps: ConnectionDeps): Promise<void> {
@@ -440,6 +502,10 @@ function handleHandshake(
     return;
   }
   ctx.capability = request.capability;
+  // The deadline has done its job: this connection is a real client now,
+  // and its lifetime is governed by the drain contract rather than by a
+  // handshake bound.
+  ctx.clearHandshakeDeadline();
   send(
     ctx.socket,
     { kind: "handshake.ok", protocol: 1, dbPath, allowPrivateEgress, agentVersion },
@@ -684,17 +750,25 @@ async function runSourceRequest(
  * synchronously over that already-materialized array, with nothing awaited
  * or computed between them, so no request can observe the
  * removed-but-not-upserted state — and no failure can leave it stranded
- * there either. Both rungs run the SAME closure (`republish`) for exactly
- * that reason: an inline second copy is a second chance to get the
- * materialize-then-mutate order wrong.
+ * there either.
+ *
+ * That claim is ABSOLUTE, including under retry, and the code structure is
+ * what makes it so: `mutate` takes an already-materialized array and
+ * contains no `await`, and the ONE retry that can follow a partial mutation
+ * calls it with the array it already holds. The function therefore never
+ * suspends after a remove. (An earlier shape re-ran a combined
+ * read-then-mutate closure on both rungs, so a mutate that failed mid-way
+ * was followed by an awaited store read — a real window, however narrow,
+ * in which the namespace was observably empty.)
  *
  * Both mutations are scoped to THIS namespace, which is the scope the held
- * lock actually covers. `store.tools.list()` returns every namespace's
- * tools, so upserting it whole would write outside the lock: a concurrent
- * provision of ANOTHER namespace holds a DIFFERENT lock, and a full-list
- * snapshot taken before its commit could re-insert tools that namespace's
- * own refresh just retired. Filtering the snapshot down to `namespace`
- * makes the write scope match the lock scope, so the two refreshes cannot
+ * lock actually covers. Upserting every namespace's tools would write
+ * outside the lock: a concurrent provision of ANOTHER namespace holds a
+ * DIFFERENT lock, and a full-list snapshot taken before its commit could
+ * re-insert tools that namespace's own refresh just retired. The read is
+ * scoped at the QUERY — `store.tools.list(namespace)`, which is indexed
+ * and carries the same ORDER BY as the unscoped form — so the write scope
+ * matches the lock scope by construction, and the two refreshes cannot
  * overwrite each other regardless of how they interleave.
  *
  * NEVER throws — not for a store fault, not for a catalog fault, and not
@@ -705,11 +779,17 @@ async function runSourceRequest(
  *
  * Recovery ladder, both rungs:
  *
- *  1. Retry the same remove-then-upsert — this namespace refreshed again
- *     from the store, not the whole catalog rebuilt. It repeats
- *     `store.tools.list()`, the call most likely to have failed —
- *     deliberately, since a transient store fault is the case worth one
- *     retry, and a persistent one lands on rung 2 immediately.
+ *  1. Retry — this namespace refreshed again, not the whole catalog
+ *     rebuilt. WHICH half is retried depends on which half failed, and the
+ *     distinction is what keeps the no-observable-state property below
+ *     absolute:
+ *       - The store READ failed: nothing was removed, so the whole
+ *         read-then-mutate repeats. A transient store fault is the case
+ *         worth one retry; a persistent one lands on rung 2 immediately.
+ *       - The MUTATE failed: the remove may already have run, so the retry
+ *         reuses the ALREADY-materialized array and never awaits. Re-reading
+ *         here would suspend after that remove, which is the one way this
+ *         function could ever publish an empty namespace to another task.
  *  2. Give up on this namespace's catalog entries and say so honestly. The
  *     failure can land on EITHER mutation, so what survives is not
  *     knowable from here: if the remove succeeded and the upsert threw,
@@ -751,39 +831,64 @@ export async function refreshNamespace(deps: ConnectionDeps, namespace: string):
       // committed write's success answer intact.
     }
   };
-  // Materialize FIRST, then mutate. The `await` is the only suspension
-  // point, and it happens before either mutation — so once `scoped` exists
-  // the remove and the upsert are two synchronous statements in one tick
-  // with no store read, no filter, and no allocation between them.
-  const republish = async (): Promise<void> => {
-    const scoped = (await deps.store.tools.list()).filter((tool) => tool.namespace === namespace);
+  // Read and mutate are SEPARATE, so the retry can re-run the mutation
+  // alone. The store read is scoped by the query rather than by a filter
+  // over the whole catalog: `tools.list(namespace)` is indexed and carries
+  // the same ORDER BY, so the lock-scope rationale above is now satisfied
+  // by the query itself instead of by a post-hoc filter over every row.
+  const read = (): Promise<Tool[]> => deps.store.tools.list(namespace);
+  // Purely SYNCHRONOUS, on an ALREADY-materialized array: no await, so the
+  // remove and the upsert are two statements in one tick. That is what
+  // makes the no-observable-empty-state claim in the docblock absolute.
+  const mutate = (scoped: Tool[]): void => {
     deps.runtime.catalog.removeNamespace(namespace);
     deps.runtime.catalog.upsert(scoped);
   };
+  // Rung 0. The two halves are caught SEPARATELY because their retries
+  // differ: a failed read has removed nothing, a failed mutate may have.
+  let scoped: Tool[] | null = null;
+  let cause: unknown = null;
   try {
-    await republish();
+    scoped = await read();
+    mutate(scoped);
+    return;
   } catch (err) {
+    cause = err;
+    // `scoped` is still null exactly when the READ threw, which is what
+    // tells rung 1 below which retry it is allowed to run.
+  }
+  safeLog(
+    `[conduitd] Catalog refresh failed after commit: retrying the namespace refresh. Context: {namespace: ${namespace}, cause: ${
+      cause instanceof Error ? cause.message : String(cause)
+    }}`,
+  );
+  try {
+    // Rung 1, in exactly one of two shapes.
+    //
+    // MUTATE failed (`scoped` materialized): retry the mutation alone, on
+    // the array already in hand. There is no await between the failed
+    // attempt and this one, so no other task can observe the namespace in
+    // the removed-but-not-upserted state a failed mutate can leave.
+    // Re-reading here would suspend after that remove and open exactly
+    // that window.
+    //
+    // READ failed (`scoped` still null): nothing was removed, so the
+    // window was never opened and the whole read+mutate is safe to repeat
+    // — and repeating it is the point, since the read is what failed.
+    mutate(scoped ?? (await read()));
     safeLog(
-      `[conduitd] Catalog refresh failed after commit: retrying the namespace refresh. Context: {namespace: ${namespace}, cause: ${
-        err instanceof Error ? err.message : String(err)
+      `[conduitd] Catalog refreshed on retry after an earlier failure. Context: {namespace: ${namespace}}`,
+    );
+  } catch (err2) {
+    // Rung 2. Deliberately NOT "serving the previous catalog": the failure
+    // can land on the upsert, after the remove already ran, so this
+    // namespace may now be empty or partial rather than stale. Only what is
+    // verifiable is claimed. Other namespaces are unaffected.
+    safeLog(
+      `[conduitd] Catalog refresh retry failed: this namespace's catalog entries may be MISSING OR PARTIAL until the next provision/revalidate of it, or a daemon restart, rehydrates them from the store. Other namespaces are unaffected. Context: {namespace: ${namespace}, cause: ${
+        err2 instanceof Error ? err2.message : String(err2)
       }}`,
     );
-    try {
-      await republish();
-      safeLog(
-        `[conduitd] Catalog refreshed on retry after an earlier failure. Context: {namespace: ${namespace}}`,
-      );
-    } catch (err2) {
-      // Deliberately NOT "serving the previous catalog": the failure can
-      // land on the upsert, after the remove already ran, so this namespace
-      // may now be empty or partial rather than stale. Only what is
-      // verifiable is claimed. Other namespaces are unaffected.
-      safeLog(
-        `[conduitd] Catalog refresh retry failed: this namespace's catalog entries may be MISSING OR PARTIAL until the next provision/revalidate of it, or a daemon restart, rehydrates them from the store. Other namespaces are unaffected. Context: {namespace: ${namespace}, cause: ${
-          err2 instanceof Error ? err2.message : String(err2)
-        }}`,
-      );
-    }
   }
 }
 
@@ -1036,9 +1141,27 @@ async function handleRequest(
         deps.requestStop();
         return;
       }
-      ctx.socket.write(encodeFrame({ kind: "result", requestId, payload }), () =>
-        deps.requestStop(),
-      );
+      ctx.socket.write(encodeFrame({ kind: "result", requestId, payload }), () => {
+        deps.requestStop();
+        // Ends the STOP connection server-side, after the flush. Without
+        // this, the connection that asked for the stop is itself a live
+        // READY-granted socket, so the §3.3 grace loop waits on it — the
+        // stop would ride the full DRAIN_DEADLINE_MS purely because the
+        // client that requested it had not disconnected yet. The design
+        // pins that stop completes promptly rather than riding the drain,
+        // and the daemon cannot depend on the client's one-shot
+        // disconnect to make that true.
+        //
+        // Safe because the write callback has already fired: the frame is
+        // handed to the kernel, so the client has its ack. `end()` sends
+        // FIN after that flush, never before, and leaves the read side
+        // open — nothing in transit is discarded the way `destroy()`
+        // would discard it.
+        //
+        // Ordering is load-bearing and unchanged: flush → requestStop →
+        // end.
+        ctx.socket.end();
+      });
       return;
     }
     case "handshake":

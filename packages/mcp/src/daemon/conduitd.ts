@@ -62,7 +62,7 @@ export const QUEUE_CAPACITY = 16;
  * `conduitd.ts` remains the public import site for the daemon's
  * normative constants.
  */
-export { RESUME_ADMISSION_DEADLINE_MS } from "./connection.js";
+export { HANDSHAKE_DEADLINE_MS, RESUME_ADMISSION_DEADLINE_MS } from "./connection.js";
 
 /**
  * How long DRAINING waits for accepted work before abandoning it.
