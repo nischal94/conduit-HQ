@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { existsSync, mkdirSync, statSync } from "node:fs";
+import { existsSync, statSync } from "node:fs";
 import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
 import { takeStateDir } from "./args.js";
@@ -13,6 +13,7 @@ import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./d
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { createRotatingLog, type RotatingLog } from "./daemon/log-sink.js";
 import { DAEMON_LOG } from "./daemon/spawn.js";
+import { ensureStateDir } from "./daemon/state-dir.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
@@ -372,22 +373,28 @@ async function main(): Promise<void> {
     // path, including the ones the sink's own construction takes.
     let sink: RotatingLog | null = null;
     try {
-      // The directory is created unconditionally, for TWO independent
-      // reasons — the first alone would not justify the unconditional form.
+      // CX2: the state-dir boundary is validated BEFORE the log sink opens.
+      // `ensureStateDir` creates the directory 0700 if absent and then runs
+      // the FULL bind validation (non-symlink, self-owned, 0700, ACL-free) —
+      // the same call `runDaemon` makes as its first act, hoisted ahead of the
+      // sink. Without this, an ancestor-owning uid could swap the just-created
+      // leaf for a directory it controls holding a regular `conduitd.log`
+      // between the old bare `mkdir` and `runDaemon`'s validation; the sink
+      // (`O_NOFOLLOW` accepts a regular file) would then write daemon
+      // diagnostics into an attacker-readable fd before the boundary check
+      // ever ran. Validating first means a swapped-in foreign-owned dir fails
+      // here (WRONG_OWNER) and the daemon refuses to start rather than logging
+      // into it. `runDaemon`'s own `ensureStateDir` stays (idempotent, and
+      // re-validates once the lifecycle lock is held, closing the later
+      // window too). This ALSO satisfies both reasons the create was
+      // unconditional: the sink opens inside a now-existent dir, and a fresh
+      // by-hand start has its directory made and blessed before locks bind.
       //
-      // 1. The sink below opens INSIDE it, so on the non-TTY path the
-      //    directory must exist before that open.
-      // 2. A fresh by-hand `--daemon --state-dir <path>` has nothing
-      //    created yet, TTY or not: `runDaemon` immediately takes locks and
-      //    binds a socket under this directory, and every one of those
-      //    would die on a raw ENOENT.
-      //
-      // `recursive: true` makes it idempotent for every later start. Like
-      // the spawn path's, this create VALIDATES NOTHING: `ensureStateDir`
-      // remains the only verification, run over this same path as the
-      // daemon's first act, so a 0700-mode create that loses a race to a
-      // hostile directory is caught there rather than trusted here.
-      mkdirSync(resolvedStateDir, { recursive: true, mode: 0o700 });
+      // A `StateDirError` here is a hard refusal: it propagates to the outer
+      // catch (a non-`DaemonExit` rethrow) rather than falling through to the
+      // sink's stderr fallback — the daemon must not serve from an unvalidated
+      // state directory.
+      await ensureStateDir(resolvedStateDir);
       // Spec §5: owned rotating sink when backgrounded; a hand-started
       // daemon on a terminal keeps stderr and performs no rotation.
       if (!process.stderr.isTTY) {
@@ -395,19 +402,22 @@ async function main(): Promise<void> {
           sink = createRotatingLog(resolvedStateDir);
         } catch (error) {
           // The daemon must not die for its log (spec §5) — but the refusal
-          // is LOUD, because the most interesting cause is hostile: the sink
-          // opens with `O_NOFOLLOW`, so an ELOOP here means something has
-          // planted a symlink at the log path inside a state directory that
-          // `ensureStateDir` has not yet verified. Falling back to
-          // unrotated stderr keeps the daemon serving; saying so is what
-          // stops the operator reading a silently unrotated log as normal.
+          // is LOUD, because the most interesting cause is hostile. The state
+          // dir was boundary-validated just above, so this is the residual
+          // micro-window between that validation and the open: the sink opens
+          // with `O_NOFOLLOW` (refuses a planted symlink — ELOOP) and fstat-
+          // verifies the fd is a regular self-owned file (CX2 — refuses a
+          // swapped-in directory with an attacker-owned regular `conduitd.log`,
+          // `LogOpenRefused`). Falling back to unrotated stderr keeps the
+          // daemon serving; saying so is what stops the operator reading a
+          // silently unrotated log as normal.
           sink = null;
           console.error(
             "[conduitd] Log sink refused to open; falling back to UNROTATED stderr — this log " +
-              "will grow without bound. An ELOOP cause means a symlink is planted at " +
-              `${join(resolvedStateDir, DAEMON_LOG)}, which the sink refuses to follow; ` +
-              "inspect that path before trusting this directory. Context: {stateDir: " +
-              `${resolvedStateDir}, cause: ${error instanceof Error ? error.message : String(error)}}`,
+              "will grow without bound. An ELOOP or LogOpenRefused cause means a symlink or a " +
+              `swapped-in file is planted at ${join(resolvedStateDir, DAEMON_LOG)}, which the sink ` +
+              "refuses to write through; inspect that path before trusting this directory. " +
+              `Context: {stateDir: ${resolvedStateDir}, cause: ${error instanceof Error ? error.message : String(error)}}`,
           );
         }
       }

@@ -1,6 +1,8 @@
+import * as fs from "node:fs";
 import {
   chmodSync,
   constants,
+  mkdirSync,
   mkdtempSync,
   readFileSync,
   rmSync,
@@ -16,6 +18,7 @@ import {
   LOG_LINE_MAX_BYTES,
   LOG_MAX_BYTES,
   LOG_OPEN_FLAGS,
+  LogOpenRefused,
 } from "./log-sink.js";
 import { DAEMON_LOG } from "./spawn.js";
 
@@ -237,6 +240,131 @@ describe("createRotatingLog", () => {
 
     expect(readFileSync(activeVictim, "utf8")).toBe("active original\n");
     expect(readFileSync(rotatedVictim, "utf8")).toBe("rotated original\n");
+  });
+
+  it("CX2: refuses a regular conduitd.log that is group/world-accessible, leaving it unwritten", () => {
+    // The fstat check (CX2) is the defense against a swapped-in file that
+    // O_NOFOLLOW cannot catch: a regular file, so no symlink, but not one the
+    // daemon should write diagnostics into. A same-uid attacker cannot forge a
+    // FOREIGN owner in a unit test (that needs root), but the mode arm of the
+    // same fstat check is exercised the same way — a group/world-accessible
+    // regular file at the log path is refused rather than written into.
+    if (!CHMOD_BITES) return; // some filesystems ignore mode; skip vacuous
+    const dir = newDir();
+    const path = join(dir, DAEMON_LOG);
+    writeFileSync(path, "planted\n", { mode: 0o600 });
+    chmodSync(path, 0o666); // group/world-accessible: mode & 0o077 !== 0
+
+    expect(() => createRotatingLog(dir)).toThrow(LogOpenRefused);
+    // Non-vacuous: not one byte of daemon diagnostics reached the file the
+    // sink refused to adopt.
+    expect(readFileSync(path, "utf8")).toBe("planted\n");
+  });
+
+  it("CX2: refuses a non-regular file at the log path (a directory)", () => {
+    // A swapped-in directory named conduitd.log is not a regular file; the
+    // fstat check refuses it. (O_WRONLY on a directory also fails EISDIR at
+    // the open, so either way the sink does not adopt it — this pins that a
+    // non-regular fd is never accepted.)
+    const dir = newDir();
+    const path = join(dir, DAEMON_LOG);
+    // A directory at the precise log path.
+    mkdirSync(path, { mode: 0o700 });
+
+    expect(() => createRotatingLog(dir)).toThrow();
+    // Still a directory — the sink created no regular file over it and wrote
+    // nothing.
+    expect(statSync(path).isDirectory()).toBe(true);
+  });
+
+  it.skipIf(!CHMOD_BITES)(
+    "CX2: rotation whose reopen hits a group/world file degrades rather than adopting it",
+    () => {
+      // The reopen call site runs the SAME `openVerifiedLogFd` as the initial
+      // open. A plant STRICTLY between `renameSync` and the reopen is
+      // unreachable from a test (adjacent synchronous statements, one tick, no
+      // seam) — exactly like the O_NOFOLLOW reopen note above. What is
+      // reachable and worth pinning: if the reopen's own verification throws,
+      // the rotation catch keeps the old fd and the daemon keeps logging
+      // rather than dying. Force that by making the reopen fail: a read-only
+      // state dir makes the fresh open fail, and the sink must degrade.
+      const dir = newDir();
+      const path = join(dir, DAEMON_LOG);
+      const sink = createRotatingLog(dir);
+      const chunk = "q".repeat(LOG_LINE_MAX_BYTES - 1);
+      while (sink.info().sizeBytes + chunk.length + 1 <= LOG_MAX_BYTES) sink.log(chunk);
+
+      chmodSync(dir, 0o500); // rename/reopen now fail
+      expect(() => {
+        sink.log("the line that tips it over");
+      }).not.toThrow();
+      sink.close();
+      chmodSync(dir, 0o700);
+
+      // Degraded, not crashed: the tipping line still landed on the old fd.
+      const content = readFileSync(path, "utf8");
+      expect(content).toContain("the line that tips it over");
+    },
+  );
+
+  it("CX4: rename succeeds then reopen fails once — rotation recovers, .1 does not grow unbounded", () => {
+    // The wedge: `renameSync` moves the active file to `.1`, then the fresh
+    // `openSync` fails transiently (EMFILE/ENFILE/inode exhaustion). Before
+    // the fix, the retained fd pointed at `.1`, the active pathname was gone,
+    // and every later attempt renamed a missing active path (ENOENT) forever
+    // while `.1` grew without bound. The fix rolls `.1` back to the active
+    // path on a post-rename open failure, so the invariant (active path
+    // exists, fd writes to it) is restored and the NEXT cap-hit rotates
+    // cleanly.
+    const dir = newDir();
+    const path = join(dir, DAEMON_LOG);
+
+    // Injected opener: the initial open (call #1) succeeds; the reopen after
+    // the first rename (call #2) throws EMFILE once; every later open runs for
+    // real. That is exactly the post-rename transient-failure the wedge needs.
+    let opens = 0;
+    const armedOpen = (p: string): number => {
+      opens += 1;
+      if (opens === 2) {
+        const e = new Error("EMFILE: too many open files") as NodeJS.ErrnoException;
+        e.code = "EMFILE";
+        throw e;
+      }
+      return fs.openSync(p, LOG_OPEN_FLAGS, 0o600);
+    };
+
+    const sink = createRotatingLog(dir, { openFd: armedOpen });
+    const chunk = "r".repeat(LOG_LINE_MAX_BYTES - 1);
+    while (sink.info().sizeBytes + chunk.length + 1 <= LOG_MAX_BYTES) sink.log(chunk);
+
+    // Tips over the cap → rotation fires → rename OK, reopen (open #2) throws
+    // once. The rollback restores the active path.
+    sink.log("the line that tips it over");
+    expect(fs.existsSync(path)).toBe(true);
+
+    // Write past the retry backoff so the next cap-hit retries. The opener no
+    // longer fails, so this rotation succeeds cleanly.
+    const filler = "s".repeat(LOG_LINE_MAX_BYTES - 1);
+    for (let written = 0; written < 200 * 1024; written += filler.length + 1) {
+      sink.log(filler);
+    }
+    sink.log("post-recovery line");
+    sink.close();
+
+    // Recovered: rotation RESUMED, which is the whole point — under the wedge
+    // the active path stayed absent and every write piled into `.1` forever.
+    // Here the active file exists, is SMALL (a fresh post-rotation file holding
+    // only the post-retry lines, far below the cap), and `.1` is bounded to a
+    // single rotation's content (the overshoot of one backed-off retry), not
+    // growing without bound.
+    expect(fs.existsSync(path)).toBe(true);
+    expect(statSync(path).size).toBeLessThan(LOG_MAX_BYTES);
+    expect(fs.existsSync(`${path}.1`)).toBe(true);
+    // Bounded: cap plus one retry's overshoot (ROTATE_RETRY_BYTES + the extra
+    // fillers written before the retry fired), NOT unbounded.
+    expect(statSync(`${path}.1`).size).toBeLessThan(LOG_MAX_BYTES + 512 * 1024);
+    // The post-recovery line is in the CURRENT active file: rotation resumed.
+    expect(readFileSync(path, "utf8")).toContain("post-recovery line");
   });
 
   it("opens the log with O_NOFOLLOW on both the initial open and the reopen", () => {
