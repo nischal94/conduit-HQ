@@ -23,7 +23,12 @@
  * failure line and a losing auto-start child both hold their own append fds
  * on the same inode, and after a rotation they follow that inode into
  * `.1`. The single-writer claim is deliberately NOT made here — the byte
- * counter below tracks what THIS sink wrote, which is what the cap governs.
+ * counter below is SEEDED from the file's current size at open (the fstat
+ * in `createRotatingLog`) and thereafter tracks only what THIS sink writes.
+ * So it accounts for what was on disk when this sink opened, plus this
+ * sink's own output; a concurrent appender's bytes after that point are not
+ * counted, which is what makes the cap a per-sink budget rather than a
+ * guarantee about the file.
  */
 import { closeSync, constants, fstatSync, openSync, renameSync, writeSync } from "node:fs";
 import { join } from "node:path";
@@ -41,13 +46,24 @@ import { DAEMON_LOG } from "./spawn.js";
  * post-rotation reopen for the same reason: the rename leaves the name free
  * for exactly that plant.
  */
-const LOG_OPEN_FLAGS =
+export const LOG_OPEN_FLAGS =
   constants.O_WRONLY | constants.O_CREAT | constants.O_APPEND | constants.O_NOFOLLOW;
 
-/** Normative-local (spec §5): active-file cap; worst case on disk ~2x. */
+/**
+ * Normative-local (spec §5): active-file cap. Worst case on disk is ~2x
+ * across the two files (the active one plus `.1`), plus the residual-stderr
+ * allowance named in the module docblock — traffic on the inherited fd 2 is
+ * not written through this sink and is therefore outside this budget.
+ */
 export const LOG_MAX_BYTES = 5 * 1024 * 1024;
 /** Normative-local (spec §5): single-line cap so one write cannot blow the budget. */
 export const LOG_LINE_MAX_BYTES = 8 * 1024;
+/**
+ * Marks a line the truncation shortened. Its own byte length is subtracted
+ * from the slice bound, so a truncated line lands at exactly
+ * `LOG_LINE_MAX_BYTES` rather than at the cap PLUS this suffix.
+ */
+const TRUNC_SUFFIX = "…[truncated]";
 /** Retry a failed rotation only after this much MORE has been written. */
 const ROTATE_RETRY_BYTES = 64 * 1024;
 
@@ -91,13 +107,21 @@ export function createRotatingLog(stateDir: string): RotatingLog {
     log(line: string): void {
       let text = line;
       if (Buffer.byteLength(text) > LOG_LINE_MAX_BYTES) {
-        text = `${Buffer.from(text).subarray(0, LOG_LINE_MAX_BYTES).toString()}…[truncated]`;
+        // The slice bound leaves room for the suffix, so the result is at
+        // most LOG_LINE_MAX_BYTES rather than that plus the marker. The
+        // multi-byte ellipsis is why the allowance is a BYTE length, not a
+        // character count.
+        const room = LOG_LINE_MAX_BYTES - Buffer.byteLength(TRUNC_SUFFIX);
+        text = `${Buffer.from(text).subarray(0, room).toString()}${TRUNC_SUFFIX}`;
       }
       const buf = Buffer.from(`${text}\n`);
       if (bytes + buf.length > nextRotateAttempt) rotate();
       try {
-        writeSync(fd, buf);
-        bytes += buf.length;
+        // Count what was WRITTEN, not what was requested: a short write
+        // leaves fewer bytes on disk than `buf.length`, and crediting the
+        // full buffer would drift the counter above the file's real size —
+        // rotating early and misreporting through `info()`.
+        bytes += writeSync(fd, buf);
       } catch {
         /* ENOSPC-class: degrade best-effort (spec §5) */
       }

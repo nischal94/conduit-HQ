@@ -1,8 +1,22 @@
-import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  constants,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  statSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { createRotatingLog, LOG_LINE_MAX_BYTES, LOG_MAX_BYTES } from "./log-sink.js";
+import {
+  createRotatingLog,
+  LOG_LINE_MAX_BYTES,
+  LOG_MAX_BYTES,
+  LOG_OPEN_FLAGS,
+} from "./log-sink.js";
 import { DAEMON_LOG } from "./spawn.js";
 
 const dirs: string[] = [];
@@ -109,9 +123,85 @@ describe("createRotatingLog", () => {
 
     const content = readFileSync(join(dir, DAEMON_LOG), "utf8");
     expect(content.endsWith("…[truncated]\n")).toBe(true);
-    // The suffix and its multi-byte ellipsis are the only allowance over the
-    // line cap; the point is that one write cannot blow the byte budget.
-    expect(statSync(join(dir, DAEMON_LOG)).size).toBeLessThanOrEqual(LOG_LINE_MAX_BYTES + 64);
+    // EXACT, not an allowance: the suffix's byte length is subtracted from
+    // the slice bound, so a truncated line is at most the line cap itself.
+    // The only byte over it is the newline every line carries.
+    expect(statSync(join(dir, DAEMON_LOG)).size).toBeLessThanOrEqual(LOG_LINE_MAX_BYTES + 1);
+  });
+
+  it("refuses to open through a symlink at the log path, leaving the target unwritten", () => {
+    // The state directory is a 0700 boundary (§3.2), but the sink opens
+    // BEFORE `ensureStateDir` has lstat-verified it — so a daemon started by
+    // hand against a not-yet-blessed directory would follow a planted
+    // `conduitd.log` link and append its diagnostics to a file OUTSIDE the
+    // boundary. `O_NOFOLLOW` is what refuses that, and this pins it.
+    const dir = newDir();
+    const outside = newDir();
+    const target = join(outside, "victim");
+    writeFileSync(target, "original\n", { mode: 0o600 });
+    symlinkSync(target, join(dir, DAEMON_LOG));
+
+    // Refused outright — a daemon that cannot open its log honestly is
+    // better than one that writes through a link it does not own.
+    expect(() => createRotatingLog(dir)).toThrow();
+    // THE ASSERTION that makes it non-vacuous: not one byte reached the
+    // link's target. A throw from some other cause would leave this true
+    // too, but a followed symlink could not.
+    expect(readFileSync(target, "utf8")).toBe("original\n");
+  });
+
+  it("rotates without writing through a symlink planted at either rotation path", () => {
+    // The post-rotation reopen is the SECOND place `O_NOFOLLOW` matters: the
+    // rename frees the log's own name, which is exactly the window a plant
+    // wants — the reopen creates a file at a name an attacker may have just
+    // claimed.
+    //
+    // WHAT THIS TEST DOES NOT DO, stated plainly: it does not pin the
+    // reopen's flags. Planting strictly BETWEEN `renameSync` and the reopen
+    // is unreachable from a test — they are adjacent synchronous statements
+    // in one tick with no seam. And a plant at either path before rotation
+    // is defused by `rename` itself, which was MEASURED rather than assumed:
+    // `renameSync` onto a symlink destination replaces the link by name and
+    // leaves its target untouched. So the outcome below would hold with or
+    // without the flag, and the flag assertion at the end of this file is
+    // what actually covers the reopen call site.
+    //
+    // It is kept because the end-to-end property is still worth pinning: a
+    // rotation run against planted links writes nothing outside the 0700
+    // boundary and never throws at the caller.
+    const dir = newDir();
+    const outside = newDir();
+    const activeVictim = join(outside, "active-victim");
+    const rotatedVictim = join(outside, "rotated-victim");
+    writeFileSync(activeVictim, "active original\n", { mode: 0o600 });
+    writeFileSync(rotatedVictim, "rotated original\n", { mode: 0o600 });
+
+    const sink = createRotatingLog(dir);
+    const chunk = "w".repeat(LOG_LINE_MAX_BYTES - 1);
+    while (sink.info().sizeBytes + chunk.length + 1 <= LOG_MAX_BYTES) sink.log(chunk);
+
+    const path = join(dir, DAEMON_LOG);
+    rmSync(path);
+    symlinkSync(activeVictim, path);
+    symlinkSync(rotatedVictim, `${path}.1`);
+
+    expect(() => {
+      sink.log("the line that tips it over");
+    }).not.toThrow();
+    sink.log("and another after the rotation attempt");
+    sink.close();
+
+    expect(readFileSync(activeVictim, "utf8")).toBe("active original\n");
+    expect(readFileSync(rotatedVictim, "utf8")).toBe("rotated original\n");
+  });
+
+  it("opens the log with O_NOFOLLOW on both the initial open and the reopen", () => {
+    // The direct pin for the reopen call site, which no filesystem
+    // arrangement can reach (see the rotation test above). Both `openSync`
+    // calls in `log-sink.ts` take the SAME `LOG_OPEN_FLAGS` constant, so
+    // asserting the constant covers both — and this fails the moment
+    // someone drops the flag from it.
+    expect(LOG_OPEN_FLAGS & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
   });
 
   it.skipIf(!CHMOD_BITES)("keeps logging through a rotation failure", () => {
