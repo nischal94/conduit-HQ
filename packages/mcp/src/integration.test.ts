@@ -1267,6 +1267,52 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
     }
   }, 60_000);
 
+  it("`--daemon --state-dir <regular file>` exits non-zero with a diagnostic, not an unhandled stack", async () => {
+    // The mirror of the "a REGULAR FILE occupies the socket path" case, one
+    // level up: here the STATE DIRECTORY itself is a file. The unconditional
+    // `mkdirSync` is the first thing to touch it and fails ENOTDIR/EEXIST.
+    // Before that create moved inside the try, the throw escaped the daemon
+    // branch's own handling entirely — an operator who fat-fingered a path
+    // got a crash dump instead of being told what was wrong.
+    const home = mkdtempSync(join(tmpdir(), "cd-file-"));
+    try {
+      const asFile = join(home, "state");
+      writeFileSync(asFile, "not a directory", { mode: 0o600 });
+
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        CONDUIT_MASTER_KEY: Buffer.from(SecretBox.generateKeyBytes()).toString("base64"),
+      };
+      delete env.CONDUIT_DB;
+      const child = spawn(process.execPath, [binPath, "--daemon", "--state-dir", asFile], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+      });
+      let output = "";
+      const collect = (c: Buffer): void => {
+        output += c.toString("utf8");
+      };
+      child.stdout?.on("data", collect);
+      child.stderr?.on("data", collect);
+      const code = await new Promise<number | null>((resolve) => {
+        child.once("exit", resolve);
+      });
+
+      // Non-zero, so a script's `&&` never reads this as a started daemon.
+      expect(code).not.toBe(0);
+      // A DIAGNOSTIC, not a raw crash: the fatal handler prints
+      // `error.message` alone, so the absence of stack frames is what
+      // distinguishes it from the unhandled throw this replaced.
+      expect(output).toContain("[ConduitMcp] Fatal:");
+      expect(output).not.toContain("\n    at ");
+      // The file is not a directory and was never made one.
+      expect(statSync(asFile).isFile()).toBe(true);
+      expect(readFileSync(asFile, "utf8")).toBe("not a directory");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
   it("INVARIANT §17 / §9.1: `--doctor --offline` REFUSES while a daemon is live, naming the holder", async () => {
     // The offline mode's exclusivity is not caution about reading — it is
     // what makes its report coherent. Beside a live daemon (or a rotation)

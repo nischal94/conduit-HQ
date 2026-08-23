@@ -11,7 +11,7 @@ import {
 } from "./daemon/client.js";
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
-import { createRotatingLog } from "./daemon/log-sink.js";
+import { createRotatingLog, type RotatingLog } from "./daemon/log-sink.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
@@ -367,22 +367,49 @@ async function main(): Promise<void> {
     // exactly `{PATH}`, so the SPAWNER reads `CONDUIT_DAEMON_DEBUG` and
     // threads the decision here as a flag.
     const debug = parsed.rest.includes("--debug");
-    // The sink below is opened INSIDE the state directory, so the directory
-    // has to exist before it. The client spawn path already does this
-    // (`spawn.ts`) before opening the inherited log fd; a by-hand
-    // `--daemon --state-dir <fresh>` with non-TTY stderr — nohup or a
-    // redirect, the normal way a hand start is backgrounded — reaches the
-    // open with nothing created yet and would die on a raw ENOENT before
-    // `runDaemon` could create it. `recursive: true` makes this idempotent
-    // for every later start. Like the spawn path's, this create validates
-    // nothing: the boundary check is `ensureStateDir`'s, run over this same
-    // path as the daemon's first act, so a 0700-mode create that loses a
-    // race to a hostile directory is caught there rather than trusted here.
-    mkdirSync(resolvedStateDir, { recursive: true, mode: 0o700 });
-    // Spec §5: owned rotating sink when backgrounded; a hand-started
-    // daemon on a terminal keeps stderr and performs no rotation.
-    const sink = process.stderr.isTTY ? null : createRotatingLog(resolvedStateDir);
+    // Declared before the try so the `finally` can close it on every exit
+    // path, including the ones the sink's own construction takes.
+    let sink: RotatingLog | null = null;
     try {
+      // The directory is created unconditionally, for TWO independent
+      // reasons — the first alone would not justify the unconditional form.
+      //
+      // 1. The sink below opens INSIDE it, so on the non-TTY path the
+      //    directory must exist before that open.
+      // 2. A fresh by-hand `--daemon --state-dir <path>` has nothing
+      //    created yet, TTY or not: `runDaemon` immediately takes locks and
+      //    binds a socket under this directory, and every one of those
+      //    would die on a raw ENOENT.
+      //
+      // `recursive: true` makes it idempotent for every later start. Like
+      // the spawn path's, this create VALIDATES NOTHING: `ensureStateDir`
+      // remains the only verification, run over this same path as the
+      // daemon's first act, so a 0700-mode create that loses a race to a
+      // hostile directory is caught there rather than trusted here.
+      mkdirSync(resolvedStateDir, { recursive: true, mode: 0o700 });
+      // Spec §5: owned rotating sink when backgrounded; a hand-started
+      // daemon on a terminal keeps stderr and performs no rotation.
+      if (!process.stderr.isTTY) {
+        try {
+          sink = createRotatingLog(resolvedStateDir);
+        } catch (error) {
+          // The daemon must not die for its log (spec §5) — but the refusal
+          // is LOUD, because the most interesting cause is hostile: the sink
+          // opens with `O_NOFOLLOW`, so an ELOOP here means something has
+          // planted a symlink at the log path inside a state directory that
+          // `ensureStateDir` has not yet verified. Falling back to
+          // unrotated stderr keeps the daemon serving; saying so is what
+          // stops the operator reading a silently unrotated log as normal.
+          sink = null;
+          console.error(
+            "[conduitd] Log sink refused to open; falling back to UNROTATED stderr — this log " +
+              "will grow without bound. An ELOOP cause means a symlink is planted at " +
+              `${join(resolvedStateDir, "conduitd.log")}, which the sink refuses to follow; ` +
+              "inspect that path before trusting this directory. Context: {stateDir: " +
+              `${resolvedStateDir}, cause: ${error instanceof Error ? error.message : String(error)}}`,
+          );
+        }
+      }
       await runDaemon({
         stateDir: resolvedStateDir,
         sweep: sweepDaemonStore,

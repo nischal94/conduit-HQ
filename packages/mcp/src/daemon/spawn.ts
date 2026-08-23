@@ -102,6 +102,26 @@ export function daemonSpawnEnv(): NodeJS.ProcessEnv {
  * lock and the other exits `already running`. That is the designed
  * outcome, not a race to prevent.
  */
+/**
+ * The child's argv, as a pure function of the SPAWNER's environment.
+ *
+ * Split out of `spawnDaemon` so the env→argv translation is testable
+ * without spawning a process. It is the only place the §5 volume gate
+ * crosses the spawn boundary, and it crosses as an ARGUMENT: the child's
+ * constructed env is exactly `{PATH}`, so `CONDUIT_DAEMON_DEBUG` is read
+ * HERE and never inherited. Reading it in the child instead would mean
+ * either inheriting the environment (which §3.1 forbids) or adding a second
+ * allowlist entry a client could set.
+ *
+ * Exactly `"1"`, not any truthy value: an opt-in gate with a fuzzy
+ * predicate turns a stray `CONDUIT_DAEMON_DEBUG=0` into debug logging.
+ */
+export function daemonArgv(env: NodeJS.ProcessEnv): string[] {
+  const argv = [daemonEntryPoint(), "--daemon"];
+  if (env.CONDUIT_DAEMON_DEBUG === "1") argv.push("--debug");
+  return argv;
+}
+
 export function spawnDaemon(): void {
   const stateDir = DEFAULT_CONDUIT_DIR;
   // On a fresh install the state directory does not exist yet, and the
@@ -121,13 +141,7 @@ export function spawnDaemon(): void {
   // protocol stream.
   const logFd = openSync(join(stateDir, DAEMON_LOG), "a", 0o600);
 
-  const argv = [daemonEntryPoint(), "--daemon"];
-  // Volume gate (spec §5): the SPAWNER's environment opts into debug
-  // logging via argv — the child's constructed env stays exactly {PATH},
-  // so the variable is read HERE and never inherited. Reading it in the
-  // child instead would mean either inheriting the environment (which
-  // §3.1 forbids) or adding a second allowlist entry a client could set.
-  if (process.env.CONDUIT_DAEMON_DEBUG === "1") argv.push("--debug");
+  const argv = daemonArgv(process.env);
 
   try {
     const child = spawn(process.execPath, argv, {
