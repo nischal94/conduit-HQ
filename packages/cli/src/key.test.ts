@@ -530,6 +530,14 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
     // it is offered as a lead ("may be stale"), never as a verdict that
     // would send the operator after an already-departed pid.
     expect(err).toMatch(/Last acquired by daemon \(pid \d+\) at .* \(may be stale\)/);
+    // The full stop-first obligation, both halves. Stopping the daemon
+    // alone is NOT sufficient: an MCP client started before rotation still
+    // holds the old key in memory, so a refusal that named only
+    // `conduit daemon stop` sent the operator into a rotation that leaves
+    // live clients unable to open the re-sealed secrets.
+    expect(err).toContain("conduit daemon stop");
+    expect(err).toContain("quit every MCP client");
+    expect(err).toContain("holds the old key");
     // Non-blocking: a fail-fast refusal, never a wait-then-take. Well under
     // EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS (1000), which only lifecycle uses.
     expect(elapsed).toBeLessThan(2000);

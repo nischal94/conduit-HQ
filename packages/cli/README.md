@@ -239,7 +239,7 @@ for its entire lifetime, so the two cannot overlap in either order:
   read and written nothing:
 
   ```
-  [ConduitKey] rotate refused: another process owns ~/.conduit — the maintenance lock is held. Last acquired by daemon (pid 4711) at 2026-08-16T12:04:00.000Z (may be stale). rotate is stop-first: stop running conduit processes first — run `conduit daemon stop`, then re-run. Nothing was read or written.
+  [ConduitKey] rotate refused: another process owns ~/.conduit — the maintenance lock is held. Last acquired by daemon (pid 4711) at 2026-08-16T12:04:00.000Z (may be stale). rotate is stop-first: stop running conduit processes first — run `conduit daemon stop`, quit every MCP client (any process started before rotation holds the old key), then re-run. Nothing was read or written.
   ```
 
 - **Rotation running → a starting daemon exits** `rotation in progress`
