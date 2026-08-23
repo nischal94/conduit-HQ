@@ -107,6 +107,63 @@ function findOversizeToolText(rawTools: readonly unknown[]): number | undefined 
 }
 
 /**
+ * True iff any credential token appears verbatim ANYWHERE in `rawTools` — as
+ * a string value or an object KEY, at any depth (tool name, description,
+ * input/output schema values and keys, nested).
+ *
+ * ## Why this scan exists (CX1, the §9.2 credential-reflection break)
+ *
+ * On the onboarding fetch the daemon has already revealed the stored
+ * credential and sent it upstream as `authorization` (`fetchAndProvision`).
+ * The ERROR paths already withhold upstream-controlled text
+ * (`logRedactedDetail` + `mapFetchError`). A SUCCESSFUL `tools/list` whose
+ * valid, sub-`MAX_TOOL_TEXT_BYTES` name / description / schema value / schema
+ * KEY reflects that credential otherwise flows through `normalizeMcp` →
+ * `store.provisionSource` → the shared catalog → `search`/`describe` → the
+ * agent, UNREDACTED. A reflecting server is exactly the F1 threat, on the
+ * success path.
+ *
+ * ## The shape: canonicalize-then-check, NOT a denylist of encodings
+ *
+ * `redactionTokens(onboardingAuth)` derives the SAME token set the shared
+ * redaction primitive uses (`packages/sdk/pipeline/upstream.ts`): the full
+ * header value plus each whitespace-separated segment long enough to be a
+ * real secret. We match the credential VALUE itself, not a list of manglings.
+ * A server that TRANSFORMS the secret before echoing (base64, url-encode,
+ * split across fields) gets past this — that is a documented residual, a
+ * narrower threat than a plain reflection, and adding per-encoding patterns
+ * is the denylist whack-a-mole `~/.claude/rules/adversarial-convergence.md`
+ * forbids. The structural guarantee is elsewhere: the credential lives only
+ * in this request's scope and is never persisted (§9.2).
+ *
+ * The whole raw response is walked — every string value and every object key,
+ * recursively — because a reflected credential can land in any of them, and a
+ * key is as agent-visible as a value once it is a schema property name.
+ */
+function reflectsCredential(rawTools: readonly unknown[], tokens: readonly string[]): boolean {
+  if (tokens.length === 0) return false;
+  const matches = (text: string): boolean => tokens.some((token) => text.includes(token));
+  const stack: unknown[] = [...rawTools];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (typeof node === "string") {
+      if (matches(node)) return true;
+    } else if (Array.isArray(node)) {
+      for (const item of node) stack.push(item);
+    } else if (typeof node === "object" && node !== null) {
+      for (const [key, value] of Object.entries(node)) {
+        // The KEY is scanned as well as the value: a reflected credential
+        // used as a schema property name reaches `describe` and the agent
+        // exactly as a value would.
+        if (matches(key)) return true;
+        stack.push(value);
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Reduces a URL to the operator-safe form `origin + path`: userinfo,
  * query, and fragment are all stripped.
  *
@@ -685,6 +742,24 @@ async function fetchAndProvision(args: {
         `exceeds the ${MAX_TOOL_TEXT_BYTES}-byte per-tool limit (tool index ${oversizeIndex}); ` +
         `nothing was written.`,
     );
+  }
+
+  // CX1 (§9.2): when a credential was sent, refuse a response that reflects it
+  // BEFORE `normalizeMcp` and BEFORE any write. A reflecting upstream can echo
+  // the `authorization` value in a tool name, description, schema value, or
+  // schema KEY, from where it would flow unredacted to the agent. The refusal
+  // names NO upstream bytes and NO tool index — the index itself could echo —
+  // and we REJECT rather than redact-and-store, which would silently change
+  // the tools' semantics. See `reflectsCredential` for the canonicalize-then-
+  // check shape and the documented transform residual.
+  if (args.onboardingAuth !== undefined) {
+    const tokens = redactionTokens(args.onboardingAuth);
+    if (reflectsCredential(rawTools, tokens)) {
+      throw new ProvisionRefused(
+        `[conduit add-mcp] upstream at ${safeUrl} reflected credential material in its ` +
+          `tools/list; nothing was written.`,
+      );
+    }
   }
 
   let tools: Awaited<ReturnType<typeof normalizeMcp>>;

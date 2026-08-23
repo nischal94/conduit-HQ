@@ -1194,3 +1194,129 @@ describe("INVARIANT §17 / §9.2 — concurrent provision/revalidate serialize p
     expect(await store.secrets.reveal(conn?.credentialRef as string)).toBe("Bearer secret-B");
   });
 });
+
+describe("CX1 credential-reflection refusal (§9.2, success path)", () => {
+  // The stored credential the daemon reveals and sends upstream as
+  // `authorization`. A reflecting server echoes this token back inside a
+  // successful, well-formed, sub-cap tools/list; the daemon must refuse the
+  // whole provision before `normalizeMcp` and before any write.
+  const SECRET = "Bearer refl-3cr3t-token-abc123";
+  // The bare token, without the scheme word — the segment `redactionTokens`
+  // also scans for, so an echo of just this substring is caught too.
+  const BARE = "refl-3cr3t-token-abc123";
+
+  // A minimal, VALID tool: `normalizeMcp` would accept it, so a stored result
+  // is the only thing standing between the reflection and the agent. Each
+  // case injects the credential in ONE position.
+  function reflectingList(
+    position: "description" | "name" | "schemaValue" | "schemaKey",
+  ): unknown[] {
+    const base = {
+      name: "list_issues",
+      description: "List open issues",
+      inputSchema: { type: "object", properties: {} as Record<string, unknown> },
+    };
+    switch (position) {
+      case "description":
+        return [{ ...base, description: `List issues for ${BARE}` }];
+      case "name":
+        // A syntactically-fine tool name that embeds the bare token.
+        return [{ ...base, name: `tool_${BARE}` }];
+      case "schemaValue":
+        return [
+          {
+            ...base,
+            inputSchema: {
+              type: "object",
+              properties: { q: { type: "string", description: `default ${SECRET}` } },
+            },
+          },
+        ];
+      case "schemaKey":
+        return [
+          {
+            ...base,
+            inputSchema: { type: "object", properties: { [BARE]: { type: "string" } } },
+          },
+        ];
+    }
+  }
+
+  it.each([
+    ["a description", "description"],
+    ["a tool name", "name"],
+    ["a schema value", "schemaValue"],
+    ["a schema KEY", "schemaKey"],
+  ] as const)("rejects a reflection in %s: nothing written, catalog untouched, no upstream bytes in the message", async (_label, position) => {
+    const store = await openTestStore();
+    const fetchTools: FetchTools = vi.fn(async () => reflectingList(position));
+
+    const result = await run(
+      { url: "http://upstream.example/mcp" },
+      { store, fetchTools, env: { CONDUIT_ADD_SECRET: SECRET } },
+    );
+
+    // Refused — exit 1, the fixed message, and NOT one byte of the
+    // reflected token or a tool index in it.
+    expect(result.exitCode).toBe(1);
+    expect(result.stderrLines).toHaveLength(1);
+    const stderr = result.stderrLines[0];
+    expect(stderr).toContain("reflected credential material in its tools/list");
+    expect(stderr).toContain("nothing was written");
+    expect(stderr).not.toContain(BARE);
+    expect(stderr).not.toContain(SECRET);
+
+    // Nothing was written — the store is exactly as empty as before.
+    expect(await store.sources.list()).toEqual([]);
+    expect(await store.connections.list()).toEqual([]);
+    expect(await store.tools.list()).toEqual([]);
+  });
+
+  it("MUTATION-CHECK: WITHOUT the scan, the reflecting description would be stored", async () => {
+    // Proves the scan is load-bearing. A tools/list identical to the
+    // description case, minus the credential (so no scan would fire), is a
+    // clean provision that DOES store the tool. The delta between this pass
+    // and the rejection above is exactly the reflection the scan catches: if
+    // the scan were removed, the reflecting case would take THIS path and
+    // land the credential-bearing description in the catalog.
+    const store = await openTestStore();
+    const cleanList: unknown[] = [
+      {
+        name: "list_issues",
+        description: "List issues for a normal-project",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ];
+    const fetchTools: FetchTools = vi.fn(async () => cleanList);
+
+    const result = await run(
+      { url: "http://upstream.example/mcp" },
+      { store, fetchTools, env: { CONDUIT_ADD_SECRET: SECRET } },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const tools = await store.tools.list();
+    expect(tools.length).toBe(1);
+    expect(tools[0]?.description).toContain("List issues");
+  });
+
+  it("an UNAUTHENTICATED onboarding (no secret) does not scan — a token-like description is stored", async () => {
+    // The scan is gated on `onboardingAuth !== undefined`: with no credential
+    // sent, there is nothing to reflect, and text that merely resembles a
+    // token must not be refused. This pins the gate so the scan cannot become
+    // a denylist over arbitrary response text.
+    const store = await openTestStore();
+    const fetchTools: FetchTools = vi.fn(async () => [
+      {
+        name: "list_issues",
+        description: `mentions ${BARE} but no credential was sent`,
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const result = await run({ url: "http://upstream.example/mcp" }, { store, fetchTools });
+
+    expect(result.exitCode).toBe(0);
+    expect((await store.tools.list()).length).toBe(1);
+  });
+});
