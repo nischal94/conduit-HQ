@@ -2055,3 +2055,74 @@ wording-independent, structural signal; matching the error string would couple
 the fix to the very text it exists to suppress. Reverse-skew (old client, new
 daemon) is safe because the response decoder was never extra-key-strict, so an
 old client silently ignores the new field — verified against the base commit.
+
+## 2026-08-23 — §17 step 3 built via SDD + full gauntlet (PR #50)
+
+Nine-task SDD build of the daemon control surface + catalog hot-reload, then
+the full load-bearing gauntlet. Lessons worth keeping:
+
+### 1. The cross-model pass earns its cost on the invariants same-model layers share
+Eleven prior review layers (9 task reviews, whole-branch, Tier-2 five-specialist,
+security-review, code-review mechanic) all passed the credential-boundary and
+state-dir surfaces clean. Codex pass 1 found TWO P1s in them: a hostile upstream's
+SUCCESSFUL `tools/list` reflecting the sent credential into a valid tool
+description flowed unredacted to the agent (§9.2 break — the code even had a
+comment acknowledging a reflecting server could echo the credential, but defended
+only the ERROR path); and a different-UID state-dir TOCTOU where the log sink
+opened before `assertStateDir` validated the directory. **Lesson: same-model
+reviewers share blind spots on the invariants they all reason about the same way.
+The value of a genuinely different model is exactly the finding every same-model
+layer waved through. Never treat "N same-model layers passed" as covering the
+cross-model pass — the arc per `codex-one-path.md` is not optional insurance, it
+is the layer that sees a different set.**
+
+### 2. Fix-then-confirm on a FIX commit finds real new findings — never skip the re-pass
+Codex pass 2 (confirming the 6 pass-1 fixes) found the CX6 fix incomplete: the new
+guard checked `startedAt` for finiteness and Date-range but not integer-ness, so a
+fractional `1.5` still rendered a silently-wrong instant. The confirming pass was
+not ceremony — it caught a real gap in the fix itself. Convergence took a pass 3.
+**Lesson: the confirming re-pass on a fix commit is where the reordered/rewritten
+code exposes new findings; budget for it, list the fixed findings in the re-pass
+prompt so convergence is explicit, and only stop when a pass returns nothing
+in-scope.**
+
+### 3. A review that says "the plan's own code is wrong" outranks the plan
+Task 3's brief carried verbatim recovery-ladder code that used `catalog.upsert`
+without `removeNamespace` — but `upsert` is a set-only Map operation, so a failed
+refresh left retired tools serving. The task reviewer caught it; the controller
+ruled the SPEC ("rehydrates the whole catalog") over the plan's literal code. The
+three-pass design review that produced the plan checked SHAPES (commit-then-refresh,
+recovery ladder); the task-scoped code review checked the SEMANTICS of each call.
+**Lesson: a plan surviving design review does not make its code correct — design
+review and code review operate at different altitudes and catch different bugs.
+When a task reviewer flags the plan's own mandated code, adjudicate against the
+spec, not against the plan's authorship.**
+
+### 4. A "once per process" latch three copies deep is three latches
+The Tier-2 and code-review waves both flagged that the skew warn-once latch,
+copy-pasted at module scope in three CLI command files, was three per-module
+latches — "once per process" held only because each entrypoint runs one command.
+Latent, not live: no current invocation crosses two command modules. **Lesson: a
+correctness property that holds "by construction" only because of an accident of
+the current call graph is a latent bug, not a safe one — the day something composes
+two of those modules it breaks silently, and the docblock asserting the property
+makes it worse. Single-source the shared instance.**
+
+### 5. Verify a test bites before trusting a scoped-query optimization
+The mechanic-wave brief predicted an existing test's assertions would still bite
+after switching a full-table read to `list(namespace)`. They didn't — the test
+fake ignored the namespace argument and returned every tool, so the optimization
+would have shipped untested. The implementer caught it and made the fake
+namespace-honoring. **Lesson: before trusting that an existing test covers a
+behavior-preserving change, confirm the test actually exercises the changed
+dimension — a permissive fake silently passes any scoping.**
+
+### 6. Environment quirks recur; a transcription-tier worker will hit them
+The Task-8 implementer (sonnet, transcription tier) backgrounded a test run
+against the foreground-only rule and stopped mid-task — the exact "background runs
+die with the turn" quirk the HANDOFF has carried since the key-lifecycle build.
+The workhorse-tier implementers never did. **Lesson: the cheapest tier follows the
+letter of its checklist but reaches for convenience tools the environment forbids;
+state the environment quirks in EVERY dispatch, and expect the transcription tier
+to need one correction — that is the tier working as designed (loud, recoverable),
+not a reason to distrust it.**
