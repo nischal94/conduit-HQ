@@ -1,7 +1,5 @@
 import {
-  AGENT_VERSION,
   CAPABILITY_REJECTION_PREFIX,
-  createSkewReporter,
   DaemonUnavailable,
   DEFAULT_CONDUIT_DIR,
   daemonPaths,
@@ -14,6 +12,8 @@ import {
   resolveEffectiveStateDir,
   sanitizeVersionForDisplay,
 } from "@conduithq/mcp";
+import { VERSION } from "../dispatch.js";
+import { reportSkew } from "../skew.js";
 
 /**
  * `conduit daemon status|stop` — the operator's window onto the background
@@ -73,17 +73,6 @@ export interface DaemonCmdDeps {
   stdout: (line: string) => void;
   stderr: (line: string) => void;
 }
-
-/**
- * Skew reporting for this process (spec §4), at MODULE scope so "once per
- * process" is true by construction — the same posture `approvals.ts` takes,
- * and for the same reason: a per-invocation latch would silently become
- * "once per invocation" the day anything called the entrypoint twice.
- *
- * Production-only: tests build their own `DaemonCmdDeps` and never reach
- * `prodDeps`, so this latch is untouched across test cases.
- */
-const reportSkew = createSkewReporter((line) => process.stderr.write(`${line}\n`));
 
 function prodDeps(stateDir: string): DaemonCmdDeps {
   // Resolved once, so the lock this command polls is the one the daemon it
@@ -208,7 +197,7 @@ export async function runStatus(deps: DaemonCmdDeps): Promise<number> {
       // socket and lands on a terminal, exactly like the skew warning's
       // copy of it, so it goes through the same allowlist. The guard proves
       // it is a STRING; it does not prove the string is printable.
-      `  version:     ${sanitizeVersionForDisplay(status.agentVersion)} (this CLI: ${AGENT_VERSION})\n` +
+      `  version:     ${sanitizeVersionForDisplay(status.agentVersion)} (this CLI: ${VERSION})\n` +
       `  started:     ${new Date(status.startedAt).toISOString()}\n` +
       `  db:          ${status.dbPath}\n` +
       `  connections: ${status.connections}\n` +
@@ -235,7 +224,21 @@ export async function runStop(deps: DaemonCmdDeps): Promise<number> {
   // reports: it means "will stop", and the fact worth printing is whether
   // it DID, which the lock below answers. So the result is checked for the
   // refusal arms and its payload deliberately never read.
-  if (!isUsableResult("stop", response, deps)) return 1;
+  //
+  // `outcome-unknown` is the ONE non-result arm that still falls through to
+  // the poll. On a STOPPING daemon a cut ack is the natural case, not an
+  // anomaly: the daemon writes the frame and immediately begins its drain,
+  // so the connection can close before the client finishes reading. The
+  // lifecycle lock is the truth about whether it stopped, and it is
+  // readable regardless of what happened to the ack — so refusing here
+  // would report "failed" about a daemon that is exiting cleanly. `status`
+  // keeps exit 1 on the same arm because it has nothing to verify against:
+  // the projection it wanted only ever exists inside the lost frame.
+  if (response.kind === "outcome-unknown") {
+    deps.stderr("[conduit daemon] ack outcome unknown; verifying via the lifecycle lock.\n");
+  } else if (!isUsableResult("stop", response, deps)) {
+    return 1;
+  }
 
   // Ack received; wait for VERIFIED termination — see the module docblock.
   const waitUntil = deps.now() + STOP_WAIT_MS;

@@ -1,5 +1,4 @@
 import {
-  createSkewReporter,
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
   deadlineForRequest,
@@ -7,6 +6,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from "@conduithq/mcp";
+import { reportSkew } from "../skew.js";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
 /**
@@ -305,16 +305,6 @@ export interface AddMcpOptions {
   /** Defaults to the uid-derived `DEFAULT_CONDUIT_DIR` (design §3.1). */
   stateDir?: string;
 }
-
-/**
- * Skew reporting for this process (spec §4), at MODULE scope so "once per
- * process" is true by construction rather than by `addMcp` happening to be
- * called once. One onboarding run issues several daemon calls, and a skew
- * diagnosis is the same fact every time.
- *
- * Production-only: tests build their own deps and never reach this path.
- */
-const reportSkew = createSkewReporter((line) => process.stderr.write(`${line}\n`));
 
 /** Production entrypoint wired into the CLI dispatch (bin.ts). */
 export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<number> {

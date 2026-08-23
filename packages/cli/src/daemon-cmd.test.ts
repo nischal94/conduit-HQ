@@ -1,4 +1,6 @@
 import {
+  AGENT_VERSION,
+  CAPABILITY_REJECTION_PREFIX,
   DaemonUnavailable,
   DRAIN_DEADLINE_MS,
   type RpcRequest,
@@ -12,6 +14,7 @@ import {
   STOP_POLL_MS,
   STOP_WAIT_MS,
 } from "./commands/daemon.js";
+import { VERSION } from "./dispatch.js";
 
 /**
  * `conduit daemon status|stop` through its DI seam (the pattern
@@ -91,12 +94,20 @@ const STATUS_PAYLOAD = {
   logSizeBytes: 8192,
 };
 
-/** The frame a PRE-CONTROL daemon sends: it has no `control` capability. */
+/**
+ * The frame a PRE-CONTROL daemon sends: it has no `control` capability.
+ *
+ * The prefix is IMPORTED rather than re-spelled — the same coupling the
+ * detection under test makes. A local copy would keep passing after a
+ * reword on the daemon side, pinning a message no daemon sends. The row
+ * list is the literal a pre-control daemon carried (no `control` in it),
+ * which is the whole point of the fixture and correctly stays a literal.
+ */
 const PRE_CONTROL_FRAME: RpcResponse = {
   kind: "error",
   requestId: "r1",
   code: "invalid",
-  message: "handshake.capability must be one of serve | approvals | add-mcp",
+  message: `${CAPABILITY_REJECTION_PREFIX} serve | approvals | add-mcp`,
 };
 
 describe("conduit daemon status", () => {
@@ -181,6 +192,19 @@ describe("conduit daemon status", () => {
     const printed = rec.err.join("");
     expect(printed).toContain("predates the control API");
     expect(printed).toContain("SIGTERM");
+  });
+
+  it("exits 1 on outcome-unknown: unlike stop, there is nothing to verify", async () => {
+    // The asymmetry with `stop` is deliberate. `stop`'s answer is a goal
+    // state the lifecycle lock can confirm independently, so a lost ack is
+    // recoverable. `status`'s answer IS the lost frame — the projection
+    // exists nowhere else — so an ambiguous outcome is simply a failure.
+    const rec = makeDeps({
+      answer: async () => ({ kind: "outcome-unknown", requestId: "r1" }),
+    });
+
+    expect(await runStatus(rec.deps)).toBe(1);
+    expect(rec.out.join("")).not.toContain("running");
   });
 });
 
@@ -268,6 +292,41 @@ describe("conduit daemon stop", () => {
     expect(rec.probes).toBe(0);
   });
 
+  it("falls through to the lock poll on outcome-unknown and reports the verified stop", async () => {
+    // A cut ack is the NATURAL case on a stopping daemon, not a fault: the
+    // daemon writes the frame and immediately begins draining, so the
+    // connection can close before the client finishes reading it. The
+    // lifecycle lock answers the only question this command asks, and it
+    // is readable whatever happened to the ack — so refusing here would
+    // print "stop failed" about a daemon that exited cleanly.
+    const rec = makeDeps({
+      answer: async () => ({ kind: "outcome-unknown", requestId: "r1" }),
+      probes: ["busy", "free"],
+    });
+
+    expect(await runStop(rec.deps)).toBe(0);
+    expect(rec.out.join("")).toContain("stopped");
+    // The verification actually ran rather than the arm being skipped.
+    expect(rec.probes).toBe(2);
+    // Said so on stderr, so the operator can tell a verified stop from an
+    // acked one when reading the transcript afterwards.
+    expect(rec.err.join("")).toContain("outcome unknown");
+  });
+
+  it("still exits 1 on outcome-unknown when the lock never frees", async () => {
+    // The fall-through is a VERIFICATION, not a pardon: an ambiguous ack
+    // over a daemon that never releases the lock is the still-draining
+    // path, identical to a clean ack that never verifies.
+    const rec = makeDeps({
+      answer: async () => ({ kind: "outcome-unknown", requestId: "r1" }),
+      probes: ["busy"],
+    });
+
+    expect(await runStop(rec.deps)).toBe(1);
+    expect(rec.err.join("")).toMatch(/draining/i);
+    expect(rec.out.join("")).not.toContain("stopped");
+  });
+
   it("waits longer than the daemon takes to drain", () => {
     // STOP_WAIT_MS is documented as "the drain deadline plus margin" but
     // derived from neither constant, and the two live in different
@@ -275,5 +334,24 @@ describe("conduit daemon stop", () => {
     // window BELOW the drain deadline would report "still draining" at an
     // operator for every daemon that merely used its full budget.
     expect(STOP_WAIT_MS).toBeGreaterThan(DRAIN_DEADLINE_MS);
+  });
+});
+
+describe("CLI and agent versions", () => {
+  it("ship in lockstep", () => {
+    // Two DIFFERENT versions that happen to be equal today. `VERSION` names
+    // the user-facing CLI release; `AGENT_VERSION` names the mcp package's
+    // build, which is what the daemon runs and therefore what the §4 skew
+    // warning compares against. `daemon status` prints `VERSION` on its
+    // "this CLI" line, because that line answers "which conduit am I
+    // running", not "which mcp does it bundle".
+    //
+    // The packages version together today, so no reader can tell the two
+    // apart by inspection — which is precisely the hazard. This test is the
+    // TRIPWIRE for a future split: the day the versions diverge it fails,
+    // and whoever splits them has to decide deliberately what each display
+    // site and each comparand should say, rather than discovering it from
+    // an operator report about a wrong number on a status line.
+    expect(VERSION).toBe(AGENT_VERSION);
   });
 });

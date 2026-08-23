@@ -1,5 +1,4 @@
 import {
-  createSkewReporter,
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
   deadlineForRequest,
@@ -8,6 +7,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from "@conduithq/mcp";
+import { reportSkew } from "../skew.js";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
 /**
@@ -58,18 +58,6 @@ export interface ApprovalsResult {
  * `serve` takes, and for the same reason: the state directory selects which
  * daemon, and therefore which database, this command decides against.
  */
-/**
- * Skew reporting for this process (spec §4), at MODULE scope so "once per
- * process" is true by construction rather than by `prodDeps` happening to
- * be called once. A single invocation issues several daemon calls, and a
- * skew diagnosis is the same fact every time — repeating it would bury the
- * command's own output under duplicate warnings.
- *
- * Production-only: tests build their own `ApprovalsDeps` and never reach
- * `prodDeps`, so this latch is never touched across test cases.
- */
-const reportSkew = createSkewReporter((line) => process.stderr.write(`${line}\n`));
-
 function prodDeps(stateDir: string): ApprovalsDeps {
   return {
     daemon: (request) =>
