@@ -60,8 +60,14 @@ export const LOG_MAX_BYTES = 5 * 1024 * 1024;
 export const LOG_LINE_MAX_BYTES = 8 * 1024;
 /**
  * Marks a line the truncation shortened. Its own byte length is subtracted
- * from the slice bound, so a truncated line lands at exactly
+ * from the slice bound, so a truncated line lands at or below
  * `LOG_LINE_MAX_BYTES` rather than at the cap PLUS this suffix.
+ *
+ * At or below, never exactly: a byte slice can land mid-character, and
+ * decoding an incomplete UTF-8 sequence EXPANDS it to U+FFFD (3 bytes) —
+ * so a slice ending 2 bytes into a 4-byte character decodes 1 byte LARGER
+ * than the slice. The truncation below therefore re-measures the decoded
+ * text rather than trusting the slice bound.
  */
 const TRUNC_SUFFIX = "…[truncated]";
 /** Retry a failed rotation only after this much MORE has been written. */
@@ -112,7 +118,20 @@ export function createRotatingLog(stateDir: string): RotatingLog {
         // multi-byte ellipsis is why the allowance is a BYTE length, not a
         // character count.
         const room = LOG_LINE_MAX_BYTES - Buffer.byteLength(TRUNC_SUFFIX);
-        text = `${Buffer.from(text).subarray(0, room).toString()}${TRUNC_SUFFIX}`;
+        let head = Buffer.from(text).subarray(0, room).toString();
+        // The slice is a BYTE bound and can cut a character in half. Node
+        // decodes the orphaned bytes to U+FFFD, which costs 3 bytes each
+        // and can therefore EXCEED the slice it came from: a 4-byte
+        // character cut after 2 bytes decodes to 3, one byte over.
+        //
+        // Dropping UTF-16 units from the end converges to a value at or
+        // below `room` for every 1..4-byte character. Each drop strictly
+        // shrinks the encoding: removing a BMP character frees its 1-3
+        // bytes, and splitting a surrogate pair replaces its 4 bytes with
+        // a 3-byte U+FFFD for the orphaned lead. The empty string measures
+        // 0, so the loop always terminates.
+        while (Buffer.byteLength(head) > room) head = head.slice(0, -1);
+        text = `${head}${TRUNC_SUFFIX}`;
       }
       const buf = Buffer.from(`${text}\n`);
       if (bytes + buf.length > nextRotateAttempt) rotate();

@@ -129,6 +129,50 @@ describe("createRotatingLog", () => {
     expect(statSync(join(dir, DAEMON_LOG)).size).toBeLessThanOrEqual(LOG_LINE_MAX_BYTES + 1);
   });
 
+  it("holds the cap when the slice cuts a 4-byte character in half", () => {
+    // The exact arithmetic that broke the cap. The suffix "…[truncated]" is
+    // 14 bytes, so room = 8192 - 14 = 8178, and 8178 % 4 == 2: the byte
+    // slice ends two bytes into a 4-byte character. Node decodes those two
+    // orphaned bytes to U+FFFD, which costs 3 — one byte MORE than the
+    // slice they came from — so the finished line ran to 8193 and the
+    // "single line cannot blow the budget" guarantee (spec §5) was off by
+    // one for exactly this input class.
+    //
+    // A pure-ASCII line can never produce this: every character is one
+    // byte, so the slice always lands on a boundary. Only a multi-byte
+    // line whose width does not divide `room` reaches the defect, which is
+    // why the ASCII case above passed throughout.
+    const dir = newDir();
+    const sink = createRotatingLog(dir);
+    // U+1F600 is 4 bytes in UTF-8. Well over the cap, so it truncates.
+    sink.log("\u{1F600}".repeat(LOG_LINE_MAX_BYTES));
+    sink.close();
+
+    const content = readFileSync(join(dir, DAEMON_LOG), "utf8");
+    expect(content.endsWith("…[truncated]\n")).toBe(true);
+    // The same bound the ASCII case asserts: the cap, plus the one newline
+    // every line carries. No allowance for the replacement character.
+    expect(statSync(join(dir, DAEMON_LOG)).size).toBeLessThanOrEqual(LOG_LINE_MAX_BYTES + 1);
+  });
+
+  it("holds the cap across every 1..4-byte character width", () => {
+    // Widths 1, 2, 3 and 4 all appear, and each is combined with a shifting
+    // one-byte prefix so the slice boundary lands at a different offset
+    // within the repeated character on every run. That sweeps all four
+    // residues of `room % width` rather than testing the one alignment a
+    // single fixture happens to produce.
+    const widths = ["a", "é", "中", "\u{1F600}"];
+    for (const char of widths) {
+      for (let pad = 0; pad < 4; pad += 1) {
+        const dir = newDir();
+        const sink = createRotatingLog(dir);
+        sink.log("a".repeat(pad) + char.repeat(LOG_LINE_MAX_BYTES));
+        sink.close();
+        expect(statSync(join(dir, DAEMON_LOG)).size).toBeLessThanOrEqual(LOG_LINE_MAX_BYTES + 1);
+      }
+    }
+  });
+
   it("refuses to open through a symlink at the log path, leaving the target unwritten", () => {
     // The state directory is a 0700 boundary (§3.2), but the sink opens
     // BEFORE `ensureStateDir` has lstat-verified it — so a daemon started by
