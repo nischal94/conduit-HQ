@@ -124,12 +124,20 @@ Properties, stated at their true strength:
   already serializes provisioning per namespace, so catalog
   publication order matches commit order; a late continuation cannot
   publish an older generation over a newer one.
-- **Recoverable.** If the catalog update itself throws after the
-  commit (programming error — it has no I/O), the daemon rehydrates
-  the whole catalog from the store; if THAT fails, it logs and keeps
-  the previous catalog (stale-but-consistent, repaired on next
-  provision or restart). §9 pins the rehydrate path with an injected
-  failure.
+- **Recoverable, per namespace.** If the catalog update throws after
+  the commit, the daemon retries the refresh of THAT NAMESPACE — not a
+  whole-catalog rehydrate. The scope is the lock's: the refresh holds
+  the per-namespace source lock, and `store.tools.list()` spans every
+  namespace, so republishing the full list would write outside the
+  lock and could resurrect a tool a concurrently-committing namespace
+  had just retired. The read is filtered to this namespace so the
+  write scope matches the lock scope.
+  If the retry ALSO fails, the daemon logs and stops there. The line
+  says only what is verifiable: the failure can land on either
+  mutation, so this namespace's entries may be MISSING OR PARTIAL —
+  not merely stale — until the next provision/revalidate of it, or a
+  restart, rehydrates them from the store. Every other namespace is
+  untouched. §9 pins both rungs with injected failures.
 - **Crash-consistent.** Daemon death between commit and catalog
   update loses nothing: the next start rehydrates from the store.
 - **Bounded input.** The provisioning tail's existing upstream
@@ -406,8 +414,9 @@ bodies. Nothing else about step 4 is anticipated here.
   cannot corrupt state at any interruption point — its first effect
   is the signal path the daemon already survives.
 - Catalog hydration failure at startup: fail-closed before bind (§2.1).
-- Catalog refresh failure after commit: rehydrate-from-store recovery,
-  then stale-but-consistent fallback (§2.2).
+- Catalog refresh failure after commit: per-namespace retry from the
+  store, then stop — the namespace's entries may be missing or partial
+  and the log says so; other namespaces are unaffected (§2.2).
 - Log rotation failure: keep old fd, retry at next cap-hit (§5).
 
 ## 9. Testing
@@ -420,8 +429,11 @@ Hot-reload:
 - Mechanism pin: a search RPC observes a direct shared-catalog
   mutation with no store write (kills the per-call-snapshot bypass).
 - Revalidate refreshes the catalog (the shared-tail hook).
-- Injected catalog-update failure after commit → rehydrate recovery
-  path runs; search still serves the committed tools.
+- Injected catalog-update failure after commit → the per-namespace
+  retry runs; search still serves the committed tools.
+- Injected UPSERT failure (the other rung's failure point): the
+  provision still answers success, and the rung-2 log line reports the
+  namespace as missing-or-partial rather than merely stale.
 - Concurrent executions through the one shared runtime complete
   correctly (overlap, not just two sequential runs).
 - Long-lived runtime: sequential executions share one runtime
@@ -505,3 +517,12 @@ same-UID privilege separation (parent design's accepted v1 limit).
   contract (deferred, §10).
 - 2026-08-22 — `status` exit code: 0 running / 3 not running
   (human-confirmed; codex #19 adopted). No open items remain.
+- 2026-08-23 — divergence fix (d0ea117 shipped the per-namespace
+  refresh; this spec still described a whole-catalog rehydrate). §2.2
+  and §8 now match the implementation: the recovery ladder is
+  per-namespace because the write scope must equal the held source
+  lock's scope, and the rung-2 log line claims only what is
+  verifiable. Found by the Tier-2 five-specialist review of
+  `feat/daemon-control`; the same review corrected the rung-2 wording
+  in code, which had asserted "serving the previous catalog" even when
+  an upsert failure had left the namespace empty or partial.

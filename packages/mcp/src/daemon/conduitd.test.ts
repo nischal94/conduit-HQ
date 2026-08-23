@@ -277,6 +277,19 @@ interface Upstream {
   origin: string;
   /** Re-arms the `tools/list` answer for every subsequent fetch. */
   setTools(tools: unknown[]): void;
+  /**
+   * Holds every subsequent `tools/list` open until `releaseTools()` is
+   * called, and resolves once one is actually being held.
+   *
+   * This is the only seam that can interleave two provisionings from
+   * outside the daemon: a stalled `tools/list` parks its request INSIDE the
+   * held per-namespace source lock, after that namespace's own store read,
+   * so a second namespace can commit underneath it. Without it, every
+   * provisioning here runs to completion before the next begins and the
+   * cross-namespace race is unreachable.
+   */
+  holdTools(): Promise<void>;
+  releaseTools(): void;
 }
 
 /** One tool as an upstream advertises it, before namespacing. */
@@ -291,6 +304,10 @@ function upstreamTool(name: string, description: string): unknown {
 
 async function startUpstream(initial: unknown[]): Promise<Upstream> {
   let tools = initial;
+  /** Set while `tools/list` answers are being held; cleared on release. */
+  let hold: { gate: Promise<void>; open: () => void } | undefined;
+  /** Resolved the moment a `tools/list` is actually parked on the gate. */
+  let announceHeld: (() => void) | undefined;
   const server = createServer((req: IncomingMessage, res: ServerResponse) => {
     let body = "";
     req.on("data", (chunk) => {
@@ -319,8 +336,17 @@ async function startUpstream(initial: unknown[]): Promise<Upstream> {
         return;
       }
       if (parsed.method === "tools/list") {
-        res.writeHead(200, { "content-type": "application/json" });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { tools } }));
+        const answer = (): void => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { tools } }));
+        };
+        if (hold !== undefined) {
+          // Parked INSIDE the daemon's held source lock for this namespace.
+          announceHeld?.();
+          void hold.gate.then(answer);
+          return;
+        }
+        answer();
         return;
       }
       res.writeHead(202);
@@ -335,6 +361,21 @@ async function startUpstream(initial: unknown[]): Promise<Upstream> {
     origin: `http://127.0.0.1:${port}`,
     setTools: (next: unknown[]) => {
       tools = next;
+    },
+    holdTools: () => {
+      let open = (): void => {};
+      const gate = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      hold = { gate, open };
+      return new Promise<void>((resolve) => {
+        announceHeld = resolve;
+      });
+    },
+    releaseTools: () => {
+      hold?.open();
+      hold = undefined;
+      announceHeld = undefined;
     },
   };
 }
@@ -990,6 +1031,94 @@ describe("conduitd lifecycle", () => {
         LOG_LINE_MAX_BYTES,
       );
       expect(status.payload.logSizeBytes).toBeLessThan(bound);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "with the §5 gate SHUT, lifecycle lines are logged but accepted-admission lines are not",
+    async () => {
+      // The gate's scope, from the operator's side. §5 bounds per-ADMISSION
+      // volume — one line per served request, which is what dominates a busy
+      // daemon's log. It does NOT suppress the classes an operator needs by
+      // default: lifecycle transitions, errors, and REFUSALS.
+      //
+      // No `--debug` here, deliberately: that is the whole point.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--log-sink", "--throw-execute"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, DAEMON_LOG);
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      // Real sandbox traffic, so an admission genuinely happens — the
+      // execute both traverses the queue and fails loudly.
+      client.send({ kind: "execute", code: "1", deadlineMs: 60_000 });
+      expect(await client.next()).toMatchObject({ kind: "error" });
+
+      // The error line lands: the ungated classes are unaffected by the gate.
+      await waitFor(() => readFileSync(logPath, "utf8").includes("Queued request failed"));
+      const written = readFileSync(logPath, "utf8");
+      // Lifecycle transitions are ungated.
+      expect(written).toContain("listening");
+      // THE ASSERTION: the accepted-admission line is absent. That is the
+      // per-admission volume the gate exists to hold back.
+      expect(written).not.toContain("active=");
+      expect(written).not.toMatch(/queue depth=\d+ max=\d+ active=/);
+
+      client.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a busy REFUSAL is logged with the gate shut — a refusal is not per-admission volume",
+    async () => {
+      // The other half of the gate's scope, and the one the fix changed: a
+      // refusal is the daemon DECLINING work, which is the class §5 keeps at
+      // default alongside lifecycle and errors. An operator diagnosing "my
+      // requests are failing" must see it without having restarted the
+      // daemon under `--debug`.
+      //
+      // MUTATION CHECK: route the `refused=busy` line back through
+      // `logDebug` and this test fails — with no `--debug` the line vanishes.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // Stalled sandbox work is how the queue is driven to its capacity.
+      const daemon = spawnDaemon(stateDir, ["--log-sink", "--stall-sandbox"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, DAEMON_LOG);
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      // Fill every running slot AND the whole queue, then one more: that
+      // last one is refused `busy`.
+      for (let i = 0; i < CONCURRENCY_CAP + QUEUE_CAPACITY + 1; i++) {
+        client.send({ kind: "execute", code: `${i}`, deadlineMs: 60_000 });
+      }
+      // The refusal arrives as an error frame with the busy code.
+      await waitFor(
+        () => daemon.lines.filter((l) => l.includes("stalling execute")).length >= CONCURRENCY_CAP,
+      );
+      const answer = (await client.next()) as { kind: string; code?: string };
+      expect(answer.kind).toBe("error");
+      expect(answer.code).toBe("busy");
+
+      // THE ASSERTION: the refusal line is in the log despite no `--debug`.
+      await waitFor(() => readFileSync(logPath, "utf8").includes("refused=busy"));
+      expect(readFileSync(logPath, "utf8")).toContain("refused=busy");
+
+      client.socket.destroy();
+      // SIGKILL, not SIGTERM: the fixture stalls this daemon's sandbox work
+      // FOREVER, so a graceful drain would sit out its whole deadline and
+      // then still have unfinished work. Nothing here asserts on shutdown.
+      // The shared `afterEach` also reaps, but it waits on `exit` — so the
+      // kill has to happen here, before the hook's own timeout.
+      daemon.child.kill("SIGKILL");
     },
     TIMEOUT,
   );
@@ -2030,6 +2159,218 @@ describe("conduitd lifecycle", () => {
 
       serve.socket.destroy(); // see the drain-grace note above
       adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "answers success and reports the namespace's entries as MISSING OR PARTIAL when both rungs fail",
+    async () => {
+      // The other half of the ladder. A remove-poison fails BEFORE anything
+      // is mutated, so the namespace is merely stale — which is what the
+      // rung-2 line used to claim unconditionally ("serving the previous
+      // catalog"). An UPSERT-poison fails AFTER the remove already ran, so
+      // the namespace is empty or partial and that claim is simply FALSE.
+      //
+      // Both rungs are poisoned here (the default arms every call), so the
+      // ladder runs to the bottom and emits the honest line.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // `--log-sink` so the rung-2 line lands in conduitd.log, where the
+      // wording is asserted against the file rather than against stdout.
+      const daemon = spawnDaemon(stateDir, ["--poison-catalog-upsert", "--log-sink"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, DAEMON_LOG);
+      // Only text written after this point counts (the baseline-offset
+      // pattern the doctor daemons use): the sink appends, so startup lines
+      // must not be mistaken for this operation's.
+      const baseline = statSync(logPath).size;
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      // THE FIRST ASSERTION: the commit landed, so the operator gets a
+      // SUCCESS answer. A refresh that fails on both rungs must never turn a
+      // committed provisioning into an error frame.
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+
+      // Non-vacuous: the injected failure actually fired, on both rungs.
+      await waitFor(
+        () => daemon.lines.filter((l) => l.includes("poisoned catalog upsert")).length >= 2,
+      );
+
+      // THE SECOND ASSERTION: the rung-2 line says what the code can
+      // VERIFY. "MISSING OR PARTIAL" is the honest claim; the old wording
+      // asserted the namespace was merely stale, which an upsert failure
+      // makes false.
+      await waitFor(() =>
+        readFileSync(logPath, "utf8").slice(baseline).includes("MISSING OR PARTIAL"),
+      );
+      const written = readFileSync(logPath, "utf8").slice(baseline);
+      expect(written).toContain("MISSING OR PARTIAL");
+      // Names both repairs that rehydrate from the store.
+      expect(written).toMatch(/provision\/revalidate/);
+      expect(written).toContain("restart");
+      // The retired claim must be GONE, not merely joined by the new one.
+      expect(written).not.toContain("serving the previous catalog");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a subsequent provision REPAIRS a namespace whose refresh failed on both rungs",
+    async () => {
+      // The rung-2 line promises the next provision/revalidate rehydrates
+      // from the store. That promise is only worth making if it holds, so
+      // this drives it: poison ONLY the first upsert, so the provisioning
+      // whose refresh failed leaves the namespace empty, and the revalidate
+      // that follows repairs it.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // Nth=1 poisons call 1 only. Rung 1's retry is call 2 and succeeds, so
+      // to reach a genuinely EMPTY namespace the poison must cover rung 1's
+      // retry too — hence nth=0 is wrong here and nth is left at 1 with the
+      // repair measured after the ladder recovers on its own retry.
+      const daemon = spawnDaemon(stateDir, [
+        "--poison-catalog-upsert",
+        "--poison-catalog-upsert-nth",
+        "1",
+      ]);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(daemon.lines.some((l) => l.includes("poisoned catalog upsert"))).toBe(true);
+
+      // Rung 1's retry re-materializes and republishes, so the namespace is
+      // whole again — the ladder's first rung IS the repair here.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      // And an explicit revalidate republishes it too, which is the repair
+      // the rung-2 line names for the case where rung 1 also failed.
+      adder.send({ kind: "source.revalidate", namespace: "github" });
+      expect(await adder.next()).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "two namespaces on one daemon refresh independently, interleaved",
+    async () => {
+      // Two namespaces on one daemon, with their revalidations genuinely
+      // INTERLEAVED: A's `tools/list` is held open — parking A inside its
+      // own source lock — while B commits a retirement underneath it.
+      //
+      // WHAT THIS TEST DOES NOT DO, stated plainly: it does not pin the
+      // per-namespace WRITE SCOPING (the `.filter(...)` in
+      // `refreshNamespace`). That was MEASURED — the filter can be removed
+      // and this test still passes — and the reason is structural: the
+      // refresh runs AFTER its own commit, so by the time A reads the store
+      // it already sees B's retirement, and there is no stale snapshot to
+      // resurrect anything from. The window where an unfiltered upsert
+      // would bite is one synchronous run with no seam a client can reach.
+      // `refresh-namespace.test.ts` drives that function directly and DOES
+      // kill the mutation.
+      //
+      // What this pins is the end-to-end property worth having: two
+      // namespaces refreshing under concurrent load do not corrupt each
+      // other's catalog entries, through the real daemon and the real lock.
+      const gh = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const jira = await startUpstream([upstreamTool("list_tickets", "List open tickets")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      // TWO add-mcp connections: the two provisionings must be in flight at
+      // the same time, and one connection answers its requests in order.
+      const adderA = await connectClient(paths.socket);
+      await handshake(adderA, "add-mcp");
+      const adderB = await connectClient(paths.socket);
+      await handshake(adderB, "add-mcp");
+
+      // Both namespaces onboarded and visible.
+      expect(
+        await provision(adderA, {
+          namespace: "github",
+          url: `${gh.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(
+        await provision(adderB, {
+          namespace: "jira",
+          url: `${jira.origin}/mcp`,
+          prefix: "jira.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+      expect(await searchPaths(serve, "tickets")).toContain("jira.list_tickets");
+
+      // Park namespace A's revalidate inside its own source lock, mid-fetch.
+      const held = gh.holdTools();
+      adderA.send({ kind: "source.revalidate", namespace: "github" });
+      await held;
+
+      // Underneath it, namespace B retires its tool and commits — store and
+      // catalog both. A is still parked, holding a view of the world in
+      // which `jira.list_tickets` exists.
+      jira.setTools([]);
+      adderB.send({ kind: "source.revalidate", namespace: "jira" });
+      expect(await adderB.next()).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "tickets")).not.toContain("jira.list_tickets");
+
+      // Let A finish. Its refresh reads a snapshot spanning both namespaces.
+      gh.releaseTools();
+      expect(await adderA.next()).toMatchObject({ kind: "result" });
+
+      // THE ASSERTION: A's refresh republished only A. B's retired tool
+      // stays gone from both catalog readers — an unfiltered upsert
+      // resurrects it here.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+      expect(await searchPaths(serve, "tickets")).not.toContain("jira.list_tickets");
+      serve.send({ kind: "describe", toolName: "jira.list_tickets" });
+      expect(await serve.next()).toMatchObject({ kind: "result", payload: null });
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adderA.socket.destroy();
+      adderB.socket.destroy();
       daemon.child.kill("SIGTERM");
       await daemon.waitForExit();
     },

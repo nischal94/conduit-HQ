@@ -147,6 +147,22 @@ const poisonCatalogRefresh = rest.includes("--poison-catalog-refresh");
 const poisonNthFlag = rest.indexOf("--poison-catalog-refresh-nth");
 const poisonNth = poisonNthFlag === -1 ? 1 : Number(rest[poisonNthFlag + 1] ?? 1);
 /**
+ * Poisons the UPSERT half of the refresh instead of the remove half — the
+ * ladder's OTHER failure point, and the one whose consequences differ.
+ *
+ * A remove-poison fails before anything is mutated, so the namespace is
+ * merely stale. An upsert-poison fails AFTER the remove already ran, so the
+ * namespace is left empty or partial — which is exactly the state the rung-2
+ * log line has to describe honestly rather than calling it "the previous
+ * catalog". Arming both rungs (the default `--poison-catalog-upsert-nth` of
+ * 0 poisons EVERY call) is what drives the ladder to rung 2 and produces
+ * that line.
+ */
+const poisonCatalogUpsert = rest.includes("--poison-catalog-upsert");
+const poisonUpsertNthFlag = rest.indexOf("--poison-catalog-upsert-nth");
+/** 0 (the default) means "every call"; a positive N poisons only the Nth. */
+const poisonUpsertNth = poisonUpsertNthFlag === -1 ? 0 : Number(rest[poisonUpsertNthFlag + 1] ?? 0);
+/**
  * Wires the REAL owned rotating sink so a test can assert on the ON-DISK
  * log file rather than on a sink object.
  *
@@ -410,22 +426,40 @@ const createRuntime = pauseExecute
                     console.log("planted catalog tool");
                     return built;
                   }
-                : poisonCatalogRefresh
+                : poisonCatalogUpsert
                   ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
                       const built = await createApprovalRuntime(runtimeOpts);
-                      const realRemove = built.catalog.removeNamespace.bind(built.catalog);
+                      const realUpsert = built.catalog.upsert.bind(built.catalog);
                       let calls = 0;
-                      built.catalog.removeNamespace = (ns: string) => {
+                      built.catalog.upsert = (tools: Parameters<typeof realUpsert>[0]) => {
                         calls += 1;
-                        if (calls === poisonNth) {
-                          console.log("poisoned catalog refresh");
-                          throw new Error("injected refresh failure");
+                        // The remove has ALREADY run by the time this throws
+                        // — that is the whole point: the namespace is left
+                        // empty, not stale.
+                        if (poisonUpsertNth === 0 || calls === poisonUpsertNth) {
+                          console.log("poisoned catalog upsert");
+                          throw new Error("injected upsert failure");
                         }
-                        realRemove(ns);
+                        realUpsert(tools);
                       };
                       return built;
                     }
-                  : undefined;
+                  : poisonCatalogRefresh
+                    ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                        const built = await createApprovalRuntime(runtimeOpts);
+                        const realRemove = built.catalog.removeNamespace.bind(built.catalog);
+                        let calls = 0;
+                        built.catalog.removeNamespace = (ns: string) => {
+                          calls += 1;
+                          if (calls === poisonNth) {
+                            console.log("poisoned catalog refresh");
+                            throw new Error("injected refresh failure");
+                          }
+                          realRemove(ns);
+                        };
+                        return built;
+                      }
+                    : undefined;
 
 const sink = useLogSink ? createRotatingLog(stateDir) : null;
 

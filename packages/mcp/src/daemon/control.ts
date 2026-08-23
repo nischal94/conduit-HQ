@@ -30,7 +30,31 @@ import {
   isDaemonStatusShape,
 } from "../payloads.js";
 
-export type Principal = { kind: "anonymous-local" };
+declare const PRINCIPAL_BRAND: unique symbol;
+
+/**
+ * Who a control call is on behalf of — CONSTRUCTIBLE ONLY by this module.
+ *
+ * The brand is what makes the docblock's rule enforceable rather than
+ * merely stated. A principal can never be decoded from a request: the wire
+ * shape `{kind: "anonymous-local"}` is trivially forgeable by any client,
+ * and a plain structural type would let a decoder hand one straight to
+ * `daemonStatus`. With the brand, the only value that type-checks as a
+ * `Principal` is one `anonymousLocalPrincipal()` produced — so a future
+ * transport that tries to read a principal off the wire fails to COMPILE
+ * instead of silently accepting a client-supplied authorization input.
+ */
+export type Principal = { kind: "anonymous-local"; readonly [PRINCIPAL_BRAND]: true };
+
+/**
+ * The ONLY producer of a `Principal`. Called by a transport, server-side,
+ * after that transport's own authentication has held — on UDS that is the
+ * §3.2 directory boundary, which is a property of the socket's location,
+ * not of anything the client sent.
+ */
+export function anonymousLocalPrincipal(): Principal {
+  return { kind: "anonymous-local" } as Principal;
+}
 
 export interface ControlDeps {
   pid: () => number;

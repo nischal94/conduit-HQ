@@ -1,7 +1,9 @@
 import { describe, expect, it } from "vitest";
-import { daemonStatus, daemonStop, type Principal } from "./control.js";
+import { anonymousLocalPrincipal, daemonStatus, daemonStop } from "./control.js";
 
-const anon: Principal = { kind: "anonymous-local" };
+// Through the constructor, not a literal: the brand makes a literal fail to
+// compile, which is the point — a principal can only come from this module.
+const anon = anonymousLocalPrincipal();
 
 const deps = {
   pid: () => 4242,

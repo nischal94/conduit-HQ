@@ -27,7 +27,7 @@ import {
   resumeToPayload,
 } from "../payloads.js";
 import type { ApprovalRuntime } from "../runtime.js";
-import { daemonStatus, daemonStop } from "./control.js";
+import { anonymousLocalPrincipal, daemonStatus, daemonStop } from "./control.js";
 import {
   DepthExceeded,
   encodeFrame,
@@ -568,7 +568,13 @@ async function submitSandboxWork(
       log,
     );
     const stats = deps.queueStats();
-    deps.logDebug(`queue depth=${stats.depth} max=${stats.maxObservedDepth} refused=busy`);
+    // UNGATED, unlike the accepted-admission line below. The §5 gate bounds
+    // per-ADMISSION volume — one line per served request, which is what
+    // dominates a busy daemon's log. A REFUSAL is the daemon declining work,
+    // which is the class §5 keeps at default alongside lifecycle transitions
+    // and errors: an operator diagnosing "my requests are failing" must see
+    // it without having restarted the daemon under `--debug`.
+    log(`queue depth=${stats.depth} max=${stats.maxObservedDepth} refused=busy`);
     return;
   }
 
@@ -673,9 +679,14 @@ async function runSourceRequest(
  * Refreshes the shared catalog after a provisioning commit (spec §2.2).
  *
  * Runs INSIDE the held per-namespace source lock, so catalog publication
- * order matches commit order. The store read happens FIRST; the two
- * catalog mutations then run synchronously in one tick, so no request can
- * observe the removed-but-not-upserted state.
+ * order matches commit order. The store read happens FIRST and is
+ * MATERIALIZED into an array; the two catalog mutations then run
+ * synchronously over that already-materialized array, with nothing awaited
+ * or computed between them, so no request can observe the
+ * removed-but-not-upserted state — and no failure can leave it stranded
+ * there either. Both rungs run the SAME closure (`republish`) for exactly
+ * that reason: an inline second copy is a second chance to get the
+ * materialize-then-mutate order wrong.
  *
  * Both mutations are scoped to THIS namespace, which is the scope the held
  * lock actually covers. `store.tools.list()` returns every namespace's
@@ -699,8 +710,15 @@ async function runSourceRequest(
  *     `store.tools.list()`, the call most likely to have failed —
  *     deliberately, since a transient store fault is the case worth one
  *     retry, and a persistent one lands on rung 2 immediately.
- *  2. Keep serving the previous catalog: stale, but CONSISTENT, and
- *     repaired by the next provision of this namespace or by a restart.
+ *  2. Give up on this namespace's catalog entries and say so honestly. The
+ *     failure can land on EITHER mutation, so what survives is not
+ *     knowable from here: if the remove succeeded and the upsert threw,
+ *     the namespace is now empty or partial, not merely stale. The rung-2
+ *     line therefore claims only what the code can verify — entries may be
+ *     missing or partial — and names the two repairs that rehydrate from
+ *     the store: the next provision/revalidate of this namespace, or a
+ *     daemon restart. Every OTHER namespace is untouched, which is what
+ *     the per-namespace scoping buys.
  *
  * Rung 1 removes the namespace before it upserts. `InMemoryCatalog.upsert`
  * is purely additive (it only ever `set`s), so an upsert alone cannot
@@ -709,8 +727,17 @@ async function runSourceRequest(
  * strictly worse than rung 2. Removing first is safe here because a failed
  * refresh of THIS namespace never touched any other, so per-namespace
  * removal is exactly the repair scope.
+ *
+ * EXPORTED FOR TESTING, deliberately. The per-namespace write scoping is
+ * unreachable from a black-box daemon test: the store read and the two
+ * mutations are one synchronous run (that is the materialize-then-mutate
+ * property above), and the refresh runs AFTER its commit inside the source
+ * lock — so no client, and no stalled upstream, can interleave another
+ * namespace's commit into the window where a full-list snapshot would do
+ * damage. The scoping is a real property with a real failure mode; the only
+ * honest way to pin it is to drive this function directly.
  */
-async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promise<void> {
+export async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promise<void> {
   // Even the log is guarded: `deps.log` writes to the daemon's stdout, and a
   // closed or full pipe throws. An escaping log call would propagate through
   // `runSourceRequest` and answer a committed provision with an error frame —
@@ -724,10 +751,17 @@ async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promis
       // committed write's success answer intact.
     }
   };
-  try {
-    const tools = await deps.store.tools.list();
+  // Materialize FIRST, then mutate. The `await` is the only suspension
+  // point, and it happens before either mutation — so once `scoped` exists
+  // the remove and the upsert are two synchronous statements in one tick
+  // with no store read, no filter, and no allocation between them.
+  const republish = async (): Promise<void> => {
+    const scoped = (await deps.store.tools.list()).filter((tool) => tool.namespace === namespace);
     deps.runtime.catalog.removeNamespace(namespace);
-    deps.runtime.catalog.upsert(tools.filter((tool) => tool.namespace === namespace));
+    deps.runtime.catalog.upsert(scoped);
+  };
+  try {
+    await republish();
   } catch (err) {
     safeLog(
       `[conduitd] Catalog refresh failed after commit: retrying the namespace refresh. Context: {namespace: ${namespace}, cause: ${
@@ -735,15 +769,17 @@ async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promis
       }}`,
     );
     try {
-      const tools = await deps.store.tools.list();
-      deps.runtime.catalog.removeNamespace(namespace);
-      deps.runtime.catalog.upsert(tools.filter((tool) => tool.namespace === namespace));
+      await republish();
       safeLog(
         `[conduitd] Catalog refreshed on retry after an earlier failure. Context: {namespace: ${namespace}}`,
       );
     } catch (err2) {
+      // Deliberately NOT "serving the previous catalog": the failure can
+      // land on the upsert, after the remove already ran, so this namespace
+      // may now be empty or partial rather than stale. Only what is
+      // verifiable is claimed. Other namespaces are unaffected.
       safeLog(
-        `[conduitd] Catalog refresh retry failed: serving the previous catalog until the next provision or restart. Context: {namespace: ${namespace}, cause: ${
+        `[conduitd] Catalog refresh retry failed: this namespace's catalog entries may be MISSING OR PARTIAL until the next provision/revalidate of it, or a daemon restart, rehydrates them from the store. Other namespaces are unaffected. Context: {namespace: ${namespace}, cause: ${
           err2 instanceof Error ? err2.message : String(err2)
         }}`,
       );
@@ -966,7 +1002,9 @@ async function handleRequest(
           // Constructed HERE, server-side, never decoded from the
           // request: `daemon.status` carries no fields at all, and the
           // §3.2 directory boundary is what authenticates a UDS caller.
-          { kind: "anonymous-local" },
+          // The branded constructor is what makes "never decoded" a
+          // compile-time property rather than a convention.
+          anonymousLocalPrincipal(),
           {
             pid: () => process.pid,
             agentVersion: deps.agentVersion,
@@ -993,7 +1031,7 @@ async function handleRequest(
       // frame is handed to the kernel, and only then does the drain begin.
       // A destroyed peer skips the write; stop still proceeds — the
       // operator asked for it.
-      const payload = daemonStop({ kind: "anonymous-local" });
+      const payload = daemonStop(anonymousLocalPrincipal());
       if (ctx.socket.destroyed) {
         deps.requestStop();
         return;
