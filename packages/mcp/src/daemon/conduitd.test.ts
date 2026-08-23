@@ -2361,8 +2361,9 @@ describe("conduitd lifecycle", () => {
       expect(await adderA.next()).toMatchObject({ kind: "result" });
 
       // THE ASSERTION: A's refresh republished only A. B's retired tool
-      // stays gone from both catalog readers — an unfiltered upsert
-      // resurrects it here.
+      // stays gone from both catalog readers. Per the docblock, this holds
+      // with or without the `.filter(...)` — the write scoping is pinned in
+      // `refresh-namespace.test.ts`, not here.
       expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
       expect(await searchPaths(serve, "tickets")).not.toContain("jira.list_tickets");
       serve.send({ kind: "describe", toolName: "jira.list_tickets" });

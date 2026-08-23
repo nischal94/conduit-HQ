@@ -12,6 +12,7 @@ import {
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { createRotatingLog, type RotatingLog } from "./daemon/log-sink.js";
+import { DAEMON_LOG } from "./daemon/spawn.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
@@ -404,7 +405,7 @@ async function main(): Promise<void> {
           console.error(
             "[conduitd] Log sink refused to open; falling back to UNROTATED stderr — this log " +
               "will grow without bound. An ELOOP cause means a symlink is planted at " +
-              `${join(resolvedStateDir, "conduitd.log")}, which the sink refuses to follow; ` +
+              `${join(resolvedStateDir, DAEMON_LOG)}, which the sink refuses to follow; ` +
               "inspect that path before trusting this directory. Context: {stateDir: " +
               `${resolvedStateDir}, cause: ${error instanceof Error ? error.message : String(error)}}`,
           );
