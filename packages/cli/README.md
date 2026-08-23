@@ -259,9 +259,13 @@ What the lock still cannot do is reach *inside* an already-running process:
 an MCP client holding a stale in-memory copy of the old key is not a
 database writer, so stopping your clients remains an operator obligation.
 
-1. **Stop clients and the daemon.** Quit every MCP client, then stop the
-   daemon with SIGTERM (`pkill -f 'bin.js --daemon'`). It drains and exits 0.
-   If you skip this, `rotate` refuses and names the holder — no harm done.
+1. **Stop clients and the daemon.** Quit every MCP client, then run
+   `conduit daemon stop`. It returns only after the daemon has actually
+   released the lifecycle lock — which is exactly what `rotate` needs, so
+   the two chain safely. (The equivalent signal path is
+   `pkill -f 'bin.js --daemon'`; it drains and exits 0 too, but does not
+   wait for termination.) If you skip this, `rotate` refuses and names the
+   holder — no harm done.
 2. **Rotate:**
 
    ```bash
@@ -361,9 +365,9 @@ sqlite3 ~/.conduit/conduit.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 ```
 
 Only run this against a stopped db — a live writer can make `VACUUM` block or
-contend for the write lock. Stop the daemon (SIGTERM) first; unlike `rotate`,
-this raw `sqlite3` invocation takes no maintenance lock and nothing will
-refuse on your behalf.
+contend for the write lock. Run `conduit daemon stop` first (it returns only
+once the daemon has actually exited); unlike `rotate`, this raw `sqlite3`
+invocation takes no maintenance lock and nothing will refuse on your behalf.
 
 ### Env-key and custom-`CONDUIT_DB` installs
 

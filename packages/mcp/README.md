@@ -140,15 +140,27 @@ or the private-egress opt-in):
 conduit-mcp --daemon
 ```
 
-### Stopping: SIGTERM
+### Stopping
 
-**SIGTERM (or SIGINT) is the only stop mechanism** — there is no
-`conduit daemon stop` command, and no pid file is written. Send the signal to
-the `--daemon` process:
+Use `conduit daemon stop`. It asks the daemon over the control API and
+returns only once the daemon has actually released its lifecycle lock — so
+`conduit daemon stop && conduit key rotate` works back to back:
+
+```bash
+conduit daemon stop
+```
+
+**SIGTERM (or SIGINT) is the equivalent signal path**, for when the CLI is
+not to hand or the daemon predates the control API. No pid file is written:
 
 ```bash
 pkill -f 'bin.js --daemon'      # or: kill <pid>
 ```
+
+Both converge on one `StopSignal` inside the daemon, so they drain
+identically — the RPC verb is not a second shutdown path, just a different
+way to raise the same one. The signal path acks nothing, so it does not wait
+for termination; `conduit daemon stop` does.
 
 A signalled daemon drains rather than dropping work: it stops accepting new
 connections, immediately ends connections that never got past the readiness
