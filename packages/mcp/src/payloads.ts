@@ -322,7 +322,7 @@ function toPendingView(pending: PendingApproval): PendingView {
  */
 export function assertProjection<T>(
   payload: T,
-  guard: (value: unknown) => boolean,
+  guard: (value: unknown) => value is T,
   projection: string,
 ): T {
   if (!guard(payload)) {
@@ -430,7 +430,10 @@ export function toTextResult(payload: unknown): { content: [{ type: "text"; text
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  // `!Array.isArray` matches `rpc.ts`'s reading: an array is an object, so
+  // without it `[]` passes every shape guard's first hurdle and the field
+  // checks below decide the answer on a value that was never a payload.
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**

@@ -1,5 +1,6 @@
 import {
   AGENT_VERSION,
+  CAPABILITY_REJECTION_PREFIX,
   createSkewReporter,
   DaemonUnavailable,
   DEFAULT_CONDUIT_DIR,
@@ -48,7 +49,7 @@ import {
  * the daemon's 30s drain deadline plus margin for lock release.
  */
 export const STOP_WAIT_MS = 35_000;
-const STOP_POLL_MS = 100;
+export const STOP_POLL_MS = 100;
 
 /**
  * The daemon seam, kind-GENERIC so the `RpcPayloadFor` map survives the
@@ -119,7 +120,12 @@ function isPreControlRejection(response: RpcResponse): boolean {
   return (
     response.kind === "error" &&
     response.code === "invalid" &&
-    response.message.includes("handshake.capability must be one of")
+    // The daemon's OWN constant, imported rather than re-spelled: this is a
+    // cross-package coupling on a message string, so it gets exactly one
+    // edit site. A local copy meant a reword on the daemon side silently
+    // turned this detection off and the operator got an opaque error where
+    // the "stop it by signal" remediation belongs.
+    response.message.includes(CAPABILITY_REJECTION_PREFIX)
   );
 }
 
@@ -144,7 +150,10 @@ const PRE_CONTROL_REMEDIATION =
  * response exists.
  */
 function isUsableResult<K extends RpcRequest["kind"]>(
-  verb: string,
+  // The two verbs this command has, not any string: the value reaches an
+  // operator-facing diagnostic, and a typo there is a message about a
+  // command that does not exist.
+  verb: "status" | "stop",
   response: RpcResponseFor<K>,
   deps: DaemonCmdDeps,
 ): response is Extract<RpcResponseFor<K>, { kind: "result" }> {
@@ -231,7 +240,29 @@ export async function runStop(deps: DaemonCmdDeps): Promise<number> {
   // Ack received; wait for VERIFIED termination — see the module docblock.
   const waitUntil = deps.now() + STOP_WAIT_MS;
   while (deps.now() < waitUntil) {
-    if ((await deps.probeLifecycle()) === "free") {
+    let held: "free" | "busy";
+    try {
+      held = await deps.probeLifecycle();
+    } catch (err) {
+      // The probe opens the lock database, so it can fail for reasons that
+      // have nothing to do with the daemon: a permissions change, a removed
+      // state directory, a corrupt lock file. Unhandled, that rejection
+      // escaped `runStop` and reached the operator as a raw stack trace on a
+      // command that had ALREADY successfully asked the daemon to stop.
+      //
+      // Reported as a failure of the VERIFICATION, not of the stop: the ack
+      // landed, so the daemon is very likely going down: what is unknown is
+      // whether it finished. Exit 1 because the command's contract is
+      // verified termination and that is what could not be established.
+      deps.stderr(
+        "[conduit daemon] stop was acknowledged, but termination could NOT be verified: " +
+          `reading the lifecycle lock failed (${err instanceof Error ? err.message : String(err)}). ` +
+          "Do NOT assume the daemon is still running, and do not assume it has exited — " +
+          'confirm with "conduit daemon status" before starting anything or rotating the key.\n',
+      );
+      return 1;
+    }
+    if (held === "free") {
       deps.stdout("stopped\n");
       return 0;
     }

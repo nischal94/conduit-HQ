@@ -1049,6 +1049,26 @@ function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcRe
       return response;
     }
 
+    case "daemon.stop": {
+      // DELIBERATELY EXEMPT, and named rather than left to fall through the
+      // `default` — a silent omission reads as an oversight, and the next
+      // reader adds a guard nobody needs.
+      //
+      // The exemption holds because NOTHING structurally consumes this
+      // payload. `runStop` (cli `commands/daemon.ts`) checks the response
+      // for its refusal arms and never reads `payload` at all: the ack means
+      // "will stop", and the fact worth reporting is whether it DID, which
+      // the lifecycle-lock poll answers. So there is no field whose
+      // malformation could become a wrong answer here — the verification is
+      // the lock, not the frame.
+      //
+      // THE CONDITION: this stops being true the moment a consumer reads
+      // `stopping`. Such a consumer must add the guard here FIRST, before
+      // reading it — the shape (`isDaemonStopShape`) does not exist yet
+      // precisely because nothing needs it.
+      return response;
+    }
+
     default:
       return response;
   }

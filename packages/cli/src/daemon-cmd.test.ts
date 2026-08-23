@@ -5,7 +5,13 @@ import {
   type RpcResponse,
 } from "@conduithq/mcp";
 import { describe, expect, it } from "vitest";
-import { type DaemonCmdDeps, runStatus, runStop, STOP_WAIT_MS } from "./commands/daemon.js";
+import {
+  type DaemonCmdDeps,
+  runStatus,
+  runStop,
+  STOP_POLL_MS,
+  STOP_WAIT_MS,
+} from "./commands/daemon.js";
 
 /**
  * `conduit daemon status|stop` through its DI seam (the pattern
@@ -217,10 +223,38 @@ describe("conduit daemon stop", () => {
     expect(printed).toMatch(/draining/i);
     expect(printed).toContain("conduit daemon status");
     expect(rec.out.join("")).not.toContain("stopped");
-    // The window is bounded: the fake clock only advances on sleep, so a
-    // finite probe count proves the loop terminated on STOP_WAIT_MS.
-    expect(rec.probes).toBeGreaterThan(0);
-    expect(rec.probes).toBeLessThanOrEqual(STOP_WAIT_MS);
+    // The window is bounded, and EXACTLY so: the fake clock advances only
+    // on sleep, so the loop probes once per poll interval across the wait
+    // window. No `+1` — the guard is `now < waitUntil`, so the iteration
+    // that would sit exactly ON the boundary never runs. The old bound
+    // (`<= STOP_WAIT_MS`) was 100x looser than the real count and would
+    // have passed a loop that polled every millisecond.
+    expect(rec.probes).toBe(STOP_WAIT_MS / STOP_POLL_MS);
+  });
+
+  it("reports a probe failure as unverified termination rather than a stack trace", async () => {
+    // The probe opens the lock database, so it can fail for reasons that
+    // have nothing to do with the daemon — a permissions change, a removed
+    // state directory. Unhandled, that rejection escaped `runStop` and hit
+    // the operator as a raw stack trace on a command that had already
+    // successfully asked the daemon to stop.
+    const rec = makeDeps({
+      answer: async () => ({ kind: "result", requestId: "r1", payload: { stopping: true } }),
+    });
+    rec.deps.probeLifecycle = async () => {
+      throw new Error("EACCES: permission denied, open '/state/lifecycle.db'");
+    };
+
+    // A defined exit code, not a thrown error.
+    expect(await runStop(rec.deps)).toBe(1);
+    const printed = rec.err.join("");
+    // Names the probe failure, and carries its cause for diagnosis.
+    expect(printed).toContain("could NOT be verified");
+    expect(printed).toContain("EACCES");
+    // Forbids BOTH wrong inferences: the ack landed, so this is not "still
+    // running", and verification failed, so it is not "stopped" either.
+    expect(printed).toContain("conduit daemon status");
+    expect(rec.out.join("")).not.toContain("stopped");
   });
 
   it("explains the manual signal path against a pre-control daemon", async () => {

@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { CAPABILITIES, decodeRequest, InvalidRpcRequest } from "./rpc.js";
+import {
+  CAPABILITIES,
+  CAPABILITY_REJECTION_PREFIX,
+  decodeRequest,
+  InvalidRpcRequest,
+} from "./rpc.js";
 
 describe("decodeRequest", () => {
   it("accepts each valid RpcRequest shape", () => {
@@ -214,8 +219,14 @@ describe("decodeRequest", () => {
     // available. Rewording this message silently turns that remediation —
     // the manual SIGTERM path — into a generic "unexpected error", so the
     // wording is pinned HERE, where the reword would happen.
+    //
+    // Against the exported CONSTANT, which both sides now share: the CLI
+    // imports it rather than re-spelling the sentence, so this asserts the
+    // decoder actually EMITS the constant it claims to. A reword of the
+    // constant moves both sides together and stays detected; a reword of
+    // the decoder's message alone fails here.
     expect(() => decodeRequest({ kind: "handshake", protocol: 1, capability: "root" })).toThrow(
-      "handshake.capability must be one of",
+      CAPABILITY_REJECTION_PREFIX,
     );
   });
 

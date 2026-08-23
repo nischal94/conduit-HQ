@@ -54,6 +54,13 @@ export {
 } from "./daemon/provision.js";
 export type { Capability, RpcRequest, RpcResponse } from "./daemon/rpc.js";
 /**
+ * The handshake capability-refusal prefix. `conduit daemon status|stop`
+ * detects a PRE-CONTROL daemon by this exact text, so it is a cross-package
+ * contract with ONE edit site rather than a sentence spelled out on both
+ * sides of the boundary.
+ */
+export { CAPABILITY_REJECTION_PREFIX } from "./daemon/rpc.js";
+/**
  * `key generate` creates its own state directory under the §3.2 boundary
  * BEFORE taking the maintenance lock (F4: creates-then-locks), so it needs
  * the same mkdir-then-assert primitive the daemon uses rather than a bare
