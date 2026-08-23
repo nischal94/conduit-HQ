@@ -398,4 +398,42 @@ describe("isDaemonStatusShape (the daemon.status projection)", () => {
     // value that was never a projection.
     expect(isDaemonStatusShape([])).toBe(false);
   });
+
+  it("CX6: rejects a finite-but-out-of-Date-range startedAt (guard refuses, no RangeError)", () => {
+    // 1e20 is finite, so the old `Number.isFinite` check let it through — and
+    // `new Date(1e20).toISOString()` throws RangeError, turning a protocol
+    // fault into a CLI-fatal stack trace. The guard must refuse it as a
+    // malformed projection instead.
+    const badStatus = { ...FULL, startedAt: 1e20 };
+    expect(isDaemonStatusShape(badStatus)).toBe(false);
+    // Non-vacuous: the value the guard rejects is exactly the one that would
+    // throw if it reached the renderer.
+    expect(() => new Date(badStatus.startedAt).toISOString()).toThrow(RangeError);
+  });
+
+  it("CX6: rejects a negative startedAt", () => {
+    expect(isDaemonStatusShape({ ...FULL, startedAt: -1 })).toBe(false);
+  });
+
+  it("CX6: accepts startedAt at the exact Date-range boundary, rejects one past it", () => {
+    expect(isDaemonStatusShape({ ...FULL, startedAt: 8.64e15 })).toBe(true);
+    expect(isDaemonStatusShape({ ...FULL, startedAt: 8.64e15 + 1 })).toBe(false);
+  });
+
+  it("CX6: rejects negative, fractional, or 2^53-imprecise counters", () => {
+    for (const field of ["pid", "connections", "executionsInFlight", "queueDepth"] as const) {
+      expect(isDaemonStatusShape({ ...FULL, [field]: -1 }), `${field} negative`).toBe(false);
+      expect(isDaemonStatusShape({ ...FULL, [field]: 1.5 }), `${field} fractional`).toBe(false);
+      expect(
+        isDaemonStatusShape({ ...FULL, [field]: Number.MAX_SAFE_INTEGER + 1 }),
+        `${field} beyond safe integer`,
+      ).toBe(false);
+    }
+  });
+
+  it("CX6: rejects a negative or fractional logSizeBytes while still accepting null", () => {
+    expect(isDaemonStatusShape({ ...FULL, logSizeBytes: -1 })).toBe(false);
+    expect(isDaemonStatusShape({ ...FULL, logSizeBytes: 1.5 })).toBe(false);
+    expect(isDaemonStatusShape({ ...FULL, logSizeBytes: null, logPath: null })).toBe(true);
+  });
 });

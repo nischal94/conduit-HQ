@@ -163,9 +163,11 @@ describe("conduit daemon status", () => {
     // read it as running.
     expect(await runStatus(rec.deps)).toBe(3);
     expect(`${rec.out.join("")}${rec.err.join("")}`).toContain("not running");
-    // Never spawns: status must not create the thing it is asking about.
-    // The suppression itself is asserted against the prod wiring below.
-    expect(rec.probes).toBe(0);
+    // CX3: absence is VERIFIED, not assumed from the timeout — status probes
+    // the lifecycle lock exactly once and reads it free. The probe is
+    // read-only (never creates the state dir), so "never spawns" still holds:
+    // it reads the lock, it does not start a daemon.
+    expect(rec.probes).toBe(1);
   });
 
   it("prints rotation guidance and exits 1 during a rotation", async () => {
@@ -230,10 +232,66 @@ describe("conduit daemon stop", () => {
       },
     });
 
-    // Exit 0, unlike status: the operator wanted it stopped, and it is.
+    // Exit 0, unlike status: the operator wanted it stopped, and it is —
+    // but only after CX3 VERIFIES absence. One read-only lifecycle-lock probe
+    // reads it free, so "not running" is truthful, not a timeout guess. Still
+    // no spawn: the probe reads the lock, it does not start a daemon.
     expect(await runStop(rec.deps)).toBe(0);
     expect(rec.out.join("")).toContain("not running");
-    expect(rec.probes).toBe(0);
+    expect(rec.probes).toBe(1);
+  });
+
+  it("CX3: DaemonUnavailable + lifecycle lock BUSY → 'still running/unreachable', exit 1", async () => {
+    // A wedged/starting/draining daemon holds the lifecycle lock but never
+    // reaches READY before the client deadline, surfacing as a plain
+    // `DaemonUnavailable("unavailable")`. Printing "not running" exit 0 there
+    // is a false success. CX3 probes the lock, reads it busy, and reports the
+    // daemon as still running / unreachable with a nonzero exit.
+    const rec = makeDeps({
+      answer: async () => {
+        throw new DaemonUnavailable("unavailable", "no daemon answered at /state");
+      },
+      probes: ["busy"],
+    });
+
+    expect(await runStop(rec.deps)).toBe(1);
+    // NOT the idempotent success line.
+    expect(rec.out.join("")).not.toContain("not running");
+    const combined = rec.err.join("");
+    expect(combined).toContain("lifecycle lock");
+    expect(combined.toLowerCase()).toContain("unreachable");
+    expect(rec.probes).toBe(1);
+  });
+
+  it("CX3: DaemonUnavailable + lifecycle lock FREE → 'not running', exit 0 (verified absence)", async () => {
+    // The complement of the busy case: a free lock is proof of genuine
+    // absence, so stop's idempotent success is truthful.
+    const rec = makeDeps({
+      answer: async () => {
+        throw new DaemonUnavailable("unavailable", "no daemon answered at /state");
+      },
+      probes: ["free"],
+    });
+
+    expect(await runStop(rec.deps)).toBe(0);
+    expect(rec.out.join("")).toContain("not running");
+    expect(rec.probes).toBe(1);
+  });
+
+  it("CX3: status + lifecycle lock BUSY → up-but-unreachable, exit 1, never 'not running'", async () => {
+    // The same conflation on the status path: a busy lock means the daemon is
+    // running but unreachable, which status must not misreport as absent.
+    const rec = makeDeps({
+      answer: async () => {
+        throw new DaemonUnavailable("unavailable", "no daemon answered at /state");
+      },
+      probes: ["busy"],
+    });
+
+    expect(await runStatus(rec.deps)).toBe(1);
+    expect(rec.out.join("")).not.toContain("not running");
+    expect(rec.err.join("").toLowerCase()).toContain("unreachable");
+    expect(rec.probes).toBe(1);
   });
 
   it("reports 'still draining' and exits 1 when the wait window elapses", async () => {

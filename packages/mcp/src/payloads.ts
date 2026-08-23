@@ -491,13 +491,15 @@ export function isCheckPayloadShape(payload: unknown): payload is CheckPayload {
  * situation, not the `isExecutePayloadShape` one: nothing here is handed
  * onward verbatim, so there is no field whose malformation is harmless.
  *
- * `startedAt` is checked as a FINITE number specifically: it reaches
- * `new Date(...).toISOString()`, where a non-finite value throws a
- * `RangeError` and `undefined` renders "Invalid Date". Either presents a
- * protocol fault to the operator as a stack trace or as a nonsense report,
- * instead of as the refusal it is. The remaining counters are finite
- * numbers for the same reason the paused row's are — they are rendered, not
- * merely carried.
+ * `startedAt` is checked as a non-negative SAFE INTEGER WITHIN THE VALID DATE
+ * RANGE (CX6): it reaches `new Date(...).toISOString()`, which throws a
+ * `RangeError` for any value outside ±8.64e15 ms — and `1e20` is finite, so a
+ * plain finite check let a protocol fault through to a CLI-fatal stack trace
+ * instead of the typed refusal it is. The remaining counters (`pid`,
+ * `connections`, `executionsInFlight`, `queueDepth`) and `logSizeBytes` are
+ * rendered and/or counted, so they are held to the same non-negative
+ * safe-integer floor: a negative, fractional, or 2^53-imprecise count is a
+ * malformed projection, not a value to print.
  *
  * `logPath`/`logSizeBytes` are NULLABLE by contract (the daemon logs to a
  * TTY when hand-started), so `null` is accepted and `undefined` is not: the
@@ -505,25 +507,34 @@ export function isCheckPayloadShape(payload: unknown): payload is CheckPayload {
  * confident claim that the daemon is hand-started, which is a different
  * fact from "the daemon told us it has no log file".
  */
+/** The maximum epoch-ms a JS `Date` can represent (±8.64e15). */
+const MAX_DATE_MS = 8.64e15;
+
+/** A non-negative integer safely representable and exactly rendered. */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
 export function isDaemonStatusShape(payload: unknown): payload is DaemonStatusPayload {
   if (!isRecord(payload)) return false;
   if (typeof payload.agentVersion !== "string") return false;
   if (typeof payload.dbPath !== "string") return false;
-  for (const field of [
-    "pid",
-    "startedAt",
-    "connections",
-    "executionsInFlight",
-    "queueDepth",
-  ] as const) {
-    const value = payload[field];
-    if (typeof value !== "number" || !Number.isFinite(value)) return false;
+  // `startedAt` must survive `new Date(v).toISOString()` — a finite but
+  // out-of-range value (e.g. 1e20) passes a finite check yet throws RangeError.
+  if (
+    typeof payload.startedAt !== "number" ||
+    !Number.isFinite(payload.startedAt) ||
+    payload.startedAt < 0 ||
+    payload.startedAt > MAX_DATE_MS
+  ) {
+    return false;
+  }
+  for (const field of ["pid", "connections", "executionsInFlight", "queueDepth"] as const) {
+    if (!isNonNegativeSafeInteger(payload[field])) return false;
   }
   if (payload.logPath !== null && typeof payload.logPath !== "string") return false;
-  if (payload.logSizeBytes !== null) {
-    if (typeof payload.logSizeBytes !== "number" || !Number.isFinite(payload.logSizeBytes)) {
-      return false;
-    }
+  if (payload.logSizeBytes !== null && !isNonNegativeSafeInteger(payload.logSizeBytes)) {
+    return false;
   }
   return true;
 }

@@ -1027,6 +1027,73 @@ describe("INVARIANT §17 / §9.2 — onboarding error text never carries a store
     expect(message).toContain("protocol error");
     expect(message).toContain("daemon log");
   });
+
+  it("CX5: upstream detail is logged as ONE printable line — no newlines, CSI, or OSC survive", async () => {
+    // The operator is told to inspect the daemon log, so raw C0/C1 controls,
+    // CR/LF, and CSI/OSC sequences in the upstream's error text would be
+    // interpreted by tail/cat — forged records, terminal manipulation. After
+    // redaction the detail must be a single printable line.
+    const store = await openTestStore();
+    const daemonLog: string[] = [];
+    // A message carrying a newline (forged second record), a CSI clear-screen,
+    // and an OSC title-set — all the sequences the sanitizer must neutralize.
+    const nasty = "bad\nFORGED RECORD\r\n\x1b[2J\x1b]0;pwned\x07 tail after controls";
+    try {
+      await provisionSourceRequest(
+        { ...BASE_ARGS },
+        {
+          store,
+          fetchTools: async () => {
+            throw new McpClientError("protocol", nasty);
+          },
+          log: (line) => daemonLog.push(line),
+        },
+      );
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProvisionRefused);
+    }
+
+    expect(daemonLog).toHaveLength(1);
+    const line = daemonLog[0] ?? "";
+    // Single line: the daemon wraps the detail in ONE log() call and the
+    // sanitized detail contributes no embedded newline or carriage return.
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line).not.toContain("\r");
+    // No control characters at all (C0/C1, ESC, BEL) — pure printable ASCII.
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: asserting controls are ABSENT
+    expect(/[\x00-\x1f\x7f-\x9f]/.test(line)).toBe(false);
+    // The inert residue of the stripped sequences remains as plain text — the
+    // detail was neutralized, not dropped — and the surrounding words survive.
+    expect(line).toContain("bad");
+    expect(line).toContain("tail after controls");
+  });
+
+  it("CX5: an over-long upstream detail is capped in the log", async () => {
+    const store = await openTestStore();
+    const daemonLog: string[] = [];
+    const huge = "A".repeat(5000);
+    try {
+      await provisionSourceRequest(
+        { ...BASE_ARGS },
+        {
+          store,
+          fetchTools: async () => {
+            throw new McpClientError("protocol", huge);
+          },
+          log: (line) => daemonLog.push(line),
+        },
+      );
+    } catch {
+      /* refusal expected */
+    }
+    const line = daemonLog[0] ?? "";
+    // The detail is bounded well below the raw 5000 chars; the surrounding
+    // framing adds a fixed prefix, so the whole line stays modest.
+    expect(line.length).toBeLessThan(1200);
+    // Non-vacuous: the cap actually bit — the full 5000-char run is not there.
+    expect(line).not.toContain("A".repeat(5000));
+    expect(line).toContain("...");
+  });
 });
 
 describe("INVARIANT §17 / §9.2 — a credential in the url is refused, and a stored url is never echoed raw (F3)", () => {

@@ -30,6 +30,13 @@ import { reportSkew } from "../skew.js";
  * text would make a reworded diagnostic silently reclassify an absent
  * daemon as an unexpected failure, or worse, the reverse.
  *
+ * **Absence is verified against the lifecycle lock, not assumed from a
+ * timeout (CX3).** `DaemonUnavailable("unavailable")` conflates a genuinely
+ * absent daemon with one that holds the lifecycle lock but never reached
+ * READY (wedged/starting/draining). Both verbs probe the lock before printing
+ * "not running": free means absent (the idempotent/systemctl exit), busy
+ * means up-but-unreachable (exit 1). See `unavailableExitCode`.
+ *
  * **Exit codes are NORMATIVE (spec §3.2).** `status` exits 3 when the
  * daemon is absent — the systemctl convention, and distinct from both 0
  * (running) and 1 (something went wrong), so a script can never read "not
@@ -157,17 +164,64 @@ function isUsableResult<K extends RpcRequest["kind"]>(
   return true;
 }
 
-function unavailableExitCode(
+/**
+ * Classifies a `DaemonUnavailable` into the operator's answer (CX3).
+ *
+ * `DaemonUnavailable("unavailable")` conflates two states: a genuinely-absent
+ * daemon, and one that HOLDS the lifecycle lock but never reached READY before
+ * the client's deadline (wedged, starting, or draining). Reporting "not
+ * running" for the second is a false negative — the operator's next step
+ * ("start one", "rotate the key") is wrong and unsafe. So before declaring
+ * absence, probe the lifecycle lock:
+ *
+ * - `rotation-in-progress` — already a distinct, truthful code; the operator
+ *   waits, exit 1.
+ * - lock FREE — nothing holds it, so the daemon is genuinely absent: "not
+ *   running", exit `absentExitCode` (0 for `stop`'s idempotent goal state, 3
+ *   for `status`'s systemctl convention).
+ * - lock BUSY (through the bound) — a daemon is up but unreachable: say so and
+ *   exit 1, never "not running".
+ * - the probe itself FAILS — absence cannot be established either way; report
+ *   the verification failure and exit 1 rather than guessing.
+ */
+async function unavailableExitCode(
   err: DaemonUnavailable,
+  verb: "status" | "stop",
   absentExitCode: number,
   deps: DaemonCmdDeps,
-): number {
+): Promise<number> {
   if (err.code === "rotation-in-progress") {
     // A rotating daemon is not a missing one: the operator's next step is
     // to wait for the rotation, not to start anything.
     deps.stderr(`[conduit daemon] ${err.message}\n`);
     return 1;
   }
+  let held: "free" | "busy";
+  try {
+    held = await deps.probeLifecycle();
+  } catch (probeErr) {
+    // The lifecycle-lock probe opens a database and can fail for reasons
+    // unrelated to the daemon (permissions, a removed state dir, a corrupt
+    // lock). Absence is then unverifiable, so we do NOT claim "not running".
+    deps.stderr(
+      `[conduit daemon] ${verb}: the daemon did not answer and its liveness could NOT be ` +
+        `verified — reading the lifecycle lock failed (${
+          probeErr instanceof Error ? probeErr.message : String(probeErr)
+        }). Confirm with "conduit daemon status" before starting anything or rotating the key.\n`,
+    );
+    return 1;
+  }
+  if (held === "busy") {
+    // The daemon holds the lifecycle lock but did not reach READY before the
+    // deadline: wedged, starting, or draining — NOT absent.
+    deps.stderr(
+      `[conduit daemon] ${verb}: a daemon holds the lifecycle lock but did not respond within ` +
+        "the deadline (it may be starting, draining, or wedged). It is still running / " +
+        "unreachable; termination could not be verified.\n",
+    );
+    return 1;
+  }
+  // Lock free: genuinely absent.
   deps.stdout("not running\n");
   return absentExitCode;
 }
@@ -179,8 +233,9 @@ export async function runStatus(deps: DaemonCmdDeps): Promise<number> {
   } catch (err) {
     if (err instanceof DaemonUnavailable) {
       // Exit 3 (normative, spec §3.2): scripts must never read "not
-      // running" as healthy.
-      return unavailableExitCode(err, 3, deps);
+      // running" as healthy. A busy lifecycle lock means the daemon is up but
+      // unreachable — reported as such (exit 1), not misread as absent (CX3).
+      return unavailableExitCode(err, "status", 3, deps);
     }
     throw err;
   }
@@ -215,8 +270,12 @@ export async function runStop(deps: DaemonCmdDeps): Promise<number> {
     response = await deps.daemon({ kind: "daemon.stop" });
   } catch (err) {
     if (err instanceof DaemonUnavailable) {
-      // Idempotent (spec §3.2): the operator wanted it stopped; it is.
-      return unavailableExitCode(err, 0, deps);
+      // Idempotent (spec §3.2) ONLY when genuinely absent: the operator wanted
+      // it stopped; a free lifecycle lock proves it is. A busy lock means a
+      // wedged/starting/draining daemon still holds it — "not running" would
+      // be a false success, so CX3 probes before declaring absence (exit 1 if
+      // still held).
+      return unavailableExitCode(err, "stop", 0, deps);
     }
     throw err;
   }

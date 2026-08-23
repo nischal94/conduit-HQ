@@ -439,6 +439,39 @@ function mapFetchError(cause: unknown, url: string): string {
  * failure to write a diagnostic must never turn a clean refusal into a
  * throw.
  */
+/**
+ * Normative-local (CX5): byte cap on the sanitized upstream detail in a log
+ * line. Larger than the 64-byte version-string cap — a log line legitimately
+ * carries more diagnostic text — but bounded so one hostile upstream message
+ * cannot dominate the daemon log.
+ */
+const LOG_DETAIL_MAX_BYTES = 512;
+
+/**
+ * Encodes already-redacted upstream detail as ONE printable log line (CX5).
+ *
+ * The operator is told to inspect the daemon log, so the upstream's own error
+ * text — C0/C1 controls, `ESC`, `CR`, `LF`, CSI/OSC sequences intact — would
+ * otherwise be interpreted by `tail`/`cat`: forged log records, cursor moves,
+ * terminal manipulation. Same allowlist shape as `sanitizeVersionForDisplay`
+ * (printable ASCII survives, everything else is dropped), so no encoding of a
+ * control character gets through and the residue of a stripped sequence
+ * (`[2J` after its `ESC` is removed) is inert. The result is capped by UTF-8
+ * BYTES; it runs on text that is already credential-redacted, so the cap can
+ * never bisect a redaction.
+ *
+ * Applied per input the caller has already redacted — redact THEN sanitize —
+ * mirroring `sanitizeUpstreamText`'s order.
+ */
+function sanitizeDetailForLog(redacted: string): string {
+  const printable = redacted.replace(/[^\x20-\x7e]/g, "");
+  if (printable.length <= LOG_DETAIL_MAX_BYTES) return printable;
+  // Printable ASCII is one byte per character, so `.length` IS the byte length
+  // and no multi-byte character can be bisected. The `...` marker is ASCII, so
+  // the result stays pure printable-ASCII and at most `LOG_DETAIL_MAX_BYTES`.
+  return `${printable.slice(0, LOG_DETAIL_MAX_BYTES - 3)}...`;
+}
+
 function logRedactedDetail(
   log: ((line: string) => void) | undefined,
   namespace: string,
@@ -449,7 +482,8 @@ function logRedactedDetail(
   if (log === undefined) return;
   const raw = cause instanceof Error ? cause.message : String(cause);
   const tokens = onboardingAuth !== undefined ? redactionTokens(onboardingAuth) : [];
-  const detail = redactTokens(raw, tokens);
+  // Redact first, THEN encode to one printable capped line (CX5).
+  const detail = sanitizeDetailForLog(redactTokens(raw, tokens));
   try {
     log(
       `[conduitd] Onboarding fetch failed: upstream detail withheld from client. Context: {namespace: ${namespace}, url: ${sanitizeUrlForOperator(url)}, cause: ${detail}}`,
