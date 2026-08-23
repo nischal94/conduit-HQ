@@ -415,6 +415,14 @@ describe("isDaemonStatusShape (the daemon.status projection)", () => {
     expect(isDaemonStatusShape({ ...FULL, startedAt: -1 })).toBe(false);
   });
 
+  it("CX6: rejects a fractional startedAt (finite and in range, but renders a wrong instant)", () => {
+    // 1.5 is finite and within the Date range, so a finiteness+range check
+    // accepts it — but it is not an epoch-ms instant the daemon could report,
+    // and the renderer would silently show 1970-01-01T00:00:00.001Z. The guard
+    // requires a safe integer, matching the counter fields.
+    expect(isDaemonStatusShape({ ...FULL, startedAt: 1.5 })).toBe(false);
+  });
+
   it("CX6: accepts startedAt at the exact Date-range boundary, rejects one past it", () => {
     expect(isDaemonStatusShape({ ...FULL, startedAt: 8.64e15 })).toBe(true);
     expect(isDaemonStatusShape({ ...FULL, startedAt: 8.64e15 + 1 })).toBe(false);

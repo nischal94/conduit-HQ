@@ -519,14 +519,11 @@ export function isDaemonStatusShape(payload: unknown): payload is DaemonStatusPa
   if (!isRecord(payload)) return false;
   if (typeof payload.agentVersion !== "string") return false;
   if (typeof payload.dbPath !== "string") return false;
-  // `startedAt` must survive `new Date(v).toISOString()` — a finite but
-  // out-of-range value (e.g. 1e20) passes a finite check yet throws RangeError.
-  if (
-    typeof payload.startedAt !== "number" ||
-    !Number.isFinite(payload.startedAt) ||
-    payload.startedAt < 0 ||
-    payload.startedAt > MAX_DATE_MS
-  ) {
+  // `startedAt` must survive `new Date(v).toISOString()` AND render exactly:
+  // an out-of-range value (e.g. 1e20) passes a finite check yet throws
+  // RangeError, and a fractional value (e.g. 1.5) renders as a silently wrong
+  // epoch-ms instant. It is a non-negative safe integer within the Date range.
+  if (!isNonNegativeSafeInteger(payload.startedAt) || payload.startedAt > MAX_DATE_MS) {
     return false;
   }
   for (const field of ["pid", "connections", "executionsInFlight", "queueDepth"] as const) {
