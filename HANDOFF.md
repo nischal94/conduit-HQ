@@ -65,10 +65,10 @@ the squash before deletion). Final stretch after the build session:
   daemon and printed the SIGTERM remediation (the bootstrap case, live),
   old daemon terminated, `approvals list` auto-started a fresh daemon
   (exit 0), `daemon status` → running, matched versions, owned log sink
-  reporting (345 bytes), exit 0. ONE step left for the user's terminal
-  (agent's permission gate declined the delete):
-  `rm -rf <repo>/.superpowers/sdd/2026-08-22-daemon-control-hot-reload`
-  (git-ignored, trail preserved in PR #50 + this file).
+  reporting (345 bytes), exit 0. The spent SDD workspace
+  (`.superpowers/sdd/2026-08-22-daemon-control-hot-reload`, git-ignored,
+  trail preserved in PR #50 + this file) was deleted by the user
+  2026-08-24. NOTHING is left pending from step 3.
 
 ### NEXT — §17 step 4: request-authenticity floor (§16)
 
@@ -90,8 +90,7 @@ step 5 console approvals UX) · source-removal verb (trigger: step 5 or an
 structural request-scope guarantee holds) · CX2 owner-mismatch fstat arm
 test-depth (needs root) · shared untrusted-display allowlist helper for
 dbPath/logPath · ApprovalRuntime catalog read/write split + CAPABILITIES
-row-partition types · bin.ts doctor() hardcoded "conduitd.log" · SDD
-workspace delete (user terminal, command above).
+row-partition types · bin.ts doctor() hardcoded "conduitd.log".
 
 ### KICKOFF PROMPT for the next session
 
