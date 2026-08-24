@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
 import { takeStateDir } from "./args.js";
 import {
+  canonicalOfMissing,
   DaemonUnavailable,
   daemonRequest,
   isDefaultStateDir,
@@ -13,7 +14,7 @@ import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./d
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
 import { createRotatingLog, type RotatingLog } from "./daemon/log-sink.js";
 import { DAEMON_LOG } from "./daemon/spawn.js";
-import { ensureStateDir } from "./daemon/state-dir.js";
+import { assertSafeAncestorChain, ensureStateDir } from "./daemon/state-dir.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
@@ -373,6 +374,22 @@ async function main(): Promise<void> {
     // path, including the ones the sink's own construction takes.
     let sink: RotatingLog | null = null;
     try {
+      // The §3.2 ancestor-chain rule, on the by-hand daemon path — the same
+      // call the client makes before it ever connects (client.ts). A leaf
+      // that is itself a self-owned 0700 directory is still unsafe if a
+      // DIFFERENT uid owns a directory the path traverses to reach it: that
+      // uid can rename the validated leaf out and drop a replacement between
+      // the leaf check below and the sink open. `ensureStateDir` validates
+      // the LEAF only, so without this line the by-hand `--daemon
+      // --state-dir <custom>` consumer was the one state-dir consumer whose
+      // ancestors went unwalked. Checked on the canonical form
+      // (`canonicalOfMissing` is idempotent on the already-canonical
+      // resolved base), and scoped to THIS branch only: the offline doctor
+      // deliberately REPORTS rather than refuses on a custom dir (its
+      // consumer row in the state-dir threat model), so the check must not
+      // blanket every bin path. A `StateDirError` here is the same hard
+      // refusal as the leaf check's — outer catch, no sink, no serve.
+      assertSafeAncestorChain(canonicalOfMissing(resolvedStateDir));
       // CX2: the state-dir boundary is validated BEFORE the log sink opens.
       // `ensureStateDir` creates the directory 0700 if absent and then runs
       // the FULL bind validation (non-symlink, self-owned, 0700, ACL-free) —
