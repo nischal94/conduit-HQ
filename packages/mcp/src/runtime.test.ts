@@ -1,6 +1,12 @@
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
-import { type ConduitStore, normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
+import {
+  type ConduitStore,
+  InMemoryCatalog,
+  normalizeMcp,
+  openSqliteStore,
+  SecretBox,
+} from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it } from "vitest";
 import { createApprovalRuntime } from "./runtime.js";
@@ -28,6 +34,42 @@ describe("createApprovalRuntime", () => {
     const outcome = await runtime.manager.start("return 42;");
     expect(outcome.status).toBe("completed");
     expect((outcome as { value: unknown }).value).toBe(42);
+  });
+
+  it("exposes the catalog it hydrated so the daemon can serve and refresh it", async () => {
+    // The runtime is built ONCE per daemon (spec §2.1), so the catalog it
+    // hydrates is the only one the daemon has. Handing it back is what
+    // lets `search`/`describe` read it and the provisioning tail refresh
+    // it; while it stayed private, every reader had to rebuild its own
+    // snapshot from the store.
+    //
+    // Seeded rather than empty: on an empty store both sides of the size
+    // assertion are 0, and a runtime that hydrated nothing would pass.
+    const store = await seedStore();
+    await store.tools.replaceNamespace(
+      "github",
+      normalizeMcp({
+        namespace: "github",
+        tools: [
+          {
+            name: "create_issue",
+            description: "Open an issue",
+            inputSchema: { type: "object", properties: {} },
+          },
+          {
+            name: "list_issues",
+            description: "List issues",
+            inputSchema: { type: "object", properties: {} },
+            annotations: { readOnlyHint: true },
+          },
+        ],
+      }),
+    );
+
+    const runtime = await createApprovalRuntime({ store, allowPrivateEgress: false });
+    expect(runtime.catalog).toBeInstanceOf(InMemoryCatalog);
+    expect(runtime.catalog.size).toBe((await store.tools.list()).length);
+    expect(runtime.catalog.size).toBe(2);
   });
 });
 

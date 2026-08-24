@@ -1,0 +1,98 @@
+/**
+ * Transport-agnostic control handlers (spec §7).
+ *
+ * Nothing here knows about sockets, frames, or HTTP. The handlers take a
+ * PRINCIPAL and a dependency record and return a payload; the transport
+ * owns everything else. That split is what lets step 4 mount these same
+ * two functions over HTTP behind the §16 floor without a second
+ * implementation of the projections, and it is why `daemonStop` returns
+ * an intent rather than performing the stop: only the transport knows
+ * when its answer is actually on the wire.
+ *
+ * The principal is constructed by the TRANSPORT, server-side, and is
+ * NEVER decoded from the request. The UDS transport constructs
+ * `anonymous-local` unconditionally — the §3.2 directory boundary is what
+ * authenticates a caller there, so a principal field on the wire would be
+ * a client-supplied authorization input, which is precisely the thing a
+ * credential boundary must not accept.
+ *
+ * `_principal` is therefore unused today: `anonymous-local` is the only
+ * variant, and authorization is decided by the connection's capability
+ * row before dispatch ever reaches here. The parameter stays in the
+ * signature because it is the seam a second transport would need, and
+ * because a handler that never sees its principal cannot later be given
+ * one without changing every call site.
+ */
+import {
+  assertProjection,
+  type DaemonStatusPayload,
+  type DaemonStopPayload,
+  isDaemonStatusShape,
+} from "../payloads.js";
+
+declare const PRINCIPAL_BRAND: unique symbol;
+
+/**
+ * Who a control call is on behalf of — CONSTRUCTIBLE ONLY by this module.
+ *
+ * The brand is what makes the docblock's rule enforceable rather than
+ * merely stated. A principal can never be decoded from a request: the wire
+ * shape `{kind: "anonymous-local"}` is trivially forgeable by any client,
+ * and a plain structural type would let a decoder hand one straight to
+ * `daemonStatus`. With the brand, the only value that type-checks as a
+ * `Principal` is one `anonymousLocalPrincipal()` produced — so a future
+ * transport that tries to read a principal off the wire fails to COMPILE
+ * instead of silently accepting a client-supplied authorization input.
+ */
+export type Principal = { kind: "anonymous-local"; readonly [PRINCIPAL_BRAND]: true };
+
+/**
+ * The ONLY producer of a `Principal`. Called by a transport, server-side,
+ * after that transport's own authentication has held — on UDS that is the
+ * §3.2 directory boundary, which is a property of the socket's location,
+ * not of anything the client sent.
+ */
+export function anonymousLocalPrincipal(): Principal {
+  return { kind: "anonymous-local" } as Principal;
+}
+
+export interface ControlDeps {
+  pid: () => number;
+  agentVersion: string;
+  startedAt: number;
+  dbPath: string;
+  connectionCount: () => number;
+  queueStats: () => { depth: number; activeCount: number };
+  logInfo: () => { path: string; sizeBytes: number } | null;
+}
+
+export function daemonStatus(_principal: Principal, deps: ControlDeps): DaemonStatusPayload {
+  const queue = deps.queueStats();
+  const log = deps.logInfo();
+  const payload: DaemonStatusPayload = {
+    pid: deps.pid(),
+    agentVersion: deps.agentVersion,
+    startedAt: deps.startedAt,
+    dbPath: deps.dbPath,
+    connections: deps.connectionCount(),
+    executionsInFlight: queue.activeCount,
+    queueDepth: queue.depth,
+    logPath: log === null ? null : log.path,
+    logSizeBytes: log === null ? null : log.sizeBytes,
+  };
+  // The runtime half of "single source of truth" (payloads.ts
+  // `assertProjection`): the sender asserts its own output against the SAME
+  // predicate the client guard checks. Every field here comes from a `deps`
+  // callback, so a dep that returns a non-finite counter fails LOUDLY inside
+  // the daemon rather than silently on the wire as a client refusal.
+  return assertProjection(payload, isDaemonStatusShape, "daemonStatus");
+}
+
+/**
+ * Returns the stopping intent only. The TRANSPORT flushes the response
+ * frame and THEN triggers the stop (spec §3.1): signaling shutdown before
+ * the ack is on the wire could close the connection under the reply.
+ */
+export function daemonStop(_principal: Principal): DaemonStopPayload {
+  return { stopping: true };
+}

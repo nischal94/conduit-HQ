@@ -115,6 +115,32 @@ export interface ConnectionListingView {
 }
 
 /**
+ * The `daemon.status` projection (§3.1): a snapshot computed daemon-side,
+ * with defined metric semantics, and no credential-adjacent material —
+ * the same §3.3 boundary `CatalogListing` draws. `logPath`/`logSizeBytes`
+ * are `null` when the daemon logs to a TTY rather than a file.
+ */
+export interface DaemonStatusPayload {
+  pid: number;
+  agentVersion: string;
+  /** Epoch ms the daemon's serve loop started. */
+  startedAt: number;
+  dbPath: string;
+  /** READY-granted open sockets, the asking connection included. */
+  connections: number;
+  /** Queue entries currently running. */
+  executionsInFlight: number;
+  /** Queue entries admitted and waiting. */
+  queueDepth: number;
+  logPath: string | null;
+  logSizeBytes: number | null;
+}
+
+export interface DaemonStopPayload {
+  stopping: true;
+}
+
+/**
  * The `approvals.list` projection — one row per paused execution.
  *
  * A PROJECTION for the same §3.3 reason as `ResumePayload`: the stored
@@ -173,7 +199,11 @@ export type RpcPayloadFor<K extends RpcRequest["kind"]> = K extends "catalog.lis
           ? ResumePayload
           : K extends "source.provision" | "source.revalidate"
             ? ProvisionPayload
-            : unknown;
+            : K extends "daemon.status"
+              ? DaemonStatusPayload
+              : K extends "daemon.stop"
+                ? DaemonStopPayload
+                : unknown;
 
 /**
  * Projects one paused `Execution` for the `approvals.list` response.
@@ -290,9 +320,9 @@ function toPendingView(pending: PendingApproval): PendingView {
  * which predicate binds which projection; the call sites name the pairing,
  * which is the thing under test.
  */
-function assertProjection<T>(
+export function assertProjection<T>(
   payload: T,
-  guard: (value: unknown) => boolean,
+  guard: (value: unknown) => value is T,
   projection: string,
 ): T {
   if (!guard(payload)) {
@@ -400,7 +430,10 @@ export function toTextResult(payload: unknown): { content: [{ type: "text"; text
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
-  return typeof value === "object" && value !== null;
+  // `!Array.isArray` matches `rpc.ts`'s reading: an array is an object, so
+  // without it `[]` passes every shape guard's first hurdle and the field
+  // checks below decide the answer on a value that was never a payload.
+  return typeof value === "object" && value !== null && !Array.isArray(value);
 }
 
 /**
@@ -448,6 +481,59 @@ export function isCheckPayloadShape(payload: unknown): payload is CheckPayload {
   if (payload.status === "not_found") return true;
   if (!(CHECK_BODY_STATUSES as readonly string[]).includes(payload.status as string)) return false;
   return typeof payload.executionId === "string";
+}
+
+/**
+ * True iff `payload` is a well-formed `DaemonStatusPayload`.
+ *
+ * EVERY field is checked, because `conduit daemon status` interpolates every
+ * one of them into the operator's report — this is the `isPausedRowShape`
+ * situation, not the `isExecutePayloadShape` one: nothing here is handed
+ * onward verbatim, so there is no field whose malformation is harmless.
+ *
+ * `startedAt` is checked as a non-negative SAFE INTEGER WITHIN THE VALID DATE
+ * RANGE (CX6): it reaches `new Date(...).toISOString()`, which throws a
+ * `RangeError` for any value outside ±8.64e15 ms — and `1e20` is finite, so a
+ * plain finite check let a protocol fault through to a CLI-fatal stack trace
+ * instead of the typed refusal it is. The remaining counters (`pid`,
+ * `connections`, `executionsInFlight`, `queueDepth`) and `logSizeBytes` are
+ * rendered and/or counted, so they are held to the same non-negative
+ * safe-integer floor: a negative, fractional, or 2^53-imprecise count is a
+ * malformed projection, not a value to print.
+ *
+ * `logPath`/`logSizeBytes` are NULLABLE by contract (the daemon logs to a
+ * TTY when hand-started), so `null` is accepted and `undefined` is not: the
+ * renderer's `?? "stderr (hand-started)"` would turn an ABSENT field into a
+ * confident claim that the daemon is hand-started, which is a different
+ * fact from "the daemon told us it has no log file".
+ */
+/** The maximum epoch-ms a JS `Date` can represent (±8.64e15). */
+const MAX_DATE_MS = 8.64e15;
+
+/** A non-negative integer safely representable and exactly rendered. */
+function isNonNegativeSafeInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value >= 0;
+}
+
+export function isDaemonStatusShape(payload: unknown): payload is DaemonStatusPayload {
+  if (!isRecord(payload)) return false;
+  if (typeof payload.agentVersion !== "string") return false;
+  if (typeof payload.dbPath !== "string") return false;
+  // `startedAt` must survive `new Date(v).toISOString()` AND render exactly:
+  // an out-of-range value (e.g. 1e20) passes a finite check yet throws
+  // RangeError, and a fractional value (e.g. 1.5) renders as a silently wrong
+  // epoch-ms instant. It is a non-negative safe integer within the Date range.
+  if (!isNonNegativeSafeInteger(payload.startedAt) || payload.startedAt > MAX_DATE_MS) {
+    return false;
+  }
+  for (const field of ["pid", "connections", "executionsInFlight", "queueDepth"] as const) {
+    if (!isNonNegativeSafeInteger(payload[field])) return false;
+  }
+  if (payload.logPath !== null && typeof payload.logPath !== "string") return false;
+  if (payload.logSizeBytes !== null && !isNonNegativeSafeInteger(payload.logSizeBytes)) {
+    return false;
+  }
+  return true;
 }
 
 /**

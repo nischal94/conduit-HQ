@@ -1,10 +1,20 @@
 import { type ChildProcess, spawn } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { connect, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { AGENT_VERSION } from "../env.js";
+import { DaemonUnavailable, daemonRequest, MIN_PASS_BUDGET_MS } from "./client.js";
 import {
   CONCURRENCY_CAP,
   DRAIN_DEADLINE_MS,
@@ -12,12 +22,16 @@ import {
   EXIT_ALREADY_RUNNING,
   EXIT_ROTATION_IN_PROGRESS,
   ExecutionQueue,
+  HANDSHAKE_DEADLINE_MS,
   QUEUE_CAPACITY,
   RESUME_ADMISSION_DEADLINE_MS,
 } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
 import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
-import { acquireExclusive, acquireShared, type HeldLock } from "./locks.js";
+import { acquireExclusive, acquireShared, type HeldLock, probeShared } from "./locks.js";
+import { LOG_LINE_MAX_BYTES, LOG_MAX_BYTES } from "./log-sink.js";
+import { MAX_TOOL_TEXT_BYTES } from "./provision.js";
+import { DAEMON_LOG } from "./spawn.js";
 
 /**
  * Real-process daemon tests (design §3.5, §7 — normative: "the
@@ -54,6 +68,8 @@ let dir: string | undefined;
 const children: ChildProcess[] = [];
 const sockets: Socket[] = [];
 const locks: HeldLock[] = [];
+/** Stub MCP upstreams started by a test; closed in afterEach. */
+const servers: Server[] = [];
 
 afterEach(async () => {
   for (const socket of sockets) socket.destroy();
@@ -70,6 +86,10 @@ afterEach(async () => {
     }),
   );
   children.length = 0;
+  await Promise.all(
+    servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+  );
+  servers.length = 0;
   for (const lock of locks) await lock.release();
   locks.length = 0;
   if (dir) {
@@ -244,6 +264,145 @@ async function handshake(client: Client, capability = "serve"): Promise<unknown>
   expect(await client.next()).toEqual({ kind: "ready" });
   client.send({ kind: "handshake", protocol: 1, capability });
   return client.next();
+}
+
+// --- A stub MCP upstream, re-armable ------------------------------------
+//
+// Speaks just enough streamable-HTTP MCP for `fetchToolsList` to complete
+// (initialize → notifications/initialized → tools/list). The advertised tool
+// set is MUTABLE via `setTools`: `source.revalidate` re-fetches the SAME
+// stored url, so the only way to prove a revalidate republished the catalog
+// is to change what the upstream answers between the two fetches.
+
+interface Upstream {
+  origin: string;
+  /** Re-arms the `tools/list` answer for every subsequent fetch. */
+  setTools(tools: unknown[]): void;
+  /**
+   * Holds every subsequent `tools/list` open until `releaseTools()` is
+   * called, and resolves once one is actually being held.
+   *
+   * This is the only seam that can interleave two provisionings from
+   * outside the daemon: a stalled `tools/list` parks its request INSIDE the
+   * held per-namespace source lock, after that namespace's own store read,
+   * so a second namespace can commit underneath it. Without it, every
+   * provisioning here runs to completion before the next begins and the
+   * cross-namespace race is unreachable.
+   */
+  holdTools(): Promise<void>;
+  releaseTools(): void;
+}
+
+/** One tool as an upstream advertises it, before namespacing. */
+function upstreamTool(name: string, description: string): unknown {
+  return {
+    name,
+    description,
+    inputSchema: { type: "object", properties: {} },
+    annotations: { readOnlyHint: true },
+  };
+}
+
+async function startUpstream(initial: unknown[]): Promise<Upstream> {
+  let tools = initial;
+  /** Set while `tools/list` answers are being held; cleared on release. */
+  let hold: { gate: Promise<void>; open: () => void } | undefined;
+  /** Resolved the moment a `tools/list` is actually parked on the gate. */
+  let announceHeld: (() => void) | undefined;
+  const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+    let body = "";
+    req.on("data", (chunk) => {
+      body += String(chunk);
+    });
+    req.on("end", () => {
+      let parsed: { id?: string; method?: string } = {};
+      try {
+        parsed = JSON.parse(body) as typeof parsed;
+      } catch {
+        // Non-JSON body (the DELETE teardown): fall through to 202.
+      }
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-1" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: {} },
+              serverInfo: { name: "fixture", version: "1" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "tools/list") {
+        const answer = (): void => {
+          res.writeHead(200, { "content-type": "application/json" });
+          res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { tools } }));
+        };
+        if (hold !== undefined) {
+          // Parked INSIDE the daemon's held source lock for this namespace.
+          announceHeld?.();
+          void hold.gate.then(answer);
+          return;
+        }
+        answer();
+        return;
+      }
+      res.writeHead(202);
+      res.end();
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  const address = server.address();
+  const port = typeof address === "object" && address !== null ? address.port : 0;
+  return {
+    origin: `http://127.0.0.1:${port}`,
+    setTools: (next: unknown[]) => {
+      tools = next;
+    },
+    holdTools: () => {
+      let open = (): void => {};
+      const gate = new Promise<void>((resolve) => {
+        open = resolve;
+      });
+      hold = { gate, open };
+      return new Promise<void>((resolve) => {
+        announceHeld = resolve;
+      });
+    },
+    releaseTools: () => {
+      hold?.open();
+      hold = undefined;
+      announceHeld = undefined;
+    },
+  };
+}
+
+/** Sends a `source.provision` and returns the daemon's answer frame. */
+function provision(
+  client: Client,
+  args: { namespace: string; url: string; prefix: string },
+): Promise<unknown> {
+  client.send({
+    kind: "source.provision",
+    namespace: args.namespace,
+    url: args.url,
+    prefix: args.prefix,
+    replace: true,
+    clearCredential: false,
+  });
+  return client.next();
+}
+
+/** The tool paths a `search` answered with, in rank order. */
+async function searchPaths(client: Client, query: string): Promise<string[]> {
+  client.send({ kind: "search", query });
+  const answer = (await client.next()) as { kind: string; payload: { path: string }[] };
+  expect(answer.kind).toBe("result");
+  return answer.payload.map((hit) => hit.path);
 }
 
 describe("conduitd lifecycle", () => {
@@ -775,6 +934,197 @@ describe("conduitd lifecycle", () => {
   );
 
   it(
+    "bounds the ON-DISK active log under real daemon logging (fd ownership, not just the sink object)",
+    async () => {
+      // The sink unit tests pin the rotation mechanics against a sink OBJECT.
+      // What they cannot pin is that the daemon's own log traffic actually
+      // goes through that object — the property that fails if the daemon
+      // keeps writing to an inherited append fd instead of owning its own
+      // (spec §5). So this drives a REAL spawned daemon whose log goes to the
+      // sink and samples the file on disk.
+      //
+      // The bound alone would be vacuous at this traffic volume: a few
+      // hundred bytes is under a 5MB cap no matter WHERE it was written, so
+      // the test would pass identically with no sink at all. The two
+      // non-vacuous halves are therefore (a) the file must actually be
+      // written and GROW as the daemon logs, which is what proves the
+      // daemon's own traffic reaches THIS file through the sink, and (b)
+      // `daemon.status` must report that same file — which also closes the
+      // `logInfo` seam end-to-end, since its default is `() => null` until
+      // an entry point wires the real accessor.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // `--log-sink` wires the real `createRotatingLog` (see run-daemon.ts
+      // for how it deliberately differs from bin.ts).
+      //
+      // The other two flags are load-bearing for the GROWTH half, and both
+      // were established by measurement rather than assumption:
+      //
+      // `--debug` because the per-admission queue lines are the §5-gated
+      // volume; with the gate shut a healthy request logs nothing at all.
+      //
+      // `--throw-execute` because the queue lines come from
+      // `submitSandboxWork`, which only sandbox work reaches — a
+      // `catalog.listing` is a plain read that never enters the queue, so
+      // read traffic alone leaves the file flat no matter how many rounds
+      // run. An `execute` both traverses the queue (a gated line) and
+      // fails loudly (an ungated error line), so it exercises both routes
+      // into the sink.
+      const daemon = spawnDaemon(stateDir, ["--log-sink", "--debug", "--throw-execute"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, "conduitd.log");
+      const bound = LOG_MAX_BYTES + LOG_LINE_MAX_BYTES;
+      // Non-empty already: the "listening" line the readiness wait just
+      // observed had to land here too, not only on stdout.
+      const initialSize = statSync(logPath).size;
+      expect(initialSize).toBeGreaterThan(0);
+      expect(initialSize).toBeLessThan(bound);
+
+      // Real request traffic through the real dispatch path, sampling the
+      // on-disk size between rounds. The execute is REFUSED (the injected
+      // fault) — an error reply is a successful drive of the logging path,
+      // which is what this test is about.
+      for (let round = 0; round < 5; round++) {
+        const client = await connectClient(paths.socket);
+        await handshake(client, "serve");
+        client.send({ kind: "execute", code: `${round}`, deadlineMs: 60_000 });
+        expect(await client.next()).toMatchObject({ kind: "error" });
+        client.socket.end();
+        expect(statSync(logPath).size).toBeLessThan(bound);
+      }
+
+      // The file must have GROWN under that traffic. This is the assertion
+      // that fails if the daemon's log goes anywhere other than the sink's
+      // own descriptor — without it the bound below is vacuous, since a few
+      // hundred bytes sit under a 5MB cap however they were written.
+      await waitFor(() => statSync(logPath).size > initialSize);
+
+      // `daemon.status` reports the daemon's OWN view of its log — the
+      // `logInfo` accessor threaded from the sink. A null here means the
+      // seam was never wired; a mismatched path means the daemon is
+      // reporting on a different file than it writes.
+      const control = await connectClient(paths.socket);
+      await handshake(control, "control");
+      control.send({ kind: "daemon.status" });
+      const status = (await control.next()) as {
+        kind: string;
+        payload: { logPath: string | null; logSizeBytes: number | null };
+      };
+      expect(status.kind).toBe("result");
+      // `realpathSync`, because the daemon resolves its state directory
+      // through `resolveEffectiveStateDir` (§17 §2) and therefore reports
+      // the canonical path — on macOS the temp dir is a symlink, so the
+      // raw `tmpdir()` spelling and the daemon's resolved one differ by a
+      // `/private` prefix while naming ONE file. Comparing canonical forms
+      // keeps the assertion about file identity rather than about spelling.
+      expect(status.payload.logPath).toBe(realpathSync(logPath));
+      const onDisk = statSync(logPath).size;
+      expect(status.payload.logSizeBytes).toBeGreaterThan(0);
+      // Approximate, not equal: lines can land between the daemon's own
+      // reading and this one, and a fault line carries a stack trace worth
+      // roughly a kilobyte. What must hold is that the two describe the
+      // SAME file rather than two unrelated counters — an unwired accessor
+      // reports null and a stale snapshot is off by the whole file, so the
+      // failure modes this guards against differ by orders of magnitude,
+      // not by one line's worth of bytes.
+      expect(Math.abs((status.payload.logSizeBytes ?? 0) - onDisk)).toBeLessThan(
+        LOG_LINE_MAX_BYTES,
+      );
+      expect(status.payload.logSizeBytes).toBeLessThan(bound);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "with the §5 gate SHUT, lifecycle lines are logged but accepted-admission lines are not",
+    async () => {
+      // The gate's scope, from the operator's side. §5 bounds per-ADMISSION
+      // volume — one line per served request, which is what dominates a busy
+      // daemon's log. It does NOT suppress the classes an operator needs by
+      // default: lifecycle transitions, errors, and REFUSALS.
+      //
+      // No `--debug` here, deliberately: that is the whole point.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--log-sink", "--throw-execute"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, DAEMON_LOG);
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      // Real sandbox traffic, so an admission genuinely happens — the
+      // execute both traverses the queue and fails loudly.
+      client.send({ kind: "execute", code: "1", deadlineMs: 60_000 });
+      expect(await client.next()).toMatchObject({ kind: "error" });
+
+      // The error line lands: the ungated classes are unaffected by the gate.
+      await waitFor(() => readFileSync(logPath, "utf8").includes("Queued request failed"));
+      const written = readFileSync(logPath, "utf8");
+      // Lifecycle transitions are ungated.
+      expect(written).toContain("listening");
+      // THE ASSERTION: the accepted-admission line is absent. That is the
+      // per-admission volume the gate exists to hold back.
+      expect(written).not.toContain("active=");
+      expect(written).not.toMatch(/queue depth=\d+ max=\d+ active=/);
+
+      client.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a busy REFUSAL is logged with the gate shut — a refusal is not per-admission volume",
+    async () => {
+      // The other half of the gate's scope, and the one the fix changed: a
+      // refusal is the daemon DECLINING work, which is the class §5 keeps at
+      // default alongside lifecycle and errors. An operator diagnosing "my
+      // requests are failing" must see it without having restarted the
+      // daemon under `--debug`.
+      //
+      // MUTATION CHECK: route the `refused=busy` line back through
+      // `logDebug` and this test fails — with no `--debug` the line vanishes.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // Stalled sandbox work is how the queue is driven to its capacity.
+      const daemon = spawnDaemon(stateDir, ["--log-sink", "--stall-sandbox"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, DAEMON_LOG);
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      // Fill every running slot AND the whole queue, then one more: that
+      // last one is refused `busy`.
+      for (let i = 0; i < CONCURRENCY_CAP + QUEUE_CAPACITY + 1; i++) {
+        client.send({ kind: "execute", code: `${i}`, deadlineMs: 60_000 });
+      }
+      // The refusal arrives as an error frame with the busy code.
+      await waitFor(
+        () => daemon.lines.filter((l) => l.includes("stalling execute")).length >= CONCURRENCY_CAP,
+      );
+      const answer = (await client.next()) as { kind: string; code?: string };
+      expect(answer.kind).toBe("error");
+      expect(answer.code).toBe("busy");
+
+      // THE ASSERTION: the refusal line is in the log despite no `--debug`.
+      await waitFor(() => readFileSync(logPath, "utf8").includes("refused=busy"));
+      expect(readFileSync(logPath, "utf8")).toContain("refused=busy");
+
+      client.socket.destroy();
+      // SIGKILL, not SIGTERM: the fixture stalls this daemon's sandbox work
+      // FOREVER, so a graceful drain would sit out its whole deadline and
+      // then still have unfinished work. Nothing here asserts on shutdown.
+      // The shared `afterEach` also reaps, but it waits on `exit` — so the
+      // kill has to happen here, before the hook's own timeout.
+      daemon.child.kill("SIGKILL");
+    },
+    TIMEOUT,
+  );
+
+  it(
     "INVARIANT §17: a second handshake cannot widen an established capability",
     async () => {
       const stateDir = newStateDir();
@@ -970,7 +1320,11 @@ describe("conduitd lifecycle", () => {
     // never reaches the manager while the cap is full.
     const stateDir = newStateDir();
     const paths = daemonPaths(stateDir);
-    const daemon = spawnDaemon(stateDir, ["--stall-sandbox"]);
+    // `--debug` because the queue-depth lines this test asserts on are the
+    // per-admission volume the §5 gate suppresses by default. The gate
+    // changes WHERE those lines are written, not whether the admission
+    // happens, so opening it is the faithful way to observe the wiring.
+    const daemon = spawnDaemon(stateDir, ["--stall-sandbox", "--debug"]);
     await daemon.waitForLine("listening");
 
     // Fill the concurrency cap with stalled executes. Each needs its
@@ -1151,6 +1505,1072 @@ describe("conduitd lifecycle", () => {
       expect(await client.next()).toEqual({ kind: "ready" });
       client.send({ kind: "approvals.list" });
       expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "answers daemon.status for a control client with live counts and no credential material",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--seed-catalog"]);
+      await daemon.waitForLine("listening");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "control");
+      client.send({ kind: "daemon.status" });
+      const answer = (await client.next()) as {
+        kind: string;
+        payload: {
+          pid: number;
+          agentVersion: string;
+          startedAt: number;
+          dbPath: string;
+          connections: number;
+          executionsInFlight: number;
+          queueDepth: number;
+          logPath: string | null;
+          logSizeBytes: number | null;
+        };
+      };
+      expect(answer.kind).toBe("result");
+      const status = answer.payload;
+
+      // The daemon's own identity, computed daemon-side — not echoed from
+      // anything the client sent (the request carries no fields at all).
+      expect(status.pid).toBeGreaterThan(0);
+      expect(status.pid).toBe(daemon.child.pid);
+      expect(status.agentVersion).toBe(AGENT_VERSION);
+      expect(status.dbPath.endsWith("conduit.db")).toBe(true);
+      expect(status.startedAt).toBeGreaterThan(0);
+
+      // The asking connection is itself READY-granted, so the count is at
+      // least one — the metric is live state, not a constant.
+      expect(status.connections).toBeGreaterThanOrEqual(1);
+      expect(Number.isFinite(status.queueDepth)).toBe(true);
+      expect(Number.isFinite(status.executionsInFlight)).toBe(true);
+
+      // §9.2/§3.3 pinned on the WIRE: the daemon holds a seeded connection
+      // row carrying a `credentialRef` and a real stored secret, and no
+      // byte of either may appear in a status answer. A future refactor
+      // that widened this projection into a store dump fails here.
+      const wire = JSON.stringify(status);
+      expect(wire).not.toContain("credentialRef");
+      expect(wire).not.toContain("secret");
+      expect(wire).not.toContain("masterKey");
+      expect(wire).not.toContain("cred_gh");
+      expect(Object.keys(status).sort()).toEqual([
+        "agentVersion",
+        "connections",
+        "dbPath",
+        "executionsInFlight",
+        "logPath",
+        "logSizeBytes",
+        "pid",
+        "queueDepth",
+        "startedAt",
+      ]);
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "ends a connection that takes READY and never handshakes, and drops it from the count",
+    async () => {
+      // READY is granted before the client says anything, so a peer that
+      // connects and then goes silent is READY-granted forever: it inflates
+      // `daemon.status`'s connection number AND holds the §3.3 grace loop,
+      // adding the full DRAIN_DEADLINE_MS to every stop. No hostile client
+      // is needed — a wedged process or a half-open peer does it by
+      // accident.
+      //
+      // Deliberately a RAW connection with no handshake sent, because the
+      // handshake is exactly what the deadline bounds.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const observer = await connectClient(paths.socket);
+      await handshake(observer, "control");
+
+      const silent = await connectClient(paths.socket);
+      // READY, and nothing after it: the connection now counts.
+      expect(await silent.next()).toMatchObject({ kind: "ready" });
+
+      observer.send({ kind: "daemon.status" });
+      const before = (await observer.next()) as { payload: { connections: number } };
+      // Both connections are READY-granted right now — non-vacuous, since a
+      // count that never rose would make the drop below meaningless.
+      expect(before.payload.connections).toBe(2);
+
+      // The daemon says WHY before it closes, so a client that stalled by
+      // accident can tell this apart from a refusal or a crash.
+      expect(await silent.next(HANDSHAKE_DEADLINE_MS * 2)).toMatchObject({
+        kind: "error",
+        code: "invalid",
+        message: expect.stringContaining("handshake"),
+      });
+      await silent.closed;
+
+      // The count returns to the one live handshaked client. This is the
+      // status half of the fix; the drain half follows from the same
+      // predicate — both surfaces count READY-granted live sockets, and the
+      // deadline only bounds how long a silent one can be among them.
+      observer.send({ kind: "daemon.status" });
+      const after = (await observer.next()) as { payload: { connections: number } };
+      expect(after.payload.connections).toBe(1);
+
+      observer.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "rejects control verbs from serve, and serve/provision verbs from control",
+    async () => {
+      // The capability row is the authorization boundary (§9), and it cuts
+      // BOTH ways: widening `control` with the stop verb must not hand an
+      // agent-facing `serve` client the ability to kill the daemon, and the
+      // operator's control client must not acquire execution or
+      // provisioning reach as a side effect of gaining it.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      for (const request of [{ kind: "daemon.stop" }, { kind: "daemon.status" }]) {
+        serve.send(request);
+        expect(await serve.next()).toMatchObject({
+          kind: "error",
+          code: "invalid",
+          message: expect.stringContaining(`capability "serve" does not permit "${request.kind}"`),
+        });
+      }
+
+      const control = await connectClient(paths.socket);
+      await handshake(control, "control");
+      for (const request of [
+        { kind: "search", query: "x" },
+        {
+          kind: "source.provision",
+          namespace: "github",
+          url: "http://127.0.0.1:1/mcp",
+          prefix: "github.acme.prod",
+          replace: true,
+          clearCredential: false,
+        },
+      ]) {
+        control.send(request);
+        expect(await control.next()).toMatchObject({
+          kind: "error",
+          code: "invalid",
+          message: expect.stringContaining(
+            `capability "control" does not permit "${request.kind}"`,
+          ),
+        });
+      }
+
+      // The refusals are pure authorization verdicts: the daemon is still
+      // serving, so nothing above stopped it as a side effect.
+      expect(daemon.child.exitCode).toBeNull();
+
+      serve.socket.destroy(); // see the drain-grace note above
+      control.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it("daemon.stop drains live work: an active execution and a queued request both resolve", async () => {
+    // §3.3: the drain FINISHES accepted work. A stop that severed live
+    // connections would turn every in-flight request into §5's ambiguous
+    // "outcome unknown" — the exact failure a graceful drain exists to
+    // avoid. Both an ALREADY-RUNNING execution and one still queued
+    // behind it must come back with a real frame.
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const daemon = spawnDaemon(stateDir);
+    await daemon.waitForLine("listening");
+
+    const worker = await connectClient(paths.socket);
+    await handshake(worker, "serve");
+    const second = await connectClient(paths.socket);
+    await handshake(second, "serve");
+
+    // Guest work that genuinely occupies a slot for seconds — long
+    // enough that the stop below lands while it is STILL RUNNING, which
+    // is the precondition under test. Self-bounding rather than an
+    // infinite loop: §16's `wallClockMs` budget is 60s, so spinning to
+    // the sandbox's own cut would outlast the drain deadline and pin a
+    // timeout rather than a drain.
+    worker.send({
+      kind: "execute",
+      code: "let n = 0; for (let i = 0; i < 60000000; i++) { n = (n + i) % 97; } return n;",
+      deadlineMs: 60_000,
+    });
+    const busy = worker.next();
+    // A quick execute behind it, admitted while the first still runs.
+    second.send({ kind: "execute", code: "return 'quick';", deadlineMs: 60_000 });
+    const queued = second.next();
+
+    // Both executes are settled-tracked so the ordering below is an
+    // ASSERTION rather than an assumption about timing.
+    let busySettled = false;
+    let queuedSettled = false;
+    void busy.then(() => {
+      busySettled = true;
+    });
+    void queued.then(() => {
+      queuedSettled = true;
+    });
+
+    const control = await connectClient(paths.socket);
+    await handshake(control, "control");
+    control.send({ kind: "daemon.stop" });
+    // The ack arrives BEFORE the executions settle: a busy daemon must
+    // not answer its own stop with `busy`, and must not wait out the
+    // drain before acknowledging.
+    expect(await control.next()).toEqual({
+      kind: "result",
+      requestId: expect.any(String),
+      payload: { stopping: true },
+    });
+    expect(busySettled).toBe(false);
+    expect(queuedSettled).toBe(false);
+
+    // Both requests get real frames rather than a destroyed socket.
+    expect(await busy).toMatchObject({ kind: "result" });
+    expect(await queued).toMatchObject({
+      kind: "result",
+      payload: { status: "completed", result: "quick" },
+    });
+
+    worker.socket.destroy();
+    second.socket.destroy();
+    control.socket.destroy();
+
+    // The stop was real: the daemon exits and RELEASES the lifecycle
+    // lock, which a successor's acquisition proves — "free" is only
+    // observable by taking it.
+    expect(await daemon.waitForExit(DRAIN_DEADLINE_MS + 15_000)).toBe(0);
+    const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+    expect(lifecycle).not.toBeNull();
+    if (lifecycle) locks.push(lifecycle);
+  }, 120_000);
+
+  it(
+    "stop is prompt when nothing is in flight",
+    async () => {
+      // Pins that the DAEMON, not the client, keeps stop prompt. The
+      // control connection is deliberately left OPEN after the ack: it is
+      // a READY-granted socket, so if the daemon did not end it server-side
+      // after flushing the ack, the §3.3 grace loop would wait on it and
+      // the stop would ride the full DRAIN_DEADLINE_MS. Adding a
+      // client-side `destroy()` here would hide exactly that defect, which
+      // is why there is none — the assertion below is only meaningful
+      // against a client that behaves badly.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const control = await connectClient(paths.socket);
+      await handshake(control, "control");
+      control.send({ kind: "daemon.stop" });
+      expect(await control.next()).toMatchObject({
+        kind: "result",
+        payload: { stopping: true },
+      });
+      const ackedAt = Date.now();
+      expect(await daemon.waitForExit()).toBe(0);
+      // The lifecycle lock reads free — measured from the ack, not from
+      // the stop request, so the number is the DRAIN's cost alone.
+      const lifecycle = await acquireExclusive(paths.lifecycleLockDb);
+      expect(lifecycle).not.toBeNull();
+      if (lifecycle) locks.push(lifecycle);
+      expect(Date.now() - ackedAt).toBeLessThan(5_000);
+    },
+    TIMEOUT,
+  );
+
+  it("a second daemon.stop and a SIGTERM racing the first are idempotent", async () => {
+    // Stop is a request, not a state transition each caller owns:
+    // `StopSignal.request` is one-shot, and draining is explicitly not
+    // cancellable. Two RPC stops plus a signal must therefore produce one
+    // clean exit, never a double-drain or a crash.
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const daemon = spawnDaemon(stateDir);
+    await daemon.waitForLine("listening");
+
+    const first = await connectClient(paths.socket);
+    await handshake(first, "control");
+    const secondClient = await connectClient(paths.socket);
+    await handshake(secondClient, "control");
+
+    first.send({ kind: "daemon.stop" });
+    secondClient.send({ kind: "daemon.stop" });
+
+    // Each stop is answered OR the connection closes cleanly under it —
+    // both are legitimate, since the second racing request can land
+    // after the drain has already begun ending connections. What must
+    // not happen is a hang or an error frame.
+    const settle = async (client: Client): Promise<void> => {
+      const answer = await Promise.race([
+        client.next(10_000).then((msg) => ({ got: msg })),
+        client.closed.then(() => ({ got: undefined })),
+      ]);
+      if (answer.got !== undefined) {
+        expect(answer.got).toMatchObject({ kind: "result", payload: { stopping: true } });
+      }
+    };
+    await settle(first);
+    await settle(secondClient);
+
+    // A signal racing the RPC drain, delivered while it is under way.
+    if (daemon.child.exitCode === null) daemon.child.kill("SIGTERM");
+
+    first.socket.destroy();
+    secondClient.socket.destroy();
+
+    expect(await daemon.waitForExit(DRAIN_DEADLINE_MS + 15_000)).toBe(0);
+    // Exactly one drain, and a clean one: the lifecycle lines appear
+    // once each and nothing crashed on the way out.
+    expect(daemon.lines.filter((line) => line === "draining")).toHaveLength(1);
+    expect(daemon.lines.filter((line) => line === "stopped")).toHaveLength(1);
+    expect(daemon.lines.some((line) => line.includes("run-daemon:"))).toBe(false);
+    expect(existsSync(paths.socket)).toBe(false);
+  }, 120_000);
+
+  it("a paused approval created before an RPC stop is resumable after the next start", async () => {
+    // Extends the signal-stop invariant above to the RPC path: approvals
+    // are durable data, not daemon state, so the way the daemon was
+    // stopped must not change what survives. A stop that skipped the
+    // drain could strand a half-written pause.
+    const stateDir = newStateDir();
+    const paths = daemonPaths(stateDir);
+    const first = spawnDaemon(stateDir, ["--pause-execute"]);
+    await first.waitForLine("listening");
+
+    const worker = await connectClient(paths.socket);
+    await handshake(worker, "serve");
+    worker.send({ kind: "execute", code: "return 1;", deadlineMs: 60_000 });
+    const paused = (await worker.next()) as {
+      kind: string;
+      payload: { status: string; executionId: string };
+    };
+    expect(paused.kind).toBe("result");
+    expect(paused.payload.status).toBe("paused");
+    const { executionId } = paused.payload;
+
+    // Stopped over RPC, not by a signal — the whole point of the test.
+    const control = await connectClient(paths.socket);
+    await handshake(control, "control");
+    control.send({ kind: "daemon.stop" });
+    expect(await control.next()).toMatchObject({
+      kind: "result",
+      payload: { stopping: true },
+    });
+    worker.socket.destroy();
+    control.socket.destroy();
+    expect(await first.waitForExit(DRAIN_DEADLINE_MS + 15_000)).toBe(0);
+
+    // A NEW daemon over the same state dir — no cleanup protocol needed
+    // after a clean drain. Real runtime this time: the resume below must
+    // drive the row through the genuine manager.
+    const second = spawnDaemon(stateDir);
+    await second.waitForLine("listening");
+
+    const approver = await connectClient(paths.socket);
+    await handshake(approver, "approvals");
+    approver.send({ kind: "approvals.list" });
+    const listed = (await approver.next()) as {
+      kind: string;
+      payload: { executionId: string }[];
+    };
+    expect(listed.kind).toBe("result");
+    expect(listed.payload.map((row) => row.executionId)).toContain(executionId);
+
+    // The decision lands and the row reaches a TERMINAL status — the
+    // pause survived the RPC stop as resumable work, not as a corpse.
+    approver.send({ kind: "approvals.resume", executionId, decision: "approve" });
+    const resumed = (await approver.next()) as {
+      kind: string;
+      payload: { status: string; decisionApplied: boolean };
+    };
+    expect(resumed.kind).toBe("result");
+    expect(["completed", "failed"]).toContain(resumed.payload.status);
+
+    approver.socket.destroy(); // see the drain-grace note above
+    second.child.kill("SIGTERM");
+    await second.waitForExit();
+  }, 120_000);
+
+  it(
+    "builds ONE runtime per daemon process and reuses it across requests",
+    async () => {
+      // The M6 per-call rehydration was the no-owner workaround: every
+      // execute and resume built a whole composition — sandbox, policy
+      // engine, credential resolver, a full catalog hydration off the
+      // store — and threw it away. The daemon OWNS the store now, so the
+      // runtime is built once in `serve()` and shared (spec §2.1).
+      //
+      // The count travels as a stdout line because the daemon is a real
+      // child process: nothing in this process can read its variables.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--count-runtime-builds"]);
+      await daemon.waitForLine("listening");
+
+      // The one build happens before the socket binds, so it is already
+      // on the wire by the time any client can connect.
+      expect(daemon.lines.filter((l) => l.includes("runtime builds="))).toEqual([
+        "runtime builds=1",
+      ]);
+
+      // Two executes and a search — the three kinds that used to build a
+      // fresh runtime or a fresh store snapshot per call.
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+      client.send({ kind: "execute", code: "return 1;", deadlineMs: 60_000 });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+      client.send({ kind: "execute", code: "return 2;", deadlineMs: 60_000 });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+      client.send({ kind: "search", query: "anything" });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+
+      // A second connection too: the runtime is daemon-scoped, not
+      // connection-scoped.
+      const second = await connectClient(paths.socket);
+      await handshake(second, "serve");
+      second.send({ kind: "execute", code: "return 3;", deadlineMs: 60_000 });
+      expect(await second.next()).toMatchObject({ kind: "result" });
+
+      // Still exactly one build after all of it.
+      expect(daemon.lines.filter((l) => l.includes("runtime builds="))).toEqual([
+        "runtime builds=1",
+      ]);
+
+      client.socket.destroy(); // see the drain-grace note above
+      second.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: search reads the daemon's shared catalog, not a per-call store snapshot",
+    async () => {
+      // The fixture plants `planted.tool` DIRECTLY into the runtime's
+      // catalog and writes nothing to the store. A per-call snapshot
+      // rebuilds from `store.tools.list()`, so it can never see this tool;
+      // finding it therefore proves the search path reads the shared
+      // catalog the daemon holds. Same for `describe`.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--plant-catalog-tool"]);
+      await daemon.waitForLine("listening");
+      // Planting is ordered before bind, so it has already happened by the
+      // time the endpoint exists — no client can race it.
+      expect(daemon.lines).toContain("planted catalog tool");
+
+      const client = await connectClient(paths.socket);
+      await handshake(client, "serve");
+
+      client.send({ kind: "search", query: "planted" });
+      const hits = (await client.next()) as { kind: string; payload: { path: string }[] };
+      expect(hits.kind).toBe("result");
+      expect(hits.payload.map((hit) => hit.path)).toContain("planted.tool");
+
+      // `describe` shares the same catalog, so it answers for the same
+      // store-invisible tool rather than `null`.
+      client.send({ kind: "describe", toolName: "planted.tool" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { path: "planted.tool", namespace: "planted" },
+      });
+
+      // Not vacuous: the store genuinely holds nothing, so a per-call
+      // snapshot would answer empty for both requests above.
+      client.send({ kind: "catalog.listing" });
+      expect(await client.next()).toMatchObject({
+        kind: "result",
+        payload: { sourceCount: 0 },
+      });
+
+      client.socket.destroy(); // see the drain-grace note above
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17: a source added via one client is visible to another with no restart",
+    async () => {
+      // The §17 startup-reload caveat closing, at the CATALOG. The
+      // source-invariants.test.ts test of the same name asserts the
+      // store-backed half (`catalog.listing` counts a new source); this one
+      // asserts the half that governs what an agent can actually reach —
+      // `search`, which reads the daemon's SHARED catalog. Before the
+      // provisioning tail refreshed that catalog, a source added against a
+      // running daemon stayed invisible to search until restart.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      // Client A: a long-lived `serve` connection opened BEFORE the source
+      // exists, and never reconnected.
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      expect(await searchPaths(serve, "issues")).toEqual([]);
+
+      // Client B: a separate `add-mcp` connection provisions the upstream.
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+
+      // THE ASSERTION: the SAME still-connected serve client — no restart,
+      // no reconnect, no new handshake — finds the new tool.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+      // `describe` shares the catalog, so it answers for the same tool.
+      serve.send({ kind: "describe", toolName: "github.list_issues" });
+      expect(await serve.next()).toMatchObject({
+        kind: "result",
+        payload: { path: "github.list_issues", namespace: "github" },
+      });
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "refreshes the shared catalog on source.revalidate too (the shared-tail hook)",
+    async () => {
+      // Both provisioning handlers run the SAME tail, so revalidate must
+      // republish exactly as provision does. `source.revalidate` re-fetches
+      // the STORED url, so the only way to tell a refresh from a no-op is to
+      // change what the upstream advertises between the two fetches — which
+      // also proves the refresh REPLACES the namespace rather than merging
+      // into it: the retired tool must disappear, not linger.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      // The upstream retires one tool and advertises another.
+      upstream.setTools([upstreamTool("list_releases", "List published releases")]);
+      adder.send({ kind: "source.revalidate", namespace: "github" });
+      expect(await adder.next()).toMatchObject({ kind: "result" });
+
+      expect(await searchPaths(serve, "releases")).toContain("github.list_releases");
+      expect(await searchPaths(serve, "issues")).not.toContain("github.list_issues");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "recovers by rehydrating when the catalog refresh throws after commit",
+    async () => {
+      // The refresh runs AFTER a committed write, so its failure must never
+      // turn a landed provisioning into an error answer, and must not strand
+      // the catalog behind the store. The fixture poisons
+      // `catalog.removeNamespace` for exactly ONE call — the refresh's — so
+      // the recovery ladder's first rung (this namespace re-read from the
+      // store) is what publishes the new tools.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, ["--poison-catalog-refresh"]);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      // The commit landed, so the answer is a success result — the refusal
+      // shape a thrown refresh would otherwise produce is exactly the bug.
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+
+      // Non-vacuous: the fixture reports that its injected failure fired.
+      expect(daemon.lines.some((line) => line.includes("poisoned catalog refresh"))).toBe(true);
+
+      // The retry rung ran, so the new tools are still reachable.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "the recovery rung RETIRES a dropped tool, rather than leaving it beside the new one",
+    async () => {
+      // `InMemoryCatalog.upsert` only ever `set`s — it never deletes. So a
+      // recovery that upserted the store's tools WITHOUT removing the
+      // namespace first would leave a retired tool serving alongside the new
+      // ones: stale AND inconsistent, and strictly worse than simply keeping
+      // the previous catalog. This pins that the retry removes before it
+      // upserts.
+      //
+      // The poison is armed for the SECOND `removeNamespace` — the provision
+      // below refreshes successfully (call 1), and the revalidate that
+      // retires a tool is the one whose refresh fails (call 2), leaving its
+      // retry as call 3.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir, [
+        "--poison-catalog-refresh",
+        "--poison-catalog-refresh-nth",
+        "2",
+      ]);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      // The precondition the retirement is measured against.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      // The upstream retires `list_issues` and advertises `list_releases`.
+      upstream.setTools([upstreamTool("list_releases", "List published releases")]);
+      adder.send({ kind: "source.revalidate", namespace: "github" });
+      expect(await adder.next()).toMatchObject({ kind: "result" });
+
+      // Non-vacuous: the injected failure fired on THIS operation's refresh.
+      expect(daemon.lines.some((line) => line.includes("poisoned catalog refresh"))).toBe(true);
+
+      // THE ASSERTION: after recovery the catalog matches the store — the
+      // new tool is present AND the retired one is gone. An additive-only
+      // recovery passes the first of these and fails the second.
+      expect(await searchPaths(serve, "releases")).toContain("github.list_releases");
+      expect(await searchPaths(serve, "issues")).not.toContain("github.list_issues");
+      serve.send({ kind: "describe", toolName: "github.list_issues" });
+      expect(await serve.next()).toMatchObject({ kind: "result", payload: null });
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "answers success and reports the namespace's entries as MISSING OR PARTIAL when both rungs fail",
+    async () => {
+      // The other half of the ladder. A remove-poison fails BEFORE anything
+      // is mutated, so the namespace is merely stale — which is what the
+      // rung-2 line used to claim unconditionally ("serving the previous
+      // catalog"). An UPSERT-poison fails AFTER the remove already ran, so
+      // the namespace is empty or partial and that claim is simply FALSE.
+      //
+      // Both rungs are poisoned here (the default arms every call), so the
+      // ladder runs to the bottom and emits the honest line.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // `--log-sink` so the rung-2 line lands in conduitd.log, where the
+      // wording is asserted against the file rather than against stdout.
+      const daemon = spawnDaemon(stateDir, ["--poison-catalog-upsert", "--log-sink"]);
+      await daemon.waitForLine("listening");
+
+      const logPath = join(stateDir, DAEMON_LOG);
+      // Only text written after this point counts (the baseline-offset
+      // pattern the doctor daemons use): the sink appends, so startup lines
+      // must not be mistaken for this operation's.
+      const baseline = statSync(logPath).size;
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      // THE FIRST ASSERTION: the commit landed, so the operator gets a
+      // SUCCESS answer. A refresh that fails on both rungs must never turn a
+      // committed provisioning into an error frame.
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+
+      // Non-vacuous: the injected failure actually fired, on both rungs.
+      await waitFor(
+        () => daemon.lines.filter((l) => l.includes("poisoned catalog upsert")).length >= 2,
+      );
+
+      // THE SECOND ASSERTION: the rung-2 line says what the code can
+      // VERIFY. "MISSING OR PARTIAL" is the honest claim; the old wording
+      // asserted the namespace was merely stale, which an upsert failure
+      // makes false.
+      await waitFor(() =>
+        readFileSync(logPath, "utf8").slice(baseline).includes("MISSING OR PARTIAL"),
+      );
+      const written = readFileSync(logPath, "utf8").slice(baseline);
+      expect(written).toContain("MISSING OR PARTIAL");
+      // Names both repairs that rehydrate from the store.
+      expect(written).toMatch(/provision\/revalidate/);
+      expect(written).toContain("restart");
+      // The retired claim must be GONE, not merely joined by the new one.
+      expect(written).not.toContain("serving the previous catalog");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a subsequent provision REPAIRS a namespace whose refresh failed on both rungs",
+    async () => {
+      // The rung-2 line promises the next provision/revalidate rehydrates
+      // from the store. That promise is only worth making if it holds, so
+      // this drives it: poison ONLY the first upsert, so the provisioning
+      // whose refresh failed leaves the namespace empty, and the revalidate
+      // that follows repairs it.
+      const upstream = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      // Nth=1 poisons call 1 only. Rung 1's retry is call 2 and succeeds, so
+      // to reach a genuinely EMPTY namespace the poison must cover rung 1's
+      // retry too — hence nth=0 is wrong here and nth is left at 1 with the
+      // repair measured after the ladder recovers on its own retry.
+      const daemon = spawnDaemon(stateDir, [
+        "--poison-catalog-upsert",
+        "--poison-catalog-upsert-nth",
+        "1",
+      ]);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      expect(
+        await provision(adder, {
+          namespace: "github",
+          url: `${upstream.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(daemon.lines.some((l) => l.includes("poisoned catalog upsert"))).toBe(true);
+
+      // Rung 1's retry re-materializes and republishes, so the namespace is
+      // whole again — the ladder's first rung IS the repair here.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      // And an explicit revalidate republishes it too, which is the repair
+      // the rung-2 line names for the case where rung 1 also failed.
+      adder.send({ kind: "source.revalidate", namespace: "github" });
+      expect(await adder.next()).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "two namespaces on one daemon refresh independently, interleaved",
+    async () => {
+      // Two namespaces on one daemon, with their revalidations genuinely
+      // INTERLEAVED: A's `tools/list` is held open — parking A inside its
+      // own source lock — while B commits a retirement underneath it.
+      //
+      // WHAT THIS TEST DOES NOT DO, stated plainly: it does not pin the
+      // per-namespace WRITE SCOPING (the `.filter(...)` in
+      // `refreshNamespace`). That was MEASURED — the filter can be removed
+      // and this test still passes — and the reason is structural: the
+      // refresh runs AFTER its own commit, so by the time A reads the store
+      // it already sees B's retirement, and there is no stale snapshot to
+      // resurrect anything from. The window where an unfiltered upsert
+      // would bite is one synchronous run with no seam a client can reach.
+      // `refresh-namespace.test.ts` drives that function directly and DOES
+      // kill the mutation.
+      //
+      // What this pins is the end-to-end property worth having: two
+      // namespaces refreshing under concurrent load do not corrupt each
+      // other's catalog entries, through the real daemon and the real lock.
+      const gh = await startUpstream([upstreamTool("list_issues", "List open issues")]);
+      const jira = await startUpstream([upstreamTool("list_tickets", "List open tickets")]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      // TWO add-mcp connections: the two provisionings must be in flight at
+      // the same time, and one connection answers its requests in order.
+      const adderA = await connectClient(paths.socket);
+      await handshake(adderA, "add-mcp");
+      const adderB = await connectClient(paths.socket);
+      await handshake(adderB, "add-mcp");
+
+      // Both namespaces onboarded and visible.
+      expect(
+        await provision(adderA, {
+          namespace: "github",
+          url: `${gh.origin}/mcp`,
+          prefix: "github.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(
+        await provision(adderB, {
+          namespace: "jira",
+          url: `${jira.origin}/mcp`,
+          prefix: "jira.acme.prod",
+        }),
+      ).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+      expect(await searchPaths(serve, "tickets")).toContain("jira.list_tickets");
+
+      // Park namespace A's revalidate inside its own source lock, mid-fetch.
+      const held = gh.holdTools();
+      adderA.send({ kind: "source.revalidate", namespace: "github" });
+      await held;
+
+      // Underneath it, namespace B retires its tool and commits — store and
+      // catalog both. A is still parked, holding a view of the world in
+      // which `jira.list_tickets` exists.
+      jira.setTools([]);
+      adderB.send({ kind: "source.revalidate", namespace: "jira" });
+      expect(await adderB.next()).toMatchObject({ kind: "result" });
+      expect(await searchPaths(serve, "tickets")).not.toContain("jira.list_tickets");
+
+      // Let A finish. Its refresh reads a snapshot spanning both namespaces.
+      gh.releaseTools();
+      expect(await adderA.next()).toMatchObject({ kind: "result" });
+
+      // THE ASSERTION: A's refresh republished only A. B's retired tool
+      // stays gone from both catalog readers. Per the docblock, this holds
+      // with or without the `.filter(...)` — the write scoping is pinned in
+      // `refresh-namespace.test.ts`, not here.
+      expect(await searchPaths(serve, "issues")).toContain("github.list_issues");
+      expect(await searchPaths(serve, "tickets")).not.toContain("jira.list_tickets");
+      serve.send({ kind: "describe", toolName: "jira.list_tickets" });
+      expect(await serve.next()).toMatchObject({ kind: "result", payload: null });
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adderA.socket.destroy();
+      adderB.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "an oversize per-tool description is refused and the shared catalog is untouched",
+    async () => {
+      // The bounded-input check runs BEFORE the commit, so a refused
+      // provisioning must leave both the store and the shared catalog exactly
+      // as they were — the refusal path never reaches the refresh at all.
+      const upstream = await startUpstream([
+        upstreamTool("list_issues", "x".repeat(MAX_TOOL_TEXT_BYTES + 1)),
+      ]);
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const serve = await connectClient(paths.socket);
+      await handshake(serve, "serve");
+      const adder = await connectClient(paths.socket);
+      await handshake(adder, "add-mcp");
+
+      const refusal = (await provision(adder, {
+        namespace: "github",
+        url: `${upstream.origin}/mcp`,
+        prefix: "github.acme.prod",
+      })) as { kind: string; code?: string; message?: string };
+      expect(refusal.kind).toBe("error");
+      expect(refusal.code).toBe("invalid");
+      expect(refusal.message).toContain(`${MAX_TOOL_TEXT_BYTES}-byte per-tool limit`);
+      // No byte of the upstream's own text crosses back with the refusal.
+      expect(refusal.message).not.toContain("xxxx");
+
+      // Nothing landed: the catalog has no tool, and the store no source.
+      expect(await searchPaths(serve, "issues")).toEqual([]);
+      serve.send({ kind: "catalog.listing" });
+      expect(await serve.next()).toMatchObject({ kind: "result", payload: { sourceCount: 0 } });
+
+      serve.socket.destroy(); // see the drain-grace note above
+      adder.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "runs two overlapping executions through the one shared runtime",
+    async () => {
+      // Sharing one manager and one QuickJS module across connections is
+      // the point of the change, and it is also where a shared runtime
+      // could plausibly go wrong: two concurrent executions must not cross
+      // their answers. Fired together on two separate connections, each
+      // returning a distinct literal.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+
+      const first = await connectClient(paths.socket);
+      await handshake(first, "serve");
+      const second = await connectClient(paths.socket);
+      await handshake(second, "serve");
+
+      const [a, b] = await Promise.all([
+        (() => {
+          first.send({ kind: "execute", code: "return 'alpha';", deadlineMs: 60_000 });
+          return first.next();
+        })(),
+        (() => {
+          second.send({ kind: "execute", code: "return 'beta';", deadlineMs: 60_000 });
+          return second.next();
+        })(),
+      ]);
+
+      expect(a).toMatchObject({
+        kind: "result",
+        payload: { status: "completed", result: "alpha" },
+      });
+      expect(b).toMatchObject({ kind: "result", payload: { status: "completed", result: "beta" } });
+
+      first.socket.destroy(); // see the drain-grace note above
+      second.socket.destroy();
+      daemon.child.kill("SIGTERM");
+      await daemon.waitForExit();
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * The `conduit daemon status|stop` suppression, end to end against the
+   * real filesystem (spec §3.2). The DI-seam tests in the cli package pin
+   * what the command PRINTS; only this one can show that the production
+   * options actually start nothing — a spawn is a side effect on disk, so
+   * the evidence has to be on disk.
+   */
+  it(
+    "status/stop with no daemon: no spawn occurs",
+    async () => {
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      let spawnCalls = 0;
+
+      for (const request of [{ kind: "daemon.status" }, { kind: "daemon.stop" }] as const) {
+        // A RECORDING spawn seam, deliberately: without it, `spawnPermitted`
+        // suppresses the spawn on the custom-state-dir clause alone
+        // (`opts.spawn !== undefined || isDefaultStateDir(...)`), and this
+        // test would pass identically with `autoStart: true` — proving
+        // nothing about the flag. Injecting the seam satisfies that clause,
+        // so `autoStart: false` is the ONLY thing left suppressing a spawn.
+        const err = await daemonRequest({
+          stateDir,
+          role: "control",
+          request,
+          // Comfortably ABOVE the floor, not exactly at it: the decision
+          // loop is entered only while `remaining >= MIN_PASS_BUDGET_MS`,
+          // so a budget equal to the floor can exit before the loop body —
+          // where the spawn lives — ever runs. That would make this test
+          // pass because nothing was attempted, not because the flag
+          // suppressed it.
+          deadlineMs: MIN_PASS_BUDGET_MS * 6,
+          autoStart: false,
+          spawn: () => {
+            spawnCalls++;
+          },
+        }).then(
+          () => null,
+          (e: unknown) => e,
+        );
+
+        expect(err).toBeInstanceOf(DaemonUnavailable);
+        expect((err as DaemonUnavailable).code).toBe("unavailable");
+      }
+
+      // The assertion the flag actually earns.
+      expect(spawnCalls).toBe(0);
+
+      // Nothing started: no lifecycle holder, no socket, no daemon log.
+      expect(await probeShared(paths.lifecycleLockDb)).toBe("free");
+      expect(existsSync(paths.socket)).toBe(false);
+      expect(existsSync(join(stateDir, DAEMON_LOG))).toBe(false);
     },
     TIMEOUT,
   );

@@ -429,8 +429,19 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
   /**
    * Starts a real daemon against `stateDir`, resolving with its exit code
    * if it exits early (the refusal cases) or with `null` once it reports
-   * "listening". Keyed on the daemon's own lifecycle lines, exactly as the
-   * integration suite's `startDaemonAt` is.
+   * "listening".
+   *
+   * Readiness is observed by polling `conduitd.log` inside the state
+   * directory, NOT by watching the child's stderr. A backgrounded daemon
+   * routes its diagnostics into the owned rotating sink (spec §5), so with
+   * piped stdio — which is how every test spawns it — `bin.ts` takes the
+   * file-sink path and the child's stderr stays empty. The lifecycle lines
+   * themselves are unchanged; only where they land moved, so the wait keys
+   * on the same "listening" line in the file the test already controls.
+   *
+   * The refusal paths still resolve through `exit`: those exit BEFORE
+   * binding, so no "listening" line is ever written, and the exit code is
+   * the §3.5 contract this suite asserts on.
    */
   function startDaemon(stateDir: string, key: string): Promise<number | null> {
     return new Promise((resolve, reject) => {
@@ -444,24 +455,58 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
         env,
       });
       spawned.push(child);
-      const timer = setTimeout(
-        () => reject(new Error(`daemon timed out. Output: ${seen}`)),
-        30_000,
-      );
+      // Kept so a timeout can still report whatever the child did say —
+      // a crash before the sink opens surfaces on stderr, not in the file.
       let seen = "";
       const watch = (chunk: Buffer): void => {
         seen += chunk.toString("utf8");
-        if (seen.includes("listening")) {
-          clearTimeout(timer);
-          resolve(null);
-        }
       };
       child.stdout?.on("data", watch);
       child.stderr?.on("data", watch);
-      child.once("error", reject);
-      child.once("exit", (code) => {
+
+      const logPath = join(stateDir, "conduitd.log");
+      // Only text written AFTER this spawn counts: the sink appends, so a
+      // previous daemon's "listening" line would otherwise report a
+      // refusing successor (exit 3 / exit 4) as ready — exactly the §3.4
+      // refusals these cases assert on.
+      const baseline = ((): number => {
+        try {
+          return readFileSync(logPath, "utf8").length;
+        } catch {
+          return 0;
+        }
+      })();
+      const settle = (fn: () => void): void => {
         clearTimeout(timer);
-        resolve(code);
+        clearInterval(poll);
+        fn();
+      };
+      const poll = setInterval(() => {
+        let contents = "";
+        try {
+          contents = readFileSync(logPath, "utf8");
+        } catch {
+          // Not created yet: the daemon opens the sink after resolving its
+          // state dir. Keep polling until the timeout.
+          return;
+        }
+        if (contents.slice(baseline).includes("listening")) settle(() => resolve(null));
+      }, 50);
+      const timer = setTimeout(() => {
+        let log = "<no conduitd.log>";
+        try {
+          log = readFileSync(logPath, "utf8");
+        } catch {
+          /* the daemon never got as far as opening its sink */
+        }
+        settle(() => reject(new Error(`daemon timed out. Output: ${seen}. Log: ${log}`)));
+      }, 30_000);
+
+      child.once("error", (err) => {
+        settle(() => reject(err));
+      });
+      child.once("exit", (code) => {
+        settle(() => resolve(code));
       });
     });
   }
@@ -485,6 +530,14 @@ describe("conduit key rotate under the maintenance lock (design §3.4)", () => {
     // it is offered as a lead ("may be stale"), never as a verdict that
     // would send the operator after an already-departed pid.
     expect(err).toMatch(/Last acquired by daemon \(pid \d+\) at .* \(may be stale\)/);
+    // The full stop-first obligation, both halves. Stopping the daemon
+    // alone is NOT sufficient: an MCP client started before rotation still
+    // holds the old key in memory, so a refusal that named only
+    // `conduit daemon stop` sent the operator into a rotation that leaves
+    // live clients unable to open the re-sealed secrets.
+    expect(err).toContain("conduit daemon stop");
+    expect(err).toContain("quit every MCP client");
+    expect(err).toContain("holds the old key");
     // Non-blocking: a fail-fast refusal, never a wait-then-take. Well under
     // EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS (1000), which only lifecycle uses.
     expect(elapsed).toBeLessThan(2000);

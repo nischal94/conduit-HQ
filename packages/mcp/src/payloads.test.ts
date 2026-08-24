@@ -3,12 +3,14 @@ import { describe, expect, it } from "vitest";
 import {
   CHECK_BODY_STATUSES,
   CHECK_EXECUTION_TOOL,
+  type DaemonStatusPayload,
   EXECUTE_STATUSES,
   type ExecuteStatus,
   estimateDefinitionTokens,
   executionToCheckPayload,
   extendExecuteDefinition,
   isCheckPayloadShape,
+  isDaemonStatusShape,
   isExecutePayloadShape,
   isResumePayloadShape,
   outcomeToPayload,
@@ -346,5 +348,100 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     expect(isCheckPayloadShape({ status: "conflict", executionId: "e" })).toBe(false);
     // And a legal status missing the mandatory executionId is rejected.
     expect(isExecutePayloadShape({ status: "completed" })).toBe(false);
+  });
+});
+
+describe("isDaemonStatusShape (the daemon.status projection)", () => {
+  /**
+   * A complete, legal payload. Every field below is interpolated into the
+   * operator's report by `conduit daemon status`, which is why the guard
+   * checks all of them rather than a structural floor.
+   */
+  const FULL: DaemonStatusPayload = {
+    pid: 4242,
+    agentVersion: "0.1.0",
+    startedAt: Date.UTC(2026, 7, 22, 12, 0, 0),
+    dbPath: "/state/conduit.db",
+    connections: 2,
+    executionsInFlight: 1,
+    queueDepth: 3,
+    logPath: "/state/conduitd.log",
+    logSizeBytes: 1024,
+  };
+
+  it("INVARIANT §3.1: accepts the full projection, and the nullable log fields as null", () => {
+    expect(isDaemonStatusShape(FULL)).toBe(true);
+    // TTY-hosted daemon: no log file to report. `null` is the CONTRACT
+    // value, distinct from an absent field.
+    expect(isDaemonStatusShape({ ...FULL, logPath: null, logSizeBytes: null })).toBe(true);
+  });
+
+  it("INVARIANT §3.1: deleting ANY field makes the status projection invalid", () => {
+    // Field-completeness, derived from the payload rather than from a
+    // hand-written list: a field ADDED to `DaemonStatusPayload` is covered
+    // here automatically, so the guard cannot silently stop checking one.
+    // Every field fails the same way — the renderer interpolates it, so an
+    // absent one reaches the operator as "undefined" or, for `startedAt`,
+    // as a RangeError out of `toISOString()`.
+    const keys = Object.keys(FULL) as (keyof DaemonStatusPayload)[];
+    expect(keys).toHaveLength(9);
+    for (const key of keys) {
+      const partial: Record<string, unknown> = { ...FULL };
+      delete partial[key];
+      expect(isDaemonStatusShape(partial), `deleting ${key} must invalidate`).toBe(false);
+    }
+  });
+
+  it("rejects an array, which is an object but never a payload", () => {
+    // `isRecord` excludes arrays (matching rpc.ts): without that, `[]`
+    // clears the first hurdle and the field checks decide the answer on a
+    // value that was never a projection.
+    expect(isDaemonStatusShape([])).toBe(false);
+  });
+
+  it("CX6: rejects a finite-but-out-of-Date-range startedAt (guard refuses, no RangeError)", () => {
+    // 1e20 is finite, so the old `Number.isFinite` check let it through — and
+    // `new Date(1e20).toISOString()` throws RangeError, turning a protocol
+    // fault into a CLI-fatal stack trace. The guard must refuse it as a
+    // malformed projection instead.
+    const badStatus = { ...FULL, startedAt: 1e20 };
+    expect(isDaemonStatusShape(badStatus)).toBe(false);
+    // Non-vacuous: the value the guard rejects is exactly the one that would
+    // throw if it reached the renderer.
+    expect(() => new Date(badStatus.startedAt).toISOString()).toThrow(RangeError);
+  });
+
+  it("CX6: rejects a negative startedAt", () => {
+    expect(isDaemonStatusShape({ ...FULL, startedAt: -1 })).toBe(false);
+  });
+
+  it("CX6: rejects a fractional startedAt (finite and in range, but renders a wrong instant)", () => {
+    // 1.5 is finite and within the Date range, so a finiteness+range check
+    // accepts it — but it is not an epoch-ms instant the daemon could report,
+    // and the renderer would silently show 1970-01-01T00:00:00.001Z. The guard
+    // requires a safe integer, matching the counter fields.
+    expect(isDaemonStatusShape({ ...FULL, startedAt: 1.5 })).toBe(false);
+  });
+
+  it("CX6: accepts startedAt at the exact Date-range boundary, rejects one past it", () => {
+    expect(isDaemonStatusShape({ ...FULL, startedAt: 8.64e15 })).toBe(true);
+    expect(isDaemonStatusShape({ ...FULL, startedAt: 8.64e15 + 1 })).toBe(false);
+  });
+
+  it("CX6: rejects negative, fractional, or 2^53-imprecise counters", () => {
+    for (const field of ["pid", "connections", "executionsInFlight", "queueDepth"] as const) {
+      expect(isDaemonStatusShape({ ...FULL, [field]: -1 }), `${field} negative`).toBe(false);
+      expect(isDaemonStatusShape({ ...FULL, [field]: 1.5 }), `${field} fractional`).toBe(false);
+      expect(
+        isDaemonStatusShape({ ...FULL, [field]: Number.MAX_SAFE_INTEGER + 1 }),
+        `${field} beyond safe integer`,
+      ).toBe(false);
+    }
+  });
+
+  it("CX6: rejects a negative or fractional logSizeBytes while still accepting null", () => {
+    expect(isDaemonStatusShape({ ...FULL, logSizeBytes: -1 })).toBe(false);
+    expect(isDaemonStatusShape({ ...FULL, logSizeBytes: 1.5 })).toBe(false);
+    expect(isDaemonStatusShape({ ...FULL, logSizeBytes: null, logPath: null })).toBe(true);
   });
 });

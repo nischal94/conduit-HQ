@@ -1030,6 +1030,10 @@ describe("the result-payload seam", () => {
   async function askWithPayload(
     request: Parameters<typeof daemonRequest>[0]["request"],
     payload: unknown,
+    // The stub server below grants whatever is asked, so this only has to
+    // be the role the REAL daemon would require for the kind — `control`
+    // for the daemon.* kinds, `approvals` for everything else here.
+    role: Parameters<typeof daemonRequest>[0]["role"] = "approvals",
   ): Promise<Awaited<ReturnType<typeof daemonRequest>>> {
     const stateDir = newStateDir();
     const paths = daemonPaths(stateDir);
@@ -1055,7 +1059,7 @@ describe("the result-payload seam", () => {
     try {
       return await daemonRequest({
         stateDir,
-        role: "approvals",
+        role,
         request,
         deadlineMs: 15_000,
         spawn: () => {},
@@ -1475,6 +1479,74 @@ describe("the result-payload seam", () => {
       expect(response.kind).toBe("error");
       if (response.kind !== "error") throw new Error("expected an error frame");
       expect(response.message).toContain("no legal execution status");
+    },
+    TIMEOUT,
+  );
+
+  const STATUS_PAYLOAD = {
+    pid: 4242,
+    agentVersion: "0.1.0",
+    startedAt: 1_700_000_000_000,
+    dbPath: "/state/conduit.db",
+    connections: 1,
+    executionsInFlight: 0,
+    queueDepth: 0,
+    logPath: null,
+    logSizeBytes: null,
+  };
+
+  it(
+    "INVARIANT §17: a daemon.status payload with a malformed startedAt is REFUSED, never rendered",
+    async () => {
+      // `conduit daemon status` renders this through
+      // `new Date(startedAt).toISOString()`, which throws a RangeError on a
+      // non-finite value — a stack trace at the operator instead of a typed
+      // refusal, the same failure the approvals.list row guard prevents.
+      const response = await askWithPayload(
+        { kind: "daemon.status" },
+        { ...STATUS_PAYLOAD, startedAt: Number.NaN },
+        "control",
+      );
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("do NOT assume it is unhealthy");
+      // A read: no side effect to be ambiguous about (§5).
+      expect(response.kind).not.toBe("outcome-unknown");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a daemon.status payload missing logPath is REFUSED (absent is not the same fact as null)",
+    async () => {
+      // The renderer's `?? "stderr (hand-started)"` would turn an ABSENT
+      // field into a confident claim the daemon is hand-started — a
+      // different fact from the daemon reporting it has no log file.
+      const { logPath: _omitted, ...withoutLogPath } = STATUS_PAYLOAD;
+      const response = await askWithPayload({ kind: "daemon.status" }, withoutLogPath, "control");
+      expect(response.kind).toBe("error");
+      if (response.kind !== "error") throw new Error("expected an error frame");
+      expect(response.message).toContain("status projection");
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a well-formed daemon.status payload passes the seam untouched",
+    async () => {
+      const response = await askWithPayload({ kind: "daemon.status" }, STATUS_PAYLOAD, "control");
+      expect(response).toMatchObject({ kind: "result", payload: STATUS_PAYLOAD });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a daemon.status payload whose log fields are a real path and size passes untouched",
+    async () => {
+      // The nullable pair's OTHER legal arm: a file-logging daemon.
+      const payload = { ...STATUS_PAYLOAD, logPath: "/state/conduitd.log", logSizeBytes: 8192 };
+      const response = await askWithPayload({ kind: "daemon.status" }, payload, "control");
+      expect(response).toMatchObject({ kind: "result", payload });
     },
     TIMEOUT,
   );

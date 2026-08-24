@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { CAPABILITIES, decodeRequest, InvalidRpcRequest } from "./rpc.js";
+import {
+  CAPABILITIES,
+  CAPABILITY_REJECTION_PREFIX,
+  decodeRequest,
+  InvalidRpcRequest,
+} from "./rpc.js";
 
 describe("decodeRequest", () => {
   it("accepts each valid RpcRequest shape", () => {
@@ -207,6 +212,24 @@ describe("decodeRequest", () => {
     ).toThrow(InvalidRpcRequest);
   });
 
+  it("the bad-capability message keeps the prefix `conduit daemon` matches on", () => {
+    // `isPreControlRejection` (cli commands/daemon.ts) detects a PRE-CONTROL
+    // daemon by this substring: such a daemon predates the `control`
+    // capability, so its refusal of the handshake is the only signal
+    // available. Rewording this message silently turns that remediation —
+    // the manual SIGTERM path — into a generic "unexpected error", so the
+    // wording is pinned HERE, where the reword would happen.
+    //
+    // Against the exported CONSTANT, which both sides now share: the CLI
+    // imports it rather than re-spelling the sentence, so this asserts the
+    // decoder actually EMITS the constant it claims to. A reword of the
+    // constant moves both sides together and stays detected; a reword of
+    // the decoder's message alone fails here.
+    expect(() => decodeRequest({ kind: "handshake", protocol: 1, capability: "root" })).toThrow(
+      CAPABILITY_REJECTION_PREFIX,
+    );
+  });
+
   it("carries an optional dbPath so the daemon can refuse a custom-db client", () => {
     expect(
       decodeRequest({
@@ -295,5 +318,38 @@ describe("CAPABILITIES", () => {
 
   it("denies execute to add-mcp", () => {
     expect(CAPABILITIES["add-mcp"].has("execute")).toBe(false);
+  });
+});
+
+describe("control vocabulary", () => {
+  it("decodes daemon.status and daemon.stop as nullary requests", () => {
+    expect(decodeRequest({ kind: "daemon.status" })).toEqual({ kind: "daemon.status" });
+    expect(decodeRequest({ kind: "daemon.stop" })).toEqual({ kind: "daemon.stop" });
+  });
+
+  it("rejects any field on the nullary control kinds — a client steers nothing", () => {
+    expect(() => decodeRequest({ kind: "daemon.status", verbose: true })).toThrow(
+      InvalidRpcRequest,
+    );
+    expect(() => decodeRequest({ kind: "daemon.stop", force: true })).toThrow(InvalidRpcRequest);
+  });
+
+  it("accepts a control-capability handshake", () => {
+    expect(decodeRequest({ kind: "handshake", protocol: 1, capability: "control" })).toEqual({
+      kind: "handshake",
+      protocol: 1,
+      capability: "control",
+    });
+  });
+
+  it("scopes the control row to exactly handshake + the two daemon verbs", () => {
+    expect([...CAPABILITIES.control].sort()).toEqual(["daemon.status", "daemon.stop", "handshake"]);
+  });
+
+  it("leaves the serve/approvals/add-mcp rows without any control verb", () => {
+    for (const row of ["serve", "approvals", "add-mcp"] as const) {
+      expect(CAPABILITIES[row].has("daemon.status")).toBe(false);
+      expect(CAPABILITIES[row].has("daemon.stop")).toBe(false);
+    }
   });
 });

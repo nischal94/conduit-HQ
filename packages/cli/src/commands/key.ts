@@ -36,7 +36,8 @@ Subcommands:
              Refuses if a key file exists, CONDUIT_MASTER_KEY is set,
              or the default db already holds sealed secrets.
   rotate     Re-seal every stored secret under a fresh key (stop-first:
-             stop all conduit processes and MCP clients before running).
+             run \`conduit daemon stop\` and quit every MCP client before
+             running — any process started before rotation holds the old key).
              Refuses for env-managed keys and custom CONDUIT_DB paths.
 
 Run with --help for this text. See packages/cli/README.md for the
@@ -222,8 +223,9 @@ async function acquireMaintenance(
   const holder = describeHolder(await readLockHolder(lockDb));
   deps.stderr(
     `[ConduitKey] ${verb} refused: another process owns ~/.conduit — the maintenance lock is held.` +
-      `${holder} ${verb} is stop-first: stop every conduit process and MCP client (the daemon exits on ` +
-      "SIGTERM), then re-run. Nothing was read or written.\n",
+      `${holder} ${verb} is stop-first: stop running conduit processes first — run \`conduit daemon stop\`, ` +
+      "quit every MCP client (any process started before rotation holds the old key), then re-run. " +
+      "Nothing was read or written.\n",
   );
   return acquisition;
 }

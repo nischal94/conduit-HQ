@@ -8,6 +8,12 @@ export {
 /** Exit codes are part of the §3.5 client contract — see conduitd.ts. */
 export {
   type DaemonPaths,
+  /**
+   * The daemon's drain budget. `conduit daemon stop`'s own wait window is
+   * sized against it, so the relationship is assertable rather than merely
+   * documented in a comment on the other side of a package boundary.
+   */
+  DRAIN_DEADLINE_MS,
   daemonPaths,
   EXIT_ALREADY_RUNNING,
   EXIT_ROTATION_IN_PROGRESS,
@@ -29,6 +35,13 @@ export {
   type ExclusiveAcquisition,
   type HeldLock,
   type LockHolder,
+  /**
+   * `conduit daemon stop` waits for VERIFIED termination rather than
+   * trusting the daemon's ack: it polls the lifecycle lock until the
+   * daemon has actually released it, because `key rotate` needs the lock
+   * free and not merely a stop acknowledged.
+   */
+  probeShared,
   readLockHolder,
 } from "./daemon/locks.js";
 export {
@@ -40,6 +53,13 @@ export {
   revalidateSourceRequest,
 } from "./daemon/provision.js";
 export type { Capability, RpcRequest, RpcResponse } from "./daemon/rpc.js";
+/**
+ * The handshake capability-refusal prefix. `conduit daemon status|stop`
+ * detects a PRE-CONTROL daemon by this exact text, so it is a cross-package
+ * contract with ONE edit site rather than a sentence spelled out on both
+ * sides of the boundary.
+ */
+export { CAPABILITY_REJECTION_PREFIX } from "./daemon/rpc.js";
 /**
  * `key generate` creates its own state directory under the §3.2 boundary
  * BEFORE taking the maintenance lock (F4: creates-then-locks), so it needs
@@ -63,6 +83,8 @@ export {
   sameDirectoryIdentity,
 } from "./daemon/state-dir-resolve.js";
 export {
+  /** `conduit daemon status` prints the daemon's build beside this CLI's. */
+  AGENT_VERSION,
   DEFAULT_CONDUIT_DIR,
   DEFAULT_KEY_FILE,
   ensureDbDir,
@@ -80,6 +102,10 @@ export {
 } from "./mcp-fetch.js";
 export {
   CHECK_EXECUTION_TOOL,
+  /** The `daemon.status` projection `conduit daemon status` renders. */
+  type DaemonStatusPayload,
+  /** The `daemon.stop` ack — "will stop", which `conduit daemon stop` then verifies. */
+  type DaemonStopPayload,
   estimateDefinitionTokens,
   executionToCheckPayload,
   extendExecuteDefinition,
@@ -103,3 +129,8 @@ export {
   RESUME_CLIENT_DEADLINE_MS,
 } from "./server.js";
 export { openStoreClientFromEnv, openStoreFromEnv } from "./store-open.js";
+export {
+  createSkewReporter,
+  sanitizeVersionForDisplay,
+  skewWarningLine,
+} from "./version-skew.js";

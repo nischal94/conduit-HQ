@@ -10,14 +10,14 @@
  * order, bind, the drain, signals, the ExecutionQueue. This one owns
  * everything whose lifetime is a single CONNECTION's, and reaches the
  * daemon only through the explicit `ConnectionDeps` it is handed: the
- * queue's `submit`, the runtime handles (`store`, `createRuntime`), and
+ * queue's `submit`, the runtime handles (`store`, `runtime`), and
  * the drain state. Nothing here reads daemon-scope mutable state
  * directly, which is why `isDraining` is a getter rather than a boolean
  * snapshot — the drain flips it after these handlers are already
  * installed.
  */
 import type { Socket } from "node:net";
-import { type ConduitStore, InMemoryCatalog } from "@conduithq/sdk";
+import type { ConduitStore, Tool } from "@conduithq/sdk";
 import {
   buildCatalogListing,
   executionToCheckPayload,
@@ -26,7 +26,8 @@ import {
   pausedToListRow,
   resumeToPayload,
 } from "../payloads.js";
-import type { createApprovalRuntime } from "../runtime.js";
+import type { ApprovalRuntime } from "../runtime.js";
+import { anonymousLocalPrincipal, daemonStatus, daemonStop } from "./control.js";
 import {
   DepthExceeded,
   encodeFrame,
@@ -56,6 +57,29 @@ import {
  */
 export const RESUME_ADMISSION_DEADLINE_MS = 60_000;
 
+/**
+ * Normative-local (spec §3.3): how long a connection may hold READY
+ * without completing its handshake.
+ *
+ * READY is granted the moment the socket is accepted, before the client has
+ * said anything. A READY-granted socket counts in `daemon.status`'s
+ * connection number AND holds the §3.3 grace loop open, so without a bound
+ * a peer that connects and then says nothing at all inflates the operator's
+ * status reading indefinitely and adds the full DRAIN_DEADLINE_MS to every
+ * stop. Neither needs a hostile client: a wedged process or a half-open TCP
+ * peer does it by accident.
+ *
+ * The deadline preserves the status↔drain predicate parity by
+ * CONSTRUCTION rather than by changing it: both surfaces still count
+ * exactly the READY-granted live sockets, and this only bounds how long a
+ * never-handshaking one can be among them.
+ *
+ * 10s is far above any real handshake — the client writes it immediately on
+ * connect, and both are local — and far below DRAIN_DEADLINE_MS, so a
+ * stalled peer cannot dominate a drain.
+ */
+export const HANDSHAKE_DEADLINE_MS = 10_000;
+
 export interface ConnectionContext {
   socket: Socket;
   capability: Capability | null;
@@ -71,6 +95,12 @@ export interface ConnectionContext {
   queued: Set<() => void>;
   /** Source of this connection's daemon-assigned correlation ids. */
   requestCounter: { n: number };
+  /**
+   * Cancels the HANDSHAKE_DEADLINE_MS timer. Called on a successful
+   * handshake and on socket close; idempotent, and a no-op once the
+   * deadline has already fired.
+   */
+  clearHandshakeDeadline: () => void;
 }
 
 /**
@@ -91,7 +121,14 @@ export interface ConnectionDeps {
    */
   agentVersion: string;
   log: (line: string) => void;
-  createRuntime: typeof createApprovalRuntime;
+  /**
+   * The daemon's ONE execution runtime (spec §2.1), built in `serve()`
+   * before the socket binds and shared by every connection. Handed over
+   * as a built value rather than a factory: a per-connection build would
+   * be the M6 workaround again, and the catalog it carries has to be the
+   * same object the provisioning tail refreshes.
+   */
+  runtime: ApprovalRuntime;
   /** The daemon's admission queue, reached only through submit. */
   submit: (run: () => Promise<void>, deadlineMs: number) => Admission;
   /** Live drain state — read per connection, never snapshotted. */
@@ -111,6 +148,35 @@ export interface ConnectionDeps {
    * connection, because the race is between connections against one store.
    */
   withSourceLock: <T>(namespace: string, fn: () => Promise<T>) => Promise<T>;
+  /**
+   * Epoch ms this daemon's serve loop started — the `daemon.status`
+   * uptime origin (§3.1). Daemon-scope and fixed at start, threaded like
+   * `agentVersion` rather than recomputed per connection.
+   */
+  startedAt: number;
+  /**
+   * Asks the daemon to stop. One-shot and idempotent underneath (see
+   * `StopSignal`), so a second call — or a signal racing it — is a no-op
+   * rather than a second drain. Called only AFTER a stop's ack has been
+   * flushed; see the `daemon.stop` arm.
+   */
+  requestStop: () => void;
+  /**
+   * The daemon's own log file, or `null` when it logs to a TTY and there
+   * is no file to report. A closure rather than a value because
+   * `sizeBytes` grows while the daemon runs — a snapshot taken at startup
+   * would report zero forever.
+   */
+  logInfo: () => { path: string; sizeBytes: number } | null;
+  /**
+   * Per-admission volume, behind the debug gate (spec §5). Every request
+   * produces a queue line, so on a busy daemon these dominate the log and
+   * push the lines that matter — lifecycle transitions and errors — out of
+   * the rotation window. Those stay on `log` unconditionally; only the
+   * per-admission chatter routes here, and `conduitd.ts` wires it to a
+   * no-op unless the daemon was started with `--debug`.
+   */
+  logDebug: (line: string) => void;
 }
 
 export type QueueOutcome = "ran" | "expired" | "abandoned";
@@ -189,6 +255,8 @@ export function handleConnection(socket: Socket, deps: ConnectionDeps): void {
     inFlight: new Set(),
     queued: new Set(),
     requestCounter: { n: 0 },
+    // Replaced below, once the timer this cancels exists.
+    clearHandshakeDeadline: () => {},
   };
   connections.add(ctx);
   const decoder = new FrameDecoder();
@@ -235,6 +303,9 @@ export function handleConnection(socket: Socket, deps: ConnectionDeps): void {
   });
 
   socket.on("close", () => {
+    // Cleared on EVERY close, handshaked or not, so a short-lived
+    // connection leaves no pending handle behind.
+    ctx.clearHandshakeDeadline();
     // Queued entries belonging to a gone client are removed here rather
     // than left to expire — they would otherwise hold bounded capacity
     // against clients that are still connected.
@@ -263,6 +334,34 @@ export function handleConnection(socket: Socket, deps: ConnectionDeps): void {
   // here that writes unprompted must keep that decoder-handoff intact.
   send(socket, { kind: "ready" }, log);
   ctx.readyGranted = true;
+
+  // Armed at READY, because READY is what makes this connection count —
+  // toward `daemon.status` and toward the drain's grace window alike. See
+  // HANDSHAKE_DEADLINE_MS.
+  const deadline = setTimeout(() => {
+    log(
+      `[conduitd] Connection closed: no handshake within the deadline. Context: {deadlineMs: ${HANDSHAKE_DEADLINE_MS}}`,
+    );
+    // The file's error-frame convention: `invalid` is the code for a
+    // verdict about the CLIENT'S OWN behavior, and the message names the
+    // deadline so the client can tell this apart from a refusal. `end()`
+    // rather than `destroy()`, so the frame is flushed first.
+    send(
+      ctx.socket,
+      {
+        kind: "error",
+        requestId: "",
+        code: "invalid",
+        message: `no handshake within ${HANDSHAKE_DEADLINE_MS}ms; handshake is required immediately after READY`,
+      },
+      log,
+    );
+    ctx.socket.end();
+  }, HANDSHAKE_DEADLINE_MS);
+  // Never holds the process open on its own: a pending handshake deadline
+  // is not a reason for the daemon (or a test's event loop) to stay alive.
+  deadline.unref();
+  ctx.clearHandshakeDeadline = () => clearTimeout(deadline);
 }
 
 async function dispatch(ctx: ConnectionContext, msg: unknown, deps: ConnectionDeps): Promise<void> {
@@ -403,18 +502,15 @@ function handleHandshake(
     return;
   }
   ctx.capability = request.capability;
+  // The deadline has done its job: this connection is a real client now,
+  // and its lifetime is governed by the drain contract rather than by a
+  // handshake bound.
+  ctx.clearHandshakeDeadline();
   send(
     ctx.socket,
     { kind: "handshake.ok", protocol: 1, dbPath, allowPrivateEgress, agentVersion },
     log,
   );
-}
-
-/** Fresh catalog snapshot per call (M6) — never cached across requests. */
-async function snapshotCatalog(store: ConduitStore): Promise<InMemoryCatalog> {
-  const catalog = new InMemoryCatalog();
-  catalog.upsert(await store.tools.list());
-  return catalog;
 }
 
 /**
@@ -538,13 +634,21 @@ async function submitSandboxWork(
       log,
     );
     const stats = deps.queueStats();
+    // UNGATED, unlike the accepted-admission line below. The §5 gate bounds
+    // per-ADMISSION volume — one line per served request, which is what
+    // dominates a busy daemon's log. A REFUSAL is the daemon declining work,
+    // which is the class §5 keeps at default alongside lifecycle transitions
+    // and errors: an operator diagnosing "my requests are failing" must see
+    // it without having restarted the daemon under `--debug`.
     log(`queue depth=${stats.depth} max=${stats.maxObservedDepth} refused=busy`);
     return;
   }
 
   ctx.queued.add(admission.abandon);
   const stats = deps.queueStats();
-  log(`queue depth=${stats.depth} max=${stats.maxObservedDepth} active=${stats.activeCount}`);
+  deps.logDebug(
+    `queue depth=${stats.depth} max=${stats.maxObservedDepth} active=${stats.activeCount}`,
+  );
   const settled = await admission.done;
   ctx.queued.delete(admission.abandon);
   // Exhaustive rather than a single `if`: the three outcomes are three
@@ -637,13 +741,164 @@ async function runSourceRequest(
   sendResult(ctx, requestId, payload, log);
 }
 
+/**
+ * Refreshes the shared catalog after a provisioning commit (spec §2.2).
+ *
+ * Runs INSIDE the held per-namespace source lock, so catalog publication
+ * order matches commit order. The store read happens FIRST and is
+ * MATERIALIZED into an array; the two catalog mutations then run
+ * synchronously over that already-materialized array, with nothing awaited
+ * or computed between them, so no request can observe the
+ * removed-but-not-upserted state — and no failure can leave it stranded
+ * there either.
+ *
+ * That claim is ABSOLUTE, including under retry, and the code structure is
+ * what makes it so: `mutate` takes an already-materialized array and
+ * contains no `await`, and the ONE retry that can follow a partial mutation
+ * calls it with the array it already holds. The function therefore never
+ * suspends after a remove. (An earlier shape re-ran a combined
+ * read-then-mutate closure on both rungs, so a mutate that failed mid-way
+ * was followed by an awaited store read — a real window, however narrow,
+ * in which the namespace was observably empty.)
+ *
+ * Both mutations are scoped to THIS namespace, which is the scope the held
+ * lock actually covers. Upserting every namespace's tools would write
+ * outside the lock: a concurrent provision of ANOTHER namespace holds a
+ * DIFFERENT lock, and a full-list snapshot taken before its commit could
+ * re-insert tools that namespace's own refresh just retired. The read is
+ * scoped at the QUERY — `store.tools.list(namespace)`, which is indexed
+ * and carries the same ORDER BY as the unscoped form — so the write scope
+ * matches the lock scope by construction, and the two refreshes cannot
+ * overwrite each other regardless of how they interleave.
+ *
+ * NEVER throws — not for a store fault, not for a catalog fault, and not
+ * for a failing `log`: a refresh failure after a COMMITTED write must not
+ * turn the operator's successful provisioning into an error answer. Every
+ * statement that can throw is therefore inside a `try`, and the only calls
+ * in the `catch` bodies are `safeLog`, which swallows its own failure.
+ *
+ * Recovery ladder, both rungs:
+ *
+ *  1. Retry — this namespace refreshed again, not the whole catalog
+ *     rebuilt. WHICH half is retried depends on which half failed, and the
+ *     distinction is what keeps the no-observable-state property below
+ *     absolute:
+ *       - The store READ failed: nothing was removed, so the whole
+ *         read-then-mutate repeats. A transient store fault is the case
+ *         worth one retry; a persistent one lands on rung 2 immediately.
+ *       - The MUTATE failed: the remove may already have run, so the retry
+ *         reuses the ALREADY-materialized array and never awaits. Re-reading
+ *         here would suspend after that remove, which is the one way this
+ *         function could ever publish an empty namespace to another task.
+ *  2. Give up on this namespace's catalog entries and say so honestly. The
+ *     failure can land on EITHER mutation, so what survives is not
+ *     knowable from here: if the remove succeeded and the upsert threw,
+ *     the namespace is now empty or partial, not merely stale. The rung-2
+ *     line therefore claims only what the code can verify — entries may be
+ *     missing or partial — and names the two repairs that rehydrate from
+ *     the store: the next provision/revalidate of this namespace, or a
+ *     daemon restart. Every OTHER namespace is untouched, which is what
+ *     the per-namespace scoping buys.
+ *
+ * Rung 1 removes the namespace before it upserts. `InMemoryCatalog.upsert`
+ * is purely additive (it only ever `set`s), so an upsert alone cannot
+ * retire a tool the upstream dropped — it would leave the retired tool
+ * serving alongside the new ones, which is stale AND inconsistent, and
+ * strictly worse than rung 2. Removing first is safe here because a failed
+ * refresh of THIS namespace never touched any other, so per-namespace
+ * removal is exactly the repair scope.
+ *
+ * EXPORTED FOR TESTING, deliberately. The per-namespace write scoping is
+ * unreachable from a black-box daemon test: the store read and the two
+ * mutations are one synchronous run (that is the materialize-then-mutate
+ * property above), and the refresh runs AFTER its commit inside the source
+ * lock — so no client, and no stalled upstream, can interleave another
+ * namespace's commit into the window where a full-list snapshot would do
+ * damage. The scoping is a real property with a real failure mode; the only
+ * honest way to pin it is to drive this function directly.
+ */
+export async function refreshNamespace(deps: ConnectionDeps, namespace: string): Promise<void> {
+  // Even the log is guarded: `deps.log` writes to the daemon's stdout, and a
+  // closed or full pipe throws. An escaping log call would propagate through
+  // `runSourceRequest` and answer a committed provision with an error frame —
+  // precisely the outcome the never-throws contract exists to prevent.
+  const safeLog = (line: string): void => {
+    try {
+      deps.log(line);
+    } catch {
+      // Nothing left to report it to; the daemon's own log is the failing
+      // surface. Dropping the line is the only disposition that keeps the
+      // committed write's success answer intact.
+    }
+  };
+  // Read and mutate are SEPARATE, so the retry can re-run the mutation
+  // alone. The store read is scoped by the query rather than by a filter
+  // over the whole catalog: `tools.list(namespace)` is indexed and carries
+  // the same ORDER BY, so the lock-scope rationale above is now satisfied
+  // by the query itself instead of by a post-hoc filter over every row.
+  const read = (): Promise<Tool[]> => deps.store.tools.list(namespace);
+  // Purely SYNCHRONOUS, on an ALREADY-materialized array: no await, so the
+  // remove and the upsert are two statements in one tick. That is what
+  // makes the no-observable-empty-state claim in the docblock absolute.
+  const mutate = (scoped: Tool[]): void => {
+    deps.runtime.catalog.removeNamespace(namespace);
+    deps.runtime.catalog.upsert(scoped);
+  };
+  // Rung 0. The two halves are caught SEPARATELY because their retries
+  // differ: a failed read has removed nothing, a failed mutate may have.
+  let scoped: Tool[] | null = null;
+  let cause: unknown = null;
+  try {
+    scoped = await read();
+    mutate(scoped);
+    return;
+  } catch (err) {
+    cause = err;
+    // `scoped` is still null exactly when the READ threw, which is what
+    // tells rung 1 below which retry it is allowed to run.
+  }
+  safeLog(
+    `[conduitd] Catalog refresh failed after commit: retrying the namespace refresh. Context: {namespace: ${namespace}, cause: ${
+      cause instanceof Error ? cause.message : String(cause)
+    }}`,
+  );
+  try {
+    // Rung 1, in exactly one of two shapes.
+    //
+    // MUTATE failed (`scoped` materialized): retry the mutation alone, on
+    // the array already in hand. There is no await between the failed
+    // attempt and this one, so no other task can observe the namespace in
+    // the removed-but-not-upserted state a failed mutate can leave.
+    // Re-reading here would suspend after that remove and open exactly
+    // that window.
+    //
+    // READ failed (`scoped` still null): nothing was removed, so the
+    // window was never opened and the whole read+mutate is safe to repeat
+    // — and repeating it is the point, since the read is what failed.
+    mutate(scoped ?? (await read()));
+    safeLog(
+      `[conduitd] Catalog refreshed on retry after an earlier failure. Context: {namespace: ${namespace}}`,
+    );
+  } catch (err2) {
+    // Rung 2. Deliberately NOT "serving the previous catalog": the failure
+    // can land on the upsert, after the remove already ran, so this
+    // namespace may now be empty or partial rather than stale. Only what is
+    // verifiable is claimed. Other namespaces are unaffected.
+    safeLog(
+      `[conduitd] Catalog refresh retry failed: this namespace's catalog entries may be MISSING OR PARTIAL until the next provision/revalidate of it, or a daemon restart, rehydrates them from the store. Other namespaces are unaffected. Context: {namespace: ${namespace}, cause: ${
+        err2 instanceof Error ? err2.message : String(err2)
+      }}`,
+    );
+  }
+}
+
 async function handleRequest(
   ctx: ConnectionContext,
   request: RpcRequest,
   requestId: string,
   deps: ConnectionDeps,
 ): Promise<void> {
-  const { store, allowPrivateEgress, log, createRuntime } = deps;
+  const { store, log } = deps;
   switch (request.kind) {
     case "execute": {
       // deadlineMs bounds ADMISSION, not execution: §16's wall-clock
@@ -654,8 +909,7 @@ async function handleRequest(
         request.kind,
         request.deadlineMs,
         async () => {
-          // M6: a fresh runtime per unit of work — never cached.
-          const { manager } = await createRuntime({ store, allowPrivateEgress, log });
+          const { manager } = deps.runtime;
           // requestKey is forwarded only when the client sent one — the
           // manager persists it BEFORE the sandbox runs, which is what
           // makes a reissue return `conflict` rather than starting a
@@ -710,17 +964,20 @@ async function handleRequest(
       return;
     }
     case "search": {
-      const catalog = await snapshotCatalog(store);
+      // The daemon's SHARED catalog (spec §2.1), not a per-call store
+      // snapshot: the daemon owns the store, so its catalog is
+      // authoritative and rebuilding one per request only paid for a
+      // hydration the daemon had already done.
+      //
       // Through `sendResult`, not a raw `send`: an oversized catalog answer
       // must surface as the same actionable "too large for the IPC frame"
       // refusal `execute` gives, rather than escaping the encode as an
       // opaque `internal daemon error`.
-      sendResult(ctx, requestId, catalog.search({ query: request.query }), log);
+      sendResult(ctx, requestId, deps.runtime.catalog.search({ query: request.query }), log);
       return;
     }
     case "describe": {
-      const catalog = await snapshotCatalog(store);
-      sendResult(ctx, requestId, catalog.describe(request.toolName) ?? null, log);
+      sendResult(ctx, requestId, deps.runtime.catalog.describe(request.toolName) ?? null, log);
       return;
     }
     case "approvals.list": {
@@ -769,7 +1026,7 @@ async function handleRequest(
         request.kind,
         RESUME_ADMISSION_DEADLINE_MS,
         async () => {
-          const { manager } = await createRuntime({ store, allowPrivateEgress, log });
+          const { manager } = deps.runtime;
           // Projected like every other answer (`ResumePayload`): the raw
           // `ResumeOutcome` carries the paused call's ARGUMENTS in
           // `pending.input`, and the projection also pins `decisionApplied`
@@ -803,8 +1060,8 @@ async function handleRequest(
       // same namespace, or a stale commit could pair a fresh secret with a
       // stale destination. See `withSourceLock`.
       await runSourceRequest(ctx, requestId, deps, () =>
-        deps.withSourceLock(request.namespace, () =>
-          provisionSourceRequest(
+        deps.withSourceLock(request.namespace, async () => {
+          const payload = await provisionSourceRequest(
             {
               namespace: request.namespace,
               url: request.url,
@@ -814,20 +1071,121 @@ async function handleRequest(
               ...(request.secret !== undefined ? { secret: request.secret } : {}),
             },
             { store, log },
-          ),
-        ),
+          );
+          // Hot-reload hook (spec §2.2): after the commit, still inside the
+          // source lock. Never throws.
+          await refreshNamespace(deps, request.namespace);
+          return payload;
+        }),
       );
       return;
     }
     case "source.revalidate": {
       await runSourceRequest(ctx, requestId, deps, () =>
-        deps.withSourceLock(request.namespace, () =>
-          revalidateSourceRequest(request.namespace, { store, log }),
-        ),
+        deps.withSourceLock(request.namespace, async () => {
+          const payload = await revalidateSourceRequest(request.namespace, { store, log });
+          await refreshNamespace(deps, request.namespace);
+          return payload;
+        }),
       );
+      return;
+    }
+    /**
+     * The §7 control verbs, answered OUTSIDE the ExecutionQueue exactly
+     * as `approvals.list` is. That is not an optimization here but a
+     * correctness requirement: the queue bounds concurrent SANDBOX
+     * execution, and routing a stop through it would let a daemon that
+     * is busy — the very state an operator most wants to stop — answer
+     * its own stop request with `busy` (§3.1). Neither verb runs guest
+     * code, touches an upstream, or reads a repository row.
+     */
+    case "daemon.status": {
+      sendResult(
+        ctx,
+        requestId,
+        daemonStatus(
+          // Constructed HERE, server-side, never decoded from the
+          // request: `daemon.status` carries no fields at all, and the
+          // §3.2 directory boundary is what authenticates a UDS caller.
+          // The branded constructor is what makes "never decoded" a
+          // compile-time property rather than a convention.
+          anonymousLocalPrincipal(),
+          {
+            pid: () => process.pid,
+            agentVersion: deps.agentVersion,
+            startedAt: deps.startedAt,
+            dbPath: deps.dbPath,
+            // READY-granted and still open — the same predicate the
+            // drain's grace window uses, so the number an operator reads
+            // means the same thing as the one the drain waits on.
+            connectionCount: () =>
+              [...deps.connections].filter((c) => c.readyGranted && !c.socket.destroyed).length,
+            queueStats: () => {
+              const stats = deps.queueStats();
+              return { depth: stats.depth, activeCount: stats.activeCount };
+            },
+            logInfo: deps.logInfo,
+          },
+        ),
+        log,
+      );
+      return;
+    }
+    case "daemon.stop": {
+      // Flush-then-stop (spec §3.1): the write callback fires once the
+      // frame is handed to the kernel, and only then does the drain begin.
+      // A destroyed peer skips the write; stop still proceeds — the
+      // operator asked for it.
+      const payload = daemonStop(anonymousLocalPrincipal());
+      if (ctx.socket.destroyed) {
+        deps.requestStop();
+        return;
+      }
+      ctx.socket.write(encodeFrame({ kind: "result", requestId, payload }), () => {
+        deps.requestStop();
+        // Ends the STOP connection server-side, after the flush. Without
+        // this, the connection that asked for the stop is itself a live
+        // READY-granted socket, so the §3.3 grace loop waits on it — the
+        // stop would ride the full DRAIN_DEADLINE_MS purely because the
+        // client that requested it had not disconnected yet. The design
+        // pins that stop completes promptly rather than riding the drain,
+        // and the daemon cannot depend on the client's one-shot
+        // disconnect to make that true.
+        //
+        // Safe because the write callback has already fired: the frame is
+        // handed to the kernel, so the client has its ack. `end()` sends
+        // FIN after that flush, never before, and leaves the read side
+        // open — nothing in transit is discarded the way `destroy()`
+        // would discard it.
+        //
+        // Ordering is load-bearing and unchanged: flush → requestStop →
+        // end.
+        ctx.socket.end();
+      });
       return;
     }
     case "handshake":
       return;
+    default: {
+      // Compile-time exhaustiveness: every `RpcRequest` kind now has an
+      // arm, so a new one added to the vocabulary breaks the BUILD here
+      // rather than reaching a client as a runtime refusal. The error
+      // answer stays as the runtime safety net — the daemon decodes
+      // frames off a socket, so a kind the type system believes
+      // impossible must still get a response rather than a silent
+      // fall-through that hangs the caller until its own deadline.
+      const unhandled: never = request;
+      send(
+        ctx.socket,
+        {
+          kind: "error",
+          requestId,
+          code: "invalid",
+          message: `request kind "${(unhandled as RpcRequest).kind}" is not handled`,
+        },
+        log,
+      );
+      return;
+    }
   }
 }

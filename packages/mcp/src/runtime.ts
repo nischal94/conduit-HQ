@@ -13,6 +13,14 @@ import {
 
 export interface ApprovalRuntime {
   manager: ExecutionManager;
+  /**
+   * The one cached piece of state in the composition (spec §2.1): policy
+   * and credentials read the store live per decision, the manager is
+   * store-backed, the sandbox module is process-shared with its own
+   * poison/rebuild recovery. The daemon refreshes this catalog at the
+   * provisioning tail; nothing else mutates it.
+   */
+  catalog: InMemoryCatalog;
 }
 
 async function hydrateCatalog(store: ConduitStore): Promise<InMemoryCatalog> {
@@ -25,9 +33,10 @@ async function hydrateCatalog(store: ConduitStore): Promise<InMemoryCatalog> {
  * Builds the SAME manager composition previously inlined in
  * `createConduitMcpServer`'s execute handler (server.ts) — one home for the
  * §9.3 egress boundary wiring and the manager graph, shared by the /mcp
- * server and the CLI's approvals command. Callers MUST invoke this fresh per
- * unit of work (M6): a freshly-hydrated catalog snapshot per call is the
- * recorded fix for stale-connection visibility.
+ * server and the CLI's approvals command. Built ONCE per daemon process
+ * (spec §2.1). The M6 per-call rehydration was the no-owner workaround;
+ * the daemon's catalog is authoritative because the daemon is the only
+ * writer.
  */
 export async function createApprovalRuntime(opts: {
   store: ConduitStore;
@@ -68,5 +77,5 @@ export async function createApprovalRuntime(opts: {
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
   });
 
-  return { manager };
+  return { manager, catalog };
 }

@@ -6,6 +6,7 @@ import {
   type RpcRequest,
   type RpcResponse,
 } from "@conduithq/mcp";
+import { reportSkew } from "../skew.js";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
 
 /**
@@ -323,6 +324,10 @@ export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<
         // spawns only for the canonical default directory. A custom
         // `--state-dir` is refused with the by-hand start command — this
         // command no longer computes that boundary.
+        //
+        // Skew WARNS and never blocks (spec §4): onboarding proceeds either
+        // way, and nothing here stops or restarts the daemon.
+        onHandshake: reportSkew,
       }),
     env: process.env,
     stdout: (line) => process.stdout.write(line),

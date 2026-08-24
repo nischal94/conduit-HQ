@@ -1,5 +1,5 @@
 import { type ChildProcess, execFile, spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync } from "node:fs";
+import { chmodSync, mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -183,31 +183,74 @@ function startDaemonAt(dir: string): Promise<ChildProcess> {
       })(),
     });
     daemons.push(child);
-    const timer = setTimeout(() => reject(new Error("daemon did not report listening")), 30_000);
     let seen = "";
-    // The daemon logs lifecycle lines to stderr by default (bin.ts), which
-    // is also where its inherited log descriptor points in production.
+    // Daemon diagnostics moved to the owned rotating sink (spec §5): with
+    // piped stdio `bin.ts` writes lifecycle lines into `conduitd.log`
+    // rather than to stderr, so readiness is observed by polling that file
+    // in the state dir this test controls. Stdout/stderr are still
+    // accumulated for diagnostics — a crash before the sink opens lands
+    // there — but they are no longer where "listening" is expected.
     const watch = (chunk: Buffer): void => {
       seen += chunk.toString("utf8");
-      if (seen.includes("listening")) {
-        clearTimeout(timer);
-        resolve(child);
-      }
     };
     child.stdout?.on("data", watch);
     child.stderr?.on("data", watch);
-    child.once("error", reject);
-    child.once("exit", (code) => {
+
+    const logPath = join(dir, "conduitd.log");
+    // Only text written AFTER this spawn counts. The sink APPENDS, and a
+    // second daemon against a live one is expected to exit 3 rather than
+    // bind — but the previous daemon's "listening" line is still in the
+    // file, so matching the whole file would report the loser as ready and
+    // silently defeat the singleton assertion.
+    const baseline = ((): number => {
+      try {
+        return readFileSync(logPath, "utf8").length;
+      } catch {
+        return 0;
+      }
+    })();
+    const settle = (fn: () => void): void => {
       clearTimeout(timer);
-      // The exit code travels as a PROPERTY, not only inside the message.
-      // `seen` is all accumulated daemon stdout+stderr, so any caller
-      // classifying this rejection by message substring would be matching
-      // against arbitrary log content — the exact hazard conduitd.ts
-      // documents when it chose "listening" over a "ready"-prefixed word
-      // ("already running" contains "ready"). `ensureDaemonAt` reads this.
-      const error = new Error(`daemon exited early with code ${code}. Output: ${seen}`);
-      (error as Error & { exitCode?: number | null }).exitCode = code;
-      reject(error);
+      clearInterval(poll);
+      fn();
+    };
+    const poll = setInterval(() => {
+      let contents = "";
+      try {
+        contents = readFileSync(logPath, "utf8");
+      } catch {
+        return; // not opened yet
+      }
+      if (contents.slice(baseline).includes("listening")) settle(() => resolve(child));
+    }, 50);
+    const timer = setTimeout(
+      () =>
+        settle(() =>
+          // `seen` is every byte of the daemon's stdout+stderr. A timeout
+          // with a bare message tells a CI reader only that 30s elapsed;
+          // the accumulated output is where the actual cause lives — a
+          // crash before the sink opened, a refusal exit, a Node fault —
+          // and it is unrecoverable from the log file in exactly those
+          // cases. Mirrors the shape `key.test.ts` already uses.
+          reject(new Error(`daemon did not report listening. Output: ${seen}`)),
+        ),
+      30_000,
+    );
+    child.once("error", (err) => {
+      settle(() => reject(err));
+    });
+    child.once("exit", (code) => {
+      settle(() => {
+        // The exit code travels as a PROPERTY, not only inside the message.
+        // `seen` is all accumulated daemon stdout+stderr, so any caller
+        // classifying this rejection by message substring would be matching
+        // against arbitrary log content — the exact hazard conduitd.ts
+        // documents when it chose "listening" over a "ready"-prefixed word
+        // ("already running" contains "ready"). `ensureDaemonAt` reads this.
+        const error = new Error(`daemon exited early with code ${code}. Output: ${seen}`);
+        (error as Error & { exitCode?: number | null }).exitCode = code;
+        reject(error);
+      });
     });
   });
 }

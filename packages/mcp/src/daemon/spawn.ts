@@ -72,6 +72,26 @@ export function daemonSpawnEnv(): NodeJS.ProcessEnv {
 }
 
 /**
+ * The child's argv, as a pure function of the SPAWNER's environment.
+ *
+ * Split out of `spawnDaemon` so the env→argv translation is testable
+ * without spawning a process. It is the only place the §5 volume gate
+ * crosses the spawn boundary, and it crosses as an ARGUMENT: the child's
+ * constructed env is exactly `{PATH}`, so `CONDUIT_DAEMON_DEBUG` is read
+ * HERE and never inherited. Reading it in the child instead would mean
+ * either inheriting the environment (which §3.1 forbids) or adding a second
+ * allowlist entry a client could set.
+ *
+ * Exactly `"1"`, not any truthy value: an opt-in gate with a fuzzy
+ * predicate turns a stray `CONDUIT_DAEMON_DEBUG=0` into debug logging.
+ */
+export function daemonArgv(env: NodeJS.ProcessEnv): string[] {
+  const argv = [daemonEntryPoint(), "--daemon"];
+  if (env.CONDUIT_DAEMON_DEBUG === "1") argv.push("--debug");
+  return argv;
+}
+
+/**
  * Starts a detached daemon against the DEFAULT state directory and returns
  * immediately.
  *
@@ -121,8 +141,10 @@ export function spawnDaemon(): void {
   // protocol stream.
   const logFd = openSync(join(stateDir, DAEMON_LOG), "a", 0o600);
 
+  const argv = daemonArgv(process.env);
+
   try {
-    const child = spawn(process.execPath, [daemonEntryPoint(), "--daemon"], {
+    const child = spawn(process.execPath, argv, {
       // Explicit, never inherited (§3.1): an inherited cwd would silently
       // anchor every relative path the daemon, sandbox, or an upstream
       // session ever resolves.

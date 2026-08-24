@@ -62,7 +62,7 @@ export const QUEUE_CAPACITY = 16;
  * `conduitd.ts` remains the public import site for the daemon's
  * normative constants.
  */
-export { RESUME_ADMISSION_DEADLINE_MS } from "./connection.js";
+export { HANDSHAKE_DEADLINE_MS, RESUME_ADMISSION_DEADLINE_MS } from "./connection.js";
 
 /**
  * How long DRAINING waits for accepted work before abandoning it.
@@ -148,12 +148,29 @@ export interface RunDaemonOptions {
   /** Structured lifecycle lines; default stderr. */
   log?: (line: string) => void;
   /**
-   * Builds the execution runtime per unit of work (M6). Defaults to
-   * `createApprovalRuntime`; overridable so a test can substitute a
-   * collaborator that stalls in a layer §16's budgets do not bound,
-   * without the daemon under test being anything other than the real one.
+   * Builds the daemon's ONE execution runtime (spec §2.1) — called
+   * exactly once per daemon, in `serve()` before the socket binds.
+   * Defaults to `createApprovalRuntime`; overridable so a test can
+   * substitute a collaborator that stalls in a layer §16's budgets do not
+   * bound, without the daemon under test being anything other than the
+   * real one.
    */
   createRuntime?: typeof createApprovalRuntime;
+  /**
+   * The daemon's own log file for `daemon.status` to report, or `null`
+   * when it logs to a TTY and there is no file. Defaults to `() => null`:
+   * `runDaemon` does not choose where its log goes — the entry point that
+   * builds the `log` sink does — so the daemon reports "no file" until
+   * that entry point supplies the real accessor.
+   */
+  logInfo?: () => { path: string; sizeBytes: number } | null;
+  /**
+   * Opens the per-admission volume gate (spec §5). Off by default: the
+   * queue lines are one per request, and on a busy daemon they would push
+   * lifecycle and error lines out of the bounded log. The entry point
+   * turns this on from `--debug`.
+   */
+  debug?: boolean;
 }
 
 /** Exit codes are part of the client contract (§3.5 decision table). */
@@ -571,6 +588,8 @@ async function startDaemon(
       log,
       stopSignal,
       createRuntime: opts.createRuntime ?? createApprovalRuntime,
+      logInfo: opts.logInfo ?? ((): null => null),
+      debug: opts.debug === true,
     });
   } finally {
     // §3.5 step 4: maintenance first, lifecycle last. Lifecycle release
@@ -624,13 +643,27 @@ interface ServeOptions {
   log: (line: string) => void;
   stopSignal: StopSignal;
   createRuntime: typeof createApprovalRuntime;
+  logInfo: () => { path: string; sizeBytes: number } | null;
+  debug: boolean;
 }
 
 async function serve(opts: ServeOptions): Promise<void> {
   const { paths, store, allowPrivateEgress, dbPath, log, stopSignal, createRuntime } = opts;
   let draining = false;
+  // The uptime origin `daemon.status` reports (§3.1). Taken at the top of
+  // serve rather than at process start: what an operator asks about is how
+  // long this daemon has been SERVING, and startup can spend real time in
+  // lock acquisition and the crash-terminal sweep before it ever binds.
+  const startedAt = Date.now();
   const queue = new ExecutionQueue();
   const connections = new Set<ConnectionContext>();
+
+  // ONE runtime for the daemon's whole life (spec §2.1). Built after the
+  // store opened, before the socket binds: hydration failure is fail-closed
+  // — the throw propagates out of serve(), the socket never binds, and the
+  // locks release through startDaemon's finally. A credential boundary
+  // does not limp.
+  const runtime = await createRuntime({ store, allowPrivateEgress, log });
 
   const server = createServer();
   await new Promise<void>((resolve, reject) => {
@@ -679,7 +712,7 @@ async function serve(opts: ServeOptions): Promise<void> {
     // from an older build. Fixed at build time — nothing runtime-configures it.
     agentVersion: AGENT_VERSION,
     log,
-    createRuntime,
+    runtime,
     submit: (run, deadlineMs): Admission => queue.submit(run, deadlineMs),
     isDraining: () => draining,
     connections,
@@ -690,6 +723,15 @@ async function serve(opts: ServeOptions): Promise<void> {
     }),
     busyMessage: `daemon busy: ${QUEUE_CAPACITY} requests queued behind ${CONCURRENCY_CAP} active`,
     withSourceLock: (namespace, fn) => sourceLock.run(namespace, fn),
+    startedAt,
+    // An RPC stop takes the SAME path a SIGTERM does — one `StopSignal`,
+    // one drain. `request` is one-shot, so a second stop, or a signal
+    // racing this one, is a no-op rather than a competing shutdown.
+    requestStop: () => stopSignal.request(),
+    logInfo: opts.logInfo,
+    // The volume gate (spec §5): without `--debug` the per-admission lines
+    // are dropped at the source rather than written and rotated away.
+    logDebug: opts.debug ? log : (): void => {},
   };
 
   server.on("connection", (socket) => {

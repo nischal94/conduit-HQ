@@ -680,11 +680,22 @@ liveness probe (rotate stays a direct-db operation, outside the daemon — the o
 to sole-writer ownership, since rotation must re-seal the database no daemon may be holding). The §17 startup-reload caveat closes here — a source added through
 one client is visible to another with no restart. Pinned by the §17 rows in
 `INVARIANTS.md`.
-- **Typed control-plane API + hot-reload** — the console's own local HTTP API (distinct
-from the `/mcp` transport). It MUST invalidate/reload so a source saved in the console is
-visible to the running server without a restart (the §17 startup-reload caveat becomes a product bug
-otherwise). The API accepts an abstract actor/principal now (anonymous-local) so Cloud/self-host auth
-does not later require rewriting every handler.
+- **Typed control-plane API + hot-reload. ✅ DAEMON-SIDE BUILT** (2026-08-22 design, build
+sequence step 3) — **the HTTP half ships WITH step 4**, so this line stays PARTIAL. Built:
+the daemon holds ONE long-lived runtime whose catalog every `search`/`describe`
+reads, and the provisioning tail hot-reloads that catalog after the commit — so a source added or
+revalidated through any client is visible to a still-connected `serve` session with no
+restart, at both the `catalog.listing` and the `search`/`describe`
+surface. Per-tool name/description bytes are bounded before the commit, so a hostile upstream cannot
+land unbounded text in the shared catalog. A `control` capability carries
+`daemon.status` and `daemon.stop` (the stop ack is flushed before the daemon
+begins its drain), surfaced as `conduit daemon status|stop` — `status` exits 3
+when no daemon is running. Every daemon-handshaking client warns once on version skew, and the daemon
+owns a bounded rotating log. NOT yet built: the console's own local HTTP API (distinct from the
+`/mcp` transport), which ships in the SAME increment as the §16 request-authenticity floor
+below — a local HTTP surface may not exist ahead of the floor that makes it safe. That API will accept
+an abstract actor/principal (anonymous-local) so Cloud/self-host auth does not later require rewriting
+every handler. Pinned by the §17 rows in `INVARIANTS.md`.
 - **Request-authenticity floor (§16)** — ships IN THE SAME INCREMENT as the console, not
 after: Host/Origin validation, CSRF nonce, non-simple-JSON mutations, no permissive CORS, restrictive
 CSP + escaped trace/upstream content, loopback-only bind (fail closed beyond loopback). This is
@@ -712,9 +723,10 @@ hosted/remote-agent need — keep its route stack independent so building the co
 trace export + retention/GC (Phase 2/4); desktop (Phase 3, cut); Cloud (4); self-host (5).
 
 **Build sequence:** (1) verify credential key lifecycle ✅ → (2) decide daemon ownership ✅ →
-(3) typed control API + hot-reload → (4) request-authenticity floor → (5) console onboarding /
-connections / policy / approvals / Connect → (6) read-only trace viewer → (7) service install / restart
-/ upgrade / recovery. Each piece is load-bearing. **Next: step 3.**
+(3) typed control API + hot-reload ✅ daemon-side (HTTP with step 4) → (4) request-authenticity floor →
+(5) console onboarding / connections / policy / approvals / Connect → (6) read-only trace viewer →
+(7) service install / restart / upgrade / recovery. Each piece is load-bearing.
+**Next: step 4.**
 
 **Phase 1 — Local runtime + CLI + MCP**
 

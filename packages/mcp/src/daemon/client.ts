@@ -32,6 +32,7 @@ import { connect, type Socket } from "node:net";
 import { join } from "node:path";
 import {
   isCheckPayloadShape,
+  isDaemonStatusShape,
   isExecutePayloadShape,
   isResumePayloadShape,
   type RpcPayloadFor,
@@ -1029,6 +1030,42 @@ function validatePayload(response: RpcResponse, kind: RpcRequest["kind"]): RpcRe
             "Look it up with check_execution before re-issuing anything.",
         );
       }
+      return response;
+    }
+
+    case "daemon.status": {
+      // Every field is interpolated into the operator's report, and
+      // `startedAt` reaches `new Date(...).toISOString()` — where a
+      // malformed value throws a RangeError at the operator as a stack
+      // trace rather than as a refusal, the same failure the
+      // `approvals.list` row guard exists to prevent.
+      if (!isDaemonStatusShape(response.payload)) {
+        return refuse(
+          "the daemon's daemon.status answer was not a status projection. " +
+            "Nothing is being reported about the daemon — do NOT assume it is unhealthy or " +
+            'idle. Re-run "conduit daemon status"; if it persists, see the daemon log.',
+        );
+      }
+      return response;
+    }
+
+    case "daemon.stop": {
+      // DELIBERATELY EXEMPT, and named rather than left to fall through the
+      // `default` — a silent omission reads as an oversight, and the next
+      // reader adds a guard nobody needs.
+      //
+      // The exemption holds because NOTHING structurally consumes this
+      // payload. `runStop` (cli `commands/daemon.ts`) checks the response
+      // for its refusal arms and never reads `payload` at all: the ack means
+      // "will stop", and the fact worth reporting is whether it DID, which
+      // the lifecycle-lock poll answers. So there is no field whose
+      // malformation could become a wrong answer here — the verification is
+      // the lock, not the frame.
+      //
+      // THE CONDITION: this stops being true the moment a consumer reads
+      // `stopping`. Such a consumer must add the guard here FIRST, before
+      // reading it — the shape (`isDaemonStopShape`) does not exist yet
+      // precisely because nothing needs it.
       return response;
     }
 

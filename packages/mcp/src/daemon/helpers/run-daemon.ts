@@ -28,6 +28,7 @@ import { writeFileSync } from "node:fs";
 import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
 import { FRAME_CAP } from "../frames.ts";
+import { createRotatingLog } from "../log-sink.ts";
 import { resolveEffectiveStateDir } from "../state-dir-resolve.ts";
 import { sweepOrphanedExecutions } from "../sweep.ts";
 
@@ -105,6 +106,80 @@ const seedCatalog = rest.includes("--seed-catalog");
 const pauseExecute = rest.includes("--pause-execute");
 const ttlFlag = rest.indexOf("--approval-ttl-ms");
 const approvalTtlMs = ttlFlag === -1 ? 60_000 : Number(rest[ttlFlag + 1] ?? 60_000);
+/**
+ * Counts how many times the daemon builds a runtime and prints the running
+ * total, so the parent test can assert ONE per process (spec §2.1) across
+ * many requests. The daemon under test is the real one — the seam only
+ * wraps the real `createApprovalRuntime` and logs.
+ *
+ * The count must travel as a stdout line rather than an in-process
+ * counter: the daemon is a genuine spawned child, so nothing in the test
+ * process can observe its variables.
+ */
+const countRuntimeBuilds = rest.includes("--count-runtime-builds");
+/**
+ * Plants a tool DIRECTLY into the daemon's shared catalog, writing nothing
+ * to the store, then prints a line once it is in place.
+ *
+ * This is the only way to tell the two designs apart from outside: a tool
+ * that exists solely in the daemon's catalog is invisible to any per-call
+ * store snapshot, so a `search` that finds it proves the search path reads
+ * the SHARED catalog. Planting happens after the runtime is built and
+ * before the socket binds, so no client can race it.
+ */
+const plantCatalogTool = rest.includes("--plant-catalog-tool");
+/**
+ * Makes the catalog throw on ONE `removeNamespace` — by default the first,
+ * or the Nth with `--poison-catalog-refresh-nth <n>` (1-based) — and behave
+ * normally on every other call.
+ *
+ * One call, not all of them: the recovery ladder's first rung retries the
+ * remove-then-upsert, so a permanently poisoned catalog would land on rung 2
+ * and test the wrong thing. Choosing WHICH call is what lets a test poison a
+ * later operation's refresh (a revalidate that retires a tool) rather than
+ * only the first provision's.
+ *
+ * The line printed on the injected throw is what keeps the parent's
+ * assertion non-vacuous — without it, a refresh that never ran would look
+ * identical to one that failed and recovered.
+ */
+const poisonCatalogRefresh = rest.includes("--poison-catalog-refresh");
+const poisonNthFlag = rest.indexOf("--poison-catalog-refresh-nth");
+const poisonNth = poisonNthFlag === -1 ? 1 : Number(rest[poisonNthFlag + 1] ?? 1);
+/**
+ * Poisons the UPSERT half of the refresh instead of the remove half — the
+ * ladder's OTHER failure point, and the one whose consequences differ.
+ *
+ * A remove-poison fails before anything is mutated, so the namespace is
+ * merely stale. An upsert-poison fails AFTER the remove already ran, so the
+ * namespace is left empty or partial — which is exactly the state the rung-2
+ * log line has to describe honestly rather than calling it "the previous
+ * catalog". Arming both rungs (the default `--poison-catalog-upsert-nth` of
+ * 0 poisons EVERY call) is what drives the ladder to rung 2 and produces
+ * that line.
+ */
+const poisonCatalogUpsert = rest.includes("--poison-catalog-upsert");
+const poisonUpsertNthFlag = rest.indexOf("--poison-catalog-upsert-nth");
+/** 0 (the default) means "every call"; a positive N poisons only the Nth. */
+const poisonUpsertNth = poisonUpsertNthFlag === -1 ? 0 : Number(rest[poisonUpsertNthFlag + 1] ?? 0);
+/**
+ * Wires the REAL owned rotating sink so a test can assert on the ON-DISK
+ * log file rather than on a sink object.
+ *
+ * Deliberately NOT identical to `bin.ts`, in two ways.
+ *
+ * First, `bin.ts` gates the sink on `process.stderr.isTTY` — a hand-started
+ * daemon on a terminal keeps stderr and rotates nothing. This helper skips
+ * that guard: the test harness always spawns it with piped stdio, so
+ * `isTTY` is never true here and the guard would be dead code. Worse than
+ * dead: a test whose whole subject is the on-disk file would silently skip
+ * its assertions if the guard ever DID fire, so the harness makes the
+ * decision explicitly instead of inheriting it from the terminal.
+ *
+ * Second, lifecycle lines go to stdout as well as to the sink — without
+ * them the parent's readiness protocol has nothing to wait on.
+ */
+const useLogSink = rest.includes("--log-sink");
 
 /** Never settles — the caller is expected to be killed, not to wait. */
 function forever(): Promise<never> {
@@ -168,11 +243,50 @@ const sweep: CrashTerminalSweep | undefined = seedCatalog
       : undefined;
 
 /**
+ * The runtime-selecting flags are MUTUALLY EXCLUSIVE: the `createRuntime`
+ * chain below is a ternary cascade, so it silently picks the first match
+ * and drops every later one. A test that passed two of them would get a
+ * daemon wired for only one and would still PASS — proving nothing about
+ * the behavior it named in its second flag. A misconfigured test must fail
+ * loudly instead.
+ *
+ * The exclusive set, in the cascade's own order:
+ * --pause-execute, --stall-sandbox, --throw-execute, --huge-execute,
+ * --stall-execute, --stall-running, --count-runtime-builds,
+ * --plant-catalog-tool, --poison-catalog-upsert, --poison-catalog-refresh.
+ *
+ * The sweep-selecting flags (--seed-catalog, --sweep-on-start, and the
+ * marker/stall/delay group) are a SEPARATE cascade and are not checked
+ * here.
+ */
+const RUNTIME_FLAGS = [
+  "--pause-execute",
+  "--stall-sandbox",
+  "--throw-execute",
+  "--huge-execute",
+  "--stall-execute",
+  "--stall-running",
+  "--count-runtime-builds",
+  "--plant-catalog-tool",
+  "--poison-catalog-upsert",
+  "--poison-catalog-refresh",
+];
+const selectedRuntimeFlags = RUNTIME_FLAGS.filter((flag) => rest.includes(flag));
+if (selectedRuntimeFlags.length > 1) {
+  console.error(
+    `[run-daemon] Runtime flag selection failed: these flags are mutually exclusive and only the first would take effect. Context: {flags: ${selectedRuntimeFlags.join(", ")}}`,
+  );
+  process.exit(1);
+}
+
+/**
  * Stalls one execution inside the store/manager layer, which §16's
  * sandbox budgets do not bound — the case a bounded drain exists for.
  * Supplied through the daemon's own `createRuntime` seam, so the daemon
  * under test is the real one with only this collaborator replaced.
  */
+let runtimeBuilds = 0;
+
 const createRuntime = pauseExecute
   ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
       const built = await createApprovalRuntime(runtimeOpts);
@@ -322,7 +436,69 @@ const createRuntime = pauseExecute
                   },
                 };
               }
-            : undefined;
+            : countRuntimeBuilds
+              ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                  runtimeBuilds += 1;
+                  const built = await createApprovalRuntime(runtimeOpts);
+                  // Printed on EVERY build, so the parent asserts on the
+                  // highest count it ever saw rather than on one line that
+                  // could have been emitted before a second build happened.
+                  console.log(`runtime builds=${runtimeBuilds}`);
+                  return built;
+                }
+              : plantCatalogTool
+                ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                    const built = await createApprovalRuntime(runtimeOpts);
+                    // Store-invisible on purpose: nothing writes this tool
+                    // to `store.tools`, so only a reader of THIS catalog can
+                    // ever see it.
+                    built.catalog.upsert([
+                      {
+                        name: "planted.tool",
+                        namespace: "planted",
+                        description: "planted directly",
+                        riskClass: "safe",
+                      },
+                    ]);
+                    console.log("planted catalog tool");
+                    return built;
+                  }
+                : poisonCatalogUpsert
+                  ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                      const built = await createApprovalRuntime(runtimeOpts);
+                      const realUpsert = built.catalog.upsert.bind(built.catalog);
+                      let calls = 0;
+                      built.catalog.upsert = (tools: Parameters<typeof realUpsert>[0]) => {
+                        calls += 1;
+                        // The remove has ALREADY run by the time this throws
+                        // — that is the whole point: the namespace is left
+                        // empty, not stale.
+                        if (poisonUpsertNth === 0 || calls === poisonUpsertNth) {
+                          console.log("poisoned catalog upsert");
+                          throw new Error("injected upsert failure");
+                        }
+                        realUpsert(tools);
+                      };
+                      return built;
+                    }
+                  : poisonCatalogRefresh
+                    ? async (runtimeOpts: Parameters<typeof createApprovalRuntime>[0]) => {
+                        const built = await createApprovalRuntime(runtimeOpts);
+                        const realRemove = built.catalog.removeNamespace.bind(built.catalog);
+                        let calls = 0;
+                        built.catalog.removeNamespace = (ns: string) => {
+                          calls += 1;
+                          if (calls === poisonNth) {
+                            console.log("poisoned catalog refresh");
+                            throw new Error("injected refresh failure");
+                          }
+                          realRemove(ns);
+                        };
+                        return built;
+                      }
+                    : undefined;
+
+const sink = useLogSink ? createRotatingLog(stateDir) : null;
 
 try {
   await runDaemon({
@@ -331,13 +507,19 @@ try {
     ...(createRuntime !== undefined ? { createRuntime } : {}),
     // stdout, not stderr: the parent reads these as the readiness
     // protocol, and mixing them with Node's own stderr noise would make
-    // the line-oriented wait fragile.
+    // the line-oriented wait fragile. With `--log-sink` the line ALSO goes
+    // through the real sink, which is what puts it on disk.
     log: (line: string) => {
+      sink?.log(line);
       console.log(line);
     },
+    ...(sink !== null ? { logInfo: sink.info } : {}),
+    ...(rest.includes("--debug") ? { debug: true } : {}),
   });
+  sink?.close();
   process.exit(0);
 } catch (err) {
+  sink?.close();
   if (err instanceof DaemonExit) {
     process.exit(err.code);
   }

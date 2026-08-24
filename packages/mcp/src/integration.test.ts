@@ -4,6 +4,7 @@ import {
   existsSync,
   mkdirSync,
   mkdtempSync,
+  readFileSync,
   realpathSync,
   rmSync,
   statSync,
@@ -253,8 +254,16 @@ function startDaemonWith(
       // daemon started BY HAND, which is the supported path (§3.1).
       env: daemonEnv(opts.allowPrivateEgress !== false),
     });
-    const timer = setTimeout(() => reject(new Error("daemon did not report listening")), 30_000);
     let buf = "";
+    // `buf` is the daemon's accumulated stdout. Without it a timeout says
+    // only that 30s elapsed; with it, the reason the readiness line never
+    // arrived — a refusal exit, an early fault — is in the failure message
+    // itself rather than lost with the child. Same shape as the
+    // exited-early rejection just below, and as `key.test.ts`.
+    const timer = setTimeout(
+      () => reject(new Error(`daemon did not report listening. Output: ${buf}`)),
+      30_000,
+    );
     child.stdout?.on("data", (chunk: Buffer) => {
       buf += chunk.toString("utf8");
       if (buf.includes("listening")) {
@@ -1179,24 +1188,138 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
         env,
       });
       doctorDaemons.push(child);
-      const timer = setTimeout(() => reject(new Error(`daemon timeout: ${seen}`)), 30_000);
       let seen = "";
+      // Daemon diagnostics moved to the owned rotating sink (spec §5): with
+      // piped stdio `bin.ts` writes lifecycle lines into `conduitd.log`
+      // rather than to stderr, so readiness is observed by polling that
+      // file in the state dir this test controls. Stdout/stderr are still
+      // accumulated so a crash before the sink opens is still reportable.
       const watch = (chunk: Buffer): void => {
         seen += chunk.toString("utf8");
-        if (seen.includes("listening")) {
-          clearTimeout(timer);
-          resolve();
-        }
       };
       child.stdout?.on("data", watch);
       child.stderr?.on("data", watch);
-      child.once("error", reject);
-      child.once("exit", (code) => {
+
+      const logPath = join(dir, "conduitd.log");
+      // Only text written AFTER this spawn counts: the sink appends, so a
+      // previous daemon's "listening" line would otherwise report a
+      // non-binding successor as ready.
+      const baseline = ((): number => {
+        try {
+          return readFileSync(logPath, "utf8").length;
+        } catch {
+          return 0;
+        }
+      })();
+      const settle = (fn: () => void): void => {
         clearTimeout(timer);
-        reject(new Error(`daemon exited ${code}: ${seen}`));
+        clearInterval(poll);
+        fn();
+      };
+      const poll = setInterval(() => {
+        let contents = "";
+        try {
+          contents = readFileSync(logPath, "utf8");
+        } catch {
+          return; // not opened yet
+        }
+        if (contents.slice(baseline).includes("listening")) settle(() => resolve());
+      }, 50);
+      const timer = setTimeout(
+        () => settle(() => reject(new Error(`daemon timeout: ${seen}`))),
+        30_000,
+      );
+      child.once("error", (err) => {
+        settle(() => reject(err));
+      });
+      child.once("exit", (code) => {
+        settle(() => reject(new Error(`daemon exited ${code}: ${seen}`)));
       });
     });
   }
+
+  it("`--daemon --state-dir <nonexistent>` with piped stdio STARTS — it creates the dir rather than dying on ENOENT", async () => {
+    // The by-hand daemon start, backgrounded the normal way (nohup or a
+    // redirect), has NO tty on stderr — so `bin.ts` opens its owned rotating
+    // sink INSIDE the state directory. On a directory that does not exist
+    // yet, that open is the first thing to touch it, and without a create
+    // ahead of it the process dies on a raw ENOENT before `ensureStateDir`
+    // ever runs. The client spawn path never hits this because `spawn.ts`
+    // creates the directory before opening its own log fd; a hand start had
+    // no equivalent. Piped stdio here reproduces the non-tty condition.
+    // A SHORT prefix, deliberately: the daemon binds a Unix socket inside
+    // this directory, and `sun_path` caps the whole pathname at ~104 bytes
+    // on macOS. A longer temp prefix binds a silently truncated path and
+    // fails the post-bind identity stat, which would look like this fix
+    // regressing when it is only the test's own path being too long.
+    const home = mkdtempSync(join(tmpdir(), "cd-fresh-"));
+    try {
+      // Deliberately NOT created: the whole point is that the daemon makes
+      // it. Nested one level so the recursive create is exercised too.
+      const freshDir = join(home, "s", "n");
+      expect(existsSync(freshDir)).toBe(false);
+
+      const keyB64 = Buffer.from(SecretBox.generateKeyBytes()).toString("base64");
+      // Readiness by the conduitd.log poll (the sink, not stderr) — the same
+      // observation every other spawned-daemon case in this block makes.
+      await startDoctorDaemon(freshDir, keyB64);
+
+      // It started, so the directory exists and carries the 0700 mode the
+      // boundary requires — proving the create happened here rather than
+      // the process having survived by some other route.
+      expect(existsSync(freshDir)).toBe(true);
+      expect(statSync(freshDir).mode & 0o777).toBe(0o700);
+      expect(existsSync(join(freshDir, "conduitd.log"))).toBe(true);
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 60_000);
+
+  it("`--daemon --state-dir <regular file>` exits non-zero with a diagnostic, not an unhandled stack", async () => {
+    // The mirror of the "a REGULAR FILE occupies the socket path" case, one
+    // level up: here the STATE DIRECTORY itself is a file. The unconditional
+    // `mkdirSync` is the first thing to touch it and fails ENOTDIR/EEXIST.
+    // Before that create moved inside the try, the throw escaped the daemon
+    // branch's own handling entirely — an operator who fat-fingered a path
+    // got a crash dump instead of being told what was wrong.
+    const home = mkdtempSync(join(tmpdir(), "cd-file-"));
+    try {
+      const asFile = join(home, "state");
+      writeFileSync(asFile, "not a directory", { mode: 0o600 });
+
+      const env: NodeJS.ProcessEnv = {
+        ...process.env,
+        CONDUIT_MASTER_KEY: Buffer.from(SecretBox.generateKeyBytes()).toString("base64"),
+      };
+      delete env.CONDUIT_DB;
+      const child = spawn(process.execPath, [binPath, "--daemon", "--state-dir", asFile], {
+        stdio: ["ignore", "pipe", "pipe"],
+        env,
+      });
+      let output = "";
+      const collect = (c: Buffer): void => {
+        output += c.toString("utf8");
+      };
+      child.stdout?.on("data", collect);
+      child.stderr?.on("data", collect);
+      const code = await new Promise<number | null>((resolve) => {
+        child.once("exit", resolve);
+      });
+
+      // Non-zero, so a script's `&&` never reads this as a started daemon.
+      expect(code).not.toBe(0);
+      // A DIAGNOSTIC, not a raw crash: the fatal handler prints
+      // `error.message` alone, so the absence of stack frames is what
+      // distinguishes it from the unhandled throw this replaced.
+      expect(output).toContain("[ConduitMcp] Fatal:");
+      expect(output).not.toContain("\n    at ");
+      // The file is not a directory and was never made one.
+      expect(statSync(asFile).isFile()).toBe(true);
+      expect(readFileSync(asFile, "utf8")).toBe("not a directory");
+    } finally {
+      rmSync(home, { recursive: true, force: true });
+    }
+  }, 60_000);
 
   it("INVARIANT §17 / §9.1: `--doctor --offline` REFUSES while a daemon is live, naming the holder", async () => {
     // The offline mode's exclusivity is not caution about reading — it is

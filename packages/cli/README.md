@@ -18,6 +18,7 @@ instead (see [Rotation walkthrough](#rotation-walkthrough)).
 | `conduit serve` | Runs the stdio MCP server (identical to `conduit-mcp`). | Daemon client (`execute`, `check_execution` reads) |
 | `conduit add-mcp` | Onboards or re-syncs an upstream MCP source. | Daemon client (`source.provision`) — the credential-bearing fetch runs daemon-side |
 | `conduit approvals list\|approve\|deny` | The human approval queue. | Daemon client (`approvals.list`, `approvals.resume`) |
+| `conduit daemon status\|stop` | Inspects or gracefully stops the running daemon. | Daemon client (`daemon.status`, `daemon.stop`) — never auto-starts one |
 | `conduit key generate` | Mints the master key. | Direct store, under the maintenance lock |
 | `conduit key rotate` | Rotates the master key. | Direct store, under the maintenance lock; re-seal via `reencryptSecrets` (`@conduithq/sdk`) |
 
@@ -132,6 +133,42 @@ in this package). `--help` and `--version` are available at the top level.
 
    This replaces the interim `scripts/approve-demo.mjs` flow.
 
+## `conduit daemon`
+
+```bash
+conduit daemon status     # running / not running, plus pid, version, db, connections, in-flight work
+conduit daemon stop       # graceful stop; waits for the daemon to actually exit
+```
+
+Neither verb ever auto-starts a daemon: `status` must not create the thing it
+reports on, and `stop`'s absent case is already the goal state.
+
+**Exit codes are the contract.** `status` exits `0` when a daemon is running
+and `3` when none is — the systemctl convention, distinct from `1`
+("something went wrong"), so a script can never read "not running" as healthy.
+`stop` exits `0` for stopped-or-not-running, because the operator's verb names
+a goal state that is reached either way, and `1` only when the daemon is still
+draining or refused. `stop` waits for VERIFIED termination rather than for the
+ack — the daemon acks and then drains in-flight work, so
+`conduit daemon stop && conduit key rotate` works back to back.
+
+**Version skew is warned, never acted on.** Every command that handshakes with
+the daemon prints one stderr line when the running daemon's build differs from
+this CLI's, naming both versions and pointing at `conduit daemon stop` (the
+next command auto-starts a matching daemon). The warning is a diagnostic: it
+never blocks the request, and no client stops or restarts a daemon on its own.
+A daemon old enough to report no version at all predates the control API
+entirely — `conduit daemon stop` cannot reach it, so that arm says to send the
+process SIGTERM instead (safe: paused approvals are durable).
+
+**The daemon log is bounded.** The daemon owns the descriptor it writes
+through and rotates `~/.conduit/conduitd.log` at 5 MB into a single
+`conduitd.log.1`, so at most one rotated file is kept and worst-case disk use
+is about twice the cap. Per-admission lines are gated behind `--debug`, so the
+ordinary volume is low. `conduit daemon status` prints the log's path and
+current size. See [The daemon](../mcp/README.md#the-daemon) for lifecycle,
+auto-start, and the refusals you may see.
+
 ## Env vars
 
 Shared with `@conduithq/mcp` (one `resolveEnv` implementation).
@@ -202,7 +239,7 @@ for its entire lifetime, so the two cannot overlap in either order:
   read and written nothing:
 
   ```
-  [ConduitKey] rotate refused: another process owns ~/.conduit — the maintenance lock is held. Last acquired by daemon (pid 4711) at 2026-08-16T12:04:00.000Z (may be stale). rotate is stop-first: stop every conduit process and MCP client (the daemon exits on SIGTERM), then re-run. Nothing was read or written.
+  [ConduitKey] rotate refused: another process owns ~/.conduit — the maintenance lock is held. Last acquired by daemon (pid 4711) at 2026-08-16T12:04:00.000Z (may be stale). rotate is stop-first: stop running conduit processes first — run `conduit daemon stop`, quit every MCP client (any process started before rotation holds the old key), then re-run. Nothing was read or written.
   ```
 
 - **Rotation running → a starting daemon exits** `rotation in progress`
@@ -222,9 +259,13 @@ What the lock still cannot do is reach *inside* an already-running process:
 an MCP client holding a stale in-memory copy of the old key is not a
 database writer, so stopping your clients remains an operator obligation.
 
-1. **Stop clients and the daemon.** Quit every MCP client, then stop the
-   daemon with SIGTERM (`pkill -f 'bin.js --daemon'`). It drains and exits 0.
-   If you skip this, `rotate` refuses and names the holder — no harm done.
+1. **Stop clients and the daemon.** Quit every MCP client, then run
+   `conduit daemon stop`. It returns only after the daemon has actually
+   released the lifecycle lock — which is exactly what `rotate` needs, so
+   the two chain safely. (The equivalent signal path is
+   `pkill -f 'bin.js --daemon'`; it drains and exits 0 too, but does not
+   wait for termination.) If you skip this, `rotate` refuses and names the
+   holder — no harm done.
 2. **Rotate:**
 
    ```bash
@@ -324,9 +365,9 @@ sqlite3 ~/.conduit/conduit.db "PRAGMA wal_checkpoint(TRUNCATE); VACUUM;"
 ```
 
 Only run this against a stopped db — a live writer can make `VACUUM` block or
-contend for the write lock. Stop the daemon (SIGTERM) first; unlike `rotate`,
-this raw `sqlite3` invocation takes no maintenance lock and nothing will
-refuse on your behalf.
+contend for the write lock. Run `conduit daemon stop` first (it returns only
+once the daemon has actually exited); unlike `rotate`, this raw `sqlite3`
+invocation takes no maintenance lock and nothing will refuse on your behalf.
 
 ### Env-key and custom-`CONDUIT_DB` installs
 

@@ -56,6 +56,114 @@ import { fetchToolsList } from "../mcp-fetch.js";
 const NAMESPACE_PATTERN = /^[a-z0-9_-]+$/;
 
 /**
+ * Hard cap on the UTF-8 bytes of any ONE tool's name or description, checked
+ * before the atomic write (spec §2.2's bounded-input requirement).
+ *
+ * The other two onboarding bounds live in `mcp-fetch.ts`: `MAX_RESPONSE_BYTES`
+ * bounds the whole response off the wire, and `MAX_TOOLS` bounds the tool
+ * count. Neither bounds ONE tool's text, so an upstream advertising a single
+ * tool with a multi-megabyte description passes both and lands that text in
+ * the store — from where it is hydrated into the shared catalog, returned by
+ * `describe`, and rendered into an agent's prompt. This cap closes that gap
+ * at the same boundary as the other two: refuse, write nothing.
+ *
+ * Normative-local, chosen here. 16 KiB is far above any legitimate tool's
+ * text (the largest real MCP descriptions run to hundreds of bytes) and far
+ * below a size that matters to a prompt budget.
+ */
+export const MAX_TOOL_TEXT_BYTES = 16 * 1024;
+
+/**
+ * Refuses a `tools/list` whose per-tool text exceeds `MAX_TOOL_TEXT_BYTES`.
+ *
+ * Reads the RAW upstream entries rather than the normalized tools: the check
+ * has to happen on what arrived, and `normalizeMcp` rewrites the name while
+ * carrying the description through unchanged. Entries that are not
+ * object-shaped are left alone — `normalizeMcp`'s own envelope validation
+ * rejects those, and duplicating its verdict here would give one malformed
+ * body two different refusals.
+ *
+ * Returns the offending tool's INDEX, never its text: the message crosses to
+ * the client, and upstream-controlled text is exactly what must not ride
+ * along (see `mapFetchError`'s F1 note — the same reflecting upstream that
+ * echoes a credential in an error message can echo one in a description).
+ */
+function findOversizeToolText(rawTools: readonly unknown[]): number | undefined {
+  for (let i = 0; i < rawTools.length; i++) {
+    const entry = rawTools[i];
+    if (typeof entry !== "object" || entry === null) continue;
+    const { name, description } = entry as { name?: unknown; description?: unknown };
+    if (typeof name === "string" && Buffer.byteLength(name, "utf8") > MAX_TOOL_TEXT_BYTES) {
+      return i;
+    }
+    if (
+      typeof description === "string" &&
+      Buffer.byteLength(description, "utf8") > MAX_TOOL_TEXT_BYTES
+    ) {
+      return i;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * True iff any credential token appears verbatim ANYWHERE in `rawTools` — as
+ * a string value or an object KEY, at any depth (tool name, description,
+ * input/output schema values and keys, nested).
+ *
+ * ## Why this scan exists (CX1, the §9.2 credential-reflection break)
+ *
+ * On the onboarding fetch the daemon has already revealed the stored
+ * credential and sent it upstream as `authorization` (`fetchAndProvision`).
+ * The ERROR paths already withhold upstream-controlled text
+ * (`logRedactedDetail` + `mapFetchError`). A SUCCESSFUL `tools/list` whose
+ * valid, sub-`MAX_TOOL_TEXT_BYTES` name / description / schema value / schema
+ * KEY reflects that credential otherwise flows through `normalizeMcp` →
+ * `store.provisionSource` → the shared catalog → `search`/`describe` → the
+ * agent, UNREDACTED. A reflecting server is exactly the F1 threat, on the
+ * success path.
+ *
+ * ## The shape: canonicalize-then-check, NOT a denylist of encodings
+ *
+ * `redactionTokens(onboardingAuth)` derives the SAME token set the shared
+ * redaction primitive uses (`packages/sdk/pipeline/upstream.ts`): the full
+ * header value plus each whitespace-separated segment long enough to be a
+ * real secret. We match the credential VALUE itself, not a list of manglings.
+ * A server that TRANSFORMS the secret before echoing (base64, url-encode,
+ * split across fields) gets past this — that is a documented residual, a
+ * narrower threat than a plain reflection, and adding per-encoding patterns
+ * is the denylist whack-a-mole `~/.claude/rules/adversarial-convergence.md`
+ * forbids. The structural guarantee is elsewhere: the credential lives only
+ * in this request's scope and is never persisted (§9.2).
+ *
+ * The whole raw response is walked — every string value and every object key,
+ * recursively — because a reflected credential can land in any of them, and a
+ * key is as agent-visible as a value once it is a schema property name.
+ */
+function reflectsCredential(rawTools: readonly unknown[], tokens: readonly string[]): boolean {
+  if (tokens.length === 0) return false;
+  const matches = (text: string): boolean => tokens.some((token) => text.includes(token));
+  const stack: unknown[] = [...rawTools];
+  while (stack.length > 0) {
+    const node = stack.pop();
+    if (typeof node === "string") {
+      if (matches(node)) return true;
+    } else if (Array.isArray(node)) {
+      for (const item of node) stack.push(item);
+    } else if (typeof node === "object" && node !== null) {
+      for (const [key, value] of Object.entries(node)) {
+        // The KEY is scanned as well as the value: a reflected credential
+        // used as a schema property name reaches `describe` and the agent
+        // exactly as a value would.
+        if (matches(key)) return true;
+        stack.push(value);
+      }
+    }
+  }
+  return false;
+}
+
+/**
  * Reduces a URL to the operator-safe form `origin + path`: userinfo,
  * query, and fragment are all stripped.
  *
@@ -331,6 +439,39 @@ function mapFetchError(cause: unknown, url: string): string {
  * failure to write a diagnostic must never turn a clean refusal into a
  * throw.
  */
+/**
+ * Normative-local (CX5): byte cap on the sanitized upstream detail in a log
+ * line. Larger than the 64-byte version-string cap — a log line legitimately
+ * carries more diagnostic text — but bounded so one hostile upstream message
+ * cannot dominate the daemon log.
+ */
+const LOG_DETAIL_MAX_BYTES = 512;
+
+/**
+ * Encodes already-redacted upstream detail as ONE printable log line (CX5).
+ *
+ * The operator is told to inspect the daemon log, so the upstream's own error
+ * text — C0/C1 controls, `ESC`, `CR`, `LF`, CSI/OSC sequences intact — would
+ * otherwise be interpreted by `tail`/`cat`: forged log records, cursor moves,
+ * terminal manipulation. Same allowlist shape as `sanitizeVersionForDisplay`
+ * (printable ASCII survives, everything else is dropped), so no encoding of a
+ * control character gets through and the residue of a stripped sequence
+ * (`[2J` after its `ESC` is removed) is inert. The result is capped by UTF-8
+ * BYTES; it runs on text that is already credential-redacted, so the cap can
+ * never bisect a redaction.
+ *
+ * Applied per input the caller has already redacted — redact THEN sanitize —
+ * mirroring `sanitizeUpstreamText`'s order.
+ */
+function sanitizeDetailForLog(redacted: string): string {
+  const printable = redacted.replace(/[^\x20-\x7e]/g, "");
+  if (printable.length <= LOG_DETAIL_MAX_BYTES) return printable;
+  // Printable ASCII is one byte per character, so `.length` IS the byte length
+  // and no multi-byte character can be bisected. The `...` marker is ASCII, so
+  // the result stays pure printable-ASCII and at most `LOG_DETAIL_MAX_BYTES`.
+  return `${printable.slice(0, LOG_DETAIL_MAX_BYTES - 3)}...`;
+}
+
 function logRedactedDetail(
   log: ((line: string) => void) | undefined,
   namespace: string,
@@ -341,7 +482,8 @@ function logRedactedDetail(
   if (log === undefined) return;
   const raw = cause instanceof Error ? cause.message : String(cause);
   const tokens = onboardingAuth !== undefined ? redactionTokens(onboardingAuth) : [];
-  const detail = redactTokens(raw, tokens);
+  // Redact first, THEN encode to one printable capped line (CX5).
+  const detail = sanitizeDetailForLog(redactTokens(raw, tokens));
   try {
     log(
       `[conduitd] Onboarding fetch failed: upstream detail withheld from client. Context: {namespace: ${namespace}, url: ${sanitizeUrlForOperator(url)}, cause: ${detail}}`,
@@ -621,6 +763,37 @@ async function fetchAndProvision(args: {
     // category from `mapFetchError`.
     logRedactedDetail(args.log, namespace, url, args.onboardingAuth, cause);
     throw new ProvisionRefused(mapFetchError(cause, url));
+  }
+
+  // The third onboarding bound (§2.2), alongside `MAX_RESPONSE_BYTES` and
+  // `MAX_TOOLS` in `mcp-fetch.ts`: neither of those bounds ONE tool's text,
+  // so this is checked here, still BEFORE any write. The index localizes the
+  // fault for the operator without forwarding a byte of upstream text.
+  const oversizeIndex = findOversizeToolText(rawTools);
+  if (oversizeIndex !== undefined) {
+    throw new ProvisionRefused(
+      `[conduit add-mcp] upstream at ${safeUrl} advertised a tool whose name or description ` +
+        `exceeds the ${MAX_TOOL_TEXT_BYTES}-byte per-tool limit (tool index ${oversizeIndex}); ` +
+        `nothing was written.`,
+    );
+  }
+
+  // CX1 (§9.2): when a credential was sent, refuse a response that reflects it
+  // BEFORE `normalizeMcp` and BEFORE any write. A reflecting upstream can echo
+  // the `authorization` value in a tool name, description, schema value, or
+  // schema KEY, from where it would flow unredacted to the agent. The refusal
+  // names NO upstream bytes and NO tool index — the index itself could echo —
+  // and we REJECT rather than redact-and-store, which would silently change
+  // the tools' semantics. See `reflectsCredential` for the canonicalize-then-
+  // check shape and the documented transform residual.
+  if (args.onboardingAuth !== undefined) {
+    const tokens = redactionTokens(args.onboardingAuth);
+    if (reflectsCredential(rawTools, tokens)) {
+      throw new ProvisionRefused(
+        `[conduit add-mcp] upstream at ${safeUrl} reflected credential material in its ` +
+          `tools/list; nothing was written.`,
+      );
+    }
   }
 
   let tools: Awaited<ReturnType<typeof normalizeMcp>>;

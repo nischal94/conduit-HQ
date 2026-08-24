@@ -8,13 +8,19 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { createRequire } from "node:module";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import { ensureDbFile, resolveEnv } from "./env.js";
+import { AGENT_VERSION, ensureDbFile, resolveEnv } from "./env.js";
 import { openStoreClientFromEnv } from "./store-open.js";
 
 const KEY = Buffer.alloc(32, 7).toString("base64");
+
+it("AGENT_VERSION matches package.json — the skew warning must never report a stale string", () => {
+  const pkg = createRequire(import.meta.url)("../package.json") as { version: string };
+  expect(AGENT_VERSION).toBe(pkg.version);
+});
 
 describe("resolveEnv (design M7/M8)", () => {
   it("resolves defaults and decodes the key", () => {

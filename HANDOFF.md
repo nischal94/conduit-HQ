@@ -31,7 +31,93 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-22 (§17 step 3 DESIGNED + PLANNED on branch `docs/daemon-control-design`; next: BUILD via SDD)
+## Current handoff — updated 2026-08-23 (§17 step 3 BUILT — PR #50 open, full gauntlet all-but-converged; NEXT: codex pass-3 convergence confirm → /explain-diff quiz → HUMAN-NAMED merge)
+
+**STATE: §17 step 3 (daemon control + hot-reload) is BUILT and on PR #50**
+(`feat/daemon-control` → main, head `242e84b`). Do NOT rebuild or
+re-review from scratch — the gauntlet is essentially complete; only the
+final convergence confirmation, the human quiz, and the human-named merge
+remain. LEARNINGS #21 applies: the branch is invisible to the git
+tripwire — pair with `gh pr list`.
+
+**BUILD:** 9-task SDD plan
+(`docs/superpowers/plans/2026-08-22-daemon-control-hot-reload.md`) built
+task-by-task, one fix round each (cap never approached), whole-branch
+review (fable) + one fix wave. Ships: one long-lived `ApprovalRuntime` per
+daemon; catalog hot-reload at the provisioning tail (per-namespace lock,
+read-then-sync-mutate with a never-throws recovery rung, per-tool text
+caps); a `control` capability (`daemon.status`/`daemon.stop`, nullary,
+outside the queue, flushed ack then server-side end, 10s handshake
+deadline); `conduit daemon status|stop` CLI (normative exit 0/3 status,
+0/1 stop, verified-termination wait, never spawns); a daemon-owned
+rotating log sink (5 MB + one `.1`, O_NOFOLLOW both opens + fstat fd
+verification, byte-accurate cap, `--debug` gate, child env exactly
+`{PATH}`); version-skew warnings (allowlist-sanitized, one shared
+per-process reporter); version pins. Spec step-3 line stays PARTIAL — the
+local HTTP API half ships WITH step 4 behind the §16 floor (spec §1).
+
+**THE GAUNTLET (all agent-side, on PR #50):** SDD task reviews + scoped
+re-reviews → whole-branch review (fable, 2 Important fixed) → Tier-2
+five-specialist wave (26 findings → one aggregated fix wave, re-reviewed
+clean) → /security-review (ZERO; one candidate filtered at 2/10 same-UID)
+→ code-review mechanic high (8 finder angles → 14 verified survivors → top
+10 reported + fixed, re-reviewed clean) → **CODEX CROSS-MODEL ARC**: pass 1
+found 6 in-scope incl. TWO P1s no same-model layer caught (hostile-upstream
+`tools/list` reflecting the sent credential into a valid tool → agent, a
+§9.2 break; different-UID state-dir TOCTOU on the log-sink open) → all 6
+fixed + P1-focused in-harness re-review → pass 2 confirmed 5/6 fixed with
+NO new findings from the fixes, 1 STILL-OPEN (CX6 checked finite+range not
+integer-ness — fractional `startedAt` rendered silently wrong) → controller
+fix `242e84b` (safe-integer guard + fractional-rejection test) → **codex
+pass 3 (convergence confirm) IN FLIGHT at session pause** (task bwg4yq4bx;
+stdout /private/tmp/.../scratchpad/codex-pass3-out.txt). Suites at head:
+sdk 444, mcp 423+, cli 112. Full SDD/gauntlet trail:
+`.superpowers/sdd/2026-08-22-daemon-control-hot-reload/progress.md`
+(git-ignored — every ruling, finding, and adjudication).
+
+### NEXT SESSION — finish the gauntlet, then human quiz + named merge
+
+1. **Read codex pass 3's verdict** (poll task bwg4yq4bx / cat the stdout
+   file; if the rate-limit window interrupted it, re-run the short pass-3
+   prompt at `.../scratchpad/codex-prompt-pass3.txt`). If CONVERGED: done.
+   If it surfaces anything in-scope, fix + one confirming re-run.
+2. **/explain-diff on PR #50** (unprompted, load-bearing — product code +
+   credential boundary + supply chain) → publish the explainer artifact →
+   the human passes the quiz FULLY before any merge (a miss = reread +
+   retake).
+3. **HUMAN-NAMED merge only.** The agent asks "merge PR #50?"; a direct
+   named instruction IS the authorization; the agent never merges on its
+   own initiative. Then post-merge sweep (delete branch after verifying
+   squash content on main), `pnpm -r build` (user terminal; serve runs
+   from dist until §17 step 7), real-db canary open, and delete the SDD
+   workspace.
+
+Carry the DEFERRED FOLLOW-UPS below (unchanged except where the build
+closed them: §16 flake pins hold; the log bound + version-sync guard both
+SHIPPED in this branch). New deferred from the gauntlet, all ledgered:
+CX1 transform-before-echo credential residual (structural request-scope
+guarantee holds); CX2 owner-mismatch fstat arm exercised only via the mode
+arm (foreign-owner needs root); the shared untrusted-display allowlist
+helper for dbPath/logPath (status printability); ApprovalRuntime catalog
+read/write split + CAPABILITIES row-partition types (deferred type
+hardening); bin.ts:128 doctor() hardcoded "conduitd.log"; the 5 Dependabot
+alerts (2 HIGHs held by pins).
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first
+> and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: §17 step 3 is BUILT and on PR #50; the full load-bearing
+> gauntlet is essentially complete (codex pass 3 convergence confirm was
+> in flight at pause — check task bwg4yq4bx / the pass-3 stdout, re-run the
+> short pass if needed). Do NOT rebuild or re-review from scratch.** Finish
+> per the NEXT section: confirm convergence → /explain-diff quiz → the
+> human passes it → HUMAN-NAMED merge → post-merge sweep + rebuild + canary
+> + delete the SDD workspace. Carry the deferred follow-ups.
+
+---
+
+## Superseded handoff — updated 2026-08-22 (§17 step 3 DESIGNED + PLANNED on branch `docs/daemon-control-design`; its NEXT [build via SDD] was completed 2026-08-23 by the section above)
 
 **DESIGN + PLAN COMPLETE 2026-08-22 — branch `docs/daemon-control-design`
 (pushed, no PR yet; LEARNINGS #21 applies: invisible to the git tripwire,
@@ -115,7 +201,7 @@ gh in background tasks is config-blind (poll unauth via curl).
 
 ---
 
-## Superseded handoff — updated 2026-08-18 (Lane B MERGED: PR #48 squash → main `f016c8d`; §17 step 2 daemon ownership COMPLETE; its NEXT [§17 step 3 design] was completed 2026-08-22 by the section above)
+## Superseded handoff — updated 2026-08-18 (Lane B MERGED: PR #48 squash → main `f016c8d`; §17 step 2 daemon ownership COMPLETE; its NEXT [§17 step 3] was BUILT 2026-08-23 by the section above)
 
 **MERGE + POST-MERGE (2026-08-18):** PR #48 squash → main `f016c8d`
 (human named the merge; agent executed it). Lane B converts every

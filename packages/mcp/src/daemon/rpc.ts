@@ -120,7 +120,16 @@ export type RpcRequest =
       replace: boolean;
       clearCredential: boolean;
     }
-  | { kind: "source.revalidate"; namespace: string };
+  | { kind: "source.revalidate"; namespace: string }
+  /**
+   * Nullary on purpose (§3.1): the client supplies no parameters, so it
+   * cannot narrow what the daemon reports or which daemon it stops.
+   * Answered outside the execution queue — a busy or unreachable queue
+   * must never delay a status read or a shutdown request. Scoped to the
+   * `control` capability alone: no other row gains either verb.
+   */
+  | { kind: "daemon.status" }
+  | { kind: "daemon.stop" };
 
 export type RpcResponse =
   | { kind: "ready" }
@@ -183,6 +192,21 @@ export type RpcResponse =
       detail?: string;
     };
 
+/**
+ * The leading text of the handshake's capability refusal, exported because a
+ * CLIENT keys on it.
+ *
+ * `conduit daemon status|stop` detects a PRE-CONTROL daemon by this exact
+ * refusal: a daemon whose vocabulary predates the `control` row answers the
+ * handshake rather than the request, and the CLI turns that into a
+ * "stop it by signal" remediation instead of an opaque error. That makes the
+ * wording a cross-package contract rather than prose — so it lives here, at
+ * the one site that emits it, and the CLI imports it. Before this, the same
+ * sentence was spelled out independently in both places, where a reword on
+ * either side silently broke the detection.
+ */
+export const CAPABILITY_REJECTION_PREFIX = "handshake.capability must be one of";
+
 export class InvalidRpcRequest extends Error {
   constructor(message: string) {
     super(message);
@@ -233,7 +257,7 @@ export function decodeRequest(v: unknown): RpcRequest {
       }
       if (!isCapability(v.capability)) {
         throw new InvalidRpcRequest(
-          `handshake.capability must be one of ${Object.keys(CAPABILITIES).join(" | ")}`,
+          `${CAPABILITY_REJECTION_PREFIX} ${Object.keys(CAPABILITIES).join(" | ")}`,
         );
       }
       if (v.dbPath !== undefined && !isString(v.dbPath)) {
@@ -377,14 +401,21 @@ export function decodeRequest(v: unknown): RpcRequest {
       }
       return { kind: "source.revalidate", namespace: v.namespace };
     }
+    case "daemon.status": {
+      assertNoExtraKeys(v, ["kind"]);
+      return { kind: "daemon.status" };
+    }
+    case "daemon.stop": {
+      assertNoExtraKeys(v, ["kind"]);
+      return { kind: "daemon.stop" };
+    }
     default:
       throw new InvalidRpcRequest(`unknown request kind "${kind}"`);
   }
 }
 
-export const CAPABILITIES: Record<
-  "serve" | "approvals" | "add-mcp",
-  ReadonlySet<RpcRequest["kind"]>
+export const CAPABILITIES: Readonly<
+  Record<"serve" | "approvals" | "add-mcp" | "control", ReadonlySet<RpcRequest["kind"]>>
 > = {
   // D-B1 added the three read-only kinds; the row stays free of every
   // administrative verb, which is what §8's prohibition actually guards.
@@ -399,4 +430,10 @@ export const CAPABILITIES: Record<
   ]),
   approvals: new Set(["approvals.list", "approvals.resume", "handshake"]),
   "add-mcp": new Set(["source.provision", "source.revalidate", "handshake"]),
+  // The capability set scopes an HONEST client — it is not a privilege
+  // boundary against a hostile same-UID process, which can already read
+  // and write the UDS socket file directly. That is the parent design's
+  // accepted v1 limit (§3.1); the boundary this row enforces is "a
+  // well-behaved client only ever asks for what its role needs."
+  control: new Set(["handshake", "daemon.status", "daemon.stop"]),
 };

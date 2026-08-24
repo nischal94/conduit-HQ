@@ -2,6 +2,7 @@
 import { takeStateDir as parseStateDir } from "@conduithq/mcp";
 import { addMcp } from "./commands/add-mcp.js";
 import { approvals } from "./commands/approvals.js";
+import { daemonCommand } from "./commands/daemon.js";
 import { runKey } from "./commands/key.js";
 import { serve } from "./commands/serve.js";
 import { type Command, dispatch } from "./dispatch.js";
@@ -65,6 +66,19 @@ async function runCommand(command: Command, args: string[]): Promise<number> {
     }
     case "key":
       return (await runKey(args)).exitCode;
+    case "daemon": {
+      // Threaded for the same reason `approvals` threads it: the state
+      // directory selects WHICH daemon this command inspects or stops.
+      const parsed = takeStateDir("daemon", args);
+      if ("error" in parsed) {
+        process.stderr.write(parsed.error);
+        return 1;
+      }
+      return daemonCommand(
+        parsed.rest,
+        parsed.stateDir !== undefined ? { stateDir: parsed.stateDir } : {},
+      );
+    }
     default: {
       const _exhaustive: never = command;
       return _exhaustive;

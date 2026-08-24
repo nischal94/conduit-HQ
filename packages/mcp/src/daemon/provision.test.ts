@@ -22,6 +22,7 @@ import { type ConduitStore, McpClientError, openSqliteStore, SecretBox } from "@
 import { createClient } from "@libsql/client";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_TOOL_TEXT_BYTES,
   type ProvisionInput,
   ProvisionRefused,
   provisionSourceRequest,
@@ -262,6 +263,78 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
 
     expect(result.exitCode).not.toBe(0);
     expect(await store.sources.list()).toEqual([]);
+  });
+
+  it("a tool whose DESCRIPTION exceeds the per-tool text cap is refused with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = {
+      store,
+      // Passes both of the other onboarding bounds — one tool, well under
+      // MAX_RESPONSE_BYTES — and is refused solely on its per-tool text.
+      fetchTools: vi.fn(async () => [
+        {
+          name: "list_issues",
+          description: "x".repeat(MAX_TOOL_TEXT_BYTES + 1),
+          inputSchema: { type: "object", properties: {} },
+        },
+      ]),
+    };
+
+    const result = await run({}, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderrLines.join("")).toContain(
+      `exceeds the ${MAX_TOOL_TEXT_BYTES}-byte per-tool limit (tool index 0)`,
+    );
+    // The refusal names the limit and the position, and forwards no byte of
+    // the upstream's own text (F1 — a reflecting upstream can put a
+    // credential in a description).
+    expect(result.stderrLines.join("")).not.toContain("xxxx");
+    expect(await store.sources.list()).toEqual([]);
+    expect(await store.tools.list()).toEqual([]);
+  });
+
+  it("a tool whose NAME exceeds the per-tool text cap is refused with 0 writes", async () => {
+    const store = await openTestStore();
+    const deps = {
+      store,
+      // A legitimate first tool, an oversize second: the reported index
+      // must localize the fault rather than always naming position 0.
+      fetchTools: vi.fn(async () => [
+        { name: "list_issues", description: "List open issues" },
+        { name: "a".repeat(MAX_TOOL_TEXT_BYTES + 1), description: "fine" },
+      ]),
+    };
+
+    const result = await run({}, deps);
+
+    expect(result.exitCode).not.toBe(0);
+    expect(result.stderrLines.join("")).toContain(
+      `exceeds the ${MAX_TOOL_TEXT_BYTES}-byte per-tool limit (tool index 1)`,
+    );
+    expect(await store.sources.list()).toEqual([]);
+    expect(await store.tools.list()).toEqual([]);
+  });
+
+  it("a tool exactly AT the per-tool text cap is accepted — the bound is inclusive", async () => {
+    const store = await openTestStore();
+    const deps = {
+      store,
+      // Not vacuous: without an exact-boundary case an off-by-one that
+      // refuses at the cap itself would pass every test above.
+      fetchTools: vi.fn(async () => [
+        {
+          name: "list_issues",
+          description: "x".repeat(MAX_TOOL_TEXT_BYTES),
+          inputSchema: { type: "object", properties: {} },
+        },
+      ]),
+    };
+
+    const result = await run({}, deps);
+
+    expect(result.exitCode).toBe(0);
+    expect((await store.tools.list()).map((tool) => tool.name)).toEqual(["github.list_issues"]);
   });
 
   it("duplicate-after-namespacing tool names (normalizeMcp throws) also fail loud with 0 writes", async () => {
@@ -954,6 +1027,73 @@ describe("INVARIANT §17 / §9.2 — onboarding error text never carries a store
     expect(message).toContain("protocol error");
     expect(message).toContain("daemon log");
   });
+
+  it("CX5: upstream detail is logged as ONE printable line — no newlines, CSI, or OSC survive", async () => {
+    // The operator is told to inspect the daemon log, so raw C0/C1 controls,
+    // CR/LF, and CSI/OSC sequences in the upstream's error text would be
+    // interpreted by tail/cat — forged records, terminal manipulation. After
+    // redaction the detail must be a single printable line.
+    const store = await openTestStore();
+    const daemonLog: string[] = [];
+    // A message carrying a newline (forged second record), a CSI clear-screen,
+    // and an OSC title-set — all the sequences the sanitizer must neutralize.
+    const nasty = "bad\nFORGED RECORD\r\n\x1b[2J\x1b]0;pwned\x07 tail after controls";
+    try {
+      await provisionSourceRequest(
+        { ...BASE_ARGS },
+        {
+          store,
+          fetchTools: async () => {
+            throw new McpClientError("protocol", nasty);
+          },
+          log: (line) => daemonLog.push(line),
+        },
+      );
+    } catch (err) {
+      expect(err).toBeInstanceOf(ProvisionRefused);
+    }
+
+    expect(daemonLog).toHaveLength(1);
+    const line = daemonLog[0] ?? "";
+    // Single line: the daemon wraps the detail in ONE log() call and the
+    // sanitized detail contributes no embedded newline or carriage return.
+    expect(line.split("\n")).toHaveLength(1);
+    expect(line).not.toContain("\r");
+    // No control characters at all (C0/C1, ESC, BEL) — pure printable ASCII.
+    // biome-ignore lint/suspicious/noControlCharactersInRegex: asserting controls are ABSENT
+    expect(/[\x00-\x1f\x7f-\x9f]/.test(line)).toBe(false);
+    // The inert residue of the stripped sequences remains as plain text — the
+    // detail was neutralized, not dropped — and the surrounding words survive.
+    expect(line).toContain("bad");
+    expect(line).toContain("tail after controls");
+  });
+
+  it("CX5: an over-long upstream detail is capped in the log", async () => {
+    const store = await openTestStore();
+    const daemonLog: string[] = [];
+    const huge = "A".repeat(5000);
+    try {
+      await provisionSourceRequest(
+        { ...BASE_ARGS },
+        {
+          store,
+          fetchTools: async () => {
+            throw new McpClientError("protocol", huge);
+          },
+          log: (line) => daemonLog.push(line),
+        },
+      );
+    } catch {
+      /* refusal expected */
+    }
+    const line = daemonLog[0] ?? "";
+    // The detail is bounded well below the raw 5000 chars; the surrounding
+    // framing adds a fixed prefix, so the whole line stays modest.
+    expect(line.length).toBeLessThan(1200);
+    // Non-vacuous: the cap actually bit — the full 5000-char run is not there.
+    expect(line).not.toContain("A".repeat(5000));
+    expect(line).toContain("...");
+  });
 });
 
 describe("INVARIANT §17 / §9.2 — a credential in the url is refused, and a stored url is never echoed raw (F3)", () => {
@@ -1119,5 +1259,131 @@ describe("INVARIANT §17 / §9.2 — concurrent provision/revalidate serialize p
     expect(source?.location).toBe(URL_B);
     expect(conn?.credentialRef).toBeDefined();
     expect(await store.secrets.reveal(conn?.credentialRef as string)).toBe("Bearer secret-B");
+  });
+});
+
+describe("CX1 credential-reflection refusal (§9.2, success path)", () => {
+  // The stored credential the daemon reveals and sends upstream as
+  // `authorization`. A reflecting server echoes this token back inside a
+  // successful, well-formed, sub-cap tools/list; the daemon must refuse the
+  // whole provision before `normalizeMcp` and before any write.
+  const SECRET = "Bearer refl-3cr3t-token-abc123";
+  // The bare token, without the scheme word — the segment `redactionTokens`
+  // also scans for, so an echo of just this substring is caught too.
+  const BARE = "refl-3cr3t-token-abc123";
+
+  // A minimal, VALID tool: `normalizeMcp` would accept it, so a stored result
+  // is the only thing standing between the reflection and the agent. Each
+  // case injects the credential in ONE position.
+  function reflectingList(
+    position: "description" | "name" | "schemaValue" | "schemaKey",
+  ): unknown[] {
+    const base = {
+      name: "list_issues",
+      description: "List open issues",
+      inputSchema: { type: "object", properties: {} as Record<string, unknown> },
+    };
+    switch (position) {
+      case "description":
+        return [{ ...base, description: `List issues for ${BARE}` }];
+      case "name":
+        // A syntactically-fine tool name that embeds the bare token.
+        return [{ ...base, name: `tool_${BARE}` }];
+      case "schemaValue":
+        return [
+          {
+            ...base,
+            inputSchema: {
+              type: "object",
+              properties: { q: { type: "string", description: `default ${SECRET}` } },
+            },
+          },
+        ];
+      case "schemaKey":
+        return [
+          {
+            ...base,
+            inputSchema: { type: "object", properties: { [BARE]: { type: "string" } } },
+          },
+        ];
+    }
+  }
+
+  it.each([
+    ["a description", "description"],
+    ["a tool name", "name"],
+    ["a schema value", "schemaValue"],
+    ["a schema KEY", "schemaKey"],
+  ] as const)("rejects a reflection in %s: nothing written, catalog untouched, no upstream bytes in the message", async (_label, position) => {
+    const store = await openTestStore();
+    const fetchTools: FetchTools = vi.fn(async () => reflectingList(position));
+
+    const result = await run(
+      { url: "http://upstream.example/mcp" },
+      { store, fetchTools, env: { CONDUIT_ADD_SECRET: SECRET } },
+    );
+
+    // Refused — exit 1, the fixed message, and NOT one byte of the
+    // reflected token or a tool index in it.
+    expect(result.exitCode).toBe(1);
+    expect(result.stderrLines).toHaveLength(1);
+    const stderr = result.stderrLines[0];
+    expect(stderr).toContain("reflected credential material in its tools/list");
+    expect(stderr).toContain("nothing was written");
+    expect(stderr).not.toContain(BARE);
+    expect(stderr).not.toContain(SECRET);
+
+    // Nothing was written — the store is exactly as empty as before.
+    expect(await store.sources.list()).toEqual([]);
+    expect(await store.connections.list()).toEqual([]);
+    expect(await store.tools.list()).toEqual([]);
+  });
+
+  it("MUTATION-CHECK: WITHOUT the scan, the reflecting description would be stored", async () => {
+    // Proves the scan is load-bearing. A tools/list identical to the
+    // description case, minus the credential (so no scan would fire), is a
+    // clean provision that DOES store the tool. The delta between this pass
+    // and the rejection above is exactly the reflection the scan catches: if
+    // the scan were removed, the reflecting case would take THIS path and
+    // land the credential-bearing description in the catalog.
+    const store = await openTestStore();
+    const cleanList: unknown[] = [
+      {
+        name: "list_issues",
+        description: "List issues for a normal-project",
+        inputSchema: { type: "object", properties: {} },
+      },
+    ];
+    const fetchTools: FetchTools = vi.fn(async () => cleanList);
+
+    const result = await run(
+      { url: "http://upstream.example/mcp" },
+      { store, fetchTools, env: { CONDUIT_ADD_SECRET: SECRET } },
+    );
+
+    expect(result.exitCode).toBe(0);
+    const tools = await store.tools.list();
+    expect(tools.length).toBe(1);
+    expect(tools[0]?.description).toContain("List issues");
+  });
+
+  it("an UNAUTHENTICATED onboarding (no secret) does not scan — a token-like description is stored", async () => {
+    // The scan is gated on `onboardingAuth !== undefined`: with no credential
+    // sent, there is nothing to reflect, and text that merely resembles a
+    // token must not be refused. This pins the gate so the scan cannot become
+    // a denylist over arbitrary response text.
+    const store = await openTestStore();
+    const fetchTools: FetchTools = vi.fn(async () => [
+      {
+        name: "list_issues",
+        description: `mentions ${BARE} but no credential was sent`,
+        inputSchema: { type: "object", properties: {} },
+      },
+    ]);
+
+    const result = await run({ url: "http://upstream.example/mcp" }, { store, fetchTools });
+
+    expect(result.exitCode).toBe(0);
+    expect((await store.tools.list()).length).toBe(1);
   });
 });

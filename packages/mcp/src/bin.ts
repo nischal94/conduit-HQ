@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { ConduitStore } from "@conduithq/sdk";
 import { takeStateDir } from "./args.js";
 import {
+  canonicalOfMissing,
   DaemonUnavailable,
   daemonRequest,
   isDefaultStateDir,
@@ -11,6 +12,9 @@ import {
 } from "./daemon/client.js";
 import { DaemonExit, daemonPaths, MAINTENANCE_ROLE_DOCTOR, runDaemon } from "./daemon/conduitd.js";
 import { acquireExclusiveIfPresent, describeHolder, readLockHolder } from "./daemon/locks.js";
+import { createRotatingLog, type RotatingLog } from "./daemon/log-sink.js";
+import { DAEMON_LOG } from "./daemon/spawn.js";
+import { assertSafeAncestorChain, ensureStateDir } from "./daemon/state-dir.js";
 import { sweepOrphanedExecutions } from "./daemon/sweep.js";
 import { AGENT_VERSION, DEFAULT_CONDUIT_DIR, KEYGEN_ONE_LINER, resolveEnv } from "./env.js";
 import { runStdioServer } from "./runtime-stdio.js";
@@ -361,17 +365,102 @@ async function main(): Promise<void> {
     // `<attacker>/custom` that `path.join` would produce from the raw
     // spelling. Client and by-hand daemon meet at one filesystem object.
     const resolvedStateDir = resolveEffectiveStateDir(override ?? DEFAULT_CONDUIT_DIR);
+    // The volume gate arrives as argv, never as an inherited environment
+    // variable: the spawn boundary (§3.1) constructs the child's env as
+    // exactly `{PATH}`, so the SPAWNER reads `CONDUIT_DAEMON_DEBUG` and
+    // threads the decision here as a flag.
+    const debug = parsed.rest.includes("--debug");
+    // Declared before the try so the `finally` can close it on every exit
+    // path, including the ones the sink's own construction takes.
+    let sink: RotatingLog | null = null;
     try {
-      await runDaemon({ stateDir: resolvedStateDir, sweep: sweepDaemonStore });
+      // The §3.2 ancestor-chain rule, on the by-hand daemon path — the same
+      // call the client makes before it ever connects (client.ts). A leaf
+      // that is itself a self-owned 0700 directory is still unsafe if a
+      // DIFFERENT uid owns a directory the path traverses to reach it: that
+      // uid can rename the validated leaf out and drop a replacement between
+      // the leaf check below and the sink open. `ensureStateDir` validates
+      // the LEAF only, so without this line the by-hand `--daemon
+      // --state-dir <custom>` consumer was the one state-dir consumer whose
+      // ancestors went unwalked. Checked on the canonical form
+      // (`canonicalOfMissing` is idempotent on the already-canonical
+      // resolved base), and scoped to THIS branch only: the offline doctor
+      // deliberately REPORTS rather than refuses on a custom dir (its
+      // consumer row in the state-dir threat model), so the check must not
+      // blanket every bin path. A `StateDirError` here is the same hard
+      // refusal as the leaf check's — outer catch, no sink, no serve.
+      assertSafeAncestorChain(canonicalOfMissing(resolvedStateDir));
+      // CX2: the state-dir boundary is validated BEFORE the log sink opens.
+      // `ensureStateDir` creates the directory 0700 if absent and then runs
+      // the FULL bind validation (non-symlink, self-owned, 0700, ACL-free) —
+      // the same call `runDaemon` makes as its first act, hoisted ahead of the
+      // sink. Without this, an ancestor-owning uid could swap the just-created
+      // leaf for a directory it controls holding a regular `conduitd.log`
+      // between the old bare `mkdir` and `runDaemon`'s validation; the sink
+      // (`O_NOFOLLOW` accepts a regular file) would then write daemon
+      // diagnostics into an attacker-readable fd before the boundary check
+      // ever ran. Validating first means a swapped-in foreign-owned dir fails
+      // here (WRONG_OWNER) and the daemon refuses to start rather than logging
+      // into it. `runDaemon`'s own `ensureStateDir` stays (idempotent, and
+      // re-validates once the lifecycle lock is held, closing the later
+      // window too). This ALSO satisfies both reasons the create was
+      // unconditional: the sink opens inside a now-existent dir, and a fresh
+      // by-hand start has its directory made and blessed before locks bind.
+      //
+      // A `StateDirError` here is a hard refusal: it propagates to the outer
+      // catch (a non-`DaemonExit` rethrow) rather than falling through to the
+      // sink's stderr fallback — the daemon must not serve from an unvalidated
+      // state directory.
+      await ensureStateDir(resolvedStateDir);
+      // Spec §5: owned rotating sink when backgrounded; a hand-started
+      // daemon on a terminal keeps stderr and performs no rotation.
+      if (!process.stderr.isTTY) {
+        try {
+          sink = createRotatingLog(resolvedStateDir);
+        } catch (error) {
+          // The daemon must not die for its log (spec §5) — but the refusal
+          // is LOUD, because the most interesting cause is hostile. The state
+          // dir was boundary-validated just above, so this is the residual
+          // micro-window between that validation and the open: the sink opens
+          // with `O_NOFOLLOW` (refuses a planted symlink — ELOOP) and fstat-
+          // verifies the fd is a regular self-owned file (CX2 — refuses a
+          // swapped-in directory with an attacker-owned regular `conduitd.log`,
+          // `LogOpenRefused`). Falling back to unrotated stderr keeps the
+          // daemon serving; saying so is what stops the operator reading a
+          // silently unrotated log as normal.
+          sink = null;
+          console.error(
+            "[conduitd] Log sink refused to open; falling back to UNROTATED stderr — this log " +
+              "will grow without bound. An ELOOP or LogOpenRefused cause means a symlink or a " +
+              `swapped-in file is planted at ${join(resolvedStateDir, DAEMON_LOG)}, which the sink ` +
+              "refuses to write through; inspect that path before trusting this directory. " +
+              `Context: {stateDir: ${resolvedStateDir}, cause: ${error instanceof Error ? error.message : String(error)}}`,
+          );
+        }
+      }
+      await runDaemon({
+        stateDir: resolvedStateDir,
+        sweep: sweepDaemonStore,
+        ...(sink !== null ? { log: sink.log, logInfo: sink.info } : {}),
+        ...(debug ? { debug: true } : {}),
+      });
     } catch (error) {
       // The two refusal paths carry their own exit codes (§3.5's client
       // decision table) — a client branches on the code, not on prose.
       if (error instanceof DaemonExit) {
+        // Reaches the log file all the same: under `--daemon` stderr is the
+        // inherited descriptor the spawning client pointed at that file.
         console.error(error.message);
         process.exitCode = error.code;
         return;
       }
       throw error;
+    } finally {
+      // Releases the daemon's own descriptor on every exit path, including
+      // the refusal `return` above. `process.exit` below would drop it
+      // anyway; closing explicitly is what makes that not the reason it is
+      // released.
+      sink?.close();
     }
     // Exit HARD, not by falling off the end of `main`. `runDaemon`
     // resolving means the drain deadline passed and BOTH locks were
