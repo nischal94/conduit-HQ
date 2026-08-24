@@ -31,7 +31,81 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-23 (§17 step 3 BUILT — PR #50 open, full gauntlet all-but-converged; NEXT: codex pass-3 convergence confirm → /explain-diff quiz → HUMAN-NAMED merge)
+## Current handoff — updated 2026-08-24 (§17 step 3 MERGED: PR #50 squash → main `2a487aa`; post-merge sweep DONE, canary green; next: §17 step 4 [request-authenticity floor])
+
+**MERGE + POST-MERGE (2026-08-24, human named the merge):** PR #50 squash
+→ main `2a487aa` (trailer-free; branch tree verified byte-identical to
+the squash before deletion). Final stretch after the build session:
+
+- **Codex pass 3 read: CONVERGED** (the in-flight run completed after the
+  build session paused) — finding #6 fixed at `242e84b`, no new in-scope
+  issues; recorded as a PR comment. Gauntlet complete.
+- **Explainer + quiz delivered** ("The Controllable Daemon" artifact, URL
+  in chat/private notes per the public-safe rule); human passed and named
+  the merge.
+- **Pre-merge incident (the PR #46 class, caught by checking):** the PR
+  sat CONFLICTING on HANDOFF/LEARNINGS (main's 08-22 rewrite vs the
+  branch's 08-23 rewrite), which had silently prevented the five required
+  CI checks from ever running on the head — green bots masked absent CI.
+  Resolved with a tree-proof insertion-only merge (`f35abdb`); CI then ran
+  and passed 9/9.
+- **Greptile score forensics (2026-08-24):** its comment's edit history
+  shows 4→3→3→5→5→3 across six revisions — the final 5→3 flip happened on
+  a ZERO-CODE-DELTA push (the prose merge), proving the scalar is
+  nondeterministic and must never be read as a gate. Its FINDING (ancestor
+  chain unwalked on the by-hand `--daemon` path) was real-but-residual and
+  already documented; closed anyway as `50747db` (one call:
+  `assertSafeAncestorChain(canonicalOfMissing(resolvedStateDir))` in
+  bin.ts's `--daemon` branch, mirroring client.ts, doctor path untouched
+  per its threat-model consumer row). mcp 424/424 + CI 9/9 on the fix.
+- **Sweep DONE:** branches = main only (local+remote; docs branch content
+  verified merged via `git branch -d` refusing-unmerged semantics); dists
+  rebuilt (direct tsup); **real-db canary GREEN and it dogfooded the new
+  surface**: `daemon status` correctly detected the stale pre-control
+  daemon and printed the SIGTERM remediation (the bootstrap case, live),
+  old daemon terminated, `approvals list` auto-started a fresh daemon
+  (exit 0), `daemon status` → running, matched versions, owned log sink
+  reporting (345 bytes), exit 0. ONE step left for the user's terminal
+  (agent's permission gate declined the delete):
+  `rm -rf <repo>/.superpowers/sdd/2026-08-22-daemon-control-hot-reload`
+  (git-ignored, trail preserved in PR #50 + this file).
+
+### NEXT — §17 step 4: request-authenticity floor (§16)
+
+Per the build sequence (spec §17): step 4 ships the Host/Origin
+validation, CSRF nonce, non-simple-JSON mutations, restrictive CSP,
+loopback-only bind — AND mounts step 3's transport-agnostic control
+handlers (`control.ts`, branded Principal seam) over the local HTTP API,
+completing the spec's step-3 line (currently PARTIAL by design). Steps
+3+4 were decided as one externally-reachable increment. START WITH
+`superpowers:brainstorming` then `writing-plans`; full load-bearing route
+→ HUMAN-NAMED merge. Carry the deferred follow-ups below.
+
+**DEFERRED (consolidated from the superseded sections; live list):** §16
+flake pins hold (worker crash is the signal, not the abort stderr) ·
+Linux ACL CI coverage (own housekeeping PR) · Dependabot 5 alerts (pins
+hold the 2 HIGHs) · execution-level source/tool revision pinning (trigger:
+step 5 console approvals UX) · source-removal verb (trigger: step 5 or an
+`add-mcp --remove` ask) · CX1 transform-before-echo residual (documented;
+structural request-scope guarantee holds) · CX2 owner-mismatch fstat arm
+test-depth (needs root) · shared untrusted-display allowlist helper for
+dbPath/logPath · ApprovalRuntime catalog read/write split + CAPABILITIES
+row-partition types · bin.ts doctor() hardcoded "conduitd.log" · SDD
+workspace delete (user terminal, command above).
+
+### KICKOFF PROMPT for the next session
+
+> Continue building Conduit in ~/projects/conduit-HQ. Read HANDOFF.md
+> first and follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: §17 step 3 is MERGED (PR #50 → main `2a487aa`), sweep done,
+> dists rebuilt, real-db canary green incl. the new `conduit daemon
+> status|stop` surface. Do NOT re-review step 3.** NEXT: §17 step 4 —
+> request-authenticity floor (§16) + mounting step 3's control handlers
+> over the local HTTP API (completing the spec's step-3 PARTIAL line).
+> Brainstorm → plan → full load-bearing route → HUMAN-NAMED merge. Carry
+> the DEFERRED list.
+
+## Superseded handoff — updated 2026-08-23 (§17 step 3 BUILT — PR #50 open, full gauntlet all-but-converged; its NEXT [convergence confirm → quiz → merge] was completed 2026-08-24 by the section above)
 
 **STATE: §17 step 3 (daemon control + hot-reload) is BUILT and on PR #50**
 (`feat/daemon-control` → main, head `242e84b`). Do NOT rebuild or

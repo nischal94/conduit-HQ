@@ -2166,3 +2166,36 @@ letter of its checklist but reaches for convenience tools the environment forbid
 state the environment quirks in EVERY dispatch, and expect the transcription tier
 to need one correction — that is the tier working as designed (loud, recoverable),
 not a reason to distrust it.**
+
+## 2026-08-24 — Merge day (PR #50) + the Greptile score forensics
+
+### 1. A bot's confidence scalar is not a signal; its edit history is checkable
+Greptile re-reviews on every push and EDITS its one summary comment in
+place. When its score "dropped to 3," the GraphQL `userContentEdits`
+history showed the real trajectory: 4→3→3→5→5→3 across six revisions,
+with the final 5→3 flip on a ZERO-code-delta push (a prose-only merge
+commit). Same code, opposite verdicts, 26 hours apart. **Lessons: (a)
+never gate on a model-generated scalar — adjudicate the FINDING, ignore
+the score; (b) the edit history is fetchable and settles "it used to say
+X" disputes with evidence instead of memory; (c) a session that asserts
+score history without checking it (the build session claimed "it was
+never 5") states a checkable fact from memory — the exact failure the
+source-faithfulness rule exists to stop.**
+
+### 2. CONFLICTING PRs silently suppress required CI — check runs, not bots
+The PR showed green Greptile/Socket/CodeRabbit while `mergeable:
+CONFLICTING` had prevented the five REQUIRED pull_request checks from
+ever running on the head — the PR #46 incident class, recurring. Bot
+checks run on their own triggers and mask the absence. **Lesson: before
+calling any PR merge-ready, read `gh pr checks` for the REQUIRED jobs by
+name AND `mergeable`/`mergeStateStatus`; a check list without the unit-
+test job is a red flag, not a shorter green list.**
+
+### 3. The bootstrap remediation fired in production on first contact
+The first real `daemon status` after merge hit the exact case all three
+review passes had flagged: a stale pre-control daemon that cannot be
+RPC-stopped. The CLI printed the manual SIGTERM remediation, the operator
+path worked, and the fresh daemon came up with the new surface reporting.
+**Lesson: the "remediation must work against the OLD deployment" review
+question (LEARNINGS 2026-08-22 #2) was not theoretical — it was the
+first thing production exercised.**
