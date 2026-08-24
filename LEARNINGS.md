@@ -2056,6 +2056,46 @@ the fix to the very text it exists to suppress. Reverse-skew (old client, new
 daemon) is safe because the response decoder was never extra-key-strict, so an
 old client silently ignores the new field — verified against the base commit.
 
+## 2026-08-22 — §17 step 3 design + plan (daemon control / hot-reload)
+
+### 1. A three-pass design review splits cleanly by what each pass can see
+The step-3 spec went through an in-session eng review, a doc-only codex
+cross-model pass (36 findings), and a code-verifying fable subagent audit
+(11 findings). The doc-only pass found REASONING flaws (no recovery after
+commit-then-refresh, unordered publication, ledger dishonesty); the
+code-reading pass found REALITY flaws the document could not contain —
+the daemon logs through INHERITED stderr so rename-rotation cannot bound
+the file, and serve's search/describe handlers bypass the runtime
+entirely via a per-call store snapshot, so the hot-reload inversion would
+have shipped incomplete WITH EVERY TEST GREEN. Overlap between the two
+was ~4 findings of 47. **Lesson: for a design doc, run both shapes — a
+doc-only adversarial pass AND a pass that verifies every code claim
+against source. Neither substitutes for the other, and the triple-found
+items (log fd, stop bootstrap, ack-vs-exit) are the highest-confidence
+fixes.**
+
+### 2. A remediation that names a command must work against the deployment it targets
+The spec's skew remedy was "run `conduit daemon stop`" — but the daemon
+that command must stop first is the CURRENTLY SHIPPED one, which rejects
+the `control` capability the command speaks. All three review passes
+caught it independently. **Lesson: when a fix's remediation is a new
+verb, check it against the OLD deployment the first upgrade leaves
+running — the bootstrap case is the one the new vocabulary structurally
+cannot reach, so it needs an explicit fallback (here: a printed manual
+SIGTERM path).**
+
+### 3. The per-call runtime was waste, not protection
+The M6 fresh-runtime-per-call rule looked load-bearing; on inspection
+both of its apparent safety properties live elsewhere (the QuickJS WASM
+module is already process-shared with poison/rebuild recovery; the
+manager keeps zero in-memory state — resume is a store-level CAS). The
+Lane A/B layering put every lifetime-sensitive property below the store,
+so runtime lifetime is free to change. **Lesson: before preserving a
+defensive pattern, locate the property it defends; if the property is
+enforced a layer down, the pattern is cost with no benefit — and its
+removal needs a mechanism test (search observes a direct catalog
+mutation) precisely because the behavior-level tests pass either way.**
+
 ## 2026-08-23 — §17 step 3 built via SDD + full gauntlet (PR #50)
 
 Nine-task SDD build of the daemon control surface + catalog hot-reload, then
