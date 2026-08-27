@@ -58,7 +58,16 @@ wording, verbatim transcripts, and full evidence — is PRIVATE (this repo
 is public; competitive material never lands here):
 `docs-private/strategy/2026-08-27-repositioning/00-STRATEGY-RECORD.md`
 (start there; the directory is git-ignored and also holds the session
-transcript, both external-conversation extracts, and a compiled PDF).
+transcript, both external-conversation extracts, a second evidence batch,
+and a compiled PDF).
+
+**THE ANALYSIS LOOP IS CLOSED (transcript T13, 2026-08-27 night).** All
+parties converged; a second market-evidence batch and a final
+correction round are already folded into the record (classified Stage 1
+inventory, conditional-claims language, evidence-tier rules for any
+competitor audit, the settled validation ladder). Do NOT reopen
+strategy analysis or run further cross-model review — the record is
+final. The ONLY open action is the founder's fork decision below.
 
 ### NEXT SESSION — a fork the founder resolves first
 
