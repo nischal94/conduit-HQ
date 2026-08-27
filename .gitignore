@@ -17,3 +17,5 @@ coverage/
 # node_modules resolution still works; removed on clean exit, left behind
 # only if a run is killed mid-suite.
 packages/mcp/.daemon-test-*/
+# Private strategy/competitive records — never published (public repo).
+docs-private/

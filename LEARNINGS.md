@@ -2199,3 +2199,35 @@ path worked, and the fresh daemon came up with the new surface reporting.
 **Lesson: the "remediation must work against the OLD deployment" review
 question (LEARNINGS 2026-08-22 #2) was not theoretical — it was the
 first thing production exercised.**
+
+## 2026-08-27 — Strategy convergence session (recommendation recorded, not adopted)
+
+### 1. Strategy-grade source review requires verbatim extraction, not summarizing fetches
+The session reviewed two very large external analysis conversations. A
+summarizing fetch returns a paraphrase — unusable when the task is "read
+each line and adjudicate." The working method: browser text extraction of
+the rendered page, preserved to files, then read in full. **Lesson: when a
+decision rests on a source document, obtain and archive the verbatim text
+FIRST; every derivative (audits, adjudications, records) cites the
+archive, never memory.**
+
+### 2. The adversarial-convergence stop line applies to strategy loops too
+A multi-round cross-review of the product strategy converged the same way
+code reviews do: rounds became refinements of agreed structure rather
+than new disagreements. Naming that stop condition explicitly ("further
+rounds are editorial; remaining questions have assigned non-debate
+venues: design artifacts or market validation") is what ended the loop
+cleanly. **Lesson: track, per round, whether anything NEW was decided;
+when the answer is no twice running, stop and route remaining questions
+to the surface that can actually answer them.**
+
+### 3. Public repos need the public-decision / private-evidence split designed in advance
+The strategy review produced material that must never land in a public
+repo (competitive analysis, commercial evidence) AND a decision that, if
+adopted, must be recorded publicly (§18). The resolution: a git-ignored
+`docs-private/` area holds the complete verbatim record; the committed
+record, when authorized, is written product-relative. The public HANDOFF
+carries only the pending-decision state and a pointer. **Lesson: decide
+the privacy split BEFORE writing the record, not by redacting after —
+and never let a recommendation enter the spec as if it were a decision;
+the founder's explicit approval is the boundary between the two.**

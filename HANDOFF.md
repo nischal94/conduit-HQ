@@ -31,7 +31,65 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-24 (§17 step 3 MERGED: PR #50 squash → main `2a487aa`; post-merge sweep DONE, canary green; next: §17 step 4 [request-authenticity floor])
+## Current handoff — updated 2026-08-27 (STRATEGY DECISION PENDING — a repositioning + roadmap-resequencing recommendation is converged and recorded PRIVATELY; §17 remains the committed source of truth; next session: the founder decides)
+
+**WHAT HAPPENED (2026-08-27):** a full market/positioning review (external
+cross-model analysis + this repo's own code evidence) CONVERGED on a
+recommendation: reposition Conduit as a **governed execution authority
+for AI agents** (the existing two-tool Code Mode surface becomes one of
+three projections — direct governed tools, discovery, Code Mode — over
+the one policy/credential/approval/trace pipeline), and RESEQUENCE the
+remaining roadmap (R1 direct+discovery projections with minimal
+capability scoping → R2 input-aware policy grounded in the real
+dogfooded GitHub schemas → R3 zero-friction CLI distribution → R4
+embedding contract with a three-grade trust model → R5 focused
+approval/evidence UX; §16 floor gates any future HTTP surface).
+
+**NOTHING IS ADOPTED.** No spec, invariant, positioning, or roadmap text
+changed. §17's committed sequence stands until the founder approves.
+Governance is two-stage: **Stage 1** = prepare six review artifacts
+(two-layer §18 package, positioning diff, R1 design brief,
+invariant/spec inventory, threat-model delta, two-tool compatibility
+assessment) — repo READ-ONLY, nothing landed; **Stage 2** (repo changes)
+only after the founder reviews those artifacts and approves.
+
+**THE COMPLETE RECORD** — synthesis, exact Stage 1 authorization
+wording, verbatim transcripts, and full evidence — is PRIVATE (this repo
+is public; competitive material never lands here):
+`docs-private/strategy/2026-08-27-repositioning/00-STRATEGY-RECORD.md`
+(start there; the directory is git-ignored and also holds the session
+transcript, both external-conversation extracts, and a compiled PDF).
+
+### NEXT SESSION — a fork the founder resolves first
+
+1. **If the founder issues the Stage 1 authorization** (exact wording in
+   the private record §9): prepare the six review artifacts as private
+   drafts/artifacts. Read-only on the repo; nothing committed,
+   published, reserved, or implemented. Present all six for review.
+2. **If not:** the committed roadmap stands — §17 step 4
+   (request-authenticity floor), brainstorm → plan → full load-bearing
+   route, per the superseded section below.
+3. Founder parallel track (own terminal / own decisions, any time): npm
+   `conduithq` availability check + reservation; trademark/domain
+   diligence for the product name; R4 reference-client choice; the
+   5-conversation validation ladder (private record §7).
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5`), then
+> read `docs-private/strategy/2026-08-27-repositioning/00-STRATEGY-RECORD.md`
+> in full. **State: §17 step 3 is MERGED and swept (see superseded
+> section); a repositioning recommendation is CONVERGED but NOT adopted;
+> the spec is unchanged.** Ask the founder which branch of the NEXT
+> fork applies (Stage 1 authorization vs. §17 step 4). Do NOT begin
+> Stage 2, change the spec, or start step 4 without the founder's
+> explicit word. Carry the deferred follow-ups in the superseded
+> section.
+
+---
+
+## Superseded handoff — updated 2026-08-24 (§17 step 3 MERGED: PR #50 squash → main `2a487aa`; post-merge sweep DONE, canary green; its NEXT [§17 step 4] is now gated behind the strategy decision in the section above)
 
 **MERGE + POST-MERGE (2026-08-24, human named the merge):** PR #50 squash
 → main `2a487aa` (trailer-free; branch tree verified byte-identical to
