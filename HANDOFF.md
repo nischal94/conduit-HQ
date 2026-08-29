@@ -70,15 +70,26 @@ sources. All folded into the artifacts.
 the founder's explicit approval of the package, then goes branch → PR → the
 full load-bearing route.
 
-### NEXT — founder review of the six artifacts
+### STAGE 2 APPROVED (2026-08-30, same day, founder-named)
 
-1. Artifact review passes are being routed through fit-assessed review
-   skills (audit in the 2026-08-30 chat; routing decision recorded there).
-   Findings go to the founder; the strategy itself is settled at T13 — the
-   review targets artifact fidelity/completeness, NOT reopening analysis.
-2. The founder redlines or approves. Approval = the Stage 2 gate.
-3. Founder parallel track unchanged: R4 reference-client choice; the
-   5-conversation validation ladder (private record §7).
+The six artifacts passed a five-layer review (fable code-grounding →
+codex fidelity → public-evidence competitor audit [filed in the private
+record as 06-*] → interactive plan-eng-review, six founder-decided
+design calls D1–D6 → codex convergence ×2, explicit CONVERGED). The
+founder then approved the package and authorized FULL Stage 2:
+
+1. Land the §18 repositioning entry (Layer 1 of the §18 Package
+   artifact, dated the day it lands) + the positioning edits (artifact 2
+   pre-R1 texts) in ONE PR — spec pair is protected-floor, so branch →
+   PR → CI → review → HUMAN-NAMED merge. `html2md.py` regenerates the
+   .md in the same commits.
+2. After merge: rewrite HANDOFF to the R1–R5 sequence; LEARNINGS append;
+   post-merge sweep.
+3. R1 then starts through the standing machinery (brainstorm → spec →
+   plan → SDD → gauntlet), carrying D1–D6 and the 12+3+2 acceptance
+   skeleton from the R1 brief artifact.
+4. Founder parallel track unchanged: R4 reference-client choice; the
+   validation ladder; trademark/domain diligence.
 
 ### KICKOFF PROMPT for the next session
 
