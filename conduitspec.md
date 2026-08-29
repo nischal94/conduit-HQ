@@ -14,7 +14,8 @@
 Conduit is the governed execution authority for AI agents: controlled access to real
 tools — with credentials, policy, approvals, network controls, and execution evidence held
 outside model-controlled execution — shared across every agent you use. Configure each
-integration once (MCP servers today; OpenAPI and GraphQL normalization on the roadmap) with
+integration once (MCP servers today; OpenAPI is normalized but not yet callable; GraphQL on
+the roadmap) with
 authentication and per-tool policies; agents reach the same governed catalog through
 Conduit's sandboxed Code Mode today — direct tool calls and discovery projections ship with
 R1 (roadmap).
