@@ -31,7 +31,71 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-27 (STRATEGY DECISION PENDING — a repositioning + roadmap-resequencing recommendation is converged and recorded PRIVATELY; §17 remains the committed source of truth; next session: the founder decides)
+## Current handoff — updated 2026-08-30 (STAGE 1 DELIVERED — the founder authorized Stage 1; the six private review artifacts are published and await founder review; the repo is otherwise untouched; §17 remains the committed source of truth until Stage 2 approval)
+
+**WHAT HAPPENED (2026-08-30):** the founder resolved the fork by issuing the
+Stage 1 authorization (exact wording: private record §9). Under it — repo
+read-only, nothing committed, published, reserved, or implemented — the six
+review artifacts were prepared and published as PRIVATE artifacts (referenced
+by title only, per the public-safe rule; URLs live in chat/private notes):
+
+1. **Conduit §18 Package** — public product-relative §18 entry draft +
+   private evidence-to-decision ledger (four-tier evidence rules, the
+   twelve-item T13 classification).
+2. **Conduit Positioning Diff** — nine verbatim old→new changes across five
+   surfaces, tagged positioning / factual correction / attribution cleanup;
+   keep-list included.
+3. **Conduit R1 Design Brief** — direct+discovery projections; reuse map
+   verified against code; the direct execution-record variant as the named
+   schema decision; drift-semantics table; 12+3 acceptance-invariant
+   skeleton; the eight remaining design decisions.
+4. **Conduit Invariant Inventory** — all 143 ledger rows triaged; found 4
+   pin gaps worth fixing regardless of the decision ("exactly two tools" is
+   unprefixed AND unledgered; claimForResume CAS unledgered; no revocation
+   invariant exists; §3.3/§3.3.1 live only in the daemon design doc).
+5. **Conduit Threat-Model Delta** — Grade A/B/C adversary model + guarantee
+   matrix; same-UID facts quoted from code; R1's four new threat surfaces;
+   the conditional bypass claim with its four exclusivity assumptions.
+6. **Conduit Two-Tool Compatibility** — execute/check_execution permanently
+   valid; pin-by-pin disposition; additive migration; four falsification
+   checks.
+
+**Real-schema grounding (dogfood store, read 2026-08-30, read-only):** no
+`force` argument exists on any of the 44 GitHub tools; `merge_pull_request`
+carries no branch argument; the `policies` table is EMPTY (enforcement
+derives from risk-class defaults); no revision column exists on tools or
+sources. All folded into the artifacts.
+
+**NOTHING IS ADOPTED.** Stage 2 (any source-of-truth change) starts only on
+the founder's explicit approval of the package, then goes branch → PR → the
+full load-bearing route.
+
+### NEXT — founder review of the six artifacts
+
+1. Artifact review passes are being routed through fit-assessed review
+   skills (audit in the 2026-08-30 chat; routing decision recorded there).
+   Findings go to the founder; the strategy itself is settled at T13 — the
+   review targets artifact fidelity/completeness, NOT reopening analysis.
+2. The founder redlines or approves. Approval = the Stage 2 gate.
+3. Founder parallel track unchanged: R4 reference-client choice; the
+   5-conversation validation ladder (private record §7).
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5`), then read
+> `docs-private/strategy/2026-08-27-repositioning/00-STRATEGY-RECORD.md`.
+> **State: Stage 1 is DELIVERED — six private review artifacts published
+> 2026-08-30, awaiting founder review; the spec/§17 are unchanged; the repo
+> has had docs-only HANDOFF updates since.** Do NOT begin Stage 2, change
+> the spec, or implement R1 without the founder's explicit approval of the
+> package. If the founder redlines: revise the named artifact(s) and
+> re-present. If the founder approves: Stage 2 per the §18 package's "what
+> approving this means" section — normal PR route, human-named merge.
+
+---
+
+## Superseded handoff — updated 2026-08-27 (STRATEGY DECISION PENDING — its NEXT [the founder's fork decision] was resolved 2026-08-30 by the section above: Stage 1 authorized and delivered)
 
 **WHAT HAPPENED (2026-08-27):** a full market/positioning review (external
 cross-model analysis + this repo's own code evidence) CONVERGED on a
