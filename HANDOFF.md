@@ -78,15 +78,7 @@ final. The ONLY open action is the founder's fork decision below.
 2. **If not:** the committed roadmap stands — §17 step 4
    (request-authenticity floor), brainstorm → plan → full load-bearing
    route, per the superseded section below.
-3. **Ops note (2026-08-29): Greptile free credits are likely exhausted**
-   (founder's report; ~50-credit tier, heavy consumption across PRs
-   #41–#50). Greptile is NOT a required check — the required set is the
-   five CI jobs — so merges are unaffected. On future PRs: if the
-   Greptile check is missing or failing, proceed on the rest of the
-   review machinery and do not treat it as a blocker; the founder
-   decides separately whether to fund a paid plan (dashboard:
-   app.greptile.com).
-4. Founder parallel track (own terminal / own decisions, any time): npm
+3. Founder parallel track (own terminal / own decisions, any time): npm
    `conduithq` availability check + reservation; trademark/domain
    diligence for the product name; R4 reference-client choice; the
    5-conversation validation ladder (private record §7).
