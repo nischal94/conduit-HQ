@@ -1,11 +1,13 @@
 # Conduit
 
-**One catalog for every tool. Guardrails on every call.**
+**Your agents' tools, behind one authority. Credentials, policy, and
+evidence on every call — approval when it matters.**
 
-Conduit is the open-source integration layer for AI agents. Configure each
-integration once — MCP servers today, with authentication and per-tool
-policies — and every MCP-compatible agent you use shares that same catalog
-through one gateway, where the same guardrails apply to every call.
+Conduit is the open-source governed execution layer for AI agents:
+controlled access to real tools, with credentials, policy, approvals, and
+execution evidence held outside model-controlled execution. Connect a tool
+once — MCP servers today — and every MCP-compatible agent you use reaches
+it through one authority boundary via Conduit's sandboxed Code Mode.
 
 [Spec](conduitspec.md) · [Contributing](CONTRIBUTING.md) ·
 [Security policy](SECURITY.md) · [License](LICENSE)
@@ -133,7 +135,7 @@ commit.
 
 | Command | What it does |
 | --- | --- |
-| `conduit serve` | Run the stdio MCP gateway (same startup as the `conduit-mcp` bin) |
+| `conduit serve` | Run the stdio MCP server (same startup as the `conduit-mcp` bin) |
 | `conduit add-mcp` | Onboard or re-sync an upstream MCP source (`--replace` to retarget, `--clear-credential` to deauth) |
 | `conduit approvals list` | Show the pending approval queue |
 | `conduit approvals approve\|deny EXEC_ID` | Decide a paused call; exit codes track the decision |

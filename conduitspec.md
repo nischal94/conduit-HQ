@@ -11,10 +11,13 @@
 
 ### 1.1 One-line definition
 
-Conduit is the open-source integration layer for AI agents: **one catalog for every
-tool, shared across every agent you use.** Configure each integration once (MCP servers,
-OpenAPI specs, GraphQL endpoints) with authentication and per-tool policies, then use that
-same catalog from any MCP-compatible agent.
+Conduit is the governed execution authority for AI agents: controlled access to real
+tools — with credentials, policy, approvals, network controls, and execution evidence held
+outside model-controlled execution — shared across every agent you use. Configure each
+integration once (MCP servers today; OpenAPI and GraphQL normalization on the roadmap) with
+authentication and per-tool policies; agents reach the same governed catalog through
+Conduit's sandboxed Code Mode today — direct tool calls and discovery projections ship with
+R1 (roadmap).
 
 ### 1.2 Thesis
 
@@ -32,7 +35,9 @@ call is recorded, inspectable, and auditable after the fact, on day one.
 can branch on the *actual argument values* of a call (e.g., auto-approve `refund` under
 $50, require approval at or above; allow `sendEmail` only to internal domains).
 
-Everything else is a faithful re-implementation of the proven core.
+Everything else builds on the same authority pipeline: one place where a call's
+principal, capability scope, policy, credential, approval, and trace are decided — whatever
+surface the call arrives through.
 
 ---
 
@@ -48,8 +53,12 @@ only when code actually calls it, so the prompt never balloons.
 - **Code-mode execution**: the model writes TypeScript that runs in an isolated sandbox.
 - **Credentials never reach the agent or model.**
 - **Per-tool policies** with spec-derived defaults; auto-run safe, pull a human in for the rest.
-- **Full surface parity**: MCP server, CLI, desktop app, programmatic SDK; same core.
-- **Full deployment parity**: CLI/local, desktop, hosted Cloud, self-host (Docker + Cloudflare).
+- **Projections over one authority pipeline**: Conduit Code Mode today; direct governed
+tools and discovery ship with R1 (roadmap). Every projection crosses the same principal →
+capability scope → policy → credential → approval-when-required → invocation → redaction +
+trace pipeline.
+- **Demand-pulled, deliberately not building now**: desktop app, hosted Cloud, self-host
+bundles, broad console — each returns when customer demand pulls it (§18).
 - "**Same code paths, different deployment.**" No behavioral fork between local and cloud.
 
 ### 2.2 Non-Goals (v1)
@@ -109,15 +118,15 @@ custom integration all become `{ name, inputSchema, outputSchema }` under the ho
 MCP clients, the CLI, and a drop-in SDK client are all clients of the same core; adding a
 new entry point requires **zero** changes to tools, schemas, or policies.
 
-### 4.2 Progressive disclosure ("thousands of tools, no bloat")
+### 4.2 Progressive disclosure
 
-Connect everything and Conduit still shows the model a **single tool** (`execute`). It
-**searches the catalog** and loads a tool's schema **only when the code actually calls it**,
-so the prompt never balloons.
+Connect everything and the Code Mode projection still shows the model a **single tool**
+(`execute`). It **searches the catalog** and loads a tool's schema **only when the code
+actually calls it**, so the prompt never balloons.
 
-**Target metric (the demo):** a representative catalog of ~1,600 tools across GitHub/Stripe/
-Jira/Sentry costs ~278,800 tokens if injected directly, vs. **1 tool / ~1,044 tokens** with
-Conduit. The interactive before/after token comparison is a first-class marketing artifact.
+**Benchmark:** a representative catalog of ~1,600 tools across GitHub/Stripe/Jira/Sentry
+costs ~278,800 tokens if injected directly, vs. ~1,044 tokens through the Code Mode surface.
+Context reduction is a measured benefit of this projection, not the product's identity.
 
 ---
 
@@ -726,7 +735,12 @@ trace export + retention/GC (Phase 2/4); desktop (Phase 3, cut); Cloud (4); self
 (3) typed control API + hot-reload ✅ daemon-side (HTTP with step 4) → (4) request-authenticity floor →
 (5) console onboarding / connections / policy / approvals / Connect → (6) read-only trace viewer →
 (7) service install / restart / upgrade / recovery. Each piece is load-bearing.
-**Next: step 4.**
+**Re-sequenced from step 4 onward (§18 repositioning decision, 2026-08-30):** the
+remaining work proceeds as **R1–R5** — R1 direct + discovery projections with minimal
+capability scoping; R2 input-aware policy v1 (real GitHub schemas); R3 zero-friction CLI
+distribution; R4 embedding contract (Grade B first); R5 focused approval + evidence UX. The
+step-4 §16 floor becomes the hard gate on any HTTP-facing surface; steps 5–7 map into R5,
+R5, and R3/R4 respectively (full continuity map in the §18 entry). **Next: R1.**
 
 **Phase 1 — Local runtime + CLI + MCP**
 
@@ -761,6 +775,44 @@ trace export + retention/GC (Phase 2/4); desktop (Phase 3, cut); Cloud (4); self
 
 **Resolved (locked):**
 
+- **Repositioning — governed execution authority; projection model; roadmap re-sequence (decided 2026-08-30):** ✅
+Conduit's identity is the *governed execution authority for AI agents*: controlled access
+to real tools with credentials, policy, approvals, network controls, and execution evidence
+held outside model-controlled execution. The Code Mode surface (§4.2 plus the two-tool
+decision of 2026-07-11: `execute` + `check_execution`) becomes one of
+**three projections** over the one authority pipeline (principal → capability scope →
+input-aware policy → credential resolution → approval when required → governed invocation
+with network enforcement → redaction + trace): *direct governed tools* (for clients with
+native orchestration), *discovery* (search / describe / execute-one), and *Conduit
+Code Mode* (permanent, no longer the whole product). Effective capabilities =
+client-requested ∩ principal-authorized ∩ current catalog visibility ∩ policy constraints; a
+client can narrow, never widen; a cached schema is advertisement, not authority; every call
+revalidates live; revocation beats stale discovery.
+Deployment guarantees are stated per trust grade: **Grade A** (separately administered
+authority service; agent host untrusted; future, demand-pulled), **Grade B**
+(trusted-host sidecar — today's architecture; §9.2 holds under the declared trusted-host
+model; a malicious same-UID host is outside the grade's protection, stated plainly),
+**Grade C** (in-process library; cannot claim §9.2 as written; specified separately
+with explicit downgrades).
+The §17 build sequence is re-sequenced from step 4 onward into **R1–R5**: R1 direct +
+discovery projections with minimal per-client capability scoping and a direct
+execution-record variant (a deliberate store-schema change — the first since the per-step
+freezes); R2 input-aware policy v1 grounded in the real stored schemas of the dogfooded
+catalog; R3 zero-friction CLI distribution; R4 embedding contract (Grade B proven against
+one real client before any SDK stabilization; Grade C specified separately); R5 focused
+approval + evidence UX. **Gate:** no HTTP-facing surface ships without the §16
+request-authenticity floor; no unused HTTP infrastructure is built ahead of need. Approved
+actions bind a defined tuple (principal, client, projection, qualified tool, canonical
+arguments, revision, policy version, connection identity, destination, decision) with
+per-field drift rules settled in the R1/R2 design specs. OpenAPI is normalized but not yet
+callable; GraphQL, CLI, and browser adapters remain future, customer-pulled roadmap items —
+none is described publicly as shipped until executable through the governed pipeline.
+*Continuity (nothing silently vanishes):* old step 4 (§16 floor) → the HTTP gate, its
+transport-agnostic control handlers and branded Principal already banked by step 3; step 5
+(console) → R5's approval slice, remainder deferred; step 6 (trace viewer) → R5 evidence
+UX; step 7 (service lifecycle) → R3/R4; deferred "execution-level source/tool revision
+pinning" → required by R2 approval integrity; deferred "source-removal verb" → R1
+profile management.
 - **Sandbox engine:** ✅ **QuickJS** (faithful) — portability across container + Worker; npm
 compat handled via the allowlist (below) rather than a heavier isolate.
 - **Policy rule language:** ✅ **Both** — declarative YAML + typed TS predicates (§10.3).

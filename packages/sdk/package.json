@@ -1,7 +1,7 @@
 {
   "name": "@conduithq/sdk",
   "version": "0.1.0",
-  "description": "Conduit core SDK — the open-source integration layer for AI agents.",
+  "description": "Conduit core SDK — governed execution for AI agents: policy, credentials, approvals, and trace outside model-controlled execution.",
   "license": "MIT",
   "type": "module",
   "exports": {
