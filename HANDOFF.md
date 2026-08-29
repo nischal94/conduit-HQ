@@ -31,7 +31,85 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-30 (STAGE 1 DELIVERED — the founder authorized Stage 1; the six private review artifacts are published and await founder review; the repo is otherwise untouched; §17 remains the committed source of truth until Stage 2 approval)
+## Current handoff — updated 2026-08-30 later (STAGE 2 LANDED: PR #51 squash → main `184f989`, human-named merge; the §18 repositioning decision is RECORDED and positioning aligned; NEXT: R1 via the standing machinery)
+
+**MERGE (2026-08-30, founder named it):** PR #51 squash → main `184f989`.
+The spec now records the §18 repositioning decision (governed execution
+authority; three projections; capability intersection; Grade A/B/C;
+§17 re-sequenced from step 4 into R1–R5 with the continuity map; §16
+floor as the HTTP gate; approval-binding tuple). Positioning surfaces
+(README tagline/definition, spec §1.1/§1.3/§2.1/§4.2, sdk/mcp package
+descriptions) track shipped truth — pre-R1 wording; direct/native
+language is roadmap-labeled until R1 ships. CodeRabbit round: 1 fix
+(OpenAPI normalized-not-callable in §1.1), 1 rejected with evidence
+(UTC-clock date pedantry). Post-merge sweep DONE: trees verified
+identical before branch deletion; branches = main only. No rebuild
+needed (docs-only diff).
+
+**CI flake recurrence (recorded on PR #51):** the mcp daemon auto-start
+race (Lane A family, parked behind the spawn retry-policy decision)
+went red on TWO consecutive runs of a docs-only diff with ROTATING
+failing tests in `packages/mcp/src/daemon/client.test.ts`, then green
+on the third. The parked item's trigger has fired: pick it up as its
+own housekeeping fix (retry policy or CI-worker isolation for that
+file) before it taxes the next load-bearing PR.
+
+**THE REVIEWED PACKAGE** (six private artifacts, five-layer review to
+explicit cross-model convergence; titles per the 2026-08-30 sections
+below) remains the R1 design input. The R1 brief carries six settled
+design decisions (D1–D6): shared status enum with per-kind meaning;
+profiles capability row + `conduit profiles` CLI as the admin surface;
+fail-closed namespace-refresh invalidation of paused direct calls until
+revision fields land; mid-connection narrowing test; projection-
+parameterized invariant harness; profile-as-advertisement-budget. The
+acceptance skeleton is 12+3+2 rows, entering INVARIANTS.md as ⏳ when
+the R1 spec lands. The public-evidence competitor audit is filed in the
+private record (06-*). Private record dir also holds the strategy
+record; artifact URLs live in chat/private notes per the public-safe
+rule.
+
+### NEXT — R1: direct + discovery projections
+
+Fresh session. Start from the R1 brief artifact ("Conduit R1 Design
+Brief") + the invariant inventory + threat-model delta. Route: 
+brainstorm → spec (three-pass review) → plan → SDD build → full
+load-bearing gauntlet → HUMAN-NAMED merge. The four pin gaps (G1–G3
+prerequisites; G4 optional spec absorption of §3.3/§3.3.1) land WITH or
+BEFORE the R1 spec. Environment quirks unchanged (commits
+sandbox-disabled, never --no-verify; agent never installs; pnpm/npx
+sfw-blocked — use packages/<p>/node_modules/.bin/*; gh in background
+tasks is config-blind).
+
+**Founder parallel track:** R4 reference-client choice · validation
+ladder (5 conversations can start now) · trademark/domain diligence.
+
+**DEFERRED (live list, updated):** mcp daemon auto-start flake fix
+(TRIGGER FIRED — see above) · §16 flake pins hold · Linux ACL CI ·
+Dependabot 5 alerts (pins hold the 2 HIGHs) · execution-level
+source/tool revision pinning (now REQUIRED by R2) · source-removal verb
+(→ R1 profiles row) · CX1 transform-before-echo residual · CX2 fstat
+arm depth · untrusted-display allowlist helper · ApprovalRuntime
+read/write split + CAPABILITIES row-partition types · bin.ts doctor()
+hardcoded "conduitd.log".
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: the §18 repositioning is RECORDED (PR #51 → main `184f989`);
+> positioning aligned; sweep done. Do NOT re-review Stage 2 or reopen
+> strategy analysis (closed at T13).** NEXT: R1 (direct + discovery
+> projections) — read the "Conduit R1 Design Brief" artifact (URL in
+> private notes; content mirrors
+> docs-private/strategy/2026-08-27-repositioning/ + the 2026-08-30
+> session) and carry its D1–D6 decisions + the 12+3+2 acceptance
+> skeleton. Brainstorm → spec → plan → SDD → full gauntlet →
+> HUMAN-NAMED merge. Carry the DEFERRED list (auto-start flake trigger
+> has fired — schedule its housekeeping fix early).
+
+---
+
+## Superseded handoff — updated 2026-08-30 (STAGE 1 DELIVERED; its NEXT [founder review → Stage 2] was completed the same day by the section above: package approved, PR #51 merged)
 
 **WHAT HAPPENED (2026-08-30):** the founder resolved the fork by issuing the
 Stage 1 authorization (exact wording: private record §9). Under it — repo

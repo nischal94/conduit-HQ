@@ -2231,3 +2231,52 @@ carries only the pending-decision state and a pointer. **Lesson: decide
 the privacy split BEFORE writing the record, not by redacting after —
 and never let a recommendation enter the spec as if it were a decision;
 the founder's explicit approval is the boundary between the two.**
+
+## 2026-08-30 — Stage 1 artifacts, five-layer review, Stage 2 landed (PR #51)
+
+### 1. A skill's description is not its function — read the file before routing
+
+The review-skill audit for the Stage 1 package initially shortlisted a
+"CEO/founder-mode plan review" skill for the positioning artifacts on its
+description alone. Reading its actual instructions showed a scope-expansion
+machine ("think bigger, find the 10-star product") — pointed at a settled
+strategy it would have reopened the exact loop the record closed. Two of
+four shortlist picks changed after reading the files. **Lesson: route work
+to a tool only after reading what it actually does this turn; a one-line
+description optimizes for discovery, not fit.**
+
+### 2. Real stored schemas kill narrative policy examples
+
+The repositioning record warned that "block force-push to main" was
+illustrative. Reading the 44 dogfooded GitHub tool schemas from the live
+store proved it unimplementable: no tool carries a force argument, and
+merge_pull_request has no branch argument at all — a protected-branch
+merge gate cannot see the base branch from call arguments. Viable
+predicates use the args that exist (branch on push/delete-class tools,
+base on PR tools, method enums on write families). **Lesson: derive
+policy design from the stored schemas, never from what a demo slide
+wants the arguments to be.**
+
+### 3. Layered reviewers earn their cost only with disjoint angles
+
+Five layers ran on the six-artifact package: an in-harness code-grounding
+pass (every file:line and quote vs the repo), a cross-model fidelity pass
+(artifacts vs the converged record), a public-evidence competitor audit,
+an interactive engineering review (six design decisions the documents had
+left implicit), and a convergence confirmation. Their finding sets were
+almost perfectly disjoint — the code pass found zero of the fidelity
+pass's 18, and the interactive review's 6 design gaps appeared in
+neither. **Lesson: assign each review layer a distinct failure mode to
+hunt; a second reviewer with the same angle mostly re-finds.**
+
+### 4. Rotating test failures on a zero-code diff are a flake signature — and a fired trigger
+
+PR #51 (documentation-only diff) went red twice on CI unit tests with
+DIFFERENT tests failing each run, all in the daemon auto-start family
+parked since Lane A, then green on the third run. A real regression fails
+deterministically; rotation under CI load is the race. The discipline
+that held: verify the diff cannot cause the failure, record the
+recurrence on the PR before re-rolling, and treat two reds as the parked
+item's trigger firing — the flake fix is now scheduled work, not
+background noise. **Lesson: re-running CI is diagnosis only when paired
+with a causality check and a durable record; otherwise it is gambling.**
