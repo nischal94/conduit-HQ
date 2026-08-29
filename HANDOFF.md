@@ -81,7 +81,10 @@ sfw-blocked — use packages/<p>/node_modules/.bin/*; gh in background
 tasks is config-blind).
 
 **Founder parallel track:** R4 reference-client choice · validation
-ladder (5 conversations can start now) · trademark/domain diligence.
+ladder (5 conversations can start now). (Trademark/domain diligence was
+DROPPED by founder decision 2026-08-29, `f022f52`; it crept back in from
+the private record's stale §8 on 2026-08-30 and was removed again the
+same day — do not carry it forward.)
 
 **DEFERRED (live list, updated):** mcp daemon auto-start flake fix
 (TRIGGER FIRED — see above) · §16 flake pins hold · Linux ACL CI ·
@@ -167,7 +170,7 @@ founder then approved the package and authorized FULL Stage 2:
    plan → SDD → gauntlet), carrying D1–D6 and the 12+3+2 acceptance
    skeleton from the R1 brief artifact.
 4. Founder parallel track unchanged: R4 reference-client choice; the
-   validation ladder; trademark/domain diligence.
+   validation ladder.
 
 ### KICKOFF PROMPT for the next session
 

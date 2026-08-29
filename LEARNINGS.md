@@ -2280,3 +2280,16 @@ recurrence on the PR before re-rolling, and treat two reds as the parked
 item's trigger firing — the flake fix is now scheduled work, not
 background noise. **Lesson: re-running CI is diagnosis only when paired
 with a causality check and a durable record; otherwise it is gambling.**
+
+### 5. A decision list in a record is a private copy — reconcile it against git before propagating
+
+The private strategy record's §8 still listed trademark/domain diligence
+as an open founder item; the founder had dropped it two days earlier
+(`f022f52`, the tip of main at session start). The stale copy won: the
+item was propagated into the artifacts and HANDOFF until the founder
+caught it. The false-green rule ("a stored NAME is a private copy —
+sweep every system that references it") applies to decision lists
+exactly as it applies to branches and deploy targets. **Lesson: before
+carrying any open-items list forward from a record, diff it against the
+decisions git already recorded since the record was written; the fresher
+surface wins, and the stale surface gets corrected in the same turn.**
