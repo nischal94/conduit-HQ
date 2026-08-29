@@ -2,7 +2,8 @@
 
 A stdio MCP server for Conduit. It spawns as a subprocess of your MCP client
 (Claude Desktop, Cursor, or any other client that supports stdio servers) and
-exposes exactly two tools — `execute` and `check_execution` — over the real
+exposes Conduit's Code Mode projection — exactly two tools, `execute` and
+`check_execution` — over the real
 Conduit SDK pipeline: catalog search/describe, the sandboxed `execute`
 workflow, the policy engine, and the credential boundary (§9.2/§9.3). This
 package adds no core logic of its own; it is a thin transport shell over
