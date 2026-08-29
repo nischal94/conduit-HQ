@@ -2283,8 +2283,8 @@ with a causality check and a durable record; otherwise it is gambling.**
 
 ### 5. A decision list in a record is a private copy — reconcile it against git before propagating
 
-The private strategy record's §8 still listed trademark/domain diligence
-as an open founder item; the founder had dropped it two days earlier
+The private strategy record's §8 still listed a founder-track item as
+open; the founder had dropped it two days earlier
 (`f022f52`, the tip of main at session start). The stale copy won: the
 item was propagated into the artifacts and HANDOFF until the founder
 caught it. The false-green rule ("a stored NAME is a private copy —

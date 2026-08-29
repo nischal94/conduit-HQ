@@ -81,10 +81,11 @@ sfw-blocked — use packages/<p>/node_modules/.bin/*; gh in background
 tasks is config-blind).
 
 **Founder parallel track:** R4 reference-client choice · validation
-ladder (5 conversations can start now). (Trademark/domain diligence was
-DROPPED by founder decision 2026-08-29, `f022f52`; it crept back in from
-the private record's stale §8 on 2026-08-30 and was removed again the
-same day — do not carry it forward.)
+ladder (5 conversations can start now). No other founder-track items —
+one previously-dropped item (`f022f52`) resurfaced from the private
+record's stale §8 on 2026-08-30 and was scrubbed everywhere on founder
+instruction; do not re-import items from the record's §8 without
+diffing against git-recorded decisions.
 
 **DEFERRED (live list, updated):** mcp daemon auto-start flake fix
 (TRIGGER FIRED — see above) · §16 flake pins hold · Linux ACL CI ·
