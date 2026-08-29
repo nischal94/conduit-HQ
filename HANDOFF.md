@@ -81,9 +81,8 @@ final. The ONLY open action is the founder's fork decision below.
 3. Founder parallel track (own terminal / own decisions, any time):
    **npm `conduithq` org — DONE 2026-08-29** (founder created it; scope
    `@conduithq/*` reserved, zero packages published; product name
-   confirmed by the founder as Conduit); remaining: trademark/domain
-   diligence for the product name; R4 reference-client choice; the
-   5-conversation validation ladder (private record §7).
+   confirmed by the founder as Conduit); remaining: R4 reference-client
+   choice; the 5-conversation validation ladder (private record §7).
 
 ### KICKOFF PROMPT for the next session
 
