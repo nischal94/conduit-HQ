@@ -482,12 +482,19 @@ git commit -m "feat(sdk): cap execute-description connection listing to hold the
 
 `packages/mcp/package.json`:
 
+> **Amended 2026-09-04:** the `license` field below read `MIT` as originally
+> written, which was correct on 2026-07-11. Apache-2.0 was decided
+> 2026-08-03 (spec §18), and this plan is a TEMPLATE a later session copies
+> from, so the stale value is corrected here rather than left to be pasted
+> into a new manifest. Verify against the repo's `LICENSE` file, never from
+> a doc, if this is ever used again.
+
 ```json
 {
   "name": "@conduithq/mcp",
   "version": "0.1.0",
   "description": "Conduit MCP server — stdio transport (spec §17 step 2).",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
   "bin": { "conduit-mcp": "./dist/bin.js" },

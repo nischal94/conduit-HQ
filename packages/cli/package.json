@@ -2,7 +2,7 @@
   "name": "@conduithq/cli",
   "version": "0.1.0",
   "description": "Conduit CLI — the conduit command dispatcher.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "exports": {
     ".": {

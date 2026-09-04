@@ -2,7 +2,7 @@
   "name": "@conduithq/mcp",
   "version": "0.1.0",
   "description": "Conduit MCP server — stdio transport (spec §17 step 2).",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "exports": {
     ".": {

@@ -2,7 +2,7 @@
   "name": "@conduithq/sdk",
   "version": "0.1.0",
   "description": "Conduit core SDK — governed execution for AI agents: policy, credentials, approvals, and trace outside model-controlled execution.",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "exports": {
     ".": {
