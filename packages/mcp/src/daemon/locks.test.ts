@@ -10,6 +10,8 @@ import {
   acquireExclusiveIfPresent,
   acquireShared,
   describeHolder,
+  EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS,
+  MAINTENANCE_PROBE_BUSY_TIMEOUT_MS,
   probeShared,
   readLockHolder,
 } from "./locks.js";
@@ -61,7 +63,7 @@ function newLockDbPath(): string {
  * separate reader can't race it for the same chunk.
  */
 function spawnHolder(
-  mode: "shared" | "exclusive",
+  mode: "shared" | "exclusive" | "stamp-loop",
   db: string,
   extraArgs: string[] = [],
 ): Promise<{ child: ChildProcess; linesBeforeHeld: string[] }> {
@@ -405,21 +407,69 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     const { child: holder } = await spawnHolder("exclusive", db);
     await waitFor(async () => (await probeShared(db)) === "busy");
 
-    // The holder is released (kernel drop on SIGKILL, exactly how a finished
-    // commit drops PENDING/EXCLUSIVE) well inside the window — by an
+    // The holder is released well inside the SHIPPED window — by an
     // INDEPENDENT process. It cannot be this process: SQLite's busy handler
     // sleeps inside the native call and stalls Node's event loop for the
     // whole wait, so a timer armed here would not fire until the probe had
     // already given up. Production has no such coupling — the committing
     // daemon is a different process — and neither may the test.
+    //
+    // A SIGKILL drop is HARDER than production's ordered commit unlock: it
+    // leaves a hot journal the prober must roll back (an EXCLUSIVE of its
+    // own) before its SHARED read can succeed. The commit-shaped release is
+    // exercised separately by the stamp-loop test below.
+    //
+    // The delay is derived from the constant, never a literal, so narrowing
+    // MAINTENANCE_PROBE_BUSY_TIMEOUT_MS below what a commit needs fails HERE.
+    const releaseAtMs = Math.floor(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS / 3);
     const killer = spawn(
       process.execPath,
-      ["-e", `setTimeout(() => process.kill(${holder.pid}, "SIGKILL"), 150)`],
+      ["-e", `setTimeout(() => process.kill(${holder.pid}, "SIGKILL"), ${releaseAtMs})`],
       { stdio: "ignore" },
     );
     children.push(killer);
 
-    expect(await probeShared(db, { busyTimeoutMs: 2_000 })).toBe("free");
+    expect(await probeShared(db, { busyTimeoutMs: MAINTENANCE_PROBE_BUSY_TIMEOUT_MS })).toBe(
+      "free",
+    );
+  });
+
+  it("INVARIANT §17 / §3.5: real holder-stamp COMMITS are ridden out — the production transient, not a SIGKILL stand-in", async () => {
+    const db = newLockDbPath();
+    // A child performs the daemon's exact maintenance acquisition in a tight
+    // loop — stamp (autocommit write: PENDING → EXCLUSIVE → ordered unlock)
+    // then SHARED hold then release — so the transient recurs continuously.
+    await spawnHolder("stamp-loop", db);
+
+    // Every windowed probe must read "free": the transient always clears
+    // inside the shipped window. 40 probes span far more than one commit
+    // period, so the probe meets the transient many times over.
+    for (let i = 0; i < 40; i++) {
+      expect(await probeShared(db, { busyTimeoutMs: MAINTENANCE_PROBE_BUSY_TIMEOUT_MS })).toBe(
+        "free",
+      );
+    }
+  });
+
+  it("acquireExclusive: its busy window now covers the journal_mode pragma too (the lifecycle backoff's first lock touch)", async () => {
+    const db = newLockDbPath();
+    const { child: holder } = await spawnHolder("exclusive", db);
+    await waitFor(async () => (await probeShared(db)) === "busy");
+
+    // Released inside the lifecycle backoff by an independent process (see
+    // above for why). Before the pragma reorder this returned null: the
+    // journal_mode pragma hit BUSY with no handler installed yet, and the
+    // 1000 ms backoff never got to run.
+    const killer = spawn(
+      process.execPath,
+      ["-e", `setTimeout(() => process.kill(${holder.pid}, "SIGKILL"), 100)`],
+      { stdio: "ignore" },
+    );
+    children.push(killer);
+
+    const held = await acquireExclusive(db, { busyTimeoutMs: EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS });
+    expect(held).not.toBeNull();
+    if (held) await held.release();
   });
 
   it("INVARIANT §17 / §3.5: an EXCLUSIVE held PAST the probe window still reads busy — rotation detection survives the window", async () => {

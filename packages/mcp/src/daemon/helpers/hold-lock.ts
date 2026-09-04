@@ -28,8 +28,10 @@ import { acquireExclusive, acquireShared } from "../locks.ts";
 
 const [, , mode, lockDbPath, flag] = process.argv;
 
-if (mode !== "shared" && mode !== "exclusive") {
-  console.error(`hold-lock: unknown mode "${mode}" (expected "shared" or "exclusive")`);
+if (mode !== "shared" && mode !== "exclusive" && mode !== "stamp-loop") {
+  console.error(
+    `hold-lock: unknown mode "${mode}" (expected "shared", "exclusive", or "stamp-loop")`,
+  );
   process.exit(1);
 }
 if (!lockDbPath) {
@@ -44,6 +46,27 @@ if (flag === "--spawn-grandchild") {
   });
   grandchild.unref();
   console.log(String(grandchild.pid));
+}
+
+if (mode === "stamp-loop") {
+  // The PRODUCTION transient, reproduced honestly: the daemon's maintenance
+  // acquisition is `acquireShared(db, { role })`, whose `stampHolder` is an
+  // autocommit write — in rollback-journal mode each commit passes
+  // PENDING → EXCLUSIVE for its journal write + fsync, then releases by an
+  // ordered unlock (no hot journal, unlike a SIGKILLed holder). Looping it
+  // keeps that transient recurring so a prober in another process meets it
+  // repeatedly. Prints "HELD" once the first stamp+hold has succeeded.
+  let announced = false;
+  for (;;) {
+    const h = await acquireShared(lockDbPath, { role: "stamp-loop" });
+    if (h) {
+      await h.release();
+      if (!announced) {
+        announced = true;
+        console.log("HELD");
+      }
+    }
+  }
 }
 
 const held =
