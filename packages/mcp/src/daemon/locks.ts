@@ -342,8 +342,9 @@ export const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
  * a laptop, tens of milliseconds on a loaded CI disk — and a client
  * polling row 1 through a daemon's startup lands inside that window
  * often enough to fail a healthy auto-start as "rotation". Rotation holds
- * EXCLUSIVE for its whole re-seal, so a window an order of magnitude past
- * the widest observed commit separates the two in practice.
+ * EXCLUSIVE for its whole re-seal, so a window several times the widest
+ * modelled commit (50 ms in the tests; the window is pinned at ≥ 3× it)
+ * separates the two in practice.
  *
  * The window is spent on ASYNC timers between fail-fast probes
  * (`probeSharedWithin`), never on SQLite's busy handler: that handler

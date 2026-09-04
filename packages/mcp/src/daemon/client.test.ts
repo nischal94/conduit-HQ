@@ -393,9 +393,10 @@ describe("daemonRequest — the §3.5 decision table", () => {
       // on the maintenance lock db, and a zero-timeout row-1 probe read it
       // as rotation — terminally, since row 1 never retries. Here an
       // EXCLUSIVE that clears inside the shipped window stands in for that
-      // commit, held and released by INDEPENDENT processes (SQLite's busy
-      // handler blocks this process's event loop for the wait, so nothing
-      // scheduled here could release it in time).
+      // commit: held by an INDEPENDENT process (as the committing daemon is
+      // in production) and released by an in-process timer — which fires
+      // mid-window precisely because the window is async re-probing, not
+      // SQLite's event-loop-blocking busy handler.
       const stateDir = newStateDir();
       const paths = daemonPaths(stateDir);
       const helper = fileURLToPath(new URL("./helpers/hold-lock.ts", import.meta.url));
