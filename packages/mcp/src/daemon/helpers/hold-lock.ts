@@ -56,6 +56,15 @@ if (mode === "stamp-loop") {
   // ordered unlock (no hot journal, unlike a SIGKILLed holder). Looping it
   // keeps that transient recurring so a prober in another process meets it
   // repeatedly. Prints "HELD" once the first stamp+hold has succeeded.
+  //
+  // PACED, not tight: production's transient is one stamp at startup and
+  // one clear at shutdown, with the lock free in between. A tight loop on
+  // a loaded CI disk (where each fsync-backed commit takes tens of
+  // milliseconds) turns the db into a near-continuously contended writer
+  // and a fail-fast prober can starve for a whole window — a saturation
+  // the real system never produces. The gap keeps the transient RECURRING
+  // (many collisions over a 40-probe test) while leaving windows in which
+  // a re-probe lands, exactly as production does.
   let announced = false;
   for (;;) {
     const h = await acquireShared(lockDbPath, { role: "stamp-loop" });
@@ -66,6 +75,7 @@ if (mode === "stamp-loop") {
         console.log("HELD");
       }
     }
+    await new Promise((r) => setTimeout(r, 40));
   }
 }
 
