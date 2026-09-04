@@ -47,6 +47,9 @@ function workspaceMemberRoots(): string[] {
   if (start < 0) throw new Error("license.test: pnpm-workspace.yaml has no `packages:` list");
   const roots: string[] = [];
   for (const line of lines.slice(start + 1)) {
+    // Blank lines and comments inside the list are not its end — stopping
+    // there would silently drop every later root.
+    if (/^\s*(#.*)?$/.test(line)) continue;
     const glob = /^\s+-\s+(.+?)\s*$/.exec(line)?.[1];
     if (glob === undefined) break;
     const dir = /^([A-Za-z0-9_-]+)\/\*$/.exec(glob)?.[1];
@@ -65,11 +68,13 @@ function publishableManifests(): Array<{ path: string; manifest: Manifest }> {
       .filter((rootDir) => existsSync(rootDir))
       .flatMap((rootDir) =>
         readdirSync(rootDir, { withFileTypes: true })
-          .filter((d) => d.isDirectory())
+          // Tool caches and editor state directories under a root (dot-dirs)
+          // are not members — pnpm's own globs never match them either — and
+          // a `.cache/package.json` must not be mistaken for a publishable one.
+          .filter((d) => d.isDirectory() && !d.name.startsWith("."))
           .map((d) => join(rootDir, d.name, "package.json")),
       )
-      // A workspace member IS a directory with a manifest; tool caches and
-      // editor state directories under a root (dot-dirs) are not members.
+      // A workspace member IS a directory with a manifest.
       .filter((path) => existsSync(path))
       .map((path) => ({ path, manifest: JSON.parse(readFileSync(path, "utf8")) as Manifest }))
       .filter(({ manifest }) => manifest.private !== true)
@@ -81,10 +86,11 @@ describe("license identity (LICENSE file ↔ package manifests)", () => {
     expect(spdxIdOfLicenseFile()).toMatch(/^[A-Za-z0-9.-]+$/);
   });
 
-  it("the member roots come from pnpm-workspace.yaml, and the file names at least one", () => {
-    const roots = workspaceMemberRoots();
-    expect(roots.length).toBeGreaterThan(0);
-    expect(roots).toContain("packages");
+  it("the member roots are exactly the ones pnpm-workspace.yaml declares", () => {
+    // Pinned to the file's full list, not a subset: a parser regression that
+    // returns only the first root would otherwise pass while skipping the
+    // rest of the workspace.
+    expect(workspaceMemberRoots()).toEqual(["packages", "apps"]);
   });
 
   it("every publishable manifest declares exactly the license the LICENSE file grants", () => {
