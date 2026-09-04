@@ -480,6 +480,12 @@ git commit -m "feat(sdk): cap execute-description connection listing to hold the
 
 - [ ] **Step 1: Write the package files**
 
+> **Amendment 2026-09-04:** the template below originally said `"license":
+> "MIT"` — correct when this plan was written (2026-07-11), superseded by the
+> §18 open-sourcing decision of 2026-08-03 (Apache-2.0). Updated so a future
+> package copied from here starts right; `packages/sdk/src/license.test.ts`
+> now derives the expected id from the LICENSE file and pins every manifest.
+
 `packages/mcp/package.json`:
 
 ```json
@@ -487,7 +493,7 @@ git commit -m "feat(sdk): cap execute-description connection listing to hold the
   "name": "@conduithq/mcp",
   "version": "0.1.0",
   "description": "Conduit MCP server — stdio transport (spec §17 step 2).",
-  "license": "MIT",
+  "license": "Apache-2.0",
   "type": "module",
   "exports": { ".": { "types": "./dist/index.d.ts", "import": "./dist/index.js" } },
   "bin": { "conduit-mcp": "./dist/bin.js" },
