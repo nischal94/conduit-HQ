@@ -445,10 +445,20 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     const held = await acquireExclusive(db);
     expect(held).not.toBeNull();
     if (!held) throw new Error("expected the lock");
-    setTimeout(() => void held.release(), Math.floor(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS / 3));
-
+    const releaseAtMs = Math.floor(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS / 3);
     const started = Date.now();
+    let firedAt = 0;
+    setTimeout(() => {
+      firedAt = Date.now();
+      void held.release();
+    }, releaseAtMs);
+
     expect(await probeSharedWithin(db, MAINTENANCE_PROBE_BUSY_TIMEOUT_MS)).toBe("free");
+    // Total duration alone would let a sub-window blocking wait pass; the
+    // timer's own firing time is the direct witness that the loop was
+    // free to run it on schedule (generous slack for scheduling).
+    expect(firedAt - started).toBeGreaterThanOrEqual(releaseAtMs);
+    expect(firedAt - started).toBeLessThan(releaseAtMs + 60);
     expect(Date.now() - started).toBeLessThan(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS);
   });
 

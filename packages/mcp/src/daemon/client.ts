@@ -490,12 +490,16 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
     // commits its holder stamp on this very lock db, and that commit is a
     // transient EXCLUSIVE a single fail-fast probe reads as "rotation" — a
     // terminal misread, because this row never retries. A real rotation is
-    // still BUSY once the window elapses. The window is clamped to the
-    // caller's remaining budget like every other timed wait in this loop.
+    // still BUSY once the window elapses. The window is clamped so that
+    // MIN_PASS_BUDGET_MS of the caller's budget REMAINS after it: a
+    // transient that clears at the window's edge must leave this pass
+    // enough time to probe lifecycle and connect — otherwise the pass
+    // would spawn a daemon (rationed to once) and then report the deadline
+    // spent, having started a daemon nobody waited for.
     if (
       (await probeSharedWithin(
         paths.maintenanceLockDb,
-        Math.min(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS, remaining(expiry)),
+        Math.min(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS, remaining(expiry) - MIN_PASS_BUDGET_MS),
       )) === "busy"
     ) {
       // The holder row read below names who LAST acquired; after a windowed

@@ -475,6 +475,12 @@ export async function probeShared(lockDbPath: string): Promise<"free" | "busy"> 
  * statement, so it bounds nothing across a connection's several lock-taking
  * statements. Each probe here is the unchanged fail-fast probe, the waits
  * are ordinary timers, and between probes no lock is held.
+ *
+ * `windowMs` is a LOWER bound on how long a persistent holder is given:
+ * a timer can resume after the deadline and the loop then issues one
+ * last probe, so an EXCLUSIVE released within one re-poll past the window
+ * still reads "free". That overshoot is bounded (≤ PROBE_REPOLL_MS plus one
+ * probe) and errs toward the truth — the lock IS free by then.
  */
 export async function probeSharedWithin(
   lockDbPath: string,
