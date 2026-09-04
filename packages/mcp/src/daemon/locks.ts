@@ -294,8 +294,12 @@ function openLockClient(lockDbPath: string): Client {
 }
 
 async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<void> {
-  await client.execute("PRAGMA journal_mode=DELETE");
+  // busy_timeout FIRST: the journal_mode pragma is itself the connection's
+  // first lock acquisition (it reads the header under SHARED), so a handler
+  // installed after it never covers it — against a live EXCLUSIVE the
+  // pragma returns BUSY at once and the requested window is silently void.
   await client.execute(`PRAGMA busy_timeout=${busyTimeoutMs}`);
+  await client.execute("PRAGMA journal_mode=DELETE");
 }
 
 /**
@@ -330,6 +334,30 @@ async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<voi
  * is 0 and only conduitd's lifecycle call passes this.
  */
 export const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
+
+/**
+ * The window the CLIENT'S maintenance probe (decision-table row 1) waits
+ * through before reading BUSY as "rotation in progress".
+ *
+ * Row 1 is fail-fast with no retry, so a misread there is terminal for
+ * the request. What it can misread is a transient EXCLUSIVE: the daemon's
+ * holder-stamp commit at startup and its clear at shutdown each hold
+ * PENDING → EXCLUSIVE for one journal write plus fsync — microseconds on
+ * a laptop, tens of milliseconds on a loaded CI disk — and a client
+ * polling row 1 through a daemon's startup lands inside that window
+ * often enough to fail a healthy auto-start as "rotation". Rotation holds
+ * EXCLUSIVE for its whole re-seal (hundreds of milliseconds at the very
+ * least), so a window an order of magnitude past the widest observed
+ * commit, and an order of magnitude short of the shortest rotation,
+ * separates the two cleanly.
+ *
+ * Bounded cost: a GENUINE rotation refusal now arrives up to this much
+ * later. No §3.5 path depends on that refusal being instant; the
+ * rotation's own EXCLUSIVE acquisition stays at busy_timeout=0, because
+ * THAT wait would turn a refusal into a silent takeover — see the doc
+ * above. This constant is for the reader that merely looks.
+ */
+export const MAINTENANCE_PROBE_BUSY_TIMEOUT_MS = 250;
 
 /**
  * BEGIN EXCLUSIVE, journal_mode=DELETE. null = BUSY (someone holds it).
@@ -373,11 +401,11 @@ export async function acquireExclusive(
  */
 export async function acquireShared(
   lockDbPath: string,
-  opts?: { role?: string },
+  opts?: { role?: string; busyTimeoutMs?: number },
 ): Promise<HeldLock | null> {
   const client = openLockClient(lockDbPath);
   try {
-    await prepareConnection(client);
+    await prepareConnection(client, opts?.busyTimeoutMs ?? 0);
     if (opts?.role !== undefined) await stampHolder(client, opts.role);
     await client.execute("BEGIN");
     await client.execute("SELECT count(*) FROM sqlite_schema");
@@ -409,11 +437,26 @@ export async function acquireShared(
  * is only inspecting (§3.2: creation is the daemon's prerogative).
  * Only the missing-directory errno is treated this way; every other
  * open failure still throws.
+ *
+ * `busyTimeoutMs` (default 0, fail-fast) lets a caller ride out a
+ * TRANSIENT exclusive before reading BUSY as "held". The §3.5 table's
+ * "BUSY on a SHARED probe = an EXCLUSIVE holder" is sound for a held
+ * transaction and unsound for an autocommit write: in rollback-journal
+ * mode every commit passes through PENDING → EXCLUSIVE for its journal
+ * write and fsync, and the daemon writes exactly such commits on the
+ * MAINTENANCE lock db at startup (`stampHolder`) and shutdown
+ * (`clearHolder`). While the busy handler waits, this connection holds
+ * NO lock — SQLite sleeps and retries the SHARED acquisition — so the
+ * waiting reader cannot itself refuse anyone (contrast the converse race
+ * documented at the client's row 1, which is one probe wide either way).
  */
-export async function probeShared(lockDbPath: string): Promise<"free" | "busy"> {
+export async function probeShared(
+  lockDbPath: string,
+  opts?: { busyTimeoutMs?: number },
+): Promise<"free" | "busy"> {
   let held: HeldLock | null;
   try {
-    held = await acquireShared(lockDbPath);
+    held = await acquireShared(lockDbPath, { busyTimeoutMs: opts?.busyTimeoutMs ?? 0 });
   } catch (err) {
     if (isMissingDirectory(err, lockDbPath)) return "free";
     throw err;

@@ -39,7 +39,12 @@ import {
 } from "../payloads.js";
 import { type DaemonPaths, daemonPaths } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
-import { describeHolder, probeShared, readLockHolder } from "./locks.js";
+import {
+  describeHolder,
+  MAINTENANCE_PROBE_BUSY_TIMEOUT_MS,
+  probeShared,
+  readLockHolder,
+} from "./locks.js";
 import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
 import { DAEMON_LOG, spawnDaemon } from "./spawn.js";
 import {
@@ -477,7 +482,17 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
     // no-progress pacing above matters beyond client cost: fewer probes per
     // second is proportionally fewer instants in which a rotation can be
     // spuriously refused by a waiting client.
-    if ((await probeShared(paths.maintenanceLockDb)) === "busy") {
+    //
+    // The probe carries a small busy window (MAINTENANCE_PROBE_BUSY_TIMEOUT_MS):
+    // a daemon coming up commits its holder stamp on this very lock db, and
+    // that commit is a transient EXCLUSIVE a zero-timeout probe reads as
+    // "rotation" — a terminal misread, because this row never retries. A
+    // real rotation is still BUSY once the window elapses.
+    if (
+      (await probeShared(paths.maintenanceLockDb, {
+        busyTimeoutMs: MAINTENANCE_PROBE_BUSY_TIMEOUT_MS,
+      })) === "busy"
+    ) {
       // Name the holder, exactly as `key rotate`'s own refusal does: the
       // operator gets told WHO to wait on rather than only that something
       // is in the way. Read only AFTER the kernel refused — the row is a
