@@ -456,8 +456,11 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     expect(await probeSharedWithin(db, MAINTENANCE_PROBE_BUSY_TIMEOUT_MS)).toBe("free");
     // Total duration alone would let a sub-window blocking wait pass; the
     // timer's own firing time is the direct witness that the loop was
-    // free to run it on schedule (generous slack for scheduling).
-    expect(firedAt - started).toBeGreaterThanOrEqual(releaseAtMs);
+    // free to run it on schedule. The property is the UPPER bound (it fired
+    // near its scheduled time, not after the probe gave up). No lower bound:
+    // a timer can read a millisecond "early" against Date.now()'s rounding
+    // (CI observed 82 vs 83), and an early timer proves nothing was blocked.
+    expect(firedAt).toBeGreaterThan(0);
     expect(firedAt - started).toBeLessThan(releaseAtMs + 60);
     expect(Date.now() - started).toBeLessThan(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS);
   });
