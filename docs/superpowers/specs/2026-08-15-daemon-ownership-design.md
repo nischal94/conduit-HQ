@@ -478,6 +478,22 @@ journal gives true shared/exclusive fcntl ranges):
   | question | probe | result meaning |
   |---|---|---|
   | is rotation running? | attempt SHARED hold on maintenance, `busy_timeout=0` | BUSY = rotation (only an EXCLUSIVE holder blocks a reader); success = no rotation — roll back immediately |
+  > **Amendment 2026-09-04 (client-side probe only):** "only an EXCLUSIVE
+  > holder blocks a reader" is true of a HELD transaction and false of an
+  > autocommit write — every commit in rollback-journal mode passes through
+  > PENDING → EXCLUSIVE for its journal write + fsync, and the daemon
+  > commits exactly such writes on the maintenance lock db (holder stamp at
+  > startup, clear at shutdown). A zero-timeout client probe landing in that
+  > window misread a starting daemon as rotation, terminally (row 1 never
+  > retries) — the CI auto-start flake. The client's row-1 probe is therefore
+  > RE-ISSUED on async timers for up to `MAINTENANCE_PROBE_BUSY_TIMEOUT_MS`
+  > (250 ms; `probeSharedWithin`) before a persistent BUSY is read as
+  > rotation; every individual probe stays exactly as this row says
+  > (`busy_timeout=0`, no lock held between probes, no event-loop stall). A
+  > rotation holds EXCLUSIVE past the window and still reads BUSY; one that
+  > finishes inside it reads "free" — correctly, it is over. Rotation's own
+  > EXCLUSIVE *acquisition* is untouched. Pinned in `locks.test.ts` and
+  > `client.test.ts`.
   | is a daemon alive/starting? | attempt SHARED hold on lifecycle | BUSY = daemon holds it; success = none — roll back immediately |
   | acquire (rotation, or daemon lifecycle) | `BEGIN EXCLUSIVE`, `busy_timeout=0` | BUSY = refuse per the decision table |
 

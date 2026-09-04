@@ -332,6 +332,40 @@ async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<voi
 export const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
 
 /**
+ * The window the CLIENT'S maintenance probe (decision-table row 1) re-probes
+ * through before reading a persistent BUSY as "rotation in progress".
+ *
+ * Row 1 is fail-fast with no retry, so a misread there is terminal for
+ * the request. What it can misread is a transient EXCLUSIVE: the daemon's
+ * holder-stamp commit at startup and its clear at shutdown each hold
+ * PENDING → EXCLUSIVE for one journal write plus fsync — microseconds on
+ * a laptop, tens of milliseconds on a loaded CI disk — and a client
+ * polling row 1 through a daemon's startup lands inside that window
+ * often enough to fail a healthy auto-start as "rotation". Rotation holds
+ * EXCLUSIVE for its whole re-seal, so a window several times the widest
+ * modelled commit (50 ms in the tests; the window is pinned at ≥ 3× it)
+ * separates the two in practice.
+ *
+ * The window is spent on ASYNC timers between fail-fast probes
+ * (`probeSharedWithin`), never on SQLite's busy handler: that handler
+ * sleeps inside the native call and stalls the whole Node event loop, and
+ * `busy_timeout` is per statement, so it bounds nothing across a
+ * connection's several lock-taking statements. Every probe stays at
+ * busy_timeout=0 exactly as the §3.5 probe table says.
+ *
+ * Bounded cost: a GENUINE rotation refusal now arrives up to this much
+ * later. No §3.5 path depends on that refusal being instant. A rotation
+ * that completes INSIDE the window is read as "free" — correctly: it has
+ * finished, kernel exclusion held throughout, and a daemon started now
+ * loads the new key. The rotation's own EXCLUSIVE acquisition is untouched
+ * (busy_timeout=0): THAT wait would turn a refusal into a silent takeover.
+ */
+export const MAINTENANCE_PROBE_BUSY_TIMEOUT_MS = 250;
+
+/** The pause between fail-fast probes inside `probeSharedWithin`. */
+const PROBE_REPOLL_MS = 20;
+
+/**
  * BEGIN EXCLUSIVE, journal_mode=DELETE. null = BUSY (someone holds it).
  * Held open until `release()` is called (or the process dies, which
  * drops the fd and releases the fcntl lock at the kernel level).
@@ -421,6 +455,44 @@ export async function probeShared(lockDbPath: string): Promise<"free" | "busy"> 
   if (!held) return "busy";
   await held.release();
   return "free";
+}
+
+/**
+ * `probeShared`, re-issued on async timers until it reads "free" or
+ * `windowMs` elapses — "busy" only for an EXCLUSIVE that OUTLIVES the window.
+ *
+ * The §3.5 table's "BUSY on a SHARED probe = an EXCLUSIVE holder" is sound
+ * for a held transaction and unsound for an autocommit write: in
+ * rollback-journal mode every commit passes through PENDING → EXCLUSIVE
+ * for its journal write and fsync, and the daemon writes exactly such
+ * commits on the MAINTENANCE lock db at startup (`stampHolder`) and
+ * shutdown (`clearHolder`). A single fail-fast probe landing in that window
+ * misreads a daemon coming up as a rotation. This wrapper separates the two
+ * by DURATION: a transient clears inside the window, a rotation does not.
+ *
+ * Deliberately NOT SQLite's `busy_timeout`: that handler sleeps inside the
+ * native call and blocks the caller's whole event loop, and it applies per
+ * statement, so it bounds nothing across a connection's several lock-taking
+ * statements. Each probe here is the unchanged fail-fast probe, the waits
+ * are ordinary timers, and between probes no lock is held.
+ *
+ * `windowMs` is a LOWER bound on how long a persistent holder is given:
+ * a timer can resume after the deadline and the loop then issues one
+ * last probe, so an EXCLUSIVE released within one re-poll past the window
+ * still reads "free". That overshoot is bounded (≤ PROBE_REPOLL_MS plus one
+ * probe) and errs toward the truth — the lock IS free by then.
+ */
+export async function probeSharedWithin(
+  lockDbPath: string,
+  windowMs: number,
+): Promise<"free" | "busy"> {
+  const deadline = Date.now() + Math.max(0, windowMs);
+  for (;;) {
+    if ((await probeShared(lockDbPath)) === "free") return "free";
+    const left = deadline - Date.now();
+    if (left <= 0) return "busy";
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(PROBE_REPOLL_MS, left)));
+  }
 }
 
 /**

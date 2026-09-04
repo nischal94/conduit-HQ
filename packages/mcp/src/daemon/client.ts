@@ -39,7 +39,13 @@ import {
 } from "../payloads.js";
 import { type DaemonPaths, daemonPaths } from "./conduitd.js";
 import { encodeFrame, FrameDecoder } from "./frames.js";
-import { describeHolder, probeShared, readLockHolder } from "./locks.js";
+import {
+  describeHolder,
+  MAINTENANCE_PROBE_BUSY_TIMEOUT_MS,
+  probeShared,
+  probeSharedWithin,
+  readLockHolder,
+} from "./locks.js";
 import type { CAPABILITIES, RpcRequest, RpcResponse } from "./rpc.js";
 import { DAEMON_LOG, spawnDaemon } from "./spawn.js";
 import {
@@ -470,14 +476,37 @@ export async function daemonRequest<K extends RpcRequest["kind"]>(
     //
     // NOTE the converse race, which runs the other way: this probe takes
     // the maintenance lock SHARED for the instant it reads, so a `key
-    // rotate` attempting its EXCLUSIVE acquisition inside that window is
-    // refused BUSY by a client that is merely looking. The window is one
-    // probe wide, and it is self-healing — the rotation's own refusal tells
-    // the operator to retry, and the probe is gone by then. It is why the
-    // no-progress pacing above matters beyond client cost: fewer probes per
-    // second is proportionally fewer instants in which a rotation can be
-    // spuriously refused by a waiting client.
-    if ((await probeShared(paths.maintenanceLockDb)) === "busy") {
+    // rotate` attempting its EXCLUSIVE acquisition inside that instant is
+    // refused BUSY by a client that is merely looking. Each probe is one
+    // SHARED acquisition wide (the re-probe window below holds nothing
+    // between probes — plain timers), and it is self-healing — the
+    // rotation's own refusal tells the operator to retry, and the probe is
+    // gone by then. It is why the no-progress pacing above matters beyond
+    // client cost: fewer probes per second is proportionally fewer instants
+    // in which a rotation can be spuriously refused by a waiting client.
+    //
+    // The probe is re-issued for up to MAINTENANCE_PROBE_BUSY_TIMEOUT_MS
+    // before a persistent BUSY is read as rotation: a daemon coming up
+    // commits its holder stamp on this very lock db, and that commit is a
+    // transient EXCLUSIVE a single fail-fast probe reads as "rotation" — a
+    // terminal misread, because this row never retries. A real rotation is
+    // still BUSY once the window elapses. The window is clamped so that
+    // MIN_PASS_BUDGET_MS of the caller's budget REMAINS after it: a
+    // transient that clears at the window's edge must leave this pass
+    // enough time to probe lifecycle and connect — otherwise the pass
+    // would spawn a daemon (rationed to once) and then report the deadline
+    // spent, having started a daemon nobody waited for.
+    if (
+      (await probeSharedWithin(
+        paths.maintenanceLockDb,
+        Math.min(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS, remaining(expiry) - MIN_PASS_BUDGET_MS),
+      )) === "busy"
+    ) {
+      // The holder row read below names who LAST acquired; after a windowed
+      // probe the EXCLUSIVE that answered BUSY is, by construction, one that
+      // outlived the window — a rotation — so the daemon's own startup stamp
+      // is the likelier stale row only when a transient cleared *exactly* at
+      // the window's edge. `describeHolder`'s hedge already covers that.
       // Name the holder, exactly as `key rotate`'s own refusal does: the
       // operator gets told WHO to wait on rather than only that something
       // is in the way. Read only AFTER the kernel refused — the row is a

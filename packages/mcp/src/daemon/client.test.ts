@@ -14,6 +14,7 @@ import {
 import { createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { join, resolve, sep } from "node:path";
+import { fileURLToPath } from "node:url";
 import { createClient } from "@libsql/client";
 import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import { DEFAULT_CONDUIT_DIR } from "../env.js";
@@ -30,7 +31,12 @@ import {
 import { daemonPaths } from "./conduitd.js";
 import { encodeFrame, FRAME_CAP, FrameTooLarge } from "./frames.js";
 import { bundleDaemonHelper, type HelperBundle } from "./helpers/bundle.js";
-import { acquireExclusive, type HeldLock, probeShared } from "./locks.js";
+import {
+  acquireExclusive,
+  type HeldLock,
+  MAINTENANCE_PROBE_BUSY_TIMEOUT_MS,
+  probeShared,
+} from "./locks.js";
 import { DAEMON_LOG, daemonEntryPoint, daemonSpawnEnv, PLATFORM_PATH } from "./spawn.js";
 import { StateDirError } from "./state-dir.js";
 
@@ -375,6 +381,62 @@ describe("daemonRequest — the §3.5 decision table", () => {
       // only exit "rotation in progress" itself.
       expect(spawnCalls).toBe(0);
       expect(Date.now() - started).toBeLessThan(10_000);
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "INVARIANT §17 / §3.5: a TRANSIENT exclusive on maintenance does not refuse a healthy auto-start — row 1 rides out a commit-length hold and the request completes",
+    async () => {
+      // The CI red on docs-only PR #51, reproduced at the layer where it
+      // lived: the daemon's own holder-stamp commit is a transient EXCLUSIVE
+      // on the maintenance lock db, and a zero-timeout row-1 probe read it
+      // as rotation — terminally, since row 1 never retries. Here an
+      // EXCLUSIVE that clears inside the shipped window stands in for that
+      // commit: held by an INDEPENDENT process (as the committing daemon is
+      // in production) and released by an in-process timer — which fires
+      // mid-window precisely because the window is async re-probing, not
+      // SQLite's event-loop-blocking busy handler.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const helper = fileURLToPath(new URL("./helpers/hold-lock.ts", import.meta.url));
+      const holder = spawn(process.execPath, [helper, "exclusive", paths.maintenanceLockDb], {
+        stdio: ["ignore", "pipe", "inherit"],
+      });
+      children.push(holder);
+      await new Promise<void>((resolveHeld) => {
+        holder.stdout?.on("data", (chunk: Buffer) => {
+          if (chunk.toString("utf8").includes("HELD")) resolveHeld();
+        });
+      });
+      expect(await probeShared(paths.maintenanceLockDb)).toBe("busy");
+      // Released at a fixed commit-length point (50 ms — the widest commit
+      // a loaded CI disk is modelled to take), from an in-process timer: the
+      // window is async by design, so the timer fires mid-window, and no
+      // spawned killer's startup latency can skew the release. The floor
+      // assertion is what pins the constant against being narrowed.
+      const WIDEST_COMMIT_MS = 50;
+      expect(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS).toBeGreaterThanOrEqual(WIDEST_COMMIT_MS * 3);
+      setTimeout(() => holder.kill("SIGKILL"), WIDEST_COMMIT_MS);
+
+      let spawnCalls = 0;
+      const realSpawn = testSpawn();
+      const response = await daemonRequest({
+        stateDir,
+        role: "serve",
+        request: { kind: "search", query: "anything" },
+        deadlineMs: 45_000,
+        spawn: (dir) => {
+          spawnCalls++;
+          realSpawn(dir);
+        },
+      });
+
+      // Not refused as rotation: the client rode out the transient, took
+      // row 4, started a daemon, and got a real answer from it.
+      expect(response.kind).toBe("result");
+      expect(spawnCalls).toBe(1);
+      expect(existsSync(paths.socket)).toBe(true);
     },
     TIMEOUT,
   );
