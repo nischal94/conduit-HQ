@@ -389,6 +389,13 @@ describe("locks.ts (design §3.5 — SQLite lock primitive)", () => {
   });
 });
 
+/**
+ * The widest transient the window must ride out: one holder-stamp commit
+ * (journal write + fsync) on a loaded CI disk. Tens of milliseconds is the
+ * observed order; 50 ms is the modelled bound the tests hold against.
+ */
+const WIDEST_COMMIT_MS = 50;
+
 describe("probeShared — a transient write is not a rotation (design §3.5, the maintenance probe)", () => {
   // The §3.5 table reads "BUSY on a SHARED probe = an EXCLUSIVE holder =
   // rotation". That inference is sound for a HELD transaction and unsound
@@ -407,22 +414,22 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     const { child: holder } = await spawnHolder("exclusive", db);
     await waitFor(async () => (await probeShared(db)) === "busy");
 
-    // The holder is released well inside the SHIPPED window by an
-    // INDEPENDENT process, as in production (the committing daemon is a
-    // different process). A SIGKILL drop is HARDER than production's
-    // ordered commit unlock: it leaves a hot journal the prober must roll
-    // back (an EXCLUSIVE of its own) before its SHARED read can succeed. The
-    // commit-shaped release is exercised separately by the stamp-loop test.
+    // The holder (a separate process, as the committing daemon is in
+    // production) is released at a FIXED point modelling the widest commit a
+    // loaded CI disk has been observed to take — a literal, not a fraction
+    // of the constant, so the assertion below is what pins the constant:
+    // the window must cover a real commit with margin, and narrowing it to
+    // where it no longer does fails HERE, not in the arithmetic. The release
+    // is an in-process timer: the window is async by design (see the timer
+    // test below), and a spawned killer's own startup latency on a loaded
+    // runner is exactly the kind of skew this test must not depend on.
     //
-    // The delay is derived from the constant, never a literal, so narrowing
-    // MAINTENANCE_PROBE_BUSY_TIMEOUT_MS below what a commit needs fails HERE.
-    const releaseAtMs = Math.floor(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS / 3);
-    const killer = spawn(
-      process.execPath,
-      ["-e", `setTimeout(() => process.kill(${holder.pid}, "SIGKILL"), ${releaseAtMs})`],
-      { stdio: "ignore" },
-    );
-    children.push(killer);
+    // A SIGKILL drop is HARDER than production's ordered commit unlock: it
+    // leaves a hot journal the prober must roll back (an EXCLUSIVE of its
+    // own) before its SHARED read can succeed. The commit-shaped release is
+    // exercised separately by the stamp-loop test.
+    expect(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS).toBeGreaterThanOrEqual(WIDEST_COMMIT_MS * 3);
+    setTimeout(() => holder.kill("SIGKILL"), WIDEST_COMMIT_MS);
 
     expect(await probeSharedWithin(db, MAINTENANCE_PROBE_BUSY_TIMEOUT_MS)).toBe("free");
   });
@@ -454,7 +461,13 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
 
     // Every windowed probe must read "free": the transient always clears
     // inside the shipped window. 40 probes span far more than one commit
-    // period, so the probe meets the transient many times over.
+    // period, so the probe meets the transient many times over. Whether a
+    // given probe actually collided with a commit is not observable from
+    // out here without a flaky "at least one raw BUSY" assertion; the
+    // multi-probe behavior this relies on is pinned deterministically by
+    // the SIGKILL-released and in-process-timer tests (a single-probe
+    // implementation fails both), so this test's job is the commit-SHAPED
+    // release — ordered unlock, no hot journal — not the collision count.
     for (let i = 0; i < 40; i++) {
       expect(await probeSharedWithin(db, MAINTENANCE_PROBE_BUSY_TIMEOUT_MS)).toBe("free");
     }

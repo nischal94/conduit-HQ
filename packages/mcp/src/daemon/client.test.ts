@@ -402,20 +402,21 @@ describe("daemonRequest — the §3.5 decision table", () => {
       const holder = spawn(process.execPath, [helper, "exclusive", paths.maintenanceLockDb], {
         stdio: ["ignore", "pipe", "inherit"],
       });
+      children.push(holder);
       await new Promise<void>((resolveHeld) => {
         holder.stdout?.on("data", (chunk: Buffer) => {
           if (chunk.toString("utf8").includes("HELD")) resolveHeld();
         });
       });
       expect(await probeShared(paths.maintenanceLockDb)).toBe("busy");
-      // Released at a fifth of the window: derived from the constant so a
-      // narrowed constant fails here, with a 4/5 margin for CI scheduling.
-      const releaseAtMs = Math.floor(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS / 5);
-      spawn(
-        process.execPath,
-        ["-e", `setTimeout(() => process.kill(${holder.pid}, "SIGKILL"), ${releaseAtMs})`],
-        { stdio: "ignore" },
-      );
+      // Released at a fixed commit-length point (50 ms — the widest commit
+      // a loaded CI disk is modelled to take), from an in-process timer: the
+      // window is async by design, so the timer fires mid-window, and no
+      // spawned killer's startup latency can skew the release. The floor
+      // assertion is what pins the constant against being narrowed.
+      const WIDEST_COMMIT_MS = 50;
+      expect(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS).toBeGreaterThanOrEqual(WIDEST_COMMIT_MS * 3);
+      setTimeout(() => holder.kill("SIGKILL"), WIDEST_COMMIT_MS);
 
       let spawnCalls = 0;
       const realSpawn = testSpawn();
