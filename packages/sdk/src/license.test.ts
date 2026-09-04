@@ -34,14 +34,42 @@ interface Manifest {
   license?: string;
 }
 
+/**
+ * The workspace's own member globs (`pnpm-workspace.yaml` → `packages:`),
+ * so a member root added later (the file already lists `apps/*`) is
+ * scanned without anyone remembering to update this test. Only the
+ * `<dir>/*` shape is supported — the only shape the file uses; anything
+ * else fails loudly rather than being silently skipped.
+ */
+function workspaceMemberRoots(): string[] {
+  const lines = readFileSync(join(REPO_ROOT, "pnpm-workspace.yaml"), "utf8").split("\n");
+  const start = lines.findIndex((l) => /^packages:\s*$/.test(l));
+  if (start < 0) throw new Error("license.test: pnpm-workspace.yaml has no `packages:` list");
+  const roots: string[] = [];
+  for (const line of lines.slice(start + 1)) {
+    const glob = /^\s+-\s+(.+?)\s*$/.exec(line)?.[1];
+    if (glob === undefined) break;
+    const dir = /^([A-Za-z0-9_-]+)\/\*$/.exec(glob)?.[1];
+    if (!dir) throw new Error(`license.test: unsupported workspace glob ${JSON.stringify(glob)}`);
+    roots.push(dir);
+  }
+  return roots;
+}
+
 function publishableManifests(): Array<{ path: string; manifest: Manifest }> {
-  const packagesDir = join(REPO_ROOT, "packages");
   return (
-    readdirSync(packagesDir, { withFileTypes: true })
-      .filter((d) => d.isDirectory())
-      .map((d) => join(packagesDir, d.name, "package.json"))
+    workspaceMemberRoots()
+      .map((root) => join(REPO_ROOT, root))
+      // A root the file names but that does not exist yet (`apps/`) is not an
+      // error — it is simply empty until the first member lands.
+      .filter((rootDir) => existsSync(rootDir))
+      .flatMap((rootDir) =>
+        readdirSync(rootDir, { withFileTypes: true })
+          .filter((d) => d.isDirectory())
+          .map((d) => join(rootDir, d.name, "package.json")),
+      )
       // A workspace member IS a directory with a manifest; tool caches and
-      // editor state directories under packages/ (dot-dirs) are not members.
+      // editor state directories under a root (dot-dirs) are not members.
       .filter((path) => existsSync(path))
       .map((path) => ({ path, manifest: JSON.parse(readFileSync(path, "utf8")) as Manifest }))
       .filter(({ manifest }) => manifest.private !== true)
@@ -51,6 +79,12 @@ function publishableManifests(): Array<{ path: string; manifest: Manifest }> {
 describe("license identity (LICENSE file ↔ package manifests)", () => {
   it("the LICENSE file is one this test recognizes", () => {
     expect(spdxIdOfLicenseFile()).toMatch(/^[A-Za-z0-9.-]+$/);
+  });
+
+  it("the member roots come from pnpm-workspace.yaml, and the file names at least one", () => {
+    const roots = workspaceMemberRoots();
+    expect(roots.length).toBeGreaterThan(0);
+    expect(roots).toContain("packages");
   });
 
   it("every publishable manifest declares exactly the license the LICENSE file grants", () => {
