@@ -2338,3 +2338,16 @@ the first install — the nanoid-6 trap recorded on 2026-08-17. The line-by-
 line lockfile review caught it before commit; the override was narrowed to
 `<4`. **Lesson: an override's upper bound is part of the fix, and the
 lockfile diff (one package, one version) is the acceptance test.**
+
+### 5. A flake fix's own tests get one CI cycle of scrutiny too
+
+Two of #53's new tests flaked on CI before merge (spawned-killer startup
+latency; a saturating stamp loop), and one more flaked once after (a
+`>= scheduledMs` lower bound on a timer that read a millisecond early
+against `Date.now()` rounding — 82 vs 83). Each was the test asserting
+more than the property required. **Lesson: for timing tests, assert the
+bound the property needs (here: the timer fired BEFORE the window closed)
+and nothing tighter; every extra bound is a future flake.** Also
+recorded: the license drift was fixed at the manifests AND pinned to the
+LICENSE file with a walk derived from the workspace file — two
+hardcoded facts removed, not one.

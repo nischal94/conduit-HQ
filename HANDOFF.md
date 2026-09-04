@@ -31,7 +31,21 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-04 (the mcp auto-start flake is FIXED at root cause: PR #53 → main `370f847`; audit gate restored: PR #54 → `f163135`; both human-named; NEXT: the license-manifest PR, then R1)
+## Current handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; branches = main only; NEXT: R1)
+
+**Later the same day:** the license PR landed — three manifests now say
+`Apache-2.0`, the plan-doc template is amended, and
+`packages/sdk/src/license.test.ts` derives the expected SPDX id FROM THE
+LICENSE FILE, walks every publishable member of the roots
+`pnpm-workspace.yaml` declares (dot-dirs excluded, empty walk refused),
+and was proven to fail on a MIT manifest. Three CodeRabbit + one Greptile
+finding folded (workspace-derived roots; comment/blank-line parsing;
+dot-dir exclusion; exact root list). #56 removed an off-by-one lower
+bound on #53's event-loop timer test that flaked once on CI (82 vs 83
+ms). No dist rebuild needed for #55/#56 (manifests + tests only). The
+"NEXT — license PR" section below is DONE; R1 is next.
+
+
 
 **WHAT HAPPENED (2026-09-04):** a website-repo session found the
 package manifests declare MIT while LICENSE/spec say Apache-2.0, made
@@ -77,14 +91,17 @@ asserts every publishable manifest matches, proven to fail by flipping
 one manifest first. Must land before any npm publish (R3). PR route.
 Then R1 per the 2026-08-30 sections below.
 
-**DEFERRED (live list, updated 2026-09-04):** `--doctor --offline`
-no-write test has a fixture race (`seedOneSourceAt` connection close /
-WAL checkpoint vs the stat capture; failed once on CI, never before —
-recorded on PR #53) · `pnpm audit` registry timeouts hit 3 CI runs today
-(a bounded retry or cached advisory db; own housekeeping PR — it is a
-false-red required check) · propose `.impeccable/` in `.gitignore` (the
-design hook's cache broke a whole-tree biome pre-commit once; moved out
-of tree) · Dependabot now 10 open (4 HIGH, 5 medium, 1 low) — the push
+**DEFERRED (live list, updated 2026-09-04 evening):** `--doctor
+--offline` no-write test has a fixture race (`seedOneSourceAt` connection
+close / WAL checkpoint vs the stat capture; failed once on CI, never
+before — recorded on PR #53) · `pnpm audit` registry timeouts hit FOUR
+CI runs today across three PRs (a bounded retry or cached advisory db;
+own housekeeping PR — a required check that fails on network weather is
+a false-red gate) · the design hook's `.impeccable/` cache dirs under
+`packages/` break the pre-commit's whole-tree `biome check .` (moved out
+of tree before each commit today; propose ignoring `.impeccable/` in
+`biome.json`/`.gitignore` — config change, founder approval) · a
+`NOTICE` file (optional under Apache-2.0) before the first npm publish · Dependabot now 10 open (4 HIGH, 5 medium, 1 low) — the push
 banner undercounts; triage via the API list · §16 flake pins hold ·
 Linux ACL CI · revision pinning (→ R2) · source-removal verb (→ R1
 profiles row) · CX1/CX2 residuals · display-allowlist helper ·
@@ -95,11 +112,10 @@ ApprovalRuntime type split · doctor log name.
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5`).
 > **State: auto-start flake FIXED (PR #53 → `370f847`), audit gate
-> restored (PR #54), sweep + rebuild + canary done. §18 repositioning
-> recorded (PR #51). Do NOT re-review any of them.** NEXT: the
-> license-manifest PR exactly as specified above (Apache-2.0 is the
-> founder's decision; the test derives the identity from LICENSE), then
-> R1 via brainstorm → spec → plan → SDD → gauntlet → HUMAN-NAMED merge,
+> restored (#54), timer bound (#56), license manifests + guard (#55 →
+> `002b9a2`); sweep + rebuild + canary done; §18 repositioning recorded
+> (#51). Do NOT re-review any of them.** NEXT: R1 via brainstorm → spec
+> → plan → SDD → gauntlet → HUMAN-NAMED merge,
 > carrying D1–D6 and the 12+3+2 acceptance skeleton from the R1 brief
 > artifact. Carry the DEFERRED list.
 
