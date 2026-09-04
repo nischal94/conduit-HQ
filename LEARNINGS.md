@@ -2351,3 +2351,18 @@ and nothing tighter; every extra bound is a future flake.** Also
 recorded: the license drift was fixed at the manifests AND pinned to the
 LICENSE file with a walk derived from the workspace file — two
 hardcoded facts removed, not one.
+
+## 2026-09-05 — shelving a converged design
+
+### 6. Convergence is a property of the review, not a decision to build
+
+A cross-project guardrail plan reached review convergence after five
+adversarial passes (22 findings → 1), and was then shelved: the founder
+judged the resulting machinery too heavy for a solo builder's workflow
+against an incident class that had occurred once and was rolled back
+within the hour. **Lesson: "the design has converged" answers "is it
+sound?", never "is it worth its cost now?" — the second question belongs
+to the founder, and a shelved design is recorded as inert documentation
+(private folder, explicit do-not-act banner, one HANDOFF pointer that
+names the only reactivation trigger) so no future session mistakes it
+for a task.**

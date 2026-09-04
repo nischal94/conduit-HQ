@@ -113,6 +113,13 @@ Linux ACL CI · revision pinning (→ R2) · source-removal verb (→ R1
 profiles row) · CX1/CX2 residuals · display-allowlist helper ·
 ApprovalRuntime type split · doctor log name.
 
+**SHELVED (not a task — do not act, do not propose):** a machine-wide
+cross-project agent guardrail plan ("project jail") was designed and
+review-converged on 2026-09-04, then shelved by founder decision on
+2026-09-05 as too heavy for the current workflow. It is recorded for
+documentation only under `docs-private/shelved/2026-09-04-project-jail/`
+(gitignored). Reactivated only by the founder saying so in chat.
+
 ### KICKOFF PROMPT for the next session
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
