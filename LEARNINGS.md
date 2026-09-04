@@ -2293,3 +2293,48 @@ exactly as it applies to branches and deploy targets. **Lesson: before
 carrying any open-items list forward from a record, diff it against the
 decisions git already recorded since the record was written; the fresher
 surface wins, and the stale surface gets corrected in the same turn.**
+
+## 2026-09-04 — The auto-start flake, root-caused (PR #53); audit gate (PR #54)
+
+### 1. "Only an EXCLUSIVE holder blocks a reader" is true of a held transaction and false of a commit
+
+The §3.5 probe table inferred rotation from a single BUSY on a SHARED probe.
+Every autocommit write in rollback-journal mode passes through PENDING →
+EXCLUSIVE for its journal write and fsync — and the daemon writes exactly
+such commits on the maintenance lock db (holder stamp at startup, clear at
+shutdown). A zero-timeout probe landing in that window read a starting
+daemon as a rotation, terminally, because row 1 never retries. Microseconds
+on a laptop; tens of milliseconds on a loaded CI disk — hence "rotating"
+failures under load and never locally. **Lesson: a lock-state inference must
+account for the transient states of every WRITER on that file, including the
+diagnostic ones nobody thinks of as writers.**
+
+### 2. A wait that blocks the event loop is not a wait — and per-statement timeouts bound nothing
+
+The first fix used SQLite's `busy_timeout`. A diagnostic showed the busy
+handler sleeps inside the native call: an in-process 150 ms timer did not
+fire until a 2 s wait gave up. Codex then showed `busy_timeout` applies per
+statement, so a "250 ms window" could be spent again at each of a
+connection's lock-taking statements. The reshape — re-issue the unchanged
+fail-fast probe on async timers — removed both problems and left every
+probe exactly as the design table describes. **Lesson: when a fix changes a
+primitive's timing, prove where the time is spent (which thread, which
+statement) before trusting the number.**
+
+### 3. Timing tests must not depend on a spawned helper's startup latency
+
+Two CI reds were the tests' fault, not the fix's: a `node -e` killer process
+whose own startup pushed the release past the window, and a stamp-loop
+helper committing in a tight loop that saturated the lock db on a slow disk.
+Both were replaced by shapes that model production (an in-process timer —
+possible only because the window is async; a paced writer with real gaps).
+**Lesson: a flake fix's tests must be more deterministic than the flake, or
+they inherit it.**
+
+### 4. Read the lockfile diff, every time — the override trap fired again
+
+An open `fast-uri >= 3.1.6` resolved to 4.1.3, outside ajv's `^3.0.1`, on
+the first install — the nanoid-6 trap recorded on 2026-08-17. The line-by-
+line lockfile review caught it before commit; the override was narrowed to
+`<4`. **Lesson: an override's upper bound is part of the fix, and the
+lockfile diff (one package, one version) is the acceptance test.**

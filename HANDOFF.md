@@ -31,7 +31,81 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-08-30 later (STAGE 2 LANDED: PR #51 squash → main `184f989`, human-named merge; the §18 repositioning decision is RECORDED and positioning aligned; NEXT: R1 via the standing machinery)
+## Current handoff — updated 2026-09-04 (the mcp auto-start flake is FIXED at root cause: PR #53 → main `370f847`; audit gate restored: PR #54 → `f163135`; both human-named; NEXT: the license-manifest PR, then R1)
+
+**WHAT HAPPENED (2026-09-04):** a website-repo session found the
+package manifests declare MIT while LICENSE/spec say Apache-2.0, made
+unrequested changes here, and rolled them back cleanly (PR #52 closed;
+main untouched). The founder then reviewed the licensing analysis,
+decided **keep Apache-2.0** (recorded rationale stands; patent grant
+matters for a security product; MIT is the OSS competitor's baseline,
+not a differentiator), and said go on: flake → license → HANDOFF.
+
+- **PR #53 (`370f847`) — the daemon auto-start flake, root-caused.** The
+  client's decision-table row 1 read ANY busy on its maintenance probe
+  as a key rotation and failed fast. Unsound for an autocommit write: the
+  daemon's own holder-stamp commit (startup) / clear (shutdown) pass
+  through PENDING → EXCLUSIVE for a journal write + fsync, and a client
+  probing through a daemon's startup under CI fsync latency misread it
+  as rotation — terminally. Fix: `probeSharedWithin` re-issues the
+  UNCHANGED fail-fast probe on async timers for up to 250 ms (clamped so
+  `MIN_PASS_BUDGET_MS` remains after it). Every probe stays at
+  `busy_timeout=0`; nothing blocks the event loop; rotation's own
+  acquisition untouched. Pinned at both layers with real processes;
+  ledger rows added; design §3.5 probe table amended (dated). Gauntlet:
+  three pre-PR reviewers → codex arc (its P2 RESHAPED the fix away from
+  SQLite's busy handler: event-loop stall + per-statement timeout) →
+  /security-review clean → codex CONVERGED ×2 → explainer + quiz passed →
+  human-named merge. CI unit tests green 3× on the runner that flaked.
+  Sweep done; mcp/cli dists rebuilt; real-db canary green INCLUDING a
+  stale-daemon stop + fresh auto-start through the fixed path.
+- **PR #54 (`f163135`) — audit gate.** Two new fast-uri HIGHs; scoped
+  override `>=3.1.6 <4` (an open range resolved to 4.1.3 outside ajv's
+  `^3.0.1` — the nanoid-6 trap, caught on lockfile review). Lockfile
+  moved exactly 3.1.5 → 3.1.6.
+
+### NEXT — the license-manifest PR (founder-approved, Apache-2.0 kept)
+
+Three manifests (`packages/{sdk,cli,mcp}/package.json`) say `"MIT"`;
+LICENSE, spec header, README, CONTRIBUTING say Apache-2.0; the plan-doc
+template at `docs/superpowers/plans/2026-07-11-mcp-stdio-server.md:490`
+also says MIT (correct when written, pre-2026-08-03). Fix: set
+`"Apache-2.0"` in all three; amend the template with a dated note; add
+a consistency test that derives the SPDX identity FROM THE LICENSE FILE
+(never a hardcoded string — that recreates the drift one layer up) and
+asserts every publishable manifest matches, proven to fail by flipping
+one manifest first. Must land before any npm publish (R3). PR route.
+Then R1 per the 2026-08-30 sections below.
+
+**DEFERRED (live list, updated 2026-09-04):** `--doctor --offline`
+no-write test has a fixture race (`seedOneSourceAt` connection close /
+WAL checkpoint vs the stat capture; failed once on CI, never before —
+recorded on PR #53) · `pnpm audit` registry timeouts hit 3 CI runs today
+(a bounded retry or cached advisory db; own housekeeping PR — it is a
+false-red required check) · propose `.impeccable/` in `.gitignore` (the
+design hook's cache broke a whole-tree biome pre-commit once; moved out
+of tree) · Dependabot now 10 open (4 HIGH, 5 medium, 1 low) — the push
+banner undercounts; triage via the API list · §16 flake pins hold ·
+Linux ACL CI · revision pinning (→ R2) · source-removal verb (→ R1
+profiles row) · CX1/CX2 residuals · display-allowlist helper ·
+ApprovalRuntime type split · doctor log name.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5`).
+> **State: auto-start flake FIXED (PR #53 → `370f847`), audit gate
+> restored (PR #54), sweep + rebuild + canary done. §18 repositioning
+> recorded (PR #51). Do NOT re-review any of them.** NEXT: the
+> license-manifest PR exactly as specified above (Apache-2.0 is the
+> founder's decision; the test derives the identity from LICENSE), then
+> R1 via brainstorm → spec → plan → SDD → gauntlet → HUMAN-NAMED merge,
+> carrying D1–D6 and the 12+3+2 acceptance skeleton from the R1 brief
+> artifact. Carry the DEFERRED list.
+
+---
+
+## Superseded handoff — updated 2026-08-30 later (STAGE 2 LANDED: PR #51 squash → main `184f989`; its NEXT [R1] is unchanged but now follows the license PR per the section above)
 
 **MERGE (2026-08-30, founder named it):** PR #51 squash → main `184f989`.
 The spec now records the §18 repositioning decision (governed execution
