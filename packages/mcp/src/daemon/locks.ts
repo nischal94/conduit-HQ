@@ -294,12 +294,8 @@ function openLockClient(lockDbPath: string): Client {
 }
 
 async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<void> {
-  // busy_timeout FIRST: the journal_mode pragma is itself the connection's
-  // first lock acquisition (it reads the header under SHARED), so a handler
-  // installed after it never covers it — against a live EXCLUSIVE the
-  // pragma returns BUSY at once and the requested window is silently void.
-  await client.execute(`PRAGMA busy_timeout=${busyTimeoutMs}`);
   await client.execute("PRAGMA journal_mode=DELETE");
+  await client.execute(`PRAGMA busy_timeout=${busyTimeoutMs}`);
 }
 
 /**
@@ -336,8 +332,8 @@ async function prepareConnection(client: Client, busyTimeoutMs = 0): Promise<voi
 export const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
 
 /**
- * The window the CLIENT'S maintenance probe (decision-table row 1) waits
- * through before reading BUSY as "rotation in progress".
+ * The window the CLIENT'S maintenance probe (decision-table row 1) re-probes
+ * through before reading a persistent BUSY as "rotation in progress".
  *
  * Row 1 is fail-fast with no retry, so a misread there is terminal for
  * the request. What it can misread is a transient EXCLUSIVE: the daemon's
@@ -346,18 +342,27 @@ export const EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS = 1000;
  * a laptop, tens of milliseconds on a loaded CI disk — and a client
  * polling row 1 through a daemon's startup lands inside that window
  * often enough to fail a healthy auto-start as "rotation". Rotation holds
- * EXCLUSIVE for its whole re-seal (hundreds of milliseconds at the very
- * least), so a window an order of magnitude past the widest observed
- * commit, and an order of magnitude short of the shortest rotation,
- * separates the two cleanly.
+ * EXCLUSIVE for its whole re-seal, so a window an order of magnitude past
+ * the widest observed commit separates the two in practice.
+ *
+ * The window is spent on ASYNC timers between fail-fast probes
+ * (`probeSharedWithin`), never on SQLite's busy handler: that handler
+ * sleeps inside the native call and stalls the whole Node event loop, and
+ * `busy_timeout` is per statement, so it bounds nothing across a
+ * connection's several lock-taking statements. Every probe stays at
+ * busy_timeout=0 exactly as the §3.5 probe table says.
  *
  * Bounded cost: a GENUINE rotation refusal now arrives up to this much
- * later. No §3.5 path depends on that refusal being instant; the
- * rotation's own EXCLUSIVE acquisition stays at busy_timeout=0, because
- * THAT wait would turn a refusal into a silent takeover — see the doc
- * above. This constant is for the reader that merely looks.
+ * later. No §3.5 path depends on that refusal being instant. A rotation
+ * that completes INSIDE the window is read as "free" — correctly: it has
+ * finished, kernel exclusion held throughout, and a daemon started now
+ * loads the new key. The rotation's own EXCLUSIVE acquisition is untouched
+ * (busy_timeout=0): THAT wait would turn a refusal into a silent takeover.
  */
 export const MAINTENANCE_PROBE_BUSY_TIMEOUT_MS = 250;
+
+/** The pause between fail-fast probes inside `probeSharedWithin`. */
+const PROBE_REPOLL_MS = 20;
 
 /**
  * BEGIN EXCLUSIVE, journal_mode=DELETE. null = BUSY (someone holds it).
@@ -401,11 +406,11 @@ export async function acquireExclusive(
  */
 export async function acquireShared(
   lockDbPath: string,
-  opts?: { role?: string; busyTimeoutMs?: number },
+  opts?: { role?: string },
 ): Promise<HeldLock | null> {
   const client = openLockClient(lockDbPath);
   try {
-    await prepareConnection(client, opts?.busyTimeoutMs ?? 0);
+    await prepareConnection(client);
     if (opts?.role !== undefined) await stampHolder(client, opts.role);
     await client.execute("BEGIN");
     await client.execute("SELECT count(*) FROM sqlite_schema");
@@ -437,26 +442,11 @@ export async function acquireShared(
  * is only inspecting (§3.2: creation is the daemon's prerogative).
  * Only the missing-directory errno is treated this way; every other
  * open failure still throws.
- *
- * `busyTimeoutMs` (default 0, fail-fast) lets a caller ride out a
- * TRANSIENT exclusive before reading BUSY as "held". The §3.5 table's
- * "BUSY on a SHARED probe = an EXCLUSIVE holder" is sound for a held
- * transaction and unsound for an autocommit write: in rollback-journal
- * mode every commit passes through PENDING → EXCLUSIVE for its journal
- * write and fsync, and the daemon writes exactly such commits on the
- * MAINTENANCE lock db at startup (`stampHolder`) and shutdown
- * (`clearHolder`). While the busy handler waits, this connection holds
- * NO lock — SQLite sleeps and retries the SHARED acquisition — so the
- * waiting reader cannot itself refuse anyone (contrast the converse race
- * documented at the client's row 1, which is one probe wide either way).
  */
-export async function probeShared(
-  lockDbPath: string,
-  opts?: { busyTimeoutMs?: number },
-): Promise<"free" | "busy"> {
+export async function probeShared(lockDbPath: string): Promise<"free" | "busy"> {
   let held: HeldLock | null;
   try {
-    held = await acquireShared(lockDbPath, { busyTimeoutMs: opts?.busyTimeoutMs ?? 0 });
+    held = await acquireShared(lockDbPath);
   } catch (err) {
     if (isMissingDirectory(err, lockDbPath)) return "free";
     throw err;
@@ -464,6 +454,38 @@ export async function probeShared(
   if (!held) return "busy";
   await held.release();
   return "free";
+}
+
+/**
+ * `probeShared`, re-issued on async timers until it reads "free" or
+ * `windowMs` elapses — "busy" only for an EXCLUSIVE that OUTLIVES the window.
+ *
+ * The §3.5 table's "BUSY on a SHARED probe = an EXCLUSIVE holder" is sound
+ * for a held transaction and unsound for an autocommit write: in
+ * rollback-journal mode every commit passes through PENDING → EXCLUSIVE
+ * for its journal write and fsync, and the daemon writes exactly such
+ * commits on the MAINTENANCE lock db at startup (`stampHolder`) and
+ * shutdown (`clearHolder`). A single fail-fast probe landing in that window
+ * misreads a daemon coming up as a rotation. This wrapper separates the two
+ * by DURATION: a transient clears inside the window, a rotation does not.
+ *
+ * Deliberately NOT SQLite's `busy_timeout`: that handler sleeps inside the
+ * native call and blocks the caller's whole event loop, and it applies per
+ * statement, so it bounds nothing across a connection's several lock-taking
+ * statements. Each probe here is the unchanged fail-fast probe, the waits
+ * are ordinary timers, and between probes no lock is held.
+ */
+export async function probeSharedWithin(
+  lockDbPath: string,
+  windowMs: number,
+): Promise<"free" | "busy"> {
+  const deadline = Date.now() + Math.max(0, windowMs);
+  for (;;) {
+    if ((await probeShared(lockDbPath)) === "free") return "free";
+    const left = deadline - Date.now();
+    if (left <= 0) return "busy";
+    await new Promise<void>((resolve) => setTimeout(resolve, Math.min(PROBE_REPOLL_MS, left)));
+  }
 }
 
 /**

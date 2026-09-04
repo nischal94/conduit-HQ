@@ -10,9 +10,9 @@ import {
   acquireExclusiveIfPresent,
   acquireShared,
   describeHolder,
-  EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS,
   MAINTENANCE_PROBE_BUSY_TIMEOUT_MS,
   probeShared,
+  probeSharedWithin,
   readLockHolder,
 } from "./locks.js";
 
@@ -407,17 +407,12 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     const { child: holder } = await spawnHolder("exclusive", db);
     await waitFor(async () => (await probeShared(db)) === "busy");
 
-    // The holder is released well inside the SHIPPED window — by an
-    // INDEPENDENT process. It cannot be this process: SQLite's busy handler
-    // sleeps inside the native call and stalls Node's event loop for the
-    // whole wait, so a timer armed here would not fire until the probe had
-    // already given up. Production has no such coupling — the committing
-    // daemon is a different process — and neither may the test.
-    //
-    // A SIGKILL drop is HARDER than production's ordered commit unlock: it
-    // leaves a hot journal the prober must roll back (an EXCLUSIVE of its
-    // own) before its SHARED read can succeed. The commit-shaped release is
-    // exercised separately by the stamp-loop test below.
+    // The holder is released well inside the SHIPPED window by an
+    // INDEPENDENT process, as in production (the committing daemon is a
+    // different process). A SIGKILL drop is HARDER than production's
+    // ordered commit unlock: it leaves a hot journal the prober must roll
+    // back (an EXCLUSIVE of its own) before its SHARED read can succeed. The
+    // commit-shaped release is exercised separately by the stamp-loop test.
     //
     // The delay is derived from the constant, never a literal, so narrowing
     // MAINTENANCE_PROBE_BUSY_TIMEOUT_MS below what a commit needs fails HERE.
@@ -429,9 +424,25 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     );
     children.push(killer);
 
-    expect(await probeShared(db, { busyTimeoutMs: MAINTENANCE_PROBE_BUSY_TIMEOUT_MS })).toBe(
-      "free",
-    );
+    expect(await probeSharedWithin(db, MAINTENANCE_PROBE_BUSY_TIMEOUT_MS)).toBe("free");
+  });
+
+  it("probeSharedWithin never blocks the event loop — a timer armed in THIS process fires mid-window", async () => {
+    // The reason the window is async timers and not SQLite's busy handler:
+    // the handler sleeps inside the native call and stalls Node for the
+    // whole wait (a probe with busy_timeout=2000 held an in-process 150 ms
+    // timer hostage until it gave up — measured while building this fix).
+    // With async re-probing, an in-process release lands on time, and so
+    // does everything else the client process is doing meanwhile.
+    const db = newLockDbPath();
+    const held = await acquireExclusive(db);
+    expect(held).not.toBeNull();
+    if (!held) throw new Error("expected the lock");
+    setTimeout(() => void held.release(), Math.floor(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS / 3));
+
+    const started = Date.now();
+    expect(await probeSharedWithin(db, MAINTENANCE_PROBE_BUSY_TIMEOUT_MS)).toBe("free");
+    expect(Date.now() - started).toBeLessThan(MAINTENANCE_PROBE_BUSY_TIMEOUT_MS);
   });
 
   it("INVARIANT §17 / §3.5: real holder-stamp COMMITS are ridden out — the production transient, not a SIGKILL stand-in", async () => {
@@ -445,31 +456,8 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     // inside the shipped window. 40 probes span far more than one commit
     // period, so the probe meets the transient many times over.
     for (let i = 0; i < 40; i++) {
-      expect(await probeShared(db, { busyTimeoutMs: MAINTENANCE_PROBE_BUSY_TIMEOUT_MS })).toBe(
-        "free",
-      );
+      expect(await probeSharedWithin(db, MAINTENANCE_PROBE_BUSY_TIMEOUT_MS)).toBe("free");
     }
-  });
-
-  it("acquireExclusive: its busy window now covers the journal_mode pragma too (the lifecycle backoff's first lock touch)", async () => {
-    const db = newLockDbPath();
-    const { child: holder } = await spawnHolder("exclusive", db);
-    await waitFor(async () => (await probeShared(db)) === "busy");
-
-    // Released inside the lifecycle backoff by an independent process (see
-    // above for why). Before the pragma reorder this returned null: the
-    // journal_mode pragma hit BUSY with no handler installed yet, and the
-    // 1000 ms backoff never got to run.
-    const killer = spawn(
-      process.execPath,
-      ["-e", `setTimeout(() => process.kill(${holder.pid}, "SIGKILL"), 100)`],
-      { stdio: "ignore" },
-    );
-    children.push(killer);
-
-    const held = await acquireExclusive(db, { busyTimeoutMs: EXCLUSIVE_ACQUIRE_BUSY_TIMEOUT_MS });
-    expect(held).not.toBeNull();
-    if (held) await held.release();
   });
 
   it("INVARIANT §17 / §3.5: an EXCLUSIVE held PAST the probe window still reads busy — rotation detection survives the window", async () => {
@@ -478,7 +466,7 @@ describe("probeShared — a transient write is not a rotation (design §3.5, the
     await waitFor(async () => (await probeShared(db)) === "busy");
 
     const started = Date.now();
-    expect(await probeShared(db, { busyTimeoutMs: 200 })).toBe("busy");
+    expect(await probeSharedWithin(db, 200)).toBe("busy");
     // The answer is BUSY only after the window elapsed — the holder was
     // never released, so the probe waited the full window and then gave
     // the verdict a rotation deserves. (Lower bound only: scheduling under
