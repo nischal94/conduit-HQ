@@ -101,8 +101,14 @@ a false-red gate) · the design hook's `.impeccable/` cache dirs under
 `packages/` break the pre-commit's whole-tree `biome check .` (moved out
 of tree before each commit today; propose ignoring `.impeccable/` in
 `biome.json`/`.gitignore` — config change, founder approval) · a
-`NOTICE` file (optional under Apache-2.0) before the first npm publish · Dependabot now 10 open (4 HIGH, 5 medium, 1 low) — the push
-banner undercounts; triage via the API list · §16 flake pins hold ·
+`NOTICE` file (optional under Apache-2.0) before the first npm publish ·
+Dependabot after #54: **0 HIGH**, 6 medium, 1 low (verified via the API
+2026-09-04 evening; the earlier "10 open / 4 HIGH" were the fast-uri
+advisories #54 cleared; the push banner undercounts — triage via the API
+list) · **R3 publish-time coupling:** the website repo has a test that
+BANS install commands (`npm i -g`, `npx @conduithq`, …) from its source
+until packages exist on npm — it will FAIL the day of the first publish
+by design; coordinate the two repos then · §16 flake pins hold ·
 Linux ACL CI · revision pinning (→ R2) · source-removal verb (→ R1
 profiles row) · CX1/CX2 residuals · display-allowlist helper ·
 ApprovalRuntime type split · doctor log name.
