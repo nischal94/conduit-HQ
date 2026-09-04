@@ -17,3 +17,11 @@ overrides:
   # Stay on the patched 3.x line: an open ">=3.3.18" resolves to nanoid 6
   # (ESM-only, engines >=22), silently forced outside postcss's ^3.3.x range.
   "nanoid@<3.3.18": ">=3.3.18 <4"
+  # 2026-09-04: two HIGH advisories on fast-uri (host confusion via skipped
+  # IDN; SSRF via …) — vulnerable >=3.1.3 <3.1.6, lockfile had 3.1.5. Rides
+  # ajv <- @modelcontextprotocol/sdk; independently verified not to reach the
+  # §9.3 egress guard (which pins the resolved IP), but the audit gate reads
+  # the advisory db. Scoped to the vulnerable range, and pinned to the 3.x
+  # line: an open ">=3.1.6" resolved to fast-uri 4.1.3 on the first install
+  # — a major outside ajv's declared ^3.0.1, the nanoid-6 trap of 2026-08-17.
+  "fast-uri@>=3.1.3 <3.1.6": ">=3.1.6 <4"
