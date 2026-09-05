@@ -1,7 +1,8 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 3 — codex interim findings + fable code-verifying
-audit folded (§12); codex re-run and in-session eng review pending
+Status: revision 4 — codex full pass (4 P0 / 8 P1 / 2 P2) folded on
+top of the fable audit (§12); codex confirming re-run and in-session
+eng review pending
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -133,30 +134,42 @@ pattern `sqlite.ts` already documents.
 
 ```
 ALTER TABLE executions ADD COLUMN kind TEXT NOT NULL DEFAULT 'code'
+ALTER TABLE executions ADD COLUMN projection TEXT NOT NULL DEFAULT 'code'
 ALTER TABLE executions ADD COLUMN direct_call TEXT
 ALTER TABLE executions ADD COLUMN client_id TEXT
+ALTER TABLE executions ADD COLUMN program TEXT
 ```
 
-Fresh DDL adds `CHECK (kind IN ('code','direct'))`. The ALTER shape
+Fresh DDL adds `CHECK (kind IN ('code','direct'))` and
+`CHECK (projection IN ('code','direct','discovery'))`. The ALTER shape
 has precedent through `tolerateSchemaRace` (`sqlite.ts:129-138`, the
 `redact_fields` retrofit).
 
-`client_id` is written for BOTH kinds at `start`/`startDirect` (null
-for the default profile) — it is what lets `resume` rebuild the scope
-thunk for a Code Mode row as well as a direct one (§5.4). Without it a
-program under a narrowed profile that pauses on an allowed tool would
-resume with the full catalog (audit P0).
+`client_id` and `projection` are written for BOTH kinds at
+`start`/`startDirect` (`client_id` null for the default profile). They
+are what let `resume` rebuild the scope for a Code Mode row as well as
+a direct one (§5.4), and what let the projection FLAG — not only the
+tool grant — be re-checked on every call and resume (§5.2): turning
+`direct` off must make a paused direct call unresumable, and turning
+`code` off must stop a running program at its next call. `projection`
+is also what Trace and `check_execution` report after a restart.
 
-`code` and `seeds` stay `NOT NULL`: SQLite cannot drop a NOT NULL
-through ALTER, and a table rebuild races across processes (M5). A
-direct row stores `seeds = '{}'` and, as `code`, the sentinel program
-`throw new Error("direct execution row: not a program")`. The sentinel
-— not `''` — is deliberate downgrade protection: an OLDER daemon build
-that does not know `kind` would otherwise resume a direct row as the
-empty program, complete it with `null`, and record a landed approval
-that performed no call. With the sentinel an old build fails the row.
-The lifecycle lock does not prevent a daemon downgrade. Hydration
-discards both fields by `kind`. Read-side guard: `kind = 'direct'` iff `direct_call` is
+**`code` holds a sentinel for EVERY new row; the program moves to
+`program`.** `code` and `seeds` stay `NOT NULL` (SQLite cannot drop a
+NOT NULL through ALTER; a table rebuild races across processes, M5).
+Every row written by this build stores, as `code`, the sentinel
+program `throw new Error("conduit: row written by a newer build")`;
+a code row stores its real program in `program`; a direct row stores
+`program = NULL` and `seeds = '{}'`. Hydration reads `program` for
+code rows and discards `code`. This is downgrade protection for BOTH
+kinds: an OLDER build ignores unknown columns, reads `code`, and would
+otherwise (a) resume a direct row as an empty program and record a
+landed approval that performed no call, or (b) resume a narrowed Code
+Mode row with the unscoped invoker, recreating the A7 bypass. With the
+sentinel in `code`, an old build fails every new row closed. Rows
+written by older builds (`program` NULL, `kind` defaulted to `code`)
+hydrate from `code` as today. The lifecycle lock does not prevent a
+daemon downgrade; this does. Read-side guard: `kind = 'direct'` iff `direct_call` is
 present and non-null; `kind = 'code'` iff `direct_call` is null. A row
 violating either is corrupt and is refused on read with a named error,
 never silently coerced.
@@ -184,6 +197,7 @@ interface ExecutionBase {
   id: string; status: ExecutionStatus; pausedOn?: PendingApproval;
   startedAt: number; endedAt?: number; requestKey?: string;
   clientId: string | null;
+  projection: "code" | "direct" | "discovery";
   result?: unknown; error?: ExecutionError;
 }
 type Execution =
@@ -206,11 +220,18 @@ Status enum shared (D1), per-kind meaning:
 | --- | --- | --- |
 | running | sandbox driving the program | performing the one governed upstream call |
 | paused | suspended on a pending call; replay on resume | approved-or-not canonical call stored; perform on resume |
-| completed | program returned | upstream returned; `result` is the redacted upstream result |
+| completed | program returned | upstream returned; `result` is the upstream result AS RETURNED (the invoker returns it unchanged — field redaction applies to Trace only, and the credential-echo tripwire REFUSES a result rather than redacting it) |
 | failed | program threw / infra / divergence | policy block, credential/upstream/infra failure, D3 invalidation, or outcome-unknown |
 | expired | pause TTL elapsed | pause TTL elapsed |
 
 A direct execution writes NO `replay_journal` rows.
+
+**Request keys are stored namespaced by client:** the manager persists
+`request_key` as `${clientId ?? ""} ${key}` so uniqueness — and
+therefore `conflict` — is PER CLIENT, and a lookup by key from another
+client finds nothing. No index change; the existing unique index on
+`request_key` does the work. A `conflict` outcome therefore only ever
+discloses an execution id the same client created.
 
 `ExecutionRepository` gains `invalidatePausedDirect(namespace: string):
 Promise<number>` — flips every `paused` `direct` row whose
@@ -230,18 +251,28 @@ the approved call against the changed catalog.
 ALTER TABLE sources ADD COLUMN generation INTEGER NOT NULL DEFAULT 0
 ```
 
-`provisionSource` bumps `generation` inside its existing single
-transaction (`sqlite.ts` `client.batch`; both provision and revalidate
-reach it through `fetchAndProvision`, `provision.ts:837`, so one bump
-covers both). The new value is TABLE-WIDE monotonic, not per-row:
-`COALESCE((SELECT MAX(generation) FROM sources), 0) + 1`, applied on
-insert AND on `ON CONFLICT(id) DO UPDATE`. A per-row counter would
-restart at 0 after `source.remove` + re-add, and a direct row claimed
-across that pair would compare equal to the new incarnation (audit
-P1). SQLite serializes the write transaction, so the table-wide read
-is race-free. `source.remove` deletes the row, so a later lookup finds
-no generation at all. Pinned: "remove then re-add does not revive a
-paused direct row". `Source` gains `generation:
+```
+CREATE TABLE IF NOT EXISTS source_generations (
+  gen INTEGER PRIMARY KEY AUTOINCREMENT,
+  namespace TEXT NOT NULL,
+  at INTEGER NOT NULL
+)
+```
+
+`provisionSource` inserts one `source_generations` row inside its
+existing single transaction (`sqlite.ts` `client.batch`; both provision
+and revalidate reach it through `fetchAndProvision`, `provision.ts:837`,
+so one insert covers both) and writes the returned `gen` into
+`sources.generation`. `AUTOINCREMENT` allocates from `sqlite_sequence`,
+a durable high-water mark that row deletion never lowers — the
+property a per-row counter (restarts at 0 on re-add) and a table-wide
+`MAX(generation)` (reusable once the highest row is deleted; codex
+reproduced `1 → absent → 1` with one source) both lack. `source.remove`
+deletes the `sources` row, so a later lookup finds no generation at
+all. Pinned: "remove then re-add does not revive a paused direct row",
+including deletion of the current maximum and deletion of every
+source. The `source_generations` table is append-only and tiny (one
+row per provision); no GC in R1. `Source` gains `generation:
 number`. This is the R1 provenance field the brief anticipated; R2 adds
 tool-level revision on top of it.
 
@@ -360,38 +391,60 @@ The no-widening pins extend: `serve` still holds no administrative verb
 ### 5.2 Effective scope
 
 ```ts
+type Projection = "code" | "direct" | "discovery";
+/** An IMMUTABLE snapshot: one profile row + one tool-name set, read together. */
 interface EffectiveScope {
   projections: { code: boolean; direct: boolean; discovery: boolean };
-  callable: (qualifiedName: string) => boolean;
-  listing: () => Promise<Tool[]>;         // store.tools.list() ∩ allow
+  /** True iff the projection flag is on AND the tool is in catalog ∩ allow. */
+  permits: (projection: Projection, qualifiedName: string) => boolean;
+  listing: Tool[];                         // store.tools.list() ∩ allow, at snapshot time
 }
-function effectiveScope(profile: Profile | DEFAULT, catalog: Catalog, store: ConduitStore): EffectiveScope
+/** The resolver the daemon hands the manager and the invoker. Async: profile
+ * and tool reads are store reads. Rejects → the call fails as infra (fail
+ * closed); a missing profile row for a named client → a scope with every
+ * flag false and an empty listing (fail closed, never the default). */
+type ScopeResolver = (clientId: string | null) => Promise<EffectiveScope>;
 ```
 
-Which catalog answers what: `callable` and `listing` read the STORE
-(`store.tools`), because the invoker resolves tools from the store
-(`invoker.ts:111`) and the store is the catalog-of-record;
-`search`/`describe` filter the in-memory catalog by `callable`. The
-in-memory `Catalog` interface gains no `list()`. The
-`EffectiveScope` TYPE is declared in the SDK (Lane A) because
-`startDirect`/`makeInvoker` signatures need it; the daemon function
-that builds one is Lane B.
+`permits` checks BOTH the projection flag and the tool grant: turning
+a flag off revokes exactly as removing a tool does. Every check in
+this spec is `permits(row.projection, toolName)` — never the grant
+alone. The resolver is async because `ProfileRepository.get` and
+`store.tools.list` are; the invoker's `runCall` is already async, so
+it awaits one snapshot per call. A snapshot is consistent (profile and
+tools read in one store round-trip, both from the catalog-of-record —
+the invoker resolves tools from the store, `invoker.ts:111`, not from
+the in-memory catalog). `search`/`describe` filter the in-memory
+catalog by the same snapshot's `permits`. The in-memory `Catalog`
+interface gains no `list()`. The `EffectiveScope`/`ScopeResolver`
+TYPES are declared in the SDK (Lane A) because `startDirect`,
+`resume`, and `makeInvoker` signatures need them; the daemon function
+that implements the resolver is Lane B.
 
-Pure over (profile row as read NOW, catalog as it is NOW). Computed on
-every `execute`, `tool.call`, `search`, `describe`, and
-`catalog.listing` — never cached on the connection, and NEVER captured
-at drive start: what the daemon hands the manager and the invoker is a
-thunk (`() => EffectiveScope`) evaluated on every in-sandbox call and
-on every direct call, so a profile narrowed while a long Code Mode
-drive is running bites on that drive's next call. `callable(name)` is
-true iff the tool exists in the catalog AND (`allow` is `ALL`, or
-contains `name`, or contains `name`'s namespace).
+Resolved fresh on every `execute`, `tool.call`, `search`, `describe`,
+`catalog.listing`, `execution.get`, and `execution.getByRequestKey` —
+never cached on the connection, and NEVER captured at drive start:
+what the daemon hands the manager and the invoker is the RESOLVER,
+awaited on every in-sandbox call and on every direct call, so a
+profile narrowed (or a flag turned off) while a long Code Mode drive
+is running bites on that drive's next call. `permits(p, name)` is true
+iff `projections[p]` is true AND the tool exists in the catalog AND
+(`allow` is `ALL`, or contains `name`, or contains `name`'s namespace).
+
+**Result-access authority:** `execution.get` and
+`execution.getByRequestKey` return a row only when `row.client_id`
+equals the connection's client id (null equals null for the default
+profile); a foreign row answers exactly as a nonexistent one. With
+client-namespaced request keys (§4.1) a foreign key cannot even be
+looked up. `check_execution` on every projection therefore reads only
+the caller's own executions; the operator-facing `approvals` row is
+unchanged and sees all.
 
 Consequences, each pinned (§9):
 
 - a removed tool is uncallable on the next call (#4);
 - a cached advertisement grants nothing (#5, T2);
-- every call checks current authority (#6);
+- every call checks current authority — flag AND grant (#6, #16);
 - upstream growth cannot widen a tool-level entry; a namespace entry
   grows with its namespace BY DEFINITION and the spec says so (#8);
 - a profile can only narrow: the intersection is bounded by `allow`
@@ -401,32 +454,63 @@ Consequences, each pinned (§9):
 
 ### 5.3 Dispatch
 
-- `execute` (Code Mode): refused with `code: "invalid"` when
-  `projections.code` is false. Otherwise as today, except the manager
-  is given a per-drive `scope` (§5.4) so A7 holds.
-- `tool.call`: refused when the requested projection flag is false or
-  `callable(toolName)` is false — refusal reason names the tool, never
-  the profile's other entries (no oracle over the allowlist). Otherwise
-  `manager.startDirect(toolName, input, { requestKey, projection })`.
+- `execute` (Code Mode): refused with `code: "invalid"` when the
+  snapshot's `projections.code` is false. Otherwise as today, with the
+  manager given `{ clientId, projection: "code", scope: resolver }`
+  (§5.4) so A7 holds.
+- `tool.call`: refused when `permits(projection, toolName)` is false —
+  refusal reason names the tool, never the profile's other entries (no
+  oracle over the allowlist). Otherwise
+  `manager.startDirect(toolName, input, { clientId, projection,
+  requestKey, scope: resolver })`, run INSIDE the daemon's per-namespace
+  source lock for the tool's namespace (§5.4, the linearization point).
   Runs OUTSIDE the sandbox queue (D-B1's reasoning: it touches no
   sandbox) but under its own DAEMON-WIDE admission cap,
   `DIRECT_ADMISSION_MAX` (a daemon constant, not client-chosen, not
   per-connection), so the daemon as a whole cannot hold unbounded
   concurrent upstream calls. Over cap → `code: "busy"` (the same code
   `execute` uses) with its own text: "daemon busy: N direct calls in
-  flight (cap M)".
-- **Client budget for `tool.call`:** the server's `deadlineForRequest`
-  gains a `tool.call` arm, `DIRECT_CLIENT_DEADLINE_MS =
-  DIRECT_ADMISSION_DEADLINE_MS + DEFAULT_UPSTREAM_TIMEOUT_MS + 30_000`,
-  so the client budget exceeds the daemon's worst legal answer time
-  (the `server.ts` ordering invariant, ledger L126). Without the arm
-  the 30 s read default would produce false outcome-unknowns on slow
-  but legal calls.
+  flight (cap M)". The slot is held until the drive SETTLES — a
+  timed-out drive still unwinding keeps its slot; it is released in
+  the same `finally` that disposes the upstream session scope.
+- **Direct drive deadline and client budget.** The manager enforces a
+  WHOLE-OPERATION deadline on a direct drive, `DIRECT_DRIVE_BUDGET_MS`
+  (60 s, the same figure as the sandbox wall clock), by its own timer:
+  the invoker's `deadline()` reports the remaining budget, so the
+  upstream call is bounded by `min(ceiling, remaining)`, and a drive
+  whose budget expires while awaiting anything else is settled
+  `failed` with the timeout classification (§7) — the direct arm has
+  no sandbox interrupt, so this timer is its interrupt. The server's
+  `deadlineForRequest` gains a `tool.call` arm,
+  `DIRECT_CLIENT_DEADLINE_MS = DIRECT_ADMISSION_DEADLINE_MS +
+  DIRECT_DRIVE_BUDGET_MS + 30_000` — admission + WHOLE drive + margin,
+  the exact shape of the existing `execute` rule (`server.ts:69-107`,
+  ledger L126). `RESUME_CLIENT_DEADLINE_MS` already covers admission +
+  wall clock + margin and applies to direct resumes unchanged since
+  `DIRECT_ADMISSION_DEADLINE_MS ≤ RESUME_ADMISSION_DEADLINE_MS` (plan
+  pins the inequality).
 - `search` / `describe`: answered from the shared catalog FILTERED by
-  `callable`. A `describe` of an out-of-scope tool returns `null`,
-  indistinguishable from a nonexistent tool.
-- `catalog.listing`: returns the scope's projection flags plus the
-  scoped listing; the server builds `tools/list` from it (§6).
+  the snapshot's `permits(projection, …)` where projection is the one
+  the caller's flag enables (`discovery` for the discovery tools,
+  `code` for in-sandbox use). A `describe` of an out-of-scope tool
+  returns `null`, indistinguishable from a nonexistent tool.
+- `catalog.listing { cursor?: string }`: returns the snapshot's
+  projection flags, the connections listing as today, and — ONLY when
+  `projections.direct` is true — a PAGE of the scoped direct listing:
+  `{ qualifiedName, advertisedName, description, riskClass,
+  inputSchema }` per tool, `DIRECT_LISTING_PAGE` tools per page
+  (constant, 50), with `nextCursor` (an opaque qualified-name
+  watermark). Schemas never travel when direct is off, so a default or
+  Code-Mode-only profile's listing stays as small as today and the
+  IPC frame cap (1 MiB, `frames.ts:23`) cannot be exceeded by catalog
+  growth; a direct listing pages under the cap by construction (the
+  plan pins page-size × max-schema-size < cap, refusing a single tool
+  whose schema alone exceeds the page budget from advertisement, logged).
+  `advertisedName` is computed by the DAEMON over the full catalog
+  (§8.3) — the daemon is the one owner of the mapping; the server never
+  computes names. Pages are consistent because names depend only on
+  the full catalog, not the scope; a catalog change mid-pagination can
+  only make a name unresolvable, which fails closed (§8.3).
 - `approvals.resume`: unchanged wire shape. The daemon reads the row's
   `kind` BEFORE admission: a `code` row is admitted through the sandbox
   queue as today; a `direct` row is admitted under `DIRECT_ADMISSION_MAX`
@@ -454,26 +538,50 @@ is the authority.
 ### 5.4 Execution manager
 
 ```ts
-startDirect(toolName: string, input: unknown,
-  opts?: { requestKey?: string; projection: "direct" | "discovery"; scope?: EffectiveScope }
-): Promise<ExecutionOutcome>;
+startDirect(toolName: string, input: unknown, opts: {
+  clientId: string | null; projection: "direct" | "discovery";
+  requestKey?: string; scope: ScopeResolver;
+}): Promise<ExecutionOutcome>;
+start(code: string, opts?: { limits?; requestKey?;
+  clientId?: string | null; scope?: ScopeResolver }): Promise<ExecutionOutcome>;
+resume(executionId: string, decision: ApprovalDecision,
+  scope: ScopeResolver): Promise<ResumeOutcome>;
 ```
+
+`start` without `clientId`/`scope` (legacy callers, tests) behaves as
+today with the default profile. `resume` ALWAYS takes the resolver:
+the daemon is the only production caller.
+
+**Linearization point (the codex P0 on the generation check):** a
+generation check followed by an upstream call is still a TOCTOU if a
+provision can commit between them — and the invoker awaits the tool,
+connection, credential, and source reads separately (`invoker.ts:111,
+178, 190`). Therefore the DAEMON runs every direct drive —
+`startDirect` and a direct `resume`, from the generation check through
+settle — inside the per-namespace source lock (`source-lock.ts`, the
+promise chain provisioning already uses), so no namespace write can
+interleave with a direct call on that namespace. Cost: a provision of
+a namespace waits behind an in-flight direct call on it (bounded by
+`DIRECT_DRIVE_BUDGET_MS`); rare and acceptable. Code Mode drives are
+NOT serialized against provisioning — a mid-execution catalog change
+for a running program is the previously accepted limit (2026-08-22
+review record) and is unchanged here; the D3 sweep + generation check
+do not apply to code rows because a code row binds no single tool.
 
 Sequence:
 
 1. `requestKey` present → persist-before-run as `start` does; an
    existing row with that key → `conflict` (unchanged semantics, #11).
-2. Persist `{ kind: "direct", status: "running", clientId, call: {
-   toolName, namespace, request: JSON.stringify(input),
+2. Persist `{ kind: "direct", status: "running", clientId, projection,
+   call: { toolName, namespace, request: JSON.stringify(input),
    sourceGeneration } }` BEFORE any upstream contact;
    `sourceGeneration` is read from `sources` for the tool's namespace
    immediately before the put (§4.1).
 3. Build the invoker exactly as `start` does (`makeInvoker` with
-   executionId, deadline, upstream session scope) and call
-   `invoke(toolName, input)` once. The drive deadline is the default
-   wall-clock budget (`DEFAULT_SANDBOX_LIMITS.wallClockMs`, 60 s) —
-   named here because `deadlineFor` is sandbox-shaped and the direct
-   arm computes its own.
+   executionId, deadline, upstream session scope, `projection`, and
+   `scope`) and call `invoke(toolName, input)` once under the
+   `DIRECT_DRIVE_BUDGET_MS` timer (§5.3) — named here because
+   `deadlineFor` is sandbox-shaped and the direct arm computes its own.
 4. Settle through the SAME guarded persistence path (`completed` with
    the result; `failed` with the classified error). The prep window
    (session scope, invoker construction) terminalizes `failed` on any
@@ -497,10 +605,11 @@ Sequence:
    `ConduitCatalogChanged` (`failClaimedResume`), `decisionApplied:
    false`. This runs AFTER the claim, so a provision that commits
    between the sweep and the claim is still caught.
-3. Revalidate the grant: the manager evaluates the CURRENT scope thunk
-   for the row's `clientId` (`scope().callable(call.toolName)`); false →
-   terminalize `failed` with `ConduitScopeRevoked`, `decisionApplied:
-   false`.
+3. Revalidate the grant AND the flag: `(await scope(row.clientId))
+   .permits(row.projection, call.toolName)`; false → terminalize
+   `failed` with `ConduitScopeRevoked`, `decisionApplied: false`. A
+   profile turned off, narrowed, or removed since the pause all land
+   here.
 4. Stage the decision bound to `{ op: "call", toolName: call.toolName,
    request: call.request }`, build the invoker with `decisions`, and
    invoke with `(call.toolName, JSON.parse(call.request))`. The
@@ -512,33 +621,45 @@ Sequence:
    host-side as today.
 5. Settle as in `startDirect`.
 
-**Scope on resume, both kinds:** `resume(executionId, decision,
-scopeFor)` takes a `scopeFor: (clientId: string | null) => () =>
-EffectiveScope` factory from the daemon, rebuilds the thunk from the
-ROW's `clientId`, and threads it into `makeInvoker` and the tool host
-exactly as `start` does. A code row that paused under a narrowed
-profile therefore resumes under that profile, not the full catalog
-(audit P0). Pinned: narrow profile → pause on an allowed tool →
-approve → an out-of-scope call after resume is blocked.
+**Scope on resume, both kinds:** `resume` binds the resolver to the
+ROW's `clientId` and `projection` and threads it into `makeInvoker`
+and the tool host exactly as `start` does. A code row that paused
+under a narrowed profile therefore resumes under that profile, not
+the full catalog (audit P0); a code row whose profile has `code` off
+fails at its first call after resume. Pinned: narrow profile → pause
+on an allowed tool → approve → an out-of-scope call after resume is
+blocked; and flag-only revocation with an unchanged allowlist.
 
-Code Mode (`start`) gains an optional `scope` THUNK: the manager passes
-it to `makeInvoker`, and the tool host it builds is a live filtered
+Code Mode (`start`) gains the optional resolver: the manager passes it
+to `makeInvoker`, and the tool host it builds is a live filtered
 catalog view (`createCatalogToolHost(scopedCatalog, invoke)` where
-`scopedCatalog` consults `scope()` on every `search`/`describe`), so
+`scopedCatalog` awaits one snapshot per `search`/`describe`), so
 in-sandbox discovery cannot see out-of-scope tools and an out-of-scope
 `tools[path]()` is blocked by the invoker at call time.
 
 ### 5.5 Invoker
 
-`CreateToolInvokerOptions` gains `projection: "code" | "direct" |
-"discovery"` (recorded on every Trace row) and `scope?: () =>
-EffectiveScope` (a thunk, evaluated per call — §5.2). Step 1 of
-`runCall` becomes: look up the tool; if `scope` is present and
-`scope().callable(path)` is false, treat exactly as an unknown tool —
+`CreateToolInvokerOptions` gains `projection: Projection` (recorded on
+every Trace row) and `scope?: () => Promise<EffectiveScope>` (the
+resolver already bound to the drive's client id, awaited per call —
+§5.2). Step 1 of `runCall` becomes: look up the tool; if `scope` is
+present and `(await scope()).permits(projection, path)` is false,
+treat exactly as an unknown tool —
 `block` with reason `Tool "<path>" is outside this client's scope.`,
-audited, guest-safe name `ConduitPolicyBlocked`. No other change to the
-pipeline. The §9.2 boundary is untouched: the credential is resolved at
-step 4 as today and never enters any projection's response.
+audited, guest-safe name `ConduitPolicyBlocked`.
+
+**One further host-side change, for §7:** `ConduitCallError` gains a
+host-only field `afterDispatch: boolean` (never crosses into the
+sandbox; guest-safe names unchanged), set `true` by the upstream
+caller on any failure raised AFTER the JSON-RPC request has been
+written to the socket — timeout, connection loss, malformed or capped
+response — and the invoker sets it `true` on a Trace-append failure
+after a successful upstream return. Today the timeout is flattened
+into a plain `ConduitUpstreamError` (`upstream.ts:284`) and the error
+vocabulary has no timeout member (`errors.ts:8`); this field is how
+the manager classifies effect uncertainty WITHOUT parsing messages.
+The §9.2 boundary is untouched: the credential is resolved at step 4
+as today and never enters any projection's response.
 
 ## 6. Approval binding and drift (R1 position)
 
@@ -579,14 +700,20 @@ Error format follows `[Module] Operation failed: reason. Context: {…}`.
   lacks if the response never arrived. Accepted for R1 and stated in
   the direct projection's tool descriptions: reissue-safe writes go
   through `call` with `requestKey` or through Code Mode.
-- **Timeout-unknown.** The upstream caller's `timeout` classification
-  does NOT record whether the request body was sent (`upstream.ts`,
-  `McpClientError("timeout", …)`), so R1 cannot tell a pre-send from a
-  post-send timeout. Conservative rule: EVERY direct-call timeout
-  settles `failed` with the timeout error and a message that names the
-  outcome as unknown ("the upstream may have performed the call"). Never
-  retried by Conduit. Adding a sent marker to the wire layer is a
-  deferred precision improvement, not an R1 requirement.
+- **Post-dispatch failures (timeout, connection loss, malformed or
+  capped response, Trace-append failure after return, drive-budget
+  expiry after dispatch, IPC loss).** Any `ConduitCallError` with
+  `afterDispatch: true` (§5.5) settles the row `failed` with error
+  name `ConduitOutcomeAmbiguous` — the SAME name the crash sweep uses
+  — and a message that names the effect as unknown ("the upstream may
+  have performed the call"). A failure before dispatch settles `failed`
+  under its own classification (the upstream did not run). Never
+  retried by Conduit. A settle-write failure after an upstream return
+  takes the existing M4 path (synthetic `ConduitPersistError`
+  fallback); the drive-budget timer firing while an upstream call is
+  in flight is post-dispatch by definition. IPC loss between daemon
+  and server keeps the server's existing outcome-unknown wording,
+  pointing at `check_execution`.
 - **Outcome-unknown on the IPC hop** (daemon connection lost after
   send): the server's existing wording, verbatim, pointing at
   `check_execution`.
@@ -608,12 +735,22 @@ serve`.
 
 ### 8.2 `tools/list`
 
-Built per request from `catalog.listing` (never cached — T2). The
-`CatalogListing` payload gains `projections` and `tools` (scoped
-qualified names + descriptions + schemas); the client guard already
-tolerates extra fields, and a listing from an OLDER daemon that omits
-them is read as code-only with no direct tools (fail closed, never
-widen).
+Built per request from `catalog.listing` (never cached as AUTHORITY —
+T2), following `nextCursor` across daemon pages and exposing the same
+pagination to the MCP client (`tools/list` `nextCursor` = the daemon
+cursor). The `CatalogListing` payload gains `projections` and the
+paged `tools` (§5.3); the client guard already tolerates extra fields,
+and a listing from an OLDER daemon that omits them is read as
+code-only with no direct tools (fail closed, never widen).
+
+**Name resolution on `tools/call` (Lane C):** the server keeps the
+`advertisedName → qualifiedName` map from the most recent listing it
+built. On a `tools/call` whose name is not a verb: resolve from that
+map; on a miss, fetch a fresh listing once and retry the lookup; still
+a miss → MCP "unknown tool". The resolved QUALIFIED name is what goes
+on `tool.call`, and the daemon re-checks `permits` on it — the server's
+map is a convenience, never authority, so a stale map can only fail
+closed.
 
 | projection flag | tools advertised |
 | --- | --- |
@@ -634,26 +771,40 @@ Qualified names are `namespace.local` with namespace `[a-z0-9_-]+` and
 local rewritten to `[A-Za-z0-9_.]+` at normalize time; the only
 character MCP-side clients (`^[a-zA-Z0-9_-]{1,64}$`) forbid is the dot.
 
-`advertisedName(qualified)`:
-1. replace every `.` with `_`;
-2. if the result exceeds 64 characters: first 55 characters + `_` +
-   the first 8 hex characters of SHA-256 over the qualified name;
-3. collisions are computed over the FULL catalog (never the scope), so
-   a profile change never renames a tool; every member of a colliding
-   set takes the step-2 hash suffix;
-4. the five reserved verb names — `execute`, `check_execution`,
-   `search`, `describe`, `call` — are members of EVERY collision set:
-   a catalog tool whose step-1 name equals a verb (namespace `check`,
-   tool `execution` → `check_execution`) takes the hash suffix, so a
-   verb is never shadowed and `tools/call` dispatch, which matches verb
-   names first, cannot be hijacked by a catalog entry.
+`advertiseNames(fullCatalog) → Map<qualified, advertised>` — computed
+by the DAEMON over the FULL catalog (never the scope), so a profile
+change never renames a tool:
 
-The daemon builds `advertised → qualified` from the catalog and
-resolves a `tools/call` name by exact match against that map — never by
-parsing. Accepted limit, documented: adding a tool that collides with
-an existing advertised name renames the existing one on the next
-listing; `listChanged` stays `false` and the cached list was never
-authority.
+1. base name: replace every `.` with `_`; if longer than 64 characters,
+   first 55 characters + `_` + the first 8 hex characters of SHA-256
+   over the qualified name;
+2. a name is COLLIDING if it equals another tool's current name or one
+   of the five reserved verbs (`execute`, `check_execution`, `search`,
+   `describe`, `call`);
+3. every colliding tool takes the hash form (first 55 + `_` + 8 hex);
+4. repeat step 2 over the FINAL names — a hash form can equal another
+   tool's base name (codex reproduced `a.b_c`, `a.b.c`, `a.b_c_5b8f934a`
+   all landing on `a_b_c_5b8f934a`); a tool that still collides after
+   the hash form is EXCLUDED from advertisement, deterministically
+   (both members of the residual set), with one log line naming them.
+   Excluded tools stay reachable through discovery `call` and Code
+   Mode. The map therefore never overwrites an entry, and uniqueness
+   of FINAL names is validated, not assumed.
+
+The map entry is resolved by exact match — never by parsing. Accepted
+limit, documented: adding a tool that collides with an existing
+advertised name renames the existing one on the next listing;
+`listChanged` stays `false` and the cached list was never authority.
+
+**Advertisement eligibility (schema envelope):** the normalizer stores
+whatever schema record the upstream declared (`normalize/mcp.ts:24`),
+including `{}` or non-object schemas, while the MCP tool contract
+requires an object `inputSchema` (`server.ts:246`). A tool whose stored
+`inputSchema` is not `{ "type": "object", … }` is NOT advertised on
+the direct projection (logged once per listing, deterministic), and
+stays reachable through discovery `call` and Code Mode, whose argument
+handling is unchanged. This is envelope validation of the
+ADVERTISEMENT, not argument validation (§5.1 parity stands).
 
 ### 8.4 Discovery tools
 
@@ -679,8 +830,9 @@ and the spec says so.
 
 ### 8.6 Responses
 
-Same envelope family as `execute`: completed → the redacted result as
-content; paused → the pending shape with `executionId` and the human
+Same envelope family as `execute`: completed → the upstream result as
+the invoker returned it (§4.1 status table; not redacted — Trace is
+what is redacted) as content; paused → the pending shape with `executionId` and the human
 step spelled out; failed → the guest-safe error; outcome-unknown → the
 existing wording. The client polls `check_execution` after a pause; no
 push channel in R1.
@@ -710,6 +862,11 @@ approval verb; `approvals.resume` remains reachable only through the
 | 13 | mid-session narrowing bites on the same connection; no re-handshake re-widens (D4) | `daemon/conduitd.test.ts` / `client.test.ts` real processes (the PR #53 pattern) |
 | 14 | namespace write invalidates paused direct calls; resume fails closed re-approve (D3) — including a provision that commits AFTER the sweep but BEFORE the claim (generation check), and remove-then-re-add | `manager.test.ts` (generation mismatch after claim → `ConduitCatalogChanged`, `decisionApplied:false`; re-add does not revive) + `daemon/provision.test.ts` (sweep runs after `provisionSource` commit, inside the lock) + `source.remove` test |
 | 15 | a Code Mode row that paused under a narrowed profile resumes under that profile (audit P0) | `manager.test.ts` (narrow → pause on allowed tool → approve → out-of-scope call blocked) |
+| 16 | a projection FLAG turned off revokes like a removed tool: a running program's next call and a paused direct call's resume both fail closed with the allowlist unchanged (codex P0) | `manager.test.ts` + `daemon/conduitd.test.ts` |
+| 17 | a direct drive is linearized against namespace writes: a provision issued mid-drive commits only after the drive settles, and a generation bump after remove+re-add (incl. deleting the current maximum / every source) never revives a paused direct row (codex P0 ×2) | `daemon/provision.test.ts` (lock interleaving) + `sqlite.test.ts` (sequence never reused) |
+| 18 | result access is per client: `execution.get`/`getByRequestKey` answer not-found for a foreign row; request keys conflict only within one client (codex P1) | `daemon/conduitd.test.ts` + `manager.test.ts` |
+| 19 | every new row fails closed on an OLDER build: `code` holds the sentinel, the program lives in `program` (codex P0) | `sqlite.test.ts` (hydrate: program present → used; sentinel in `code`) + a legacy-hydrator simulation |
+| 20 | the direct listing pages under the IPC frame cap; schemas never travel when direct is off; non-object schemas and residual name collisions are excluded from advertisement, deterministically (codex P1 ×3) | `daemon/conduitd.test.ts` (pagination, cap) + `server.test.ts` (name algorithm incl. the reproduced triple) |
 
 Three ambiguity invariants (§7): crash-before-persist (sweep test over a
 `running` direct row, Lane A); keyless-upstream documented limit (Lane
@@ -723,8 +880,11 @@ and the read-side kind guard (corrupt row refused).
 ### 9.2 D5 harness
 
 `packages/sdk/src/execution/projection-harness.test.ts` runs #2, #10,
-#11 once each over `["code", "direct"]` using one fixture set. A
-per-projection copy of any of these is a review REJECT.
+#11 once each over the valid `(kind, projection)` pairs —
+`("code","code")`, `("direct","direct")`, `("direct","discovery")` —
+using one fixture set, so discovery's distinct flag, request-key
+surface, and Trace value are exercised, not only the execution kind.
+A per-projection copy of any of these is a review REJECT.
 
 ### 9.3 Ledger gap fixes (G1–G3; land with the spec commit)
 
@@ -748,17 +908,23 @@ Three lanes, each its own PR, each load-bearing (full gauntlet,
 explainer + quiz, human-named merge):
 
 1. **Lane A — store + manager.** §4 (all columns incl. `client_id`,
-   `sources.generation`), §5.4, §5.5, the `EffectiveScope` type, D5
-   harness, ambiguity invariants (manager side), rows #1–#3, #9 (unit),
-   #15, G1–G3. No wire change; `serve` behaviour unchanged.
+   `projection`, `program`, `source_generations`), §5.4, §5.5 (incl.
+   `afterDispatch`), the `EffectiveScope`/`ScopeResolver` types,
+   client-namespaced request keys, D5 harness, ambiguity invariants
+   (manager side), rows #1–#3, #9 (unit), #15, #16 (manager half),
+   #17 (sequence half), #18 (manager half), #19, G1–G3. No wire
+   change; `serve` behaviour unchanged.
 2. **Lane B — daemon + profiles + admin.** §5.1–5.3 (`tool.call`,
-   `clientId` on handshake, `describe.includeSchemas`, `admin` row,
-   direct admission cap, resume routing by kind, D3 sweep placement),
-   `conduit profiles`, `conduit remove-mcp`, real-process tests
-   #4/#5 (RPC level)/#6/#13/#14.
-3. **Lane C — MCP surface.** §8, `--client`, `DIRECT_CLIENT_DEADLINE_MS`,
-   rows #7, #12, the advertised-name variant of #5, the description
-   statement for the keyless limit.
+   `clientId` on handshake, `describe.includeSchemas`, paged
+   `catalog.listing` with daemon-computed `advertisedName`, `admin`
+   row, direct admission cap + drive budget, source-lock linearization,
+   resume routing by kind, D3 sweep placement, result-access
+   authority), `conduit profiles`, `conduit remove-mcp`, real-process
+   tests #4/#5 (RPC level)/#6/#13/#14/#16/#17/#18/#20 (daemon half).
+3. **Lane C — MCP surface.** §8, `--client`, `DIRECT_CLIENT_DEADLINE_MS`
+   arm, paginated `tools/list`, server-side name map + one-refetch
+   resolution, rows #7, #12, #20 (name algorithm), the advertised-name
+   variant of #5, the description statement for the keyless limit.
 
 Buildable in that order: no lane depends on a later one (audit
 confirmed after the Lane assignments above).
@@ -771,7 +937,9 @@ regenerated per commit · agent never installs.
 ## 11. Open items handed to the plan
 
 - `DIRECT_ADMISSION_MAX` value (daemon-wide; recommend 4, same order as
-  the sandbox queue cap) and `DIRECT_ADMISSION_DEADLINE_MS`.
+  the sandbox queue cap), `DIRECT_ADMISSION_DEADLINE_MS` (must be ≤
+  `RESUME_ADMISSION_DEADLINE_MS`, pinned), `DIRECT_LISTING_PAGE` (50)
+  and the per-page byte budget under the 1 MiB frame cap.
 - Whether `profile.set` validates that every `allow` entry currently
   exists in the catalog (recommend: warn, do not refuse — a profile may
   be written before its source is added).
@@ -818,3 +986,26 @@ regenerated per commit · agent never installs.
   commit-then-refresh order; sweep has no kind filter; no MCP name
   constraint enforced anywhere; `--client` threading path; listing
   payload tolerates extras; G1/G2 targets are the named tests.
+- 2026-09-05 — **codex full cross-model pass on rev 3** (4 P0 / 8 P1 /
+  2 P2, NOT CONVERGED; all fourteen adjudicated IN SCOPE — none is a
+  documented accepted limit — and folded): P0 generation check still a
+  TOCTOU → direct drives linearized under the per-namespace source lock
+  (§5.4); P0 `MAX(generation)` reusable → `source_generations`
+  AUTOINCREMENT sequence (§4.1a); P0 flag revocation inert → persisted
+  `projection` + `permits(projection, tool)` everywhere (§4.1, §5.2);
+  P0 downgrade left narrowed code rows executable → sentinel in `code`
+  for every new row, program in `program` (§4.1). P1: sync/async scope
+  contract → `ScopeResolver` snapshot, compilable signatures (§5.2,
+  §5.4); duplicate FINAL advertised names → iterate-and-exclude
+  algorithm (§8.3); name-map owner unassigned → daemon computes,
+  server resolves with one refetch (§5.3, §8.2); cross-profile result
+  reads → per-client result access + client-namespaced request keys
+  (§4.1, §5.2); non-object stored schemas → advertisement eligibility
+  (§8.3); listing vs 1 MiB frame cap → paged listing, schemas only
+  when direct is on (§5.3); timeout/post-dispatch classification →
+  host-only `afterDispatch` + `ConduitOutcomeAmbiguous` (§5.5, §7);
+  client deadline ≤ drive budget → whole-drive timer + admission +
+  drive + margin (§5.3). P2: "redacted result" wording corrected
+  (§4.1, §8.6); harness over `(kind, projection)` pairs (§9.2). Rows
+  #16–#20 added. Confirming re-run follows per the
+  adversarial-convergence rule.
