@@ -86,7 +86,17 @@ async function main() {
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
   });
 
-  const outcome = await manager.resume(executionId, { kind: "approve" });
+  // An approval is for ONE pending call (spec §5.5): name the call this
+  // execution is paused on, exactly as `conduit approvals approve` reads it
+  // off the queue. No pending call → the same conflict exit as a stale id.
+  const pending = (await store.executions.get(executionId))?.pausedOn;
+  if (pending === undefined) {
+    console.error(
+      `[ApproveDemo] conflict: execution ${executionId} has no pending approval (not paused, or not found).`,
+    );
+    process.exit(1);
+  }
+  const outcome = await manager.resume(executionId, { kind: "approve" }, pending.callId);
   console.error(`[ApproveDemo] outcome: ${outcome.status}`);
 
   if (outcome.status === "conflict" || outcome.status === "failed") {

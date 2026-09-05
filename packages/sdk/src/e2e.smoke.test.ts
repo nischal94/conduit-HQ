@@ -398,7 +398,11 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     expect(pausedJournal).toHaveLength(0);
 
     // Resume with approve → the approved call runs LIVE and completes.
-    const resumed = await manager.resume(managerExecId, { kind: "approve" });
+    const resumed = await manager.resume(
+      managerExecId,
+      { kind: "approve" },
+      (await manager.get(managerExecId))?.pausedOn?.callId ?? "no-pending-call",
+    );
     expect(resumed.status).toBe("completed");
     if (resumed.status === "completed") {
       expect(resumed.value).toEqual({ deleted: ISSUES_RESULT });

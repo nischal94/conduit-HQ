@@ -157,6 +157,8 @@ export interface DaemonStopPayload {
  */
 export interface PausedListRow {
   executionId: string;
+  /** The pending call this row is waiting on; `approvals.resume` must name it. */
+  callId: string;
   startedAt: number;
   toolName: string;
   reason: string;
@@ -218,6 +220,7 @@ export function pausedToListRow(execution: Execution): PausedListRow | undefined
   if (pausedOn === undefined) return undefined;
   return {
     executionId: execution.id,
+    callId: pausedOn.callId,
     startedAt: execution.startedAt,
     toolName: pausedOn.toolName,
     reason: pausedOn.reason,

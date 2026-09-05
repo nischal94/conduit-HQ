@@ -464,6 +464,7 @@ describe("createConduitMcpServer", () => {
         kind: "approvals.resume",
         executionId: "e",
         decision: "approve",
+        callId: "c1",
       }),
     ).toBe(RESUME_CLIENT_DEADLINE_MS);
     expect(RESUME_CLIENT_DEADLINE_MS).toBeGreaterThan(READ_DEADLINE_MS);

@@ -46,8 +46,13 @@ export interface ExecutionManager {
     code: string,
     opts?: { limits?: Partial<SandboxLimits>; requestKey?: string },
   ): Promise<ExecutionOutcome>;
-  /** Resume a paused execution after a human decision. */
-  resume(executionId: string, decision: ApprovalDecision): Promise<ResumeOutcome>;
+  /**
+   * Resume a paused execution after a human decision on ONE pending call.
+   * `callId` is the `PendingApproval.callId` the human saw; if the execution
+   * is no longer paused on that call (already decided, or paused again on a
+   * later call) the resume is a `conflict`, never a decision on another call.
+   */
+  resume(executionId: string, decision: ApprovalDecision, callId: string): Promise<ResumeOutcome>;
   /** Inspect the persisted execution (CLI / API surface). */
   get(executionId: string): Promise<Execution | undefined>;
 }
@@ -698,10 +703,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       }
     },
 
-    async resume(executionId, decision) {
-      // FIRST: atomic paused→running claim (design F4). Lose → conflict no-op.
+    async resume(executionId, decision, callId) {
+      // FIRST: atomic paused→running claim (design F4), bound to the ONE
+      // pending call the decision is for. Lose → conflict no-op — including
+      // when the execution is paused again on a LATER call than the one
+      // this decision names.
       const resumeAttemptId = newId();
-      const won = await deps.store.executions.claimForResume(executionId, resumeAttemptId);
+      const won = await deps.store.executions.claimForResume(executionId, resumeAttemptId, callId);
       if (!won) {
         return { status: "conflict", executionId, decisionApplied: false };
       }

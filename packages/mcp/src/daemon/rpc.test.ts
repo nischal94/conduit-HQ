@@ -28,11 +28,26 @@ describe("decodeRequest", () => {
     });
     expect(decodeRequest({ kind: "approvals.list" })).toEqual({ kind: "approvals.list" });
     expect(
-      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "approve" }),
-    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: "call_1",
+      }),
+    ).toEqual({
+      kind: "approvals.resume",
+      executionId: "e1",
+      decision: "approve",
+      callId: "call_1",
+    });
     expect(
-      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "deny" }),
-    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "deny" });
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "deny",
+        callId: "call_1",
+      }),
+    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "deny", callId: "call_1" });
     expect(
       decodeRequest({
         kind: "source.provision",
@@ -144,7 +159,25 @@ describe("decodeRequest", () => {
     expect(() => decodeRequest({ kind: "search", query: 42 })).toThrow();
     expect(() => decodeRequest({ kind: "describe", toolName: null })).toThrow();
     expect(() =>
-      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "maybe" }),
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "maybe",
+        callId: "call_1",
+      }),
+    ).toThrow();
+    // INVARIANT §5.5: an approval names the pending call it approves — a
+    // resume without a callId is refused, never bound to "whatever is paused".
+    expect(() =>
+      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "approve" }),
+    ).toThrow();
+    expect(() =>
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: 7,
+      }),
     ).toThrow();
     expect(() => decodeRequest({ kind: "source.revalidate", namespace: 5 })).toThrow();
   });

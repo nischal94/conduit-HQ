@@ -299,8 +299,13 @@ const createRuntime = pauseExecute
           // test reads back; the TTL is short so it genuinely lapses.
           start: async (code: string) => {
             const id = `exec_paused_${Date.now()}`;
+            // A COMPLETE PendingApproval, as the real manager writes one: the
+            // resume path binds to `callId` (spec §5.5), so a fixture row
+            // without it would be un-resumable rather than merely paused.
             const pausedOn = {
+              callId: `call_${id}`,
               toolName: "github.delete_repo",
+              input: {},
               reason: "policy requires approval",
               expiresAt: Date.now() + approvalTtlMs,
             };

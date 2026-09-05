@@ -269,9 +269,36 @@ export async function runDecide(
     return { exitCode: 1 };
   }
 
+  // An approval is for ONE pending call (spec §5.5), so the request names
+  // the call, not just the execution: read the queue and take the call id
+  // of the row the operator is deciding on. Without this, a program that
+  // was approved, ran on, and paused again could be approved a second time
+  // by a queued duplicate — a call no human ever looked at.
+  const listed = await ask(deps, { kind: "approvals.list" }, kind);
+  if (!listed.ok) {
+    deps.stderr(listed.line);
+    return { exitCode: listed.exitCode };
+  }
+  const row = listed.payload.find((candidate) => candidate.executionId === executionId);
+  if (row === undefined) {
+    // Nothing pending for this execution — already decided, expired and
+    // swept, or never paused. The SAME outcome the daemon would report for
+    // a resume that finds no paused row, so the operator sees one message
+    // for one situation whichever side detects it first.
+    deps.stdout("conflict\n");
+    deps.stderr(
+      `[conduit approvals] ${kind}: execution ${executionId} was not in a resumable (paused) state.\n`,
+    );
+    return { exitCode: 1 };
+  }
+
   // The daemon drives the resume, through the one long-lived runtime it
   // built at startup (spec §2.1).
-  const answer = await ask(deps, { kind: "approvals.resume", executionId, decision: kind }, kind);
+  const answer = await ask(
+    deps,
+    { kind: "approvals.resume", executionId, decision: kind, callId: row.callId },
+    kind,
+  );
   if (!answer.ok) {
     deps.stderr(answer.line);
     return { exitCode: answer.exitCode };

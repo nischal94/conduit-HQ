@@ -161,7 +161,9 @@ function realDaemon(opts: {
         allowPrivateEgress: opts.allowPrivateEgress ?? false,
       });
       return result(
-        resumeToPayload(await manager.resume(request.executionId, { kind: request.decision })),
+        resumeToPayload(
+          await manager.resume(request.executionId, { kind: request.decision }, request.callId),
+        ),
       );
     }
     throw new Error(`[approvals.test] unexpected request kind: ${request.kind}`);
@@ -372,6 +374,28 @@ describe("conduit approvals approve|deny — real runtime", () => {
     expect(row?.status).toBe("completed");
   });
 
+  it("INVARIANT §5.5: approve names the pending call it approves — the resume request carries the listed row's callId", async () => {
+    await setup();
+    const executionId = await pauseOne();
+    const pendingCallId = (await store.executions.get(executionId))?.pausedOn?.callId;
+    expect(typeof pendingCallId).toBe("string");
+
+    const inner = makeDeps({ store, allowPrivateEgress: true, live: true });
+    let captured: RpcRequest | undefined;
+    const deps = {
+      ...inner,
+      daemon: async (request: RpcRequest) => {
+        if (request.kind === "approvals.resume") captured = request;
+        return inner.daemon(request);
+      },
+    };
+
+    const result = await runDecide("approve", executionId, deps);
+    expect(result.exitCode).toBe(0);
+    expect(captured?.kind).toBe("approvals.resume");
+    expect(captured?.kind === "approvals.resume" ? captured.callId : undefined).toBe(pendingCallId);
+  });
+
   it("INVARIANT /cli deny-verb-truth: a REAL applied deny prints 'denied' and exits 0 — the operator's verb succeeded, no tool call", async () => {
     await setup();
     const executionId = await pauseOne();
@@ -482,8 +506,23 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
    * a projection that stopped carrying `decisionApplied` would break them.
    */
   function depsWithOutcome(outcome: ResumeOutcome) {
+    // `approve|deny` reads the queue first to learn the pending call's id
+    // (spec §5.5), so the double answers `approvals.list` with one row for
+    // the execution under test and everything else with the outcome.
     return makeDeps({
-      daemon: async () => result(resumeToPayload(outcome)),
+      daemon: async (request) =>
+        request.kind === "approvals.list"
+          ? result([
+              {
+                executionId: outcome.executionId,
+                callId: "call_double",
+                startedAt: 0,
+                toolName: "t",
+                reason: "r",
+                expiresAt: Number.MAX_SAFE_INTEGER,
+              },
+            ])
+          : result(resumeToPayload(outcome)),
     });
   }
 
@@ -766,7 +805,16 @@ describe("conduit approvals — daemon transport answers", () => {
       daemon: async (request) => {
         seen.push(request.kind);
         return request.kind === "approvals.list"
-          ? result([])
+          ? result([
+              {
+                executionId: "x",
+                callId: "call_x",
+                startedAt: 0,
+                toolName: "t",
+                reason: "r",
+                expiresAt: Number.MAX_SAFE_INTEGER,
+              },
+            ])
           : result(
               resumeToPayload({ status: "conflict", executionId: "x", decisionApplied: false }),
             );

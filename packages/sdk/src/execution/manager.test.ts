@@ -23,6 +23,18 @@ import { createInMemoryApprovalDecisions } from "./decisions.js";
 import { createExecutionManager, type ExecutionManagerDeps } from "./manager.js";
 
 /**
+ * The callId a resume must name (spec §5.5: an approval binds to ONE pending
+ * call). Read from the persisted row, exactly as the CLI reads it from the
+ * approvals list. Tests that deliberately break `get` pass a literal instead.
+ */
+async function pendingCallOf(
+  manager: { get(id: string): Promise<Execution | undefined> },
+  executionId: string,
+): Promise<string> {
+  return (await manager.get(executionId))?.pausedOn?.callId ?? "no-pending-call";
+}
+
+/**
  * §5.5 execution-manager invariant + behavior suite. Composes the REAL stack
  * across its seams the way the product will (mirrors e2e.smoke.test.ts): an
  * MCP source normalized → persisted to SQLite → catalog rehydrated → policy +
@@ -325,7 +337,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(JSON.parse(journalRows[0]?.request ?? "{}").path).toBe("github.list_issues");
 
     // Resume with approve → the paused call runs live, execution completes.
-    const outcome = await manager.resume(id, { kind: "approve" });
+    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("completed");
     if (outcome.status === "completed") {
       expect(outcome.value).toEqual({
@@ -362,7 +374,11 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       return;
     }
 
-    const outcome = await manager.resume(first.executionId, { kind: "deny" });
+    const outcome = await manager.resume(
+      first.executionId,
+      { kind: "deny" },
+      await pendingCallOf(manager, first.executionId),
+    );
     expect(outcome.status).toBe("completed");
     if (outcome.status === "completed") {
       expect(outcome.value).toEqual({ blocked: true, name: "ConduitPolicyBlocked" });
@@ -390,13 +406,54 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Two concurrent approve-resumes: the atomic claim (F4) guarantees exactly
     // one drives; the other is a no-op conflict.
     const [a, b] = await Promise.all([
-      manager.resume(id, { kind: "approve" }),
-      manager.resume(id, { kind: "approve" }),
+      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
+      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
     ]);
     const statuses = [a.status, b.status].sort();
     expect(statuses).toEqual(["completed", "conflict"]);
 
     // The approved side effect executed EXACTLY once despite two resumes.
+    expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(1);
+  });
+
+  it("INVARIANT §5.5: an approval binds to ONE pending call — a stale duplicate approval cannot approve a LATER pause of the same program", async () => {
+    const h = await makeHarness();
+    active = h;
+    const manager = createExecutionManager(h.deps);
+
+    // Two approval gates in one program: approving the first pause drives the
+    // program straight into the second.
+    const code = `
+      await tools.github.create_issue({ title: "first" });
+      await tools.github.create_issue({ title: "second" });
+      return "done";
+    `;
+    const first = await manager.start(code);
+    expect(first.status).toBe("paused");
+    if (first.status !== "paused") {
+      return;
+    }
+    const id = first.executionId;
+    const firstCallId = first.pending.callId;
+
+    // The operator approves pause A; the program reaches pause B.
+    const afterFirst = await manager.resume(id, { kind: "approve" }, firstCallId);
+    expect(afterFirst.status).toBe("paused");
+    if (afterFirst.status !== "paused") {
+      return;
+    }
+    expect(afterFirst.pending.callId).not.toBe(firstCallId);
+
+    // A queued DUPLICATE approval of pause A arrives now. It must NOT approve
+    // pause B: the execution is paused, but not on the call that was approved.
+    const stale = await manager.resume(id, { kind: "approve" }, firstCallId);
+    expect(stale.status).toBe("conflict");
+    expect(stale.decisionApplied).toBe(false);
+
+    // Pause B is still waiting on a human, and only the first call ran upstream.
+    expect((await h.deps.store.executions.get(id))?.pausedOn?.callId).toBe(
+      afterFirst.pending.callId,
+    );
     expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(1);
   });
 
@@ -440,7 +497,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       }),
     );
 
-    const outcome = await manager.resume(id, { kind: "approve" });
+    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("completed");
     if (outcome.status === "completed") {
       const value = outcome.value as { first: string; created: unknown };
@@ -485,7 +542,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(rows[0]?.request).toBe(JSON.stringify({ path: "github.create_issue" }));
 
     // Resume(approve) must COMPLETE — not die with NondeterministicExecutionError.
-    const outcome = await manager.resume(id, { kind: "approve" });
+    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("completed");
     if (outcome.status === "completed") {
       expect(outcome.value).toEqual({
@@ -520,7 +577,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       JSON.stringify({ path: "github.create_issue", includeSchemas: true }),
     );
 
-    const outcome = await manager.resume(id, { kind: "approve" });
+    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("completed");
     if (outcome.status === "completed") {
       const value = outcome.value as { hasSchema: boolean };
@@ -548,7 +605,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(p1.pending.input).toEqual({ title: "one" });
     const id = p1.executionId;
 
-    const p2 = await manager.resume(id, { kind: "approve" });
+    const p2 = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(p2.status).toBe("paused");
     if (p2.status !== "paused") {
       return;
@@ -560,7 +617,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const rows = await h.store.replayJournal.listByExecution(id);
     expect(rows.map((r) => r.op)).toEqual(["call"]);
 
-    const done = await manager.resume(id, { kind: "approve" });
+    const done = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(done.status).toBe("completed");
     if (done.status === "completed") {
       expect(done.value).toEqual({
@@ -589,7 +646,11 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     }
     // Advance the clock beyond expiresAt.
     clock = first.pending.expiresAt + 1;
-    const outcome = await manager.resume(first.executionId, { kind: "approve" });
+    const outcome = await manager.resume(
+      first.executionId,
+      { kind: "approve" },
+      await pendingCallOf(manager, first.executionId),
+    );
     expect(outcome.status).toBe("expired");
     // The approved call was never made — expiry short-circuits before re-drive.
     expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(0);
@@ -693,7 +754,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Resume with approve. The staged approve is bound to create_issue (A); the
     // first live call on replay is delete_repo (B) → identity mismatch → TERMINAL
     // replay-divergence. The guest CANNOT catch-and-continue; the execution fails.
-    const outcome = await manager.resume(id, { kind: "approve" });
+    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitReplayDivergence");
@@ -709,7 +770,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const settled = await manager.get(id);
     expect(settled?.status).toBe("failed");
     expect(settled?.pausedOn).toBeUndefined();
-    const retry = await manager.resume(id, { kind: "approve" });
+    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(retry.status).toBe("conflict");
   });
 
@@ -763,7 +824,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
 
     // Resume with approve: create_issue reaches upstream (side effect fires),
     // then its journal append throws → outcome-ambiguous terminal failed.
-    const outcome = await manager.resume(id, { kind: "approve" });
+    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(poisoned).toBe(true);
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
@@ -777,7 +838,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const settled = await manager.get(id);
     expect(settled?.status).toBe("failed");
     expect(settled?.pausedOn).toBeUndefined();
-    const retry = await manager.resume(id, { kind: "approve" });
+    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(retry.status).toBe("conflict");
     expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(1);
   });
@@ -830,7 +891,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     });
 
     // Resume must NOT swallow the throw, but it MUST finalize the row first.
-    await expect(manager.resume(id, { kind: "approve" })).rejects.toThrow("corrupt replay state");
+    await expect(
+      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
+    ).rejects.toThrow("corrupt replay state");
     expect(calls).toBe(1);
 
     // The invariant: the row is terminal `failed`, NOT a stranded `running`.
@@ -843,7 +906,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // `running`), a second resume returns `conflict` (claimForResume finds no
     // `paused` row) rather than re-driving — the execution is settled, not
     // half-transitioned.
-    const second = await manager.resume(id, { kind: "approve" });
+    const second = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(second.status).toBe("conflict");
   });
 
@@ -921,7 +984,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Resume: claimForResume flips paused→running, the sandbox settles
     // `completed`, then finish's put() throws. The error may surface (throw is
     // acceptable) — what is NOT acceptable is a silently-stranded `running`.
-    await expect(manager.resume(id, { kind: "approve" })).rejects.toThrow();
+    await expect(manager.resume(id, { kind: "approve" }, pausedOn.callId)).rejects.toThrow();
     expect(faults).toBe(1);
 
     // The invariant: the row is NOT a stranded `running` that looks
@@ -934,7 +997,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Consequence proof: a later resume is a no-op conflict (no `paused` row to
     // claim) — the execution is settled, not half-transitioned into a
     // permanently un-resumable `running`.
-    const retry = await manager.resume(id, { kind: "approve" });
+    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(retry.status).toBe("conflict");
   });
 
@@ -1004,7 +1067,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const manager = createExecutionManager(makeStubDeps(wrappedStore, neverSandbox));
 
     // The fault surfaces (not swallowed), but the row is finalized first.
-    await expect(manager.resume(id, { kind: "approve" })).rejects.toThrow(/not valid JSON/);
+    await expect(manager.resume(id, { kind: "approve" }, "call_1")).rejects.toThrow(
+      /not valid JSON/,
+    );
 
     // Invariant: terminal `failed`, NOT a stranded `running`. Read via the REAL
     // store (the wrapped get throws).
@@ -1013,7 +1078,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(after?.pausedOn).toBeUndefined();
 
     // Consequence: a later resume is a no-op conflict (no `paused` row to claim).
-    const retry = await manager.resume(id, { kind: "approve" });
+    const retry = await manager.resume(id, { kind: "approve" }, "call_1");
     expect(retry.status).toBe("conflict");
   });
 
@@ -1059,7 +1124,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     };
     const manager = createExecutionManager(makeStubDeps(wrappedStore, neverSandbox));
 
-    const outcome = await manager.resume(id, { kind: "approve" });
+    // The claim runs against the REAL row (callId "c1"); only the wrapped
+    // `get` afterwards strips pausedOn — the corrupt state under test.
+    const outcome = await manager.resume(id, { kind: "approve" }, "c1");
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitInternalError");
@@ -1071,7 +1138,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const after = await store.executions.get(id);
     expect(after?.status).toBe("failed");
     expect(after?.pausedOn).toBeUndefined();
-    const retry = await manager.resume(id, { kind: "approve" });
+    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(retry.status).toBe("conflict");
   });
 
@@ -1246,9 +1313,13 @@ describe("outcome persistence (mcp design M4)", () => {
     const resumeDeps: ExecutionManagerDeps = { ...deps, store: faultyStore };
     const resumeManager = createExecutionManager(resumeDeps);
 
-    await expect(resumeManager.resume(paused.executionId, { kind: "approve" })).rejects.toThrow(
-      "[test] simulated executions.put fault on the settle write",
-    );
+    await expect(
+      resumeManager.resume(
+        paused.executionId,
+        { kind: "approve" },
+        await pendingCallOf(resumeManager, paused.executionId),
+      ),
+    ).rejects.toThrow("[test] simulated executions.put fault on the settle write");
     const row = await h.store.executions.get(paused.executionId);
     expect(row?.status).toBe("failed");
     expect(row?.error?.name).toBe("ConduitPersistError");
@@ -1269,7 +1340,11 @@ describe("outcome persistence (mcp design M4)", () => {
       return;
     }
     clock = paused.pending.expiresAt + 1;
-    await manager.resume(paused.executionId, { kind: "approve" });
+    await manager.resume(
+      paused.executionId,
+      { kind: "approve" },
+      await pendingCallOf(manager, paused.executionId),
+    );
     const row = await h.store.executions.get(paused.executionId);
     expect(row?.status).toBe("expired");
     expect(row?.result).toBeUndefined();
@@ -1492,7 +1567,11 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
 
     expect(events).toEqual(["created", "disposed"]);
 
-    const resumed = await manager.resume(first.executionId, { kind: "approve" });
+    const resumed = await manager.resume(
+      first.executionId,
+      { kind: "approve" },
+      await pendingCallOf(manager, first.executionId),
+    );
     expect(resumed.status).toBe("completed");
 
     // A SECOND scope was created for the resume — not a reuse of the first —
@@ -1572,7 +1651,11 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
     };
     const manager = createExecutionManager(deps);
     const resumed = await manager
-      .resume(first.executionId, { kind: "approve" })
+      .resume(
+        first.executionId,
+        { kind: "approve" },
+        await pendingCallOf(manager, first.executionId),
+      )
       .then((r) => ({ kind: "resolved" as const, r }))
       .catch((e) => ({ kind: "threw" as const, e }));
     const row = await h.store.executions.get(first.executionId);
@@ -1641,7 +1724,7 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
     const manager = createExecutionManager(h.deps);
     const id = await pauseOnCreateIssue(manager);
 
-    const outcome = await manager.resume(id, { kind: "approve" });
+    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("completed");
     expect(outcome.decisionApplied).toBe(true);
   });
@@ -1662,7 +1745,7 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
     `,
     );
 
-    const outcome = await manager.resume(id, { kind: "deny" });
+    const outcome = await manager.resume(id, { kind: "deny" }, await pendingCallOf(manager, id));
     // The drive's own outcome is completed (guest handled the denial) — but the
     // deny itself LANDED, and the outcome says so independently of drive status.
     expect(outcome.status).toBe("completed");
@@ -1676,7 +1759,7 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
     const manager = createExecutionManager(h.deps);
     const id = await pauseOnCreateIssue(manager);
 
-    const outcome = await manager.resume(id, { kind: "deny" });
+    const outcome = await manager.resume(id, { kind: "deny" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitPolicyBlocked");
@@ -1691,8 +1774,8 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
     const id = await pauseOnCreateIssue(manager);
 
     const [a, b] = await Promise.all([
-      manager.resume(id, { kind: "approve" }),
-      manager.resume(id, { kind: "approve" }),
+      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
+      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
     ]);
     const loser = a.status === "conflict" ? a : b;
     expect(loser.status).toBe("conflict");
@@ -1713,7 +1796,11 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       return;
     }
     clock = first.pending.expiresAt + 1;
-    const outcome = await manager.resume(first.executionId, { kind: "deny" });
+    const outcome = await manager.resume(
+      first.executionId,
+      { kind: "deny" },
+      await pendingCallOf(manager, first.executionId),
+    );
     expect(outcome.status).toBe("expired");
     expect(outcome.decisionApplied).toBe(false);
   });
@@ -1740,7 +1827,7 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       pausedOn: { ...persisted.pausedOn, toolName: "github.create_issue", input: { title: "x" } },
     });
 
-    const outcome = await manager.resume(id, { kind: "deny" });
+    const outcome = await manager.resume(id, { kind: "deny" }, await pendingCallOf(manager, id));
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitReplayDivergence");
@@ -1779,7 +1866,7 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
     await store.executions.put(paused);
 
     const manager = createExecutionManager(makeStubDeps(store, spoofingSandbox));
-    const outcome = await manager.resume("exec_spoof", { kind: "deny" });
+    const outcome = await manager.resume("exec_spoof", { kind: "deny" }, "call_spoof");
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitPolicyBlocked");

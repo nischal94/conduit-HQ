@@ -1033,7 +1033,7 @@ async function handleRequest(
           // as a deliberate wire field rather than an incidental one — the
           // CLI's verb reporting is unimplementable without it.
           return resumeToPayload(
-            await manager.resume(request.executionId, { kind: request.decision }),
+            await manager.resume(request.executionId, { kind: request.decision }, request.callId),
           );
         },
         deps,
