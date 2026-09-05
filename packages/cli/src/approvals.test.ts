@@ -276,6 +276,27 @@ describe("conduit approvals list", () => {
     expect(row?.pausedOn?.expiresAt).toBe(5_000);
   });
 
+  it("a row from an OLDER daemon (no callId) renders `-` in the CALL ID column and null-free JSON", async () => {
+    const deps = makeDeps({
+      daemon: async () =>
+        result([
+          {
+            executionId: "exec_old_daemon",
+            startedAt: 1_000,
+            toolName: "t",
+            reason: "r",
+            expiresAt: 9e12,
+          },
+        ]),
+      now: () => 10_000,
+    });
+    await runList({ json: false }, deps);
+    expect(deps.stdoutLines.join("")).toMatch(/exec_old_daemon\s+-\s+t\s/);
+    deps.stdoutLines.length = 0;
+    await runList({ json: true }, deps);
+    expect(JSON.parse(deps.stdoutLines.join(""))[0].callId).toBe("-");
+  });
+
   it("--json emits the machine shape", async () => {
     const store = await seedPaused();
     const deps = makeDeps({ store, now: () => 10_000 });

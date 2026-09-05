@@ -8,7 +8,7 @@
 // approver — the argv/exit/stdio contract below is load-bearing, not
 // incidental.
 //
-// Usage: node scripts/approve-demo.mjs <executionId>
+// Usage: node scripts/approve-demo.mjs <executionId> <callId>
 // stdout: NOTHING, ever.
 // stderr: the outcome status line (or the failure reason).
 // exit 0: resume settled (completed / paused / expired).
@@ -45,8 +45,9 @@ async function hydrateCatalog(store) {
 
 async function main() {
   const executionId = process.argv[2];
-  if (executionId === undefined || executionId === "") {
-    console.error("[ApproveDemo] Usage: node scripts/approve-demo.mjs <executionId>");
+  const callId = process.argv[3];
+  if (executionId === undefined || executionId === "" || callId === undefined || callId === "") {
+    console.error("[ApproveDemo] Usage: node scripts/approve-demo.mjs <executionId> <callId>");
     process.exit(1);
   }
 
@@ -86,17 +87,11 @@ async function main() {
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
   });
 
-  // An approval is for ONE pending call (spec §5.5): name the call this
-  // execution is paused on, exactly as `conduit approvals approve` reads it
-  // off the queue. No pending call → the same conflict exit as a stale id.
-  const pending = (await store.executions.get(executionId))?.pausedOn;
-  if (pending === undefined) {
-    console.error(
-      `[ApproveDemo] conflict: execution ${executionId} has no pending approval (not paused, or not found).`,
-    );
-    process.exit(1);
-  }
-  const outcome = await manager.resume(executionId, { kind: "approve" }, pending.callId);
+  // An approval is for ONE pending call (spec §5.5): the caller names the
+  // call it reviewed and this script passes it UNCHANGED — never looked up
+  // here, which would bind a queued duplicate to whatever is pending now.
+  // A stale id is refused by the daemon's claim as `conflict`.
+  const outcome = await manager.resume(executionId, { kind: "approve" }, callId);
   console.error(`[ApproveDemo] outcome: ${outcome.status}`);
 
   if (outcome.status === "conflict" || outcome.status === "failed") {

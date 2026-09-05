@@ -1192,6 +1192,30 @@ describe("the result-payload seam", () => {
     TIMEOUT,
   );
 
+  it(
+    "a list row from an OLDER daemon (no callId) still passes the seam — a new CLI can render that queue",
+    async () => {
+      // Wire skew allowance: a daemon built before call-bound approvals
+      // omits `callId`. Refusing its whole queue would blind the operator;
+      // the CLI renders `-` and the daemon refuses the decide on its own.
+      const rows = [
+        {
+          executionId: "exec_1",
+          startedAt: 1,
+          toolName: "delete_repo",
+          reason: "destructive",
+          expiresAt: 2,
+        },
+      ];
+      const response = await askWithPayload({ kind: "approvals.list" }, rows);
+      expect(response).toMatchObject({ kind: "result", payload: rows });
+      // A malformed callId is still refused, though.
+      const bad = await askWithPayload({ kind: "approvals.list" }, [{ ...rows[0], callId: 7 }]);
+      expect(bad.kind).toBe("error");
+    },
+    TIMEOUT,
+  );
+
   /**
    * The seam covers ALL structurally-consumed kinds, not `approvals.list`
    * alone. One malformed case per kind below, each asserting the same two

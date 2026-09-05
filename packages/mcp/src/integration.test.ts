@@ -635,7 +635,21 @@ describe("ring-2: spawned bin integration", () => {
 
     // Separate one-shot child process approver — never the process that
     // ran the execution.
-    await execFileAsync("node", ["../../scripts/approve-demo.mjs", executionId], {
+    // The approver names the call it decides (spec §5.5). The daemon is
+    // stopped here, so a direct store read is the legitimate way for this
+    // out-of-band process to learn the pending call's id.
+    const pendingCallId = await (async () => {
+      const client = createClient({ url: `file:${approvalDb}` });
+      const store = await openSqliteStore({
+        client,
+        secretBox: await SecretBox.fromKeyBytes(masterKey),
+      });
+      const callId = (await store.executions.get(executionId))?.pausedOn?.callId;
+      client.close();
+      if (callId === undefined) throw new Error(`[integration] ${executionId} has no pending call`);
+      return callId;
+    })();
+    await execFileAsync("node", ["../../scripts/approve-demo.mjs", executionId, pendingCallId], {
       cwd: process.cwd(),
       env: { ...process.env, ...baseEnv(), CONDUIT_DB: approvalDb },
     });
