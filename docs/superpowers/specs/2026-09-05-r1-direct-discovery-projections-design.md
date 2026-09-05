@@ -1,8 +1,9 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 6 — all eight P1s from the rev-4 confirming pass
-folded (§12); codex pass #3 (convergence check) and the in-session eng
-review pending. Not converged until pass #3 says so.
+Status: revision 7 — in-session eng review folded (D2–D7, §12); codex
+convergence pass #3 still owed (two attempts lost to the provider's
+usage limit); outside-voice findings recorded in §12. Not converged
+until pass #3 says so.
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -146,7 +147,8 @@ has precedent through `tolerateSchemaRace` (`sqlite.ts:129-138`, the
 `redact_fields` retrofit).
 
 `client_id` and `projection` are written for BOTH kinds at
-`start`/`startDirect` (`client_id` null for the default profile). They
+`start`/`startDirect` (`client_id` is `''` for the default profile —
+rev 7, §4.1 request keys). They
 are what let `resume` rebuild the scope for a Code Mode row as well as
 a direct one (§5.4), and what let the projection FLAG — not only the
 tool grant — be re-checked on every call and resume (§5.2): turning
@@ -197,7 +199,7 @@ TypeScript:
 interface ExecutionBase {
   id: string; status: ExecutionStatus; pausedOn?: PendingApproval;
   startedAt: number; endedAt?: number; requestKey?: string;
-  clientId: string | null;
+  clientId: string;                       // '' = default profile (rev 7)
   projection: "code" | "direct" | "discovery";
   result?: unknown; error?: ExecutionError;
 }
@@ -227,19 +229,35 @@ Status enum shared (D1), per-kind meaning:
 
 A direct execution writes NO `replay_journal` rows.
 
-**Request keys are per client, legacy-compatible (rev 6):** for a NAMED
-client the manager persists `request_key` as `${clientId}\u0000${key}`;
-for the DEFAULT profile it persists the RAW key, exactly as every
-pre-R1 row was written — so no migration exists and a legacy
-`check_execution({requestKey})` or reissue from a default-profile
-client still finds its row. The decoder refuses a `requestKey`
-containing U+0000, and the `clientId` grammar (§4.2) already excludes
-it, so a named key can never be spelled as a raw key or vice versa; a
-key is encoded exactly once, at persist, and decoded nowhere (lookups
-encode the query the same way). No index change. **Ownership before
-disclosure:** a `conflict` carries the existing execution id ONLY when
-that row's `client_id` equals the caller's; otherwise the outcome is
-`conflict` with no id (pinned, row #18).
+**Request keys are per client, declared in the schema (rev 7, eng
+review D3 — replaces rev 6's NUL-joined encoding):** uniqueness is a
+composite index, and the default profile is the EMPTY STRING client id,
+never NULL, because SQLite treats NULLs as distinct in a unique index:
+
+```
+UPDATE executions SET client_id = '' WHERE client_id IS NULL   -- backfill, idempotent
+DROP INDEX IF EXISTS idx_executions_request_key
+CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_client_request
+  ON executions (client_id, request_key)
+```
+
+The shipped single-column index (`sqlite.ts:195`) is a standalone
+`CREATE UNIQUE INDEX`, so it can be dropped and replaced through the
+same PRAGMA-then-ALTER ladder; the backfill runs AFTER the `client_id`
+ALTER and BEFORE the index swap, is idempotent, and tolerates the M5
+cross-process race exactly as the ALTERs do (a concurrent opener sees
+the same end state). `client_id` is therefore `TEXT NOT NULL DEFAULT ''`
+on fresh DDL and `''` means the default profile everywhere in this
+spec. Lookups are plain equality on two columns; a legacy
+default-profile `check_execution({requestKey})` or reissue still finds
+its row because its `client_id` is now `''` and the default profile
+writes `''`. **Regression pin (CRITICAL, row #25):** a legacy row with
+key `k` and a fresh default-profile `execute` with key `k` still
+`conflict` after the swap. **Ownership before disclosure:** a
+`conflict` carries the existing execution id ONLY when that row's
+`client_id` equals the caller's — with the composite index that is the
+only row the lookup can find, so the check is structural (pinned, row
+#18).
 
 `ExecutionRepository` gains `invalidatePausedDirect(namespace: string):
 Promise<number>` — flips every `paused` `direct` row whose
@@ -320,11 +338,15 @@ profile → handshake refused for any `clientId`.
 
 ```
 ALTER TABLE trace_events ADD COLUMN projection TEXT NOT NULL DEFAULT 'code'
+ALTER TABLE trace_events ADD COLUMN client_id TEXT NOT NULL DEFAULT ''
 ```
 
 Fresh DDL adds `CHECK (projection IN ('code','direct','discovery'))`.
-`TraceEvent.projection` is set by the invoker from its options. No other
-trace change; #10 is testable from stored rows.
+`TraceEvent.projection` and `TraceEvent.clientId` are set by the
+invoker from its options (rev 7, eng review D4: audit rows are
+write-once, so attribution must land at append time — R5's evidence
+UX cannot backfill it). No other trace change; #10 is testable from
+stored rows.
 
 ### 4.4 Not added
 
@@ -430,8 +452,24 @@ interface EffectiveScope {
  * and tool reads are store reads. Rejects → the call fails as infra (fail
  * closed); a missing profile row for a named client → a scope with every
  * flag false and an empty listing (fail closed, never the default). */
-type ScopeResolver = (clientId: string | null) => Promise<EffectiveScope>;
+type ScopeResolver = (clientId: string) => Promise<EffectiveScope>;  // '' = default
 ```
+
+**Versioned snapshot (rev 7, eng review D7):** the daemon holds one
+in-memory `scopeVersion` counter, bumped in the SAME code path as every
+profile write (`profile.set`/`profile.remove`) and every namespace
+write (`provisionSource` commit, `source.remove`). The resolver caches
+one snapshot per client id tagged with the version it was built at and
+returns it while the version is unchanged; a mismatch re-reads the
+store. "Every call checks current authority" stays literally true — the
+version changes in the same tick as the write, and there is no other
+writer — while the hot path becomes a counter compare and a set lookup
+instead of a profile read plus a full `tools.list` per in-sandbox call.
+The counter starts at 0 on daemon start, which means "no snapshot", so
+restart fails closed into a fresh read. Pinned: a write path that does
+not bump the version is impossible (each write helper takes the bump
+as a required callback), and a snapshot built before a write is never
+returned after it.
 
 `permits` checks BOTH the projection flag and the tool grant: turning
 a flag off revokes exactly as removing a tool does. Every check in
@@ -460,7 +498,7 @@ iff `projections[p]` is true AND the tool exists in the catalog AND
 
 **Result-access authority:** `execution.get` and
 `execution.getByRequestKey` return a row only when `row.client_id`
-equals the connection's client id (null equals null for the default
+equals the connection's client id (`''` equals `''` for the default
 profile); a foreign row answers exactly as a nonexistent one. With
 client-namespaced request keys (§4.1) a foreign key cannot even be
 looked up. `check_execution` on every projection therefore reads only
@@ -527,10 +565,35 @@ Consequences, each pinned (§9):
   **Admission includes lock acquisition (rev 6):** the source lock
   waits indefinitely for predecessors (`source-lock.ts:65`), so joining
   it must be part of bounded admission: `DIRECT_ADMISSION_DEADLINE_MS`
-  covers slot wait AND lock wait; `run` gains a deadline and a
+  covers slot wait AND lock wait; acquisition gains a deadline and a
   cancelled-check, and a waiter whose deadline expired or whose
-  connection closed before the chain reached it NEVER enters its
-  callback (it answers `busy`, and the chain proceeds). The same bound
+  connection closed before its turn NEVER enters its callback (it
+  answers `busy`, and the chain proceeds).
+  **Readers-writer shape (rev 7, eng review D2):** the shipped lock is
+  an exclusive promise chain (`source-lock.ts:55-76`: each run awaits
+  the previous run for the key). Direct drives on one namespace would
+  serialize behind each other's upstream latency, collapsing the
+  daemon-wide cap to one call per hot namespace. So the lock becomes a
+  readers-writer lock per namespace: a direct drive takes a SHARED hold
+  (many run concurrently, bounded only by `DIRECT_ADMISSION_MAX`);
+  provisioning, revalidate, and removal take an EXCLUSIVE hold (they
+  wait for every in-flight shared holder, then run alone). Writer
+  preference: once a writer is queued, new readers wait behind it, so
+  a stream of direct calls cannot starve a provision. The correctness
+  property is unchanged — no namespace write interleaves with a direct
+  drive — and the generation check (§5.4) stays sound because the
+  write cannot commit while any drive holds the namespace. Pinned:
+  two readers run concurrently; a writer waits for in-flight readers
+  and blocks new ones; a queued writer is not starved.
+  **One `DirectDrive` object (rev 7, eng review D5):** the per-drive
+  state the review rounds accumulated — the dispatch-state cell
+  (§5.5), the settlement latch, the attempt id used to fence the settle
+  write, and the drive deadline — is ONE object, `DirectDrive
+  { dispatch; settled; attemptId; deadline }`, created by the manager
+  and passed once through `makeInvoker` to the upstream caller.
+  Forgetting a piece is a type error; the tests assert on one object's
+  transitions; the ASCII state diagram in the plan lives on this type.
+  No behavioural change from rev 6. The same bound
   applies to provisioning and removal, which now wait behind a direct
   drive of up to `DIRECT_DRIVE_BUDGET_MS`: their client budgets
   (`mcp-fetch.ts:23`, 35 s today) grow by `DIRECT_DRIVE_BUDGET_MS` and
@@ -599,11 +662,11 @@ is the authority.
 
 ```ts
 startDirect(toolName: string, input: unknown, opts: {
-  clientId: string | null; projection: "direct" | "discovery";
+  clientId: string; projection: "direct" | "discovery";
   requestKey?: string; scope: ScopeResolver;
 }): Promise<ExecutionOutcome>;
 start(code: string, opts?: { limits?; requestKey?;
-  clientId?: string | null; scope?: ScopeResolver }): Promise<ExecutionOutcome>;
+  clientId?: string; scope?: ScopeResolver }): Promise<ExecutionOutcome>;
 resume(executionId: string, decision: ApprovalDecision,
   scope: ScopeResolver): Promise<ResumeOutcome>;
 ```
@@ -618,12 +681,13 @@ provision can commit between them — and the invoker awaits the tool,
 connection, credential, and source reads separately (`invoker.ts:111,
 178, 190`). Therefore the DAEMON runs every direct drive —
 `startDirect` and a direct `resume`, from the generation check through
-settle — inside the per-namespace source lock (`source-lock.ts`, the
-promise chain provisioning already uses), so no namespace write can
-interleave with a direct call on that namespace. Cost: a provision of
-a namespace waits behind an in-flight direct call on it (bounded by
-`DIRECT_DRIVE_BUDGET_MS`, and itself bounded by its own admission
-deadline — §5.3); rare and acceptable. Code Mode drives are
+settle — under a SHARED hold of the per-namespace readers-writer lock
+(§5.3, rev 7), while every namespace write takes the EXCLUSIVE hold,
+so no namespace write can interleave with a direct call on that
+namespace and direct calls on one namespace still run concurrently.
+Cost: a provision of a namespace waits behind in-flight direct calls
+on it (each bounded by `DIRECT_DRIVE_BUDGET_MS`, the provision itself
+bounded by its own admission deadline — §5.3); rare and acceptable. Code Mode drives are
 NOT serialized against provisioning — a mid-execution catalog change
 for a running program is the previously accepted limit (2026-08-22
 review record) and is unchanged here; the D3 sweep + generation check
@@ -711,9 +775,10 @@ audited, guest-safe name `ConduitPolicyBlocked`.
 
 **One further host-side change, for §7 — dispatch STATE, not an error
 field (rev 6):** each direct drive owns a host-side, monotonic
-`DispatchState = "none" | "initializing" | "dispatched"` cell, created
-by the manager and passed through `CreateToolInvokerOptions` to the
-upstream caller. The caller advances it to `initializing` when
+`DispatchState = "none" | "initializing" | "dispatched"` — the
+`dispatch` field of the drive's `DirectDrive` object (§5.3, rev 7) —
+created by the manager and passed through `CreateToolInvokerOptions`
+to the upstream caller. The caller advances it to `initializing` when
 session/handshake traffic starts (`upstream.ts:129` — initialize
 precedes the governed call and must not count as dispatch) and to
 `dispatched` at the moment the governed `tools/call` frame is written
@@ -973,6 +1038,21 @@ approval verb; `approvals.resume` remains reachable only through the
 | 22 | a direct drive settles exactly once: a late continuation after the timer cannot overwrite `failed`; slot and lock are released only after the work stops; lock waiting is inside bounded admission and an expired waiter never runs (codex P1 ×2, rev 6) | `manager.test.ts` (delayed success / delayed refusal after timeout) + `daemon/source-lock.test.ts` (expired waiter skipped) + `sqlite.test.ts` (attempt-fenced settle) |
 | 23 | two handshakes in one tick on a named-client connection bind exactly once; requests during `validating` are refused (codex P1, rev 6) | `daemon/conduitd.test.ts` real processes |
 | 24 | post-dispatch classification survives error replacement: a dispatched call whose refusal audit also fails still settles `ConduitOutcomeAmbiguous`; initialize traffic never counts as dispatch (codex P1, rev 6) | `manager.test.ts` + `pipeline/upstream.test.ts` |
+| 25 | **CRITICAL regression pin:** after the index swap + backfill, a legacy default-profile row with key `k` still `conflict`s with a fresh default-profile `execute` using `k`; the backfill is idempotent and survives the M5 cross-process race (eng review D3) | `sqlite.test.ts` (Lane A) |
+| 26 | readers-writer lock: two direct drives on one namespace run concurrently; a provision waits for in-flight drives and blocks new ones; a queued writer is not starved by a reader stream (D2) | `daemon/source-lock.test.ts` (Lane B) |
+| 27 | every trace row carries `projection` and `client_id`, on both kinds (D4) | D5 harness (Lane A) |
+| 28 | `DirectDrive` transitions: dispatch monotonic; `settled` taken exactly once; attempt id fences the settle write (D5) | `manager.test.ts` (Lane A) |
+| 29 | versioned scope snapshot: a write without a version bump is impossible; a snapshot built before a write is never served after it; restart starts unversioned (D7) | `daemon/conduitd.test.ts` (Lane B) |
+| 30 | decoder: `clientId` on a non-`serve` handshake → `invalid`; `tool.call` without `input` → `invalid`; `describe.includeSchemas` decoded, absent = false | `daemon/rpc.test.ts` (Lane B) |
+| 31 | admin row no-widening: `serve` holds no `profile.*`/`source.*`/`daemon.*`/`approvals.*`; `admin` holds no `execute`/`tool.call`/`search`/`describe` and no approval verb (extends the existing capability pins) | `daemon/rpc.test.ts` (Lane B) |
+| 32 | `conduit remove-mcp` is atomic: tools, policies, connection, integration, source, AND the sealed secret all gone or none; paused direct calls on it invalidated; unknown namespace is a named error | `daemon/provision.test.ts` + `packages/cli/src/remove-mcp.test.ts` (Lane B) |
+| 33 | `conduit profiles set|list|remove`: argv parsing, `clientId` grammar rejection, `allow`/`projections` JSON round-trip, exit codes, and no credential-bearing output | `packages/cli/src/profiles.test.ts` (Lane B) |
+| 34 | `conduit serve --client <unknown>` exits non-zero naming the id and never serves the default profile | `packages/cli/src/integration.test.ts` (Lane C) |
+| 35 | direct-cap refusal is `code: "busy"` with the direct-specific text, and the slot is released only after the drive settles | `daemon/conduitd.test.ts` (Lane B) |
+| 36 | listing cursor is stable across pages; a catalog change mid-pagination can only make a name unresolvable, never resolve it to a different tool | `daemon/conduitd.test.ts` (Lane B) |
+| 37 | a listing carries no schemas when `projections.direct` is false; a listing from an OLDER daemon (no `projections`/`tools`) is read as code-only with no direct tools | `daemon/conduitd.test.ts` + `server.test.ts` (Lanes B, C) |
+| 38 | server name resolution: stale advertised name → one listing refetch → still unknown → MCP "unknown tool"; the qualified name goes on the wire and the daemon re-checks `permits` | `server.test.ts` (Lane C) |
+| 39 | `approvals list` renders direct rows with their projection and tool name; `check_execution` payload shape is unchanged for code rows | `packages/cli/src/approvals.test.ts` + `payloads.test.ts` (Lanes B, C) |
 
 Three ambiguity invariants (§7): crash-before-persist (sweep test over a
 `running` direct row, Lane A); keyless-upstream documented limit (Lane
@@ -1182,7 +1262,7 @@ regenerated per commit · agent never installs.
   Still-partial from the prior round are subsumed by items 1, 2, 3, 6,
   7 above.
 - 2026-09-05 — **rev 6 folds all eight:** (1) named keys
-  `clientId key`, default profile keeps RAW keys → no migration,
+  `clientId<NUL>key`, default profile keeps RAW keys → no migration,
   decoder refuses U+0000, conflict id only to its owner (§4.1); (2)
   per-drive monotonic `DispatchState` cell read at settle, replacing
   the `afterDispatch` error field (§5.5, §7); (3) lock acquisition
@@ -1198,5 +1278,18 @@ regenerated per commit · agent never installs.
   `LISTING_PAGE_BYTES`, oversized entries skipped with progress (§5.3);
   (8) handshake state machine `unbound → validating → bound | closed`,
   reserved before the first await (§5.1). Rows #22–#24 added; #7 and
-  #20 reworded. Next: codex pass #3 → if converged, in-session eng
-  review → founder read → writing-plans.
+  #20 reworded.
+- 2026-09-05 — **in-session eng review (plan-eng-review, founder
+  present; codex pass #3 still blocked by the provider limit, so the
+  review ran first — the passes are independent).** Scope: full spec
+  accepted (D1; Lane C already lands last and alone). Architecture:
+  D2 exclusive namespace chain → readers-writer lock, writer
+  preference (§5.3, §5.4). Code quality: D3 NUL-joined request keys →
+  composite `(client_id, request_key)` unique index + idempotent
+  backfill, default profile = `''` (§4.1); D4 `client_id` on
+  `trace_events` (§4.3); D5 one `DirectDrive` object (§5.3, §5.5).
+  Tests: D6 fifteen unpinned paths → rows #25–#39, #25 CRITICAL
+  regression (§9.1). Performance: D7 per-call store reads → versioned
+  scope snapshot (§5.2). Outside voice: codex unavailable (usage
+  limit) → Claude subagent; its findings and the founder's
+  dispositions are recorded below when they land.
