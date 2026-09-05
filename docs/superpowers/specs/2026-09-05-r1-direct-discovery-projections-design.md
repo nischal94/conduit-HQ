@@ -1,8 +1,10 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 9 — codex pass #3 (on rev 8: 0 P0 / 8 P1 / 1 P2, NOT
-CONVERGED) folded, §12. Confirming pass #4 owed. Not converged until it
-says so.
+Status: revision 10 — codex pass #4 (on rev 9: 2 P0 / 3 P1 / 1 P2, NOT
+CONVERGED; both P0s a NEW class: binding to an INSTANCE across time and
+across writers) folded, §12. Per the adversarial-convergence rule, the
+next step is a dedicated threat-model pass on instance binding, NOT a
+fifth fold-and-rerun. Not converged.
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -151,7 +153,16 @@ ALTER TABLE executions ADD COLUMN projection TEXT NOT NULL DEFAULT 'code'
 ALTER TABLE executions ADD COLUMN direct_call TEXT
 ALTER TABLE executions ADD COLUMN client_id TEXT
 ALTER TABLE executions ADD COLUMN program TEXT
+ALTER TABLE executions ADD COLUMN result_state TEXT
 ```
+
+`result_state` (rev 10, codex #4 P2): NULL for code rows and for any
+non-terminal row; on a `completed` DIRECT row exactly one of
+`'delivered'` (result returned on the wire, not stored — `result` IS
+NULL) or `'retained'` (resumed path; `result` holds the redacted
+value). Fresh DDL adds `CHECK (result_state IN ('delivered','retained'))`;
+the read-side guard refuses a completed direct row whose `result_state`
+is NULL or whose `result`/`result_state` combination is inconsistent.
 
 Fresh DDL adds `CHECK (kind IN ('code','direct'))` and
 `CHECK (projection IN ('code','direct','discovery'))`. The ALTER shape
@@ -234,7 +245,8 @@ interface ExecutionBase {
 type Execution =
   | (ExecutionBase & { kind: "code"; code: string; seeds: { now: number; random: number } })
   | (ExecutionBase & { kind: "direct";
-      call: { toolName: string; namespace: string; request: string } });
+      call: { toolName: string; namespace: string; request: string };
+      resultState?: "delivered" | "retained" });   // set iff completed
 
 interface PendingApproval {                 // both kinds
   callId: string; toolName: string; namespace: string; sourceGeneration: number;
@@ -321,6 +333,37 @@ CREATE TABLE IF NOT EXISTS source_generations (
   at INTEGER NOT NULL
 )
 ```
+
+**Generation advancement is enforced INSIDE SQLite, not by the R1
+writer (rev 10, codex #4 P0):** an OLDER daemon run temporarily after
+R1 has persisted a pause at generation 42 would provision or revalidate
+through the shipped statements (`sqlite.ts:689` updates source fields
+and leaves unknown columns untouched; `:727` replaces tools) without
+touching `generation`, and the R1 daemon would then accept the obsolete
+provenance on resume. Triggers close this for every writer version:
+
+```
+CREATE TRIGGER IF NOT EXISTS sources_gen_on_update AFTER UPDATE ON sources
+BEGIN
+  INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
+  UPDATE sources SET generation = last_insert_rowid() WHERE id = NEW.id;
+END;
+CREATE TRIGGER IF NOT EXISTS sources_gen_on_tools AFTER INSERT ON tools
+BEGIN
+  INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
+  UPDATE sources SET generation = last_insert_rowid() WHERE namespace = NEW.namespace;
+END;
+```
+
+(`sources_gen_on_update` is guarded `WHEN NEW.generation = OLD.generation`
+so the trigger's own write does not recurse.) Any provision, replace,
+or revalidate — by any daemon build that opens the database after R1's
+schema has run once — bumps the namespace's generation because the
+database does it, not the code. Pinned: R1 pause → provision through
+the SHIPPED pre-R1 SQL against the same database → R1 resume →
+`ConduitCatalogChanged` (row #47). R1's own `provisionSource` still
+inserts its row explicitly (below) so the bump is visible in the
+transaction it belongs to; the triggers make it a floor.
 
 `provisionSource` inserts one `source_generations` row inside its
 existing single transaction (`sqlite.ts` `client.batch`; both provision
@@ -620,7 +663,20 @@ Consequences, each pinned (§9):
   `deadline()` before writing the governed frame. Pinned: delayed
   success and delayed refusal after timeout both leave the row
   `failed`, AND a store read that never returns still yields the
-  timeout outcome on the wire within budget.
+  timeout outcome on the wire within budget. **Bounded persistence
+  (rev 10, codex #4):** the outcome promise must not wait on a SETTLE
+  WRITE either — the store write has no deadline (`sqlite.ts:437`) and
+  the persistence guard awaits the write and its fallback
+  (`manager.ts:442`). Whichever side wins the latch, its settle write
+  runs under `SETTLE_WRITE_BUDGET_MS` (5 s); if that expires the outcome
+  promise resolves with `{ status: "unknown", executionId,
+  reason: "persist-timeout" }` — a new outcome variant meaning "the
+  effect may have landed and the row may not yet say so" — WITHOUT
+  claiming durable terminalization, while the write stays tracked in
+  the cleanup promise and remains fenced. `check_execution` on that id
+  later shows whatever the write eventually persisted. Pinned: a
+  stalled timer write, and a stalled completion write after the
+  continuation won the latch (row #45).
   **Admission is the slot only (rev 8, D10):** no lock is acquired for
   a direct drive, so `DIRECT_ADMISSION_DEADLINE_MS` bounds the slot
   wait alone; provisioning and removal budgets are UNCHANGED from the
@@ -646,14 +702,21 @@ Consequences, each pinned (§9):
   returned (row #43). A `describe` of an out-of-scope tool returns
   `null`, indistinguishable from a nonexistent tool.
 - `catalog.listing { cursor?: string }`: returns the snapshot's
-  projection flags, the connections listing as today, and — ONLY when
+  projection flags, a BOUNDED connections listing — capped at
+  `LISTING_CONNECTIONS_MAX` (200) entries with a `connectionsTruncated`
+  flag, since the shipped listing reads every connection unbounded
+  (`payloads.ts:553`) and 20,000 short entries alone encode past 1 MiB
+  (codex #4), and the page packer counts the connections block in the
+  budget before any tool — and — ONLY when
   `projections.direct` is true — a PAGE of the scoped direct listing:
   `{ qualifiedName, advertisedName, description, riskClass,
   inputSchema }` per tool, with `nextCursor` (an opaque qualified-name
   watermark). Schemas never travel when direct is off, so a default or
   Code-Mode-only profile's listing stays as small as today and the
   IPC frame cap (1 MiB, `frames.ts:23`) cannot be exceeded by catalog
-  growth. **Pages are packed by COMPLETE encoded size (rev 6):** the
+  growth by TOOL entries; the connections block is bounded separately
+  (above), so a page can never be over budget before its first tool.
+  **Pages are packed by COMPLETE encoded size (rev 6):** the
   daemon appends entries while the JSON encoding of the WHOLE response
   so far (flags, connections, entries, cursor) stays under
   `LISTING_PAGE_BYTES` (512 KiB, half the frame cap), measured on the
@@ -668,7 +731,18 @@ Consequences, each pinned (§9):
   because names depend only on the qualified name (§8.3, injective), so
   a catalog change mid-pagination can only make a name unresolvable,
   which fails closed.
-- `approvals.resume`: unchanged wire shape. The daemon reads the row's
+- `approvals.resume { executionId, decision, callId }` (rev 10, codex
+  #4 P0 — the wire shape is NO LONGER unchanged): the request names the
+  PENDING CALL being approved, not only the execution. Today the
+  request carries no call identifier (`rpc.ts:97`), admission precedes
+  `manager.resume` (`connection.ts:1023`), the claim checks only
+  `id` and `status='paused'` (`sqlite.ts:482`), and the manager then
+  stages whatever `pausedOn` it reads (`manager.ts:784`) — so two
+  queued approvals for pause A let the second one approve a LATER
+  pause B of the same program. Codex reproduced it; it is a defect in
+  shipped Code Mode, not only R1. `conduit approvals approve|deny`
+  reads `callId` from the list row it already displays and sends it.
+  The daemon reads the row's
   `kind` BEFORE admission: a `code` row is admitted through the sandbox
   queue as today; a `direct` row is admitted under `DIRECT_ADMISSION_MAX`
   — a direct resume must not consume a sandbox slot. The manager then
@@ -752,9 +826,15 @@ Sequence:
 steps 4–5 are the direct arm, and a code row continues into the
 shipped replay drive after step 3:
 
-1. `claimForResume` (unchanged CAS; lose → `conflict`; TTL lazily
-   expires as today). The claim IS the sweep check: a row the sweep
-   already failed is no longer `paused`, so the claim loses.
+1. `claimForResume(id, attempt, callId)` — the CAS predicate gains the
+   pending call: `WHERE id = ? AND status = 'paused' AND
+   json_extract(paused_on, '$.callId') = ?` (rev 10). A stale approval
+   for an earlier pause CONFLICTS even when the execution is paused
+   again on a different call; lose → `conflict`; TTL lazily expires as
+   today. The claim IS the sweep check: a row the sweep already failed
+   is no longer `paused`, so the claim loses. Pinned with two queued
+   approvals against a program with two approval gates (row #46; G2's
+   ledger row is reworded to "exactly one winner PER PENDING CALL").
 2. **Generation check (D3 authority, both kinds):** read the namespace's
    current `sources.generation`; missing (source removed), not equal to
    `pausedOn.sourceGeneration`, or `pausedOn.sourceGeneration` ABSENT
@@ -856,7 +936,7 @@ start for both kinds).
 | effective capability grant | revalidate on resume | §5.4 step 3 |
 | policy version | R1 INHERITS D6: a staged approval applies to exactly one byte-identical call and skips the policy engine, for Code Mode today and for direct now. The brief's "a stricter policy is never bypassed by an old approval" rule needs a policy version to compare against and is R2 work; stated here so it is not read as shipped. | invoker (unchanged) |
 | credential secret version | resolve live if connection unchanged | invoker step 4 (unchanged) |
-| tool/source revision | **fail closed on any namespace write (D3)** | `sources.generation` compared after the resume claim (authority) + `invalidatePausedDirect` sweep (housekeeping) |
+| tool/source revision | **fail closed on any namespace write (D3)** | `sources.generation` compared after the resume claim (authority, both kinds) + `invalidatePaused` sweep (housekeeping); triggers make the bump writer-independent |
 | upstream destination | immutable identity; egress pinning reruns live | §9.3 (unchanged) |
 | runtime version | informational | `AGENT_VERSION` in Trace context (unchanged) |
 
@@ -1102,7 +1182,10 @@ approval verb; `approvals.resume` remains reachable only through the
 | 42 | a paused Code Mode row whose namespace is re-provisioned resumes to `ConduitCatalogChanged`, same as a direct row (D13) | D5 harness (Lane A) |
 | 43 | scoped search filters BEFORE ranking and the limit: an allowed tool ranked below ten disallowed ones is still returned, for discovery and in-sandbox search (codex #3, rev 9) | `catalog.test.ts` + `daemon/conduitd.test.ts` (Lanes A, B) |
 | 44 | direct drives are in the daemon's lifecycle accounting: disconnect then `daemon stop` while a direct call runs waits the drain grace and reports abandonment; `executionsInFlight` counts them (codex #3, rev 9) | `daemon/conduitd.test.ts` (Lane B) |
-| 45 | the client-visible timeout outcome resolves within budget even when the continuation is blocked on a store read; late preparation never dispatches after expiry (codex #3, rev 9) | `manager.test.ts` (Lane A) |
+| 45 | the client-visible timeout outcome resolves within budget even when the continuation OR the settle write is blocked; a stalled write yields `status:"unknown"` with the id, never a claimed terminalization; late preparation never dispatches after expiry (codex #3/#4) | `manager.test.ts` (Lane A) |
+| 46 | an approval binds to ONE pending call: two queued approvals for pause A against a program with two gates → the second `conflict`s, never approves pause B; `claimForResume` predicate includes `callId` (codex #4 P0, rev 10; shipped-code defect) | `sqlite.test.ts` + `manager.test.ts` + `packages/cli/src/approvals.test.ts` (Lane A, B) |
+| 47 | a provision or revalidate through the SHIPPED pre-R1 SQL against an R1 database still bumps the namespace generation (triggers), so a pause taken before a daemon downgrade fails closed on resume after the upgrade (codex #4 P0, rev 10) | `sqlite.test.ts` (Lane A) |
+| 48 | the connections block of a listing is bounded at `LISTING_CONNECTIONS_MAX` with a truncation flag and is counted in the page budget; an empty-tool page and a direct-disabled listing both fit the frame cap with 20,000 connections (codex #4, rev 10) | `daemon/conduitd.test.ts` (Lane B) |
 | 30 | decoder: `clientId` on a non-`serve` handshake → `invalid`; `tool.call` without `input` → `invalid`; `describe.includeSchemas` decoded, absent = false | `daemon/rpc.test.ts` (Lane B) |
 | 31 | admin row no-widening: `serve` holds no `profile.*`/`source.*`/`daemon.*`/`approvals.*`; `admin` holds no `execute`/`tool.call`/`search`/`describe` and no approval verb (extends the existing capability pins) | `daemon/rpc.test.ts` (Lane B) |
 | 32 | `conduit remove-mcp` is atomic: tools, policies, connection, integration, source, AND the sealed secret all gone or none; paused direct calls on it invalidated; unknown namespace is a named error | `daemon/provision.test.ts` + `packages/cli/src/remove-mcp.test.ts` (Lane B) |
@@ -1156,7 +1239,7 @@ explainer + quiz, human-named merge):
 
 1. **Lane A — store + manager.** §4 (all columns incl. `client_id`,
    `projection`, `program`, `source_generations`), §5.4, §5.5 (incl.
-   `afterDispatch`), the `EffectiveScope`/`ScopeResolver` types,
+   the per-call dispatch cell), the `EffectiveScope`/`ScopeResolver` types,
    client-namespaced request keys, D5 harness, ambiguity invariants
    (manager side), rows #1–#3, #9 (unit), #15, #16 (manager half),
    #17, #18 (manager half), #19, #21, #25, #41, #42, G1–G3. No wire
@@ -1402,6 +1485,28 @@ regenerated per commit · agent never installs.
   from cleanup promise, timer starts before prep (§5.3, §5.4, row
   #45); stale lock/`invalidatePausedDirect`/`afterDispatch` wording
   swept. Confirming pass #4 follows.
+- 2026-09-06 (00:10) — **codex pass #4 on rev 9: 2 P0 / 3 P1 / 1 P2,
+  NOT CONVERGED.** Both P0s are a NEW class — an approval or a
+  provenance stamp binding to an INSTANCE that can be replaced across
+  TIME (a later pause of the same execution) or across WRITERS (an
+  older daemon build): (1) `approvals.resume` names only the execution
+  and the claim checks only `paused`, so a queued duplicate approval
+  can approve a later pause — a shipped Code Mode defect, reproduced
+  → `callId` on the wire and in the CAS predicate (§5.3, §5.4, row
+  #46, T9); (2) an older daemon's provisioning leaves `generation`
+  untouched → SQLite triggers bump it for any writer (§4.1a, row #47,
+  T10). P1: settle-write stall still blocks the outcome → bounded
+  persistence + `status:"unknown"` variant (§5.3, row #45); the
+  connections block alone can exceed the frame cap → bounded +
+  counted (§5.3, row #48); T2 still mandated the rejected encoding and
+  two stale terms survived → fixed (report, §6, §10). P2: `result_state`
+  missing from the model → column, vocabulary, type, guard (§4.1). All
+  folded in rev 10. **Per `~/.claude/rules/adversarial-convergence.md`
+  ("new-class breaks repeatedly → pause for a dedicated threat-model
+  pass before more code"), the loop STOPS here: the next step is a
+  threat-model pass on instance binding (approval ↔ pending call ↔
+  provenance ↔ writer version), then pass #5 — not a fifth
+  fold-and-rerun.**
 
 ## GSTACK REVIEW REPORT
 
@@ -1421,7 +1526,9 @@ regenerated per commit · agent never installs.
 Synthesized from this review's findings. Each task derives from a specific finding above.
 
 - [ ] **T1 (P1, human: ~1d / CC: ~15min)** — sdk/execution — Remove drive linearization; keep sweep + post-claim generation check on BOTH kinds — Surfaced by: D10, D13 — Files: `packages/sdk/src/execution/manager.ts`, `packages/mcp/src/daemon/connection.ts` — Verify: rows #17, #42
-- [ ] **T2 (P1, human: ~2h / CC: ~10min)** — sdk/store — Request keys: rev 6 encoding, one function + round-trip pin — Surfaced by: D11 — Verify: row #25
+- [ ] **T2 (P1, human: ~4h / CC: ~15min)** — sdk/store — Request keys: the `request_keys` mapping table for named clients, written atomically with the execution row; legacy column untouched for the default profile — Surfaced by: D11 → codex #3 (rev 9) — Verify: row #25
+- [ ] **T9 (P1, human: ~1d / CC: ~20min)** — sdk/store + mcp/daemon + cli — Approval instance binding: `callId` on `approvals.resume` and in the `claimForResume` predicate; CLI sends the listed call id — Surfaced by: codex #4 P0 (rev 10) — Verify: row #46
+- [ ] **T10 (P1, human: ~2h / CC: ~10min)** — sdk/store — SQLite triggers that bump `sources.generation` on any source update or tool insert, writer-independent — Surfaced by: codex #4 P0 (rev 10) — Verify: row #47
 - [ ] **T3 (P1, human: ~4h / CC: ~15min)** — sdk/execution — Persist a direct result only on the resume path, redacted; synchronous completion not persisted — Surfaced by: D12 — Verify: row #41
 - [ ] **T4 (P1, human: ~4h / CC: ~15min)** — mcp/server — Decode advertised names; walk all daemon pages into one tools/list — Surfaced by: D14 — Verify: rows #36, #38
 - [ ] **T5 (P2, human: ~30min / CC: ~3min)** — sdk/store — `client_id` on trace_events; invoker writes projection + client_id — Surfaced by: D4 — Verify: row #27
