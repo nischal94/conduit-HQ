@@ -1312,7 +1312,7 @@ regenerated per commit · agent never installs.
 - **CROSS-MODEL:** outside voice (Claude subagent, fresh context) vs the eng review: 9 findings, 7 tensions put to the founder — 6 accepted (D10–D15), 1 rejected (D9); it independently confirmed D4 and D7.
 - **VERDICT:** ENG REVIEW COMPLETE, findings folded — eng review required to re-clear after codex pass #3 (convergence) runs on rev 8.
 
-## Implementation Tasks
+### Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above.
 
 - [ ] **T1 (P1, human: ~1d / CC: ~15min)** — sdk/execution — Remove drive linearization; keep sweep + post-claim generation check on BOTH kinds — Surfaced by: D10, D13 — Files: `packages/sdk/src/execution/manager.ts`, `packages/mcp/src/daemon/connection.ts` — Verify: rows #17, #42
