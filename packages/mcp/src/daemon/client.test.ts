@@ -1179,6 +1179,7 @@ describe("the result-payload seam", () => {
       const rows = [
         {
           executionId: "exec_1",
+          callId: "call_1",
           startedAt: 1,
           toolName: "delete_repo",
           reason: "destructive",
@@ -1187,6 +1188,30 @@ describe("the result-payload seam", () => {
       ];
       const response = await askWithPayload({ kind: "approvals.list" }, rows);
       expect(response).toMatchObject({ kind: "result", payload: rows });
+    },
+    TIMEOUT,
+  );
+
+  it(
+    "a list row from an OLDER daemon (no callId) still passes the seam — a new CLI can render that queue",
+    async () => {
+      // Wire skew allowance: a daemon built before call-bound approvals
+      // omits `callId`. Refusing its whole queue would blind the operator;
+      // the CLI renders `-` and the daemon refuses the decide on its own.
+      const rows = [
+        {
+          executionId: "exec_1",
+          startedAt: 1,
+          toolName: "delete_repo",
+          reason: "destructive",
+          expiresAt: 2,
+        },
+      ];
+      const response = await askWithPayload({ kind: "approvals.list" }, rows);
+      expect(response).toMatchObject({ kind: "result", payload: rows });
+      // A malformed callId is still refused, though.
+      const bad = await askWithPayload({ kind: "approvals.list" }, [{ ...rows[0], callId: 7 }]);
+      expect(bad.kind).toBe("error");
     },
     TIMEOUT,
   );
@@ -1357,7 +1382,7 @@ describe("the result-payload seam", () => {
       // operator to re-issue a decision the execution already consumed.
       // Absence must be a refusal, not a hedge.
       const response = await askWithPayload(
-        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny", callId: "c1" },
         { status: "completed", executionId: "exec_1" },
       );
       expect(response.kind).toBe("error");
@@ -1380,7 +1405,7 @@ describe("the result-payload seam", () => {
       // wrong answer omitting `decisionApplied` produces. Guarding one
       // field and not the other left the seam short of its own standard.
       const response = await askWithPayload(
-        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny", callId: "c1" },
         { executionId: "exec_1", decisionApplied: false },
       );
       expect(response.kind).toBe("error");
@@ -1395,7 +1420,7 @@ describe("the result-payload seam", () => {
     async () => {
       const payload = { status: "completed", executionId: "exec_1", decisionApplied: true };
       const response = await askWithPayload(
-        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny", callId: "c1" },
         payload,
       );
       expect(response).toMatchObject({ kind: "result", payload });
@@ -1489,7 +1514,7 @@ describe("the result-payload seam", () => {
       // the deny arm print "settled as bogus". A legal status member is
       // required.
       const response = await askWithPayload(
-        { kind: "approvals.resume", executionId: "exec_1", decision: "deny" },
+        { kind: "approvals.resume", executionId: "exec_1", decision: "deny", callId: "c1" },
         { status: "bogus", executionId: "exec_1", decisionApplied: true },
       );
       expect(response.kind).toBe("error");

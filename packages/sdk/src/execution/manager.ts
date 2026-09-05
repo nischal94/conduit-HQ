@@ -46,8 +46,13 @@ export interface ExecutionManager {
     code: string,
     opts?: { limits?: Partial<SandboxLimits>; requestKey?: string },
   ): Promise<ExecutionOutcome>;
-  /** Resume a paused execution after a human decision. */
-  resume(executionId: string, decision: ApprovalDecision): Promise<ResumeOutcome>;
+  /**
+   * Resume a paused execution after a human decision on ONE pending call.
+   * `callId` is the `PendingApproval.callId` the human saw; if the execution
+   * is no longer paused on that call (already decided, or paused again on a
+   * later call) the resume is a `conflict`, never a decision on another call.
+   */
+  resume(executionId: string, decision: ApprovalDecision, callId: string): Promise<ResumeOutcome>;
   /** Inspect the persisted execution (CLI / API surface). */
   get(executionId: string): Promise<Execution | undefined>;
 }
@@ -698,10 +703,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       }
     },
 
-    async resume(executionId, decision) {
-      // FIRST: atomic paused→running claim (design F4). Lose → conflict no-op.
+    async resume(executionId, decision, callId) {
+      // FIRST: atomic paused→running claim (design F4), bound to the ONE
+      // pending call the decision is for. Lose → conflict no-op — including
+      // when the execution is paused again on a LATER call than the one
+      // this decision names.
       const resumeAttemptId = newId();
-      const won = await deps.store.executions.claimForResume(executionId, resumeAttemptId);
+      const won = await deps.store.executions.claimForResume(executionId, resumeAttemptId, callId);
       if (!won) {
         return { status: "conflict", executionId, decisionApplied: false };
       }
@@ -740,6 +748,25 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           };
         }
         const pausedOn = execution.pausedOn;
+        if (pausedOn.callId !== callId) {
+          // The claim admits a CORRUPT pause (no callId in the stored JSON)
+          // so it can be terminalized here rather than stranded `paused`
+          // forever; a well-formed pause can only have been claimed with
+          // its own callId, so a mismatch is corruption, never a race.
+          await deps.store.executions.failClaimedResume(
+            executionId,
+            "resumed execution's pending approval carries no call id (corrupt state)",
+          );
+          return {
+            status: "failed",
+            executionId,
+            error: {
+              name: "ConduitInternalError",
+              message: `[ExecutionManager] Resumed execution's pending approval carries no call id. Context: { executionId: ${executionId} }`,
+            },
+            decisionApplied: false,
+          };
+        }
 
         // TTL (design D8): lazily expire on resume. `claimForResume` already
         // flipped status to running, so persist the terminal `expired` state.

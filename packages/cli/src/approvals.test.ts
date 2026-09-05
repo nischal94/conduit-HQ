@@ -161,7 +161,9 @@ function realDaemon(opts: {
         allowPrivateEgress: opts.allowPrivateEgress ?? false,
       });
       return result(
-        resumeToPayload(await manager.resume(request.executionId, { kind: request.decision })),
+        resumeToPayload(
+          await manager.resume(request.executionId, { kind: request.decision }, request.callId),
+        ),
       );
     }
     throw new Error(`[approvals.test] unexpected request kind: ${request.kind}`);
@@ -262,6 +264,8 @@ describe("conduit approvals list", () => {
     const newIdx = output.indexOf("exec_new");
     expect(oldIdx).toBeGreaterThan(-1);
     expect(newIdx).toBeGreaterThan(oldIdx);
+    expect(output).toMatch(/EXEC ID\s+CALL ID\s+TOOL/);
+    expect(output).toMatch(/exec_old\s+c1\s+github\.delete_repo/);
     expect(output).toMatch(/exec_old.*EXPIRED \(finalizes on next resume\)/s);
     expect(output).toMatch(/exec_new.*remaining/s);
     expect(output).not.toContain("exec_done");
@@ -272,6 +276,27 @@ describe("conduit approvals list", () => {
     expect(row?.pausedOn?.expiresAt).toBe(5_000);
   });
 
+  it("a row from an OLDER daemon (no callId) renders `-` in the CALL ID column and null-free JSON", async () => {
+    const deps = makeDeps({
+      daemon: async () =>
+        result([
+          {
+            executionId: "exec_old_daemon",
+            startedAt: 1_000,
+            toolName: "t",
+            reason: "r",
+            expiresAt: 9e12,
+          },
+        ]),
+      now: () => 10_000,
+    });
+    await runList({ json: false }, deps);
+    expect(deps.stdoutLines.join("")).toMatch(/exec_old_daemon\s+-\s+t\s/);
+    deps.stdoutLines.length = 0;
+    await runList({ json: true }, deps);
+    expect(JSON.parse(deps.stdoutLines.join(""))[0].callId).toBe("-");
+  });
+
   it("--json emits the machine shape", async () => {
     const store = await seedPaused();
     const deps = makeDeps({ store, now: () => 10_000 });
@@ -279,6 +304,7 @@ describe("conduit approvals list", () => {
     await runList({ json: true }, deps);
     const parsed = JSON.parse(deps.stdoutLines.join("")) as Array<{
       executionId: string;
+      callId: string;
       tool: string;
       waitingSince: number;
       expiresAt: number;
@@ -287,6 +313,7 @@ describe("conduit approvals list", () => {
     expect(parsed).toEqual([
       {
         executionId: "exec_old",
+        callId: "c1",
         tool: "github.delete_repo",
         waitingSince: 1_000,
         expiresAt: 5_000,
@@ -294,6 +321,7 @@ describe("conduit approvals list", () => {
       },
       {
         executionId: "exec_new",
+        callId: "c2",
         tool: "github.create_issue",
         waitingSince: 2_000,
         expiresAt: 999_999_999_999,
@@ -354,6 +382,14 @@ describe("conduit approvals approve|deny — real runtime", () => {
     return outcome.executionId;
   }
 
+  /** The call id the operator reads off `approvals list` for this execution. */
+  async function pendingCallId(executionId: string): Promise<string> {
+    const callId = (await store.executions.get(executionId))?.pausedOn?.callId;
+    if (callId === undefined)
+      throw new Error(`[approvals.test] ${executionId} has no pending call`);
+    return callId;
+  }
+
   it("approve maps to manager.resume({kind:'approve'}) and prints 'completed'", async () => {
     await setup();
     const executionId = await pauseOne();
@@ -363,13 +399,73 @@ describe("conduit approvals approve|deny — real runtime", () => {
       live: true,
     });
 
-    const result = await runDecide("approve", executionId, deps);
+    const result = await runDecide("approve", executionId, await pendingCallId(executionId), deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("completed\n");
     expect(upstream.calls.map((c) => c.name)).toEqual(["delete_repo"]);
 
     const row = await store.executions.get(executionId);
     expect(row?.status).toBe("completed");
+  });
+
+  it("INVARIANT §5.5: approve names the pending call the OPERATOR reviewed — the resume request carries the call id passed on the command line, and nothing is looked up", async () => {
+    await setup();
+    const executionId = await pauseOne();
+    const reviewed = await pendingCallId(executionId);
+
+    const inner = makeDeps({ store, allowPrivateEgress: true, live: true });
+    const seen: RpcRequest["kind"][] = [];
+    let captured: RpcRequest | undefined;
+    const deps = {
+      ...inner,
+      daemon: async (request: RpcRequest) => {
+        seen.push(request.kind);
+        if (request.kind === "approvals.resume") captured = request;
+        return inner.daemon(request);
+      },
+    };
+
+    const result = await runDecide("approve", executionId, reviewed, deps);
+    expect(result.exitCode).toBe(0);
+    expect(seen).toEqual(["approvals.resume"]);
+    expect(captured?.kind === "approvals.resume" ? captured.callId : undefined).toBe(reviewed);
+  });
+
+  it("INVARIANT §5.5: a call id that went stale between review and approve is refused as conflict — the program's LATER pause is never approved", async () => {
+    await setup();
+    // Two approval gates: approving the first pause drives the program to
+    // the second. The operator reviewed pause A.
+    const runtime = await createApprovalRuntime({ store, allowPrivateEgress: true });
+    const started = await runtime.manager.start(
+      'await tools.github.delete_repo({ repo: "one" }); await tools.github.delete_repo({ repo: "two" }); return "done";',
+    );
+    if (started.status !== "paused") throw new Error(`expected paused, got ${started.status}`);
+    const executionId = started.executionId;
+    const reviewedA = started.pending.callId;
+
+    // Someone else approves A first; the program runs on and pauses on B.
+    const advanced = await runtime.manager.resume(executionId, { kind: "approve" }, reviewedA);
+    expect(advanced.status).toBe("paused");
+
+    // The operator's queued `approve` of A now arrives.
+    const deps = makeDeps({ store, allowPrivateEgress: true, live: true });
+    const result = await runDecide("approve", executionId, reviewedA, deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stdoutLines.join("")).toBe("conflict\n");
+    expect(deps.stderrLines.join("")).toMatch(/not in a resumable \(paused\) state/);
+
+    // Pause B is untouched and only the first delete ran upstream.
+    expect((await store.executions.get(executionId))?.pausedOn?.callId).not.toBe(reviewedA);
+    expect(upstream.calls.map((c) => c.name)).toEqual(["delete_repo"]);
+  });
+
+  it("approve without a call id exits 1 without ever reaching the daemon", async () => {
+    const daemon = vi.fn();
+    const deps = makeDeps({ daemon: daemon as unknown as ApprovalsDeps["daemon"] });
+    const result = await runDecide("approve", "exec_1", undefined, deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stderrLines.join("")).toMatch(/missing required <call-id>/);
+    expect(daemon).not.toHaveBeenCalled();
   });
 
   it("INVARIANT /cli deny-verb-truth: a REAL applied deny prints 'denied' and exits 0 — the operator's verb succeeded, no tool call", async () => {
@@ -381,7 +477,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
       live: true,
     });
 
-    const result = await runDecide("deny", executionId, deps);
+    const result = await runDecide("deny", executionId, await pendingCallId(executionId), deps);
     // The deny APPLIED (host-side decision consumption — decisionApplied), so
     // the CLI reports the operator's verb as a success, whatever the drive
     // then did (here: the guest has no try/catch, so the drive itself failed
@@ -416,7 +512,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
       allowPrivateEgress: true,
       live: true,
     });
-    const result = await runDecide("approve", executionId, deps);
+    const result = await runDecide("approve", executionId, await pendingCallId(executionId), deps);
 
     // Not an error: the first call ran, the run paused again on the second.
     expect(result.exitCode).toBe(0);
@@ -445,13 +541,16 @@ describe("conduit approvals approve|deny — real runtime", () => {
       live: true,
     });
 
-    const first = await runDecide("approve", executionId, deps);
+    // The operator reviewed ONE call id and reuses it for both invocations —
+    // the second cannot look anything up because nothing is pending anymore.
+    const reviewed = await pendingCallId(executionId);
+    const first = await runDecide("approve", executionId, reviewed, deps);
     expect(first.exitCode).toBe(0);
 
     // Second approve of the same id: claimForResume finds no paused row →
     // a genuine conflict outcome through the real runtime path (sdk
     // manager.test.ts double-resume precedent).
-    const second = await runDecide("approve", executionId, deps);
+    const second = await runDecide("approve", executionId, reviewed, deps);
     expect(second.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("completed\nconflict\n");
     expect(deps.stderrLines.join("")).toMatch(/not in a resumable \(paused\) state/);
@@ -465,7 +564,7 @@ describe("conduit approvals approve|deny — real runtime", () => {
     await setup();
     const daemon = vi.fn();
     const deps = makeDeps({ daemon: daemon as unknown as ApprovalsDeps["daemon"] });
-    const result = await runDecide("approve", undefined, deps);
+    const result = await runDecide("approve", undefined, "call_1", deps);
     expect(result.exitCode).toBe(1);
     // Argument validation is client-side and happens BEFORE any RPC: a
     // malformed invocation must not auto-start a daemon.
@@ -495,7 +594,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("approve", "exec_x", deps);
+    const result = await runDecide("approve", "exec_x", "call_x", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("expired\n");
     expect(deps.stderrLines.join("")).toMatch(
@@ -511,7 +610,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_y", deps);
+    const result = await runDecide("deny", "exec_y", "call_x", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stderrLines.join("")).toMatch(/no tool call was made/i);
   });
@@ -523,7 +622,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("approve", "exec_z", deps);
+    const result = await runDecide("approve", "exec_z", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("conflict\n");
   });
@@ -536,7 +635,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_w", deps);
+    const result = await runDecide("deny", "exec_w", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("failed\n");
     expect(deps.stderrLines.join("")).toMatch(/SomeError: boom/);
@@ -550,7 +649,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: true,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_denied", deps);
+    const result = await runDecide("deny", "exec_denied", "call_x", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
     // One informational drive-outcome line: the operator sees what the
@@ -566,7 +665,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_spoof", deps);
+    const result = await runDecide("deny", "exec_spoof", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("failed\n");
     expect(deps.stdoutLines.join("")).not.toContain("denied");
@@ -580,7 +679,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: true,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_caught", deps);
+    const result = await runDecide("deny", "exec_caught", "call_x", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
     expect(deps.stderrLines.join("")).toMatch(/deny was applied.*completed/is);
@@ -594,7 +693,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: true,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_later_fail", deps);
+    const result = await runDecide("deny", "exec_later_fail", "call_x", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
     expect(deps.stderrLines.join("")).toMatch(/deny was applied.*failed.*NetworkError/is);
@@ -608,7 +707,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: true,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_repause", deps);
+    const result = await runDecide("deny", "exec_repause", "call_x", deps);
     expect(result.exitCode).toBe(0);
     expect(deps.stdoutLines.join("")).toBe("denied\n");
     expect(deps.stderrLines.join("")).toMatch(/paused again on a new approval/i);
@@ -627,7 +726,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("deny", "exec_never_applied", deps);
+    const result = await runDecide("deny", "exec_never_applied", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("completed\n");
     expect(deps.stdoutLines.join("")).not.toContain("denied");
@@ -645,7 +744,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: false,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("approve", "exec_approve_never_applied", deps);
+    const result = await runDecide("approve", "exec_approve_never_applied", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("completed\n");
     expect(deps.stderrLines.join("")).toMatch(/approve was never applied/i);
@@ -659,7 +758,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       decisionApplied: true,
     };
     const deps = depsWithOutcome(outcome);
-    const result = await runDecide("approve", "exec_approve_blocked", deps);
+    const result = await runDecide("approve", "exec_approve_blocked", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("failed\n");
     expect(deps.stderrLines.join("")).toMatch(/ConduitPolicyBlocked: policy denied the execution/);
@@ -681,7 +780,7 @@ describe("conduit approvals — daemon transport answers", () => {
     const deps = makeDeps({
       daemon: async () => ({ kind: "outcome-unknown", requestId: "req_9" }),
     });
-    const result = await runDecide("deny", "exec_amb", deps);
+    const result = await runDecide("deny", "exec_amb", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).not.toContain("denied");
     const stderr = deps.stderrLines.join("");
@@ -701,7 +800,7 @@ describe("conduit approvals — daemon transport answers", () => {
         message: "the daemon is at capacity",
       }),
     });
-    const result = await runDecide("approve", "exec_busy", deps);
+    const result = await runDecide("approve", "exec_busy", "call_x", deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stderrLines.join("")).toMatch(/busy.*at capacity/is);
   });
@@ -773,8 +872,8 @@ describe("conduit approvals — daemon transport answers", () => {
       },
     });
     await runList({ json: true }, deps);
-    await runDecide("approve", "x", deps);
-    await runDecide("deny", "x", deps);
+    await runDecide("approve", "x", "call_x", deps);
+    await runDecide("deny", "x", "call_x", deps);
     // `handshake` is the client's own, written inside daemonRequest — the
     // command itself may only ever name these two kinds.
     expect([...new Set(seen)].sort()).toEqual(["approvals.list", "approvals.resume"]);

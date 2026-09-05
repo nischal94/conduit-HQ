@@ -371,6 +371,11 @@ first run and replayed verbatim on resume.</li>
 <li><strong>Approval TTL:</strong> a pending approval expires after a configurable window
 (<code>CONDUIT_APPROVAL_TTL</code>, default 72h); the Execution then fails with a policy-timeout
 error, recorded in Trace.</li>
+<li><strong>One decision per pending call (2026-09-06):</strong> a pending approval is identified by
+the paused call&#39;s <code>callId</code>. A resume names that call, and the paused→running claim
+succeeds only while the Execution is paused on it — a decision naming a call the Execution is no
+longer paused on (already decided, or paused again on a later call) is refused as a conflict,
+never applied to another call.</li>
 </ul>
 <hr>
 <h2 id="6-the-execute-tool-amp-code-mode-workflow">6. The <code>execute</code> tool &amp; code-mode workflow</h2>

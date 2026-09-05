@@ -204,6 +204,11 @@ first run and replayed verbatim on resume.
 - **Approval TTL:** a pending approval expires after a configurable window
 (`CONDUIT_APPROVAL_TTL`, default 72h); the Execution then fails with a policy-timeout
 error, recorded in Trace.
+- **One decision per pending call (2026-09-06):** a pending approval is identified by
+the paused call's `callId`. A resume names that call, and the paused→running claim
+succeeds only while the Execution is paused on it — a decision naming a call the Execution is no
+longer paused on (already decided, or paused again on a later call) is refused as a conflict,
+never applied to another call.
 
 ---
 

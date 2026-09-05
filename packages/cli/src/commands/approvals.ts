@@ -90,7 +90,7 @@ function prodDeps(stateDir: string): ApprovalsDeps {
  * socket cannot drift apart on this shape.
  *
  * Structurally FLAT and narrower than a stored `Execution`: the daemon
- * projects the five fields this command renders and drops the raw
+ * projects the six fields this command renders and drops the raw
  * `pausedOn`, whose `input` is the paused call's arguments. A corrupt row
  * (paused with no `pausedOn`) is omitted and logged daemon-side, so nothing
  * here has to defend against it.
@@ -140,6 +140,8 @@ function ask<K extends RpcRequest["kind"]>(
 
 interface PausedRow {
   executionId: string;
+  /** `-` when the daemon predates call-bound approvals (wire skew). */
+  callId: string;
   tool: string;
   waitingSince: number;
   expiresAt: number;
@@ -149,6 +151,7 @@ interface PausedRow {
 function toPausedRow(row: PausedRowWire, now: number): PausedRow {
   return {
     executionId: row.executionId,
+    callId: row.callId ?? "-",
     tool: row.toolName,
     waitingSince: row.startedAt,
     expiresAt: row.expiresAt,
@@ -187,12 +190,13 @@ function renderTable(rows: PausedRow[], now: number): string {
     return "No paused executions awaiting approval.\n";
   }
   const idWidth = Math.max(7, ...rows.map((r) => r.executionId.length));
+  const callWidth = Math.max(7, ...rows.map((r) => r.callId.length));
   const toolWidth = Math.max(4, ...rows.map((r) => r.tool.length));
   const lines = rows.map((row) => {
     const waiting = new Date(row.waitingSince).toISOString();
-    return `${pad(row.executionId, idWidth)}  ${pad(row.tool, toolWidth)}  ${pad(waiting, 24)}  ${expiryLabel(row, now)}`;
+    return `${pad(row.executionId, idWidth)}  ${pad(row.callId, callWidth)}  ${pad(row.tool, toolWidth)}  ${pad(waiting, 24)}  ${expiryLabel(row, now)}`;
   });
-  const header = `${pad("EXEC ID", idWidth)}  ${pad("TOOL", toolWidth)}  ${pad("WAITING SINCE", 24)}  EXPIRY`;
+  const header = `${pad("EXEC ID", idWidth)}  ${pad("CALL ID", callWidth)}  ${pad("TOOL", toolWidth)}  ${pad("WAITING SINCE", 24)}  EXPIRY`;
   return `${[header, ...lines].join("\n")}\n`;
 }
 
@@ -216,6 +220,7 @@ export async function runList(
       `${JSON.stringify(
         rows.map((row) => ({
           executionId: row.executionId,
+          callId: row.callId,
           tool: row.tool,
           waitingSince: row.waitingSince,
           expiresAt: row.expiresAt,
@@ -262,16 +267,34 @@ function formatOutcomeError(error: { code: string; message: string } | undefined
 export async function runDecide(
   kind: "approve" | "deny",
   executionId: string | undefined,
+  callId: string | undefined,
   deps: ApprovalsDeps,
 ): Promise<ApprovalsResult> {
   if (executionId === undefined || executionId.trim() === "") {
     deps.stderr(`[conduit approvals] ${kind}: missing required <execution-id>.\n`);
     return { exitCode: 1 };
   }
+  // An approval is for ONE pending call (spec §5.5), and the call the
+  // OPERATOR reviewed is the one that must be decided — so the call id is
+  // an argument, read off `conduit approvals list`, never looked up here.
+  // Looking it up at decide time would bind the decision to whatever is
+  // pending NOW: a program approved on pause A that ran on to pause B would
+  // have B approved by a second, queued `approve` of A — a call no human
+  // looked at. The daemon's claim refuses a stale id as `conflict`.
+  if (callId === undefined || callId.trim() === "") {
+    deps.stderr(
+      `[conduit approvals] ${kind}: missing required <call-id> — the CALL ID column of "conduit approvals list" for execution ${executionId}.\n`,
+    );
+    return { exitCode: 1 };
+  }
 
   // The daemon drives the resume, through the one long-lived runtime it
   // built at startup (spec §2.1).
-  const answer = await ask(deps, { kind: "approvals.resume", executionId, decision: kind }, kind);
+  const answer = await ask(
+    deps,
+    { kind: "approvals.resume", executionId, decision: kind, callId },
+    kind,
+  );
   if (!answer.ok) {
     deps.stderr(answer.line);
     return { exitCode: answer.exitCode };
@@ -372,12 +395,12 @@ export async function approvals(argv: string[], opts: ApprovalsOptions = {}): Pr
     }
     case "approve":
     case "deny": {
-      const result = await runDecide(sub, rest[0], deps);
+      const result = await runDecide(sub, rest[0], rest[1], deps);
       return result.exitCode;
     }
     default: {
       deps.stderr(
-        `[conduit approvals] Unknown subcommand: ${sub ?? "(none)"}. Usage: conduit approvals list|approve|deny [<execution-id>]\n`,
+        `[conduit approvals] Unknown subcommand: ${sub ?? "(none)"}. Usage: conduit approvals list|approve|deny [<execution-id> <call-id>]\n`,
       );
       return 1;
     }
