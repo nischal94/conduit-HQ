@@ -2407,3 +2407,25 @@ direct calls now. **Lesson: a design brief's "starting position" rows
 are claims to verify against code before they become spec text; the
 spec now states the inherited behaviour plainly and routes the rule to
 R2 with the policy version it needs.**
+
+### 10. The outside voice earned its cost by reversing two of my own recommendations
+
+The eng review's architecture and code-quality picks (a readers-writer
+lock; a composite request-key index) were each reversed an hour later by
+a fresh-context reviewer with two facts I had not checked: the spec's
+own threat model makes the locked race operator-created, and the
+single-column unique index is recreated on every store open, so the
+composite index turned a one-row downgrade failure into a bricked open.
+**Lesson: a recommendation made inside a long review inherits that
+review's blind spots; the outside voice is not a formality, and its
+value is highest exactly where the in-session reviewer was most
+confident.** Both reversals were smaller diffs than what they replaced.
+
+### 11. Fail-closed has a blast radius too
+
+Two fixes this session protected against daemon downgrade: a sentinel
+program in `code` (fails one new row) and a composite index (fails the
+whole store at open). Both are "fail closed"; only one is proportionate.
+**Lesson: when choosing a fail-closed mechanism, name what it takes
+down — one row, one client, or the store — and pick the smallest unit
+that still closes the hole.**

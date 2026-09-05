@@ -31,72 +31,78 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-05 late (R1 SPEC at rev 6 on PR #57 — all eight P1s folded; codex pass #3 NOT YET RUN (provider usage limit, retry after 23:41); NEXT: codex #3 → eng review → founder read → plan)
+## Current handoff — updated 2026-09-05 night (R1 SPEC at rev 8 on PR #57: eng review DONE and folded, outside voice folded; codex convergence pass #3 STILL OWED — three runs lost to the provider's usage limit; NEXT: codex #3 on rev 8 → founder read → writing-plans)
 
-**WHAT HAPPENED (2026-09-05):** R1 started through the standing
-machinery. Brainstorm with the founder settled five decisions on top
-of D1–D6 — **A1** widen `serve` (no `direct` row; `tool.call` kind;
-`clientId` on the handshake), **A2** allowlist = namespaces + exact
-tool names, **A3** `conduit serve --client <id>`, **A4** `requestKey`
-on the discovery `call` tool only, **A5** one `admin` row + `conduit
-profiles` + `conduit remove-mcp` — plus two agent-decided and
-disclosed: **A6** direct execution is a manager arm (`startDirect`),
-**A7** the allowlist applies to Code Mode too. The spec is
-`docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`
-on branch `docs/r1-design-spec`, **draft PR #57**, five revisions:
-rev 1 brainstorm → rev 2 four codex interim findings (its first run
-died on the provider's usage limit; findings recovered from its stderr
-reasoning) → rev 3 fable code-verifying audit (1 P0 / 5 P1 / 14 P2)
-→ rev 4 codex full pass (4 P0 / 8 P1 / 2 P2) → rev 5 codex confirming
-pass (9 closed, 5 partial, NEW 1 P0 / 8 P1 / 2 P2): the P0 (the MCP
-client's scoped 404 retry can dispatch one approved call TWICE → no
-post-dispatch retry for governed calls, any projection) and both P2
-are folded; **the eight P1 are recorded verbatim as OPEN in the spec's
-§12** (request-key migration; dispatch STATE not error field;
-source-lock wait unbudgeted + provisioning-behind-direct regression;
-drive-timer exactly-once settlement; advertised-name REASSIGNMENT;
-full MCP envelope validation; page packing by encoded size; async
-handshake race). Nothing else changed: main is untouched by R1;
-conduitspec, INVARIANTS, code — all unchanged. No rebuild needed.
+**WHAT HAPPENED (2026-09-05, one long session):** R1 started through the
+standing machinery and reached a reviewed spec in eight revisions on
+branch `docs/r1-design-spec`, **draft PR #57** (tip `7753f60`):
+`docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`.
+Brainstorm settled A1–A7 on top of D1–D6 (widen `serve` with
+`tool.call` + `clientId` on the handshake; allowlist = namespaces +
+exact tool names; `conduit serve --client <id>`; `requestKey` on the
+discovery `call` tool only; one `admin` row + `conduit profiles` +
+`conduit remove-mcp`; direct execution as a manager arm; allowlist
+applies to Code Mode). Review ladder: rev 2 codex interim (recovered
+from stderr after a usage-limit death) → rev 3 fable code-verifying
+audit (1 P0 / 5 P1 / 14 P2) → rev 4 codex full pass (4 P0 / 8 P1 /
+2 P2) → rev 5 codex confirming pass (1 P0: the MCP client's 404 retry
+dispatches an approved call twice → no post-dispatch retry for governed
+calls) → rev 6 its eight P1s → **rev 7 in-session plan-eng-review with
+the founder (D1–D8)** → **rev 8 outside voice (Claude subagent; codex
+blocked), D9–D15.** Net design after the last two rounds: NO drive
+linearization (the check-then-dispatch race needs the trusted OPERATOR
+to re-provision mid-call → accepted Grade-B limit, §3); rev 6
+request-key encoding kept (the composite index was a downgrade hazard:
+the single-column index is recreated on every open); a direct result is
+NEVER persisted unredacted (sync completion not persisted; resumed one
+redacted); the D3 generation check runs on paused rows of BOTH kinds;
+advertised names are an injective encoding the server DECODES (no map);
+the server walks every daemon page into one `tools/list`; versioned
+scope snapshot; `client_id` on Trace; one `DirectDrive` object; 42
+acceptance rows. The spec ends with the GSTACK REVIEW REPORT and eight
+implementation tasks (T1–T8). Main is untouched by R1 code; no rebuild.
 
-### NEXT — converge the R1 spec, then plan
+### NEXT — converge, then plan
 
-1. **Rev 6 is DONE** (`90705a0`, pushed): the eight §12 items are folded
-   (legacy-compatible per-client keys; dispatch-state cell; lock wait
-   inside admission; exactly-once settlement; INJECTIVE name encoding
-   `-`→`--`, `.`→`-`; full MCP envelope validation; pages packed by
-   encoded size; handshake state machine). Rows #22–#24 added. Then
-   **codex pass #3** per
-   `~/.claude/rules/codex-one-path.md` — long form, detached, `pgrep`
-   liveness OUTSIDE the sandbox (inside it `pgrep` cannot list
-   processes and the wait loop exits immediately: false DONE). The
-   prompt file pattern lives in the spec's §12 trail; re-derive it
-   (scratchpad is gone). Convergence criterion: adversarial-convergence
-   rule — a third round of NEW-class breaks means pause for a threat-
-   model pass, not a fourth fold.
-2. The interactive **plan-eng-review** with the founder present — it is
-   INDEPENDENT of codex #3 (the 2026-08-22 spec ran its three passes in
-   parallel), so run it whenever the founder is available rather than
-   after codex; fold both results together. Prerequisites: founder (gstack onboarding prompts fire on first run — LEARNINGS
-   2026-08-30 #1) → founder reads the spec → `superpowers:writing-plans`.
-3. The spec PR (#57) also carries, when converged: the R1 §18 entry in
-   `conduitspec.html` (+ `html2md.py`), G1–G3 ledger fixes, and the
-   ⏳ rows #1–#21 in INVARIANTS.md. Load-bearing route: explainer +
-   quiz, human-named merge.
-4. Build shape is in spec §10: three lanes A (store+manager) → B
-   (daemon+profiles+admin) → C (MCP surface), each its own PR.
+1. **Codex pass #3 on rev 8** per `~/.claude/rules/codex-one-path.md`:
+   long form, detached, `pgrep` liveness OUTSIDE the sandbox (inside it
+   `pgrep` cannot list processes → false DONE). Expect the usage limit:
+   the failure is exit 1 + empty stdout + an `ERROR: … usage limit …
+   try again at HH:MM` line in stderr; queue a `sleep` until that time
+   and re-run rather than diagnosing the empty stdout. Prompt = the
+   standing adversarial brief (threat model, guarantees, exclusions)
+   with the spec inlined and the §12 trail as the closure list.
+   Convergence criterion: adversarial-convergence.md — all findings
+   (a)/(b) → converged; a NEW-class P0 → threat-model pause, not a
+   ninth fold.
+2. Converged → the founder reads the spec (brainstorming skill's
+   review gate: "Spec written and committed to <path>. Please review
+   it…") → `superpowers:writing-plans` from spec §10's three lanes and
+   the T1–T8 task list.
+3. PR #57 also carries, when converged: the R1 §18 entry in
+   `conduitspec.html` (+ `html2md.py`), G1–G3 ledger fixes, and the ⏳
+   rows #1–#42 in INVARIANTS.md. Load-bearing route: explainer + quiz,
+   human-named merge.
 
-**DEFERRED (live list, carried from 2026-09-04 unchanged):** `--doctor
---offline` fixture race · `pnpm audit` registry-timeout false-red ·
-`.impeccable/` dirs vs `biome check .` (config change, founder
-approval) · `NOTICE` file before first publish · Dependabot 0 HIGH /
-6 medium / 1 low · R3 website publish coupling · §16 flake pins ·
-Linux ACL CI · revision pinning (→ R2; R1 now adds
-`sources.generation` as its base) · CX1/CX2 residuals ·
-display-allowlist helper · ApprovalRuntime type split · doctor log
-name. **Added 2026-09-05:** input-schema validation is absent on BOTH
-projections (parity, stated in spec §5.1; R2 candidate) · a sent-marker
-in the MCP wire layer is superseded by the dispatch-state item above.
+**Session quirks worth inheriting:** gstack's plan-eng-review fires two
+onboarding prompts every run (continuous checkpoint, proactive) because
+the marker `touch` under `~/.claude/skills/gstack` and `~/.gstack` is
+denied in the sandbox — run the two `touch` commands UNSANDBOXED once
+to silence them · gstack review-log / test-plan / tasks writes need the
+unsandboxed path (learning on file) · a raw NUL byte in a spec
+paragraph breaks the Edit tool's matching; the spec now spells it
+`<NUL>`.
+
+**DEFERRED (live list, updated 2026-09-05 night):** `--client` on the
+bare `conduit-mcp` bin (D8; TRIGGER: R3's entry-point decision) ·
+input-schema validation on BOTH projections (parity, spec §5.1; R2
+candidate) · G4 spec absorption of §3.3/§3.3.1 · `--doctor --offline`
+fixture race · `pnpm audit` registry-timeout false-red · `.impeccable/`
+dirs vs `biome check .` (config change, founder approval) · `NOTICE`
+file before first publish · Dependabot 0 HIGH / 6 medium / 1 low · R3
+website publish coupling · §16 flake pins · Linux ACL CI · revision
+pinning (→ R2; `sources.generation` is its base) · CX1/CX2 residuals ·
+display-allowlist helper · ApprovalRuntime type split · doctor log name.
 
 **SHELVED (unchanged):** the project-jail plan; reactivated only by the
 founder in chat.
@@ -106,16 +112,14 @@ founder in chat.
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — PR
 > #57 is the OPEN draft carrying the R1 spec). **State: R1 spec at rev
-> 6 on `docs/r1-design-spec` (`90705a0`), all review findings folded,
-> convergence NOT yet confirmed — codex pass #3 was blocked by the
-> provider's usage limit (two runs lost to it today). Do NOT write a
-> plan, touch code, or re-brainstorm A1–A7/D1–D6.** NEXT: check out
-> the branch, run codex pass #3 (codex-one-path; pgrep outside the
-> sandbox; prompt = the standing adversarial brief + the spec inline),
-> fold anything it finds, and if converged run the interactive
-> plan-eng-review with the founder, then hand the spec to the founder
-> to read, then writing-plans. Carry the DEFERRED list.
-
+> 8 on `docs/r1-design-spec` (`7753f60`), eng review + outside voice
+> folded, 42 acceptance rows, GSTACK REVIEW REPORT appended;
+> convergence NOT yet confirmed — codex pass #3 owed (usage limit
+> blocked three runs). Do NOT write a plan, touch code, or re-open
+> A1–A7 / D1–D15.** NEXT: check out the branch, run codex pass #3 on
+> rev 8 (codex-one-path; pgrep outside the sandbox; queue on the
+> limit's retry time), fold anything in-scope, then hand the spec to
+> the founder to read, then writing-plans. Carry the DEFERRED list.
 ---
 
 ## Superseded handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; its NEXT [R1] was STARTED 2026-09-05 by the section above — spec drafted to rev 5, not converged)
