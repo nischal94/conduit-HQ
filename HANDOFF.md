@@ -31,7 +31,86 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; branches = main only; NEXT: R1)
+## Current handoff — updated 2026-09-05 evening (R1 SPEC DRAFTED to rev 5 on PR #57, NOT CONVERGED; NEXT: rev 6 folds eight open P1s → codex pass #3 → eng review → founder read → plan)
+
+**WHAT HAPPENED (2026-09-05):** R1 started through the standing
+machinery. Brainstorm with the founder settled five decisions on top
+of D1–D6 — **A1** widen `serve` (no `direct` row; `tool.call` kind;
+`clientId` on the handshake), **A2** allowlist = namespaces + exact
+tool names, **A3** `conduit serve --client <id>`, **A4** `requestKey`
+on the discovery `call` tool only, **A5** one `admin` row + `conduit
+profiles` + `conduit remove-mcp` — plus two agent-decided and
+disclosed: **A6** direct execution is a manager arm (`startDirect`),
+**A7** the allowlist applies to Code Mode too. The spec is
+`docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`
+on branch `docs/r1-design-spec`, **draft PR #57**, five revisions:
+rev 1 brainstorm → rev 2 four codex interim findings (its first run
+died on the provider's usage limit; findings recovered from its stderr
+reasoning) → rev 3 fable code-verifying audit (1 P0 / 5 P1 / 14 P2)
+→ rev 4 codex full pass (4 P0 / 8 P1 / 2 P2) → rev 5 codex confirming
+pass (9 closed, 5 partial, NEW 1 P0 / 8 P1 / 2 P2): the P0 (the MCP
+client's scoped 404 retry can dispatch one approved call TWICE → no
+post-dispatch retry for governed calls, any projection) and both P2
+are folded; **the eight P1 are recorded verbatim as OPEN in the spec's
+§12** (request-key migration; dispatch STATE not error field;
+source-lock wait unbudgeted + provisioning-behind-direct regression;
+drive-timer exactly-once settlement; advertised-name REASSIGNMENT;
+full MCP envelope validation; page packing by encoded size; async
+handshake race). Nothing else changed: main is untouched by R1;
+conduitspec, INVARIANTS, code — all unchanged. No rebuild needed.
+
+### NEXT — converge the R1 spec, then plan
+
+1. On `docs/r1-design-spec`: **rev 6** folds the eight §12 OPEN items
+   (each carries codex's condensed fix). Then **codex pass #3** per
+   `~/.claude/rules/codex-one-path.md` — long form, detached, `pgrep`
+   liveness OUTSIDE the sandbox (inside it `pgrep` cannot list
+   processes and the wait loop exits immediately: false DONE). The
+   prompt file pattern lives in the spec's §12 trail; re-derive it
+   (scratchpad is gone). Convergence criterion: adversarial-convergence
+   rule — a third round of NEW-class breaks means pause for a threat-
+   model pass, not a fourth fold.
+2. Converged → the interactive **plan-eng-review** with the founder
+   present (gstack onboarding prompts fire on first run — LEARNINGS
+   2026-08-30 #1) → founder reads the spec → `superpowers:writing-plans`.
+3. The spec PR (#57) also carries, when converged: the R1 §18 entry in
+   `conduitspec.html` (+ `html2md.py`), G1–G3 ledger fixes, and the
+   ⏳ rows #1–#21 in INVARIANTS.md. Load-bearing route: explainer +
+   quiz, human-named merge.
+4. Build shape is in spec §10: three lanes A (store+manager) → B
+   (daemon+profiles+admin) → C (MCP surface), each its own PR.
+
+**DEFERRED (live list, carried from 2026-09-04 unchanged):** `--doctor
+--offline` fixture race · `pnpm audit` registry-timeout false-red ·
+`.impeccable/` dirs vs `biome check .` (config change, founder
+approval) · `NOTICE` file before first publish · Dependabot 0 HIGH /
+6 medium / 1 low · R3 website publish coupling · §16 flake pins ·
+Linux ACL CI · revision pinning (→ R2; R1 now adds
+`sources.generation` as its base) · CX1/CX2 residuals ·
+display-allowlist helper · ApprovalRuntime type split · doctor log
+name. **Added 2026-09-05:** input-schema validation is absent on BOTH
+projections (parity, stated in spec §5.1; R2 candidate) · a sent-marker
+in the MCP wire layer is superseded by the dispatch-state item above.
+
+**SHELVED (unchanged):** the project-jail plan; reactivated only by the
+founder in chat.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — PR
+> #57 is the OPEN draft carrying the R1 spec). **State: R1 spec at rev
+> 5 on `docs/r1-design-spec`, NOT CONVERGED; eight open P1s listed
+> verbatim in the spec's §12. Do NOT write a plan, touch code, or
+> re-brainstorm A1–A7/D1–D6.** NEXT: check out the branch, fold the
+> eight §12 OPEN items into rev 6, run codex pass #3 (codex-one-path;
+> pgrep outside the sandbox), and if converged run the interactive
+> plan-eng-review with the founder, then hand the spec to the founder
+> to read, then writing-plans. Carry the DEFERRED list.
+
+---
+
+## Superseded handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; its NEXT [R1] was STARTED 2026-09-05 by the section above — spec drafted to rev 5, not converged)
 
 **Later the same day:** the license PR landed — three manifests now say
 `Apache-2.0`, the plan-doc template is amended, and

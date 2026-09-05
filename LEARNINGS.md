@@ -2366,3 +2366,44 @@ to the founder, and a shelved design is recorded as inert documentation
 (private folder, explicit do-not-act banner, one HANDOFF pointer that
 names the only reactivation trigger) so no future session mistakes it
 for a task.**
+
+## 2026-09-05 — R1 spec drafted to rev 5 (PR #57, not converged)
+
+### 7. A spec review that finds a P0 per round is still finding, not converging
+
+Five revisions in one session: a self-review caught two defects, the
+fable audit found a P0 (Code Mode resume ignored the profile), the codex
+full pass found four P0s in the fixes for the previous round (the
+generation check moved a race instead of closing it; `MAX(generation)`
+is reusable after a delete; a flag turned off revoked nothing; the
+downgrade sentinel covered one kind), and the confirming pass found one
+more P0 in INHERITED code (the MCP client's 404 retry dispatches an
+approved call twice). **Lesson: when each fold produces a new P0 in the
+fold itself, the design is still being discovered — record the open
+findings verbatim in the spec's own trail and stop the session there;
+a fourth fold at 90% of the usage window would have been the worst
+place to reason about exactly-once settlement.** The
+adversarial-convergence rule's "new-class breaks repeatedly → pause"
+branch applies to specs exactly as it does to code.
+
+### 8. `pgrep` lies inside the sandbox
+
+The codex wait loop (`pgrep -f "codex exec" || break`) exited on its
+first iteration with "DONE" and zero stdout while codex was still
+reading the tree: inside the sandbox `pgrep` cannot get the process
+list, so the liveness probe failed closed as "not running". Exactly the
+false-green shape. **Lesson: the liveness probe from codex-one-path runs
+with the sandbox OFF, or it proves nothing; the tell was `pgrep: Cannot
+get process list` on stderr, which the loop discarded.** Also: a run
+that dies on the provider's usage limit leaves its reasoning on stderr —
+four real findings were recovered from it before the re-run.
+
+### 9. The brief's drift table over-promised; the spec must say so
+
+The R1 brief's "a stricter policy is never bypassed by an old approval"
+is not true of the shipped D6 branch: a staged approval skips the policy
+engine for its one byte-identical call, for Code Mode today and for
+direct calls now. **Lesson: a design brief's "starting position" rows
+are claims to verify against code before they become spec text; the
+spec now states the inherited behaviour plainly and routes the rule to
+R2 with the policy version it needs.**
