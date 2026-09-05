@@ -31,7 +31,7 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-05 evening (R1 SPEC DRAFTED to rev 5 on PR #57, NOT CONVERGED; NEXT: rev 6 folds eight open P1s → codex pass #3 → eng review → founder read → plan)
+## Current handoff — updated 2026-09-05 late (R1 SPEC at rev 6 on PR #57 — all eight P1s folded; codex pass #3 NOT YET RUN (provider usage limit, retry after 23:41); NEXT: codex #3 → eng review → founder read → plan)
 
 **WHAT HAPPENED (2026-09-05):** R1 started through the standing
 machinery. Brainstorm with the founder settled five decisions on top
@@ -61,8 +61,12 @@ conduitspec, INVARIANTS, code — all unchanged. No rebuild needed.
 
 ### NEXT — converge the R1 spec, then plan
 
-1. On `docs/r1-design-spec`: **rev 6** folds the eight §12 OPEN items
-   (each carries codex's condensed fix). Then **codex pass #3** per
+1. **Rev 6 is DONE** (`90705a0`, pushed): the eight §12 items are folded
+   (legacy-compatible per-client keys; dispatch-state cell; lock wait
+   inside admission; exactly-once settlement; INJECTIVE name encoding
+   `-`→`--`, `.`→`-`; full MCP envelope validation; pages packed by
+   encoded size; handshake state machine). Rows #22–#24 added. Then
+   **codex pass #3** per
    `~/.claude/rules/codex-one-path.md` — long form, detached, `pgrep`
    liveness OUTSIDE the sandbox (inside it `pgrep` cannot list
    processes and the wait loop exits immediately: false DONE). The
@@ -100,11 +104,13 @@ founder in chat.
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — PR
 > #57 is the OPEN draft carrying the R1 spec). **State: R1 spec at rev
-> 5 on `docs/r1-design-spec`, NOT CONVERGED; eight open P1s listed
-> verbatim in the spec's §12. Do NOT write a plan, touch code, or
-> re-brainstorm A1–A7/D1–D6.** NEXT: check out the branch, fold the
-> eight §12 OPEN items into rev 6, run codex pass #3 (codex-one-path;
-> pgrep outside the sandbox), and if converged run the interactive
+> 6 on `docs/r1-design-spec` (`90705a0`), all review findings folded,
+> convergence NOT yet confirmed — codex pass #3 was blocked by the
+> provider's usage limit (two runs lost to it today). Do NOT write a
+> plan, touch code, or re-brainstorm A1–A7/D1–D6.** NEXT: check out
+> the branch, run codex pass #3 (codex-one-path; pgrep outside the
+> sandbox; prompt = the standing adversarial brief + the spec inline),
+> fold anything it finds, and if converged run the interactive
 > plan-eng-review with the founder, then hand the spec to the founder
 > to read, then writing-plans. Carry the DEFERRED list.
 
