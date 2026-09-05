@@ -1297,3 +1297,32 @@ regenerated per commit · agent never installs.
   independently confirmed the D7 snapshot and the D4 trace column;
   its remaining feasibility note (clients honouring `nextCursor`)
   dissolves under D14.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 (3 direct `codex exec` passes on revs 3/4/6: two completed, one lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 6: not run |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open (all folded; convergence pass #3 owed) | 15 issues, 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
+
+- **CODEX:** the direct passes (not `/codex review`) drove revs 2–6; all their findings are folded; the confirming pass on rev 6 has not run (usage limit).
+- **CROSS-MODEL:** outside voice (Claude subagent, fresh context) vs the eng review: 9 findings, 7 tensions put to the founder — 6 accepted (D10–D15), 1 rejected (D9); it independently confirmed D4 and D7.
+- **VERDICT:** ENG REVIEW COMPLETE, findings folded — eng review required to re-clear after codex pass #3 (convergence) runs on rev 8.
+
+## Implementation Tasks
+Synthesized from this review's findings. Each task derives from a specific finding above.
+
+- [ ] **T1 (P1, human: ~1d / CC: ~15min)** — sdk/execution — Remove drive linearization; keep sweep + post-claim generation check on BOTH kinds — Surfaced by: D10, D13 — Files: `packages/sdk/src/execution/manager.ts`, `packages/mcp/src/daemon/connection.ts` — Verify: rows #17, #42
+- [ ] **T2 (P1, human: ~2h / CC: ~10min)** — sdk/store — Request keys: rev 6 encoding, one function + round-trip pin — Surfaced by: D11 — Verify: row #25
+- [ ] **T3 (P1, human: ~4h / CC: ~15min)** — sdk/execution — Persist a direct result only on the resume path, redacted; synchronous completion not persisted — Surfaced by: D12 — Verify: row #41
+- [ ] **T4 (P1, human: ~4h / CC: ~15min)** — mcp/server — Decode advertised names; walk all daemon pages into one tools/list — Surfaced by: D14 — Verify: rows #36, #38
+- [ ] **T5 (P2, human: ~30min / CC: ~3min)** — sdk/store — `client_id` on trace_events; invoker writes projection + client_id — Surfaced by: D4 — Verify: row #27
+- [ ] **T6 (P2, human: ~1h / CC: ~5min)** — sdk/execution — One `DirectDrive` object — Surfaced by: D5 — Verify: row #28
+- [ ] **T7 (P2, human: ~1d / CC: ~15min)** — mcp/daemon — Versioned scope snapshot + writer-location test — Surfaced by: D7, D15 — Verify: rows #29, #40
+- [ ] **T8 (P2, human: ~3d / CC: ~1h)** — tests — Ledger rows #25–#42 with their tests, per lane — Surfaced by: D6, D12–D15 — Verify: INVARIANTS.md flips per commit
+
+NO UNRESOLVED DECISIONS
+
