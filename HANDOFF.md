@@ -31,100 +31,109 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-06 00:20 (R1 SPEC at rev 10 on PR #57; codex passes #3 and #4 RAN — #4 found two NEW-CLASS P0s (instance binding), folded; the review loop is PAUSED by rule; NEXT: a dedicated threat-model pass on instance binding → codex #5 → founder read → plan)
+## Current handoff — updated 2026-09-06 01:50 (TWO open PRs: #58 approval-call-binding FIX — gauntlet all but done, codex #3 QUEUED for 04:43, quiz pending, merge is the founder's call · #57 R1 spec rev 10, review loop PAUSED by rule; NEXT: merge #58 when quiz passed + codex #3 converged → threat-model pass on instance binding for R1)
 
-**WHAT HAPPENED (2026-09-05 → 06, one long session):** R1 went from
-the design brief to a ten-revision spec on branch `docs/r1-design-spec`,
-**draft PR #57** (tip = the rev 10 commit):
-`docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`.
-Brainstorm settled A1–A7 on top of D1–D6. Review ladder: rev 2 codex
-interim → rev 3 fable audit → rev 4 codex full (4 P0) → rev 5 codex
-confirming (1 P0: MCP 404 retry double-dispatch) → rev 6 its P1s →
-rev 7 **in-session plan-eng-review with the founder (D1–D8)** → rev 8
-**outside voice (D9–D15)**: no drive lock (operator-created race =
-accepted Grade-B limit), rev 6 keys kept, results never persisted
-unredacted, generation check on both kinds, injective name decode →
-rev 9 **codex #3 on rev 8 (0 P0 / 8 P1)**: prefix-free `_u/_h/_d` name
-escapes, a `request_keys` mapping table (legacy NUL keys), one
-`PendingApproval` provenance shape, Code Mode 404 ambiguity made
-guest-uncatchable, `resultAvailable:false`, filter-before-rank search,
-drain accounting, outcome/cleanup promise split → rev 10 **codex #4 on
-rev 9 (2 P0 / 3 P1 / 1 P2)**: **(P0) `approvals.resume` binds to the
-execution, not the pending call — a queued duplicate approval can
-approve a LATER pause; this is a SHIPPED Code Mode defect** → `callId`
-on the wire + in the CAS predicate (row #46, T9); **(P0) an older
-daemon's provisioning leaves `generation` untouched** → SQLite triggers
-bump it for any writer (row #47, T10); bounded settle writes with an
-`unknown` outcome; bounded connections block; `result_state` modelled.
-48 acceptance rows, tasks T1–T10, GSTACK REVIEW REPORT at the end.
-Main untouched by R1 code; no rebuild.
+**WHAT HAPPENED (2026-09-06, 00:30 → 01:50):** the founder chose to ship
+the approval-rebinding defect (R1 spec row #46, live in shipped Code
+Mode) as its own fix ahead of R1. **PR #58** `fix/approval-call-binding`
+(three commits, tip `3cdd7dc`): an approval binds to the ONE pending
+call — `approvals.resume` requires a non-blank `callId`; the store's
+paused→running CAS checks it in the same statement (with an escape for
+NULL / invalid / call-id-less `paused_on` so the manager terminalizes
+corrupt rows instead of stranding them); the manager treats a post-claim
+id mismatch as corruption; the list row carries `callId` (optional on
+the wire for older daemons); **`conduit approvals approve|deny
+<execution-id> <call-id>`** — the OPERATOR passes the id read off the
+new CALL ID column (a first draft listed inside `approve` and rebound
+the decision one layer up — caught by codex + CodeRabbit); spec §5.5
+gains the one-decision-per-call bullet; INVARIANTS gains a §5.5 row
+naming 11 pins. Suites sdk 454 / mcp 432 / cli 116, biome + tsc clean,
+CI green on all three pushes. Gauntlet: 5 reviewer agents + Aikido
+(clean) + `/security-review` (no findings) + CodeRabbit + Greptile +
+codex ×2 (astra medium: P1 CLI rebinding → fixed; P1 demo script
+rebinding + P2 guard coverage → fixed). **Codex #3 (the FIRST run under
+`gpt-5.6-sol`, high) died on the usage limit at 01:20 — proof the limit
+is per account, not per model — and is QUEUED in this session for
+04:43;** if the session is gone, re-run it: prompt = the standing PR
+brief + "third commit closes: demo script takes <callId>; guard
+tested"; expect CONVERGED or a P2. Explainer published ("One Decision
+Per Call"); the quiz gate is pending the founder.
 
-### THE RULE FIRED — read before doing anything
+**Wire/UX change to announce at merge:** the daemon MUST be restarted
+after upgrading (older CLI → new daemon is refused `invalid`; new CLI →
+older daemon lists with `-` and is refused on decide). Rebuild mcp/cli
+dists post-merge and run one real-db canary of `approve <exec> <call>`
+against a live daemon.
 
-Passes #3 and #4 each surfaced a NEW class of break (#4: binding to an
-INSTANCE that can be replaced across time or across writers).
-`~/.claude/rules/adversarial-convergence.md`: "New-class breaks
-repeatedly → pause for a dedicated threat-model pass before more code."
-So the next session does NOT run a fifth fold-and-rerun first.
+**Codex workflow decisions today:** model `gpt-5.6-sol`, effort
+`medium` default with NAMED `high` triggers, written to
+`~/.claude/rules/codex-one-path.md`. Two audit suggestions are OPEN for
+the founder: (1) narrow the `high` triggers from "any sdk store /
+execution / pipeline / daemon file" (which makes high the de-facto
+default for product code) to the security boundaries only (invoker +
+credentials, egress, execution manager + decisions, store claim +
+secrets, daemon capability check); (2) set `model_reasoning_effort =
+"medium"` in `~/.codex/config.toml` (currently `low`), so unpinned
+invocations match the policy. Also: calibrate Sol high on R1 spec rev
+10 against astra's known pass-4 findings before trusting it for a
+convergence verdict.
 
-### NEXT — threat-model pass, then converge, then plan
+### NEXT
 
-1. **Threat-model pass on instance binding** (fresh session, its own
-   short design note or a §3 amendment in the spec): enumerate every
-   place R1 binds a decision or a stamp to something that can be
-   replaced — approval ↔ pending call (callId), pause ↔ namespace
-   generation (writer-independent), client ↔ profile row (scope
-   version), advertised name ↔ qualified name (injective), request key
-   ↔ client, execution ↔ daemon build (sentinel) — and for each: what
-   replaces it, who can cause that, and whether the binding is checked
-   at USE time. Route: `/blindspot` codebase mode is the right tool;
-   codex adversarial brief afterwards. Output folds into the spec as
-   rev 11.
-2. **Codex pass #5** on rev 11 per codex-one-path (pgrep OUTSIDE the
-   sandbox; on the usage limit, `sleep` until the retry time it names —
-   four runs were lost to it this session; passes went through at 23:42
-   and 00:05). Converged = only documented-limit findings.
-3. Founder reads the spec → `superpowers:writing-plans` from §10 and
-   T1–T10 → PR #57 also carries the §18 R1 entry, G1–G3, the ⏳ rows.
-4. **Standalone housekeeping candidate:** the approval-rebinding defect
-   (row #46) exists in SHIPPED Code Mode. It can ship as its own small
-   fix PR ahead of R1 (callId on `approvals.resume` + CAS predicate +
-   CLI) — founder's call; it is the only R1 finding that is live today.
+1. **PR #58:** founder passes the quiz → codex #3 result (04:43 or
+   re-run) → if converged, founder says "merge #58" → squash, verify
+   tree, delete branch, rebuild dists, real-db canary, LEARNINGS note.
+2. **R1 (PR #57, rev 10):** the adversarial-convergence PAUSE branch
+   applies (two new-class P0s on pass #4). Next: the dedicated
+   threat-model pass on instance binding (approval ↔ pending call ↔
+   provenance ↔ writer version) → rev 11, which ALSO amends §5.3 (the
+   operator passes the call id; the spec said the CLI reads it — PR #58
+   settled it) and marks row #46 as SHIPPED → codex #5 → founder read →
+   writing-plans.
 
 **Session quirks worth inheriting:** gstack plan-eng-review's two
 onboarding prompts re-fire until the marker `touch` runs UNSANDBOXED ·
 gstack review-log / test-plan / tasks writes need the unsandboxed path
-· a raw NUL byte in a spec paragraph breaks the Edit tool's matching
-(spec spells it `<NUL>`) · codex's usage-limit death is exit 1 + empty
-stdout + an `ERROR … try again at HH:MM` stderr line.
+· a raw NUL byte in a spec paragraph breaks the Edit tool (spec spells
+it `<NUL>`) · codex usage-limit death = exit 1 + empty stdout + `ERROR …
+try again at HH:MM` on stderr; queue a `sleep` until then · `pgrep`
+cannot list processes inside the sandbox (false DONE) · the mcp and cli
+packages import `@conduithq/sdk`/`@conduithq/mcp` from their built
+`dist`, so an sdk/mcp source change is INVISIBLE to mcp/cli tests until
+`tsup` rebuilds (sdk: `tsup src/index.ts --format esm --dts
+--sourcemap`; mcp, cli: bare `tsup`) — a stale dist made a CLI test
+fail against the OLD resume arity today.
 
-**DEFERRED (live list, updated 2026-09-06):** `--client` on the bare
-`conduit-mcp` bin (D8; TRIGGER: R3's entry-point decision) ·
+**DEFERRED (live list, updated 2026-09-06 01:50):** brand `CallId` as a
+nominal type across PendingApproval / list row / RPC / claim (type
+reviewer on #58; do it in R1 Lane A with the other SDK types) ·
+`--client` on the bare `conduit-mcp` bin (D8; TRIGGER: R3) ·
 input-schema validation on BOTH projections (parity; R2) · G4 spec
-absorption of §3.3/§3.3.1 · `--doctor --offline` fixture race ·
-`pnpm audit` registry-timeout false-red · `.impeccable/` dirs vs `biome
-check .` (config change, founder approval) · `NOTICE` file before
-first publish · Dependabot 0 HIGH / 6 medium / 1 low · R3 website
-publish coupling · §16 flake pins · Linux ACL CI · revision pinning
-(→ R2; `sources.generation` + triggers are its base) · CX1/CX2
-residuals · display-allowlist helper · ApprovalRuntime type split ·
-doctor log name.
+absorption of §3.3/§3.3.1 · `--doctor --offline` fixture race · `pnpm
+audit` registry-timeout false-red · `.impeccable/` dirs vs `biome check
+.` (config change, founder approval) · `NOTICE` file before first
+publish · Dependabot 0 HIGH / 6 medium / 1 low · R3 website publish
+coupling · §16 flake pins · Linux ACL CI · revision pinning (→ R2) ·
+CX1/CX2 residuals · display-allowlist helper · ApprovalRuntime type
+split · doctor log name.
 
 **SHELVED (unchanged):** the project-jail plan.
 
 ### KICKOFF PROMPT for the next session
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
-> follow its protocol (incl. `gh pr list --state all --limit 5` — PR
-> #57 is the OPEN draft carrying the R1 spec). **State: R1 spec at rev
-> 10 on `docs/r1-design-spec`; codex passes #3 and #4 both ran and are
-> folded; #4 found two NEW-CLASS P0s (instance binding), so the
-> adversarial-convergence rule's PAUSE branch applies. Do NOT run codex
-> #5 first, write a plan, touch code, or reopen A1–A7 / D1–D15.** NEXT:
-> the dedicated threat-model pass on instance binding (HANDOFF NEXT
-> step 1) → fold as rev 11 → codex #5 → founder read → writing-plans.
-> Ask the founder whether row #46 (approval rebinding, live in shipped
-> Code Mode) ships as its own fix PR first. Carry the DEFERRED list.
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #58
+> is the OPEN fix PR, #57 the OPEN draft spec PR). **State: PR #58
+> (approval binds to one pending call) has passed every review layer
+> except codex #3 (queued for 04:43 — check its result or re-run per
+> HANDOFF) and the founder's quiz; merge ONLY on the founder naming it.
+> R1 spec at rev 10, loop PAUSED by the convergence rule. Do NOT reopen
+> A1–A7 / D1–D15.** NEXT: settle #58 (codex #3 → quiz → founder-named
+> merge → sweep + dist rebuild + canary), then the instance-binding
+> threat-model pass for R1 (rev 11 also amends §5.3 to "the operator
+> passes the call id" and marks row #46 shipped) → codex #5 → founder
+> read → writing-plans. Carry the DEFERRED list and the two OPEN codex
+> workflow suggestions.
 ---
 
 ## Superseded handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; its NEXT [R1] was STARTED 2026-09-05 by the section above — spec drafted to rev 5, not converged)
