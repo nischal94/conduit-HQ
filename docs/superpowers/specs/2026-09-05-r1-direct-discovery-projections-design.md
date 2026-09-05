@@ -1,9 +1,8 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 8 — eng review (D1–D8) and outside voice (D9–D15)
-folded, §12; codex convergence pass #3 still owed (three attempts lost
-to the provider's usage limit today). Not converged until pass #3 says
-so.
+Status: revision 9 — codex pass #3 (on rev 8: 0 P0 / 8 P1 / 1 P2, NOT
+CONVERGED) folded, §12. Confirming pass #4 owed. Not converged until it
+says so.
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -190,19 +189,30 @@ violating either is corrupt and is refused on read with a named error,
 never silently coerced.
 
 `direct_call` is JSON `{ "toolName": string, "namespace": string,
-"request": string }`. **`PendingApproval` gains `namespace` and
-`sourceGeneration` for BOTH kinds (rev 8, D13):** a paused Code Mode
-row binds exactly one call too (`pausedOn.toolName`), and on resume the
-invoker re-resolves that tool from the store (`invoker.ts:111`) — so
-the D3 catalog-change rule is kind-neutral. The sweep becomes
-`invalidatePaused(namespace)` over `pausedOn.namespace`, and the
-post-claim generation check (§5.4) runs on every resume. `namespace` is
-stored as its own field so the sweep matches by equality — never by
-`LIKE`, whose `_` wildcard is a legal namespace character.
-`sourceGeneration` is the namespace's `sources.generation` (§4.1a) as
-read immediately before the row is persisted (two statements; the
-read-then-provision-then-put TOCTOU is caught by the resume check,
-§5.4 step 3, so a single-transaction `putDirect` is not required).
+"request": string }` — provenance does NOT live here.
+
+**Provenance lives on `PendingApproval`, for BOTH kinds, in ONE shape
+(rev 9 — codex #3 found rev 8 stating it in three inconsistent
+places):** `PendingApproval` gains two REQUIRED fields, `namespace:
+string` and `sourceGeneration: number`, captured at pause time by BOTH
+pause paths — the sandbox-suspension path (`start`, the manager's
+`onApprovalPause` capture) and the direct path (`startDirect` step 5) —
+from `sources.generation` for `pausedOn.toolName`'s namespace, read
+immediately before the `paused` row is written. The persisted JSON is
+`{ callId, toolName, namespace, sourceGeneration, input, reason,
+expiresAt }`. On resume, after `claimForResume`, the manager compares
+`pausedOn.sourceGeneration` with the namespace's CURRENT
+`sources.generation`; missing source or mismatch → `ConduitCatalogChanged`.
+**Legacy pauses (rows written before R1) lack both fields:** hydration
+returns them with `sourceGeneration` absent, and resume treats absence
+as a mismatch — fail closed with the re-approve outcome, NEVER
+substitute the current generation. The read-then-provision-then-put
+TOCTOU on capture is caught by that resume check, so no single
+transaction is required. `namespace` is stored as its own field so the
+sweep (`invalidatePaused`, below) matches by equality — never by
+`LIKE`, whose `_` wildcard is a legal namespace character. The sweep
+covers every `paused` row of either kind whose `pausedOn.namespace`
+equals the written namespace.
 `request` is the SAME canonical serialization the decisions seam binds
 on: `JSON.stringify(input)` as computed by the invoker
 (`invoker.ts:282`). Round-trip property, pinned by test: for any
@@ -224,7 +234,12 @@ interface ExecutionBase {
 type Execution =
   | (ExecutionBase & { kind: "code"; code: string; seeds: { now: number; random: number } })
   | (ExecutionBase & { kind: "direct";
-      call: { toolName: string; namespace: string; request: string; sourceGeneration: number } });
+      call: { toolName: string; namespace: string; request: string } });
+
+interface PendingApproval {                 // both kinds
+  callId: string; toolName: string; namespace: string; sourceGeneration: number;
+  input: unknown; reason: string; expiresAt: number;
+}
 ```
 
 The direct arm's failure payload is the SDK's `ExecutionError`
@@ -241,33 +256,45 @@ Status enum shared (D1), per-kind meaning:
 | --- | --- | --- |
 | running | sandbox driving the program | performing the one governed upstream call |
 | paused | suspended on a pending call; replay on resume | approved-or-not canonical call stored; perform on resume |
-| completed | program returned | upstream returned. **At rest (rev 8, D12):** a SYNCHRONOUS direct completion returns the upstream result on the wire and persists NO `result` (`executions.result` is not on the §11 redaction path; an upstream that returns tokens or PII must not land in SQLite in the clear); a completion reached through RESUME persists `result` passed through `redactSensitiveFields` with the tool's policy `redactFields`, because `check_execution` must deliver it later. The credential-echo tripwire still REFUSES a result rather than redacting it. |
+| completed | program returned | upstream returned. **At rest (rev 8, D12):** a SYNCHRONOUS direct completion returns the upstream result on the wire and persists NO `result` (`executions.result` is not on the §11 redaction path; an upstream that returns tokens or PII must not land in SQLite in the clear); a completion reached through RESUME persists `result` passed through `redactSensitiveFields` with the tool's policy `redactFields`, because `check_execution` must deliver it later. **Polling a direct row (rev 9, codex #3):** the shipped projection turns an absent result into `null` (`payloads.ts:408`), which would INVENT a value for a discarded synchronous result. A direct row therefore persists `result_state: 'delivered' \| 'retained'`; `check_execution` on a `delivered` direct row answers `completed` with `resultAvailable: false` and no `result` key, and a `retained` one answers with the redacted result. Code rows keep today's shape exactly. **Oversized result:** if the completed envelope exceeds the IPC frame cap, the daemon answers `completed` with `executionId` and `resultTooLarge: true` (the effect landed; the payload is discarded — `connection.ts:575` today emits an `invalid` error after completion, which read as failure). The credential-echo tripwire still REFUSES a result rather than redacting it. |
 | failed | program threw / infra / divergence | policy block, credential/upstream/infra failure, D3 invalidation, or outcome-unknown |
 | expired | pause TTL elapsed | pause TTL elapsed |
 
 A direct execution writes NO `replay_journal` rows.
 
-**Request keys are per client, legacy-compatible (rev 8 restores
-rev 6; eng-review D11 reversed D3 after the outside voice showed the
-composite index recreates on every open — `sqlite.ts:195` — so a
-downgrade after cross-client key reuse fails at STORE OPEN, and the
-shipped conflict detection matches the single-column constraint
-message, `manager.ts:628`):** for a NAMED client the manager persists
-`request_key` as `${clientId}<NUL>${key}` (U+0000 between); for the
-DEFAULT profile it persists the RAW key, exactly as every pre-R1 row
-was written — so no migration exists and a legacy
-`check_execution({requestKey})` or reissue from a default-profile
-client still finds its row. The decoder refuses a `requestKey`
-containing U+0000, and the `clientId` grammar (§4.2) already excludes
-it, so a named key can never be spelled as a raw key or vice versa; a
-key is encoded exactly once, at persist, and decoded nowhere (lookups
-encode the query the same way). No index change; the shipped
-single-column unique index and its conflict-detection string keep
-working. The encoding is ONE function with its own round-trip pin
-(row #25). **Ownership before disclosure:** a `conflict` carries the
-existing execution id ONLY when that row's `client_id` equals the
-caller's; otherwise the outcome is `conflict` with no id (pinned, row
-#18).
+**Request keys are per client via a mapping table (rev 9 — codex #3
+showed the rev 6 encoding collides with LEGACY rows: the shipped decoder
+accepts any string, `rpc.ts:277`, so a pre-R1 default-profile row may
+already hold `acme<NUL>k`, and rejecting future NULs cannot remove it):**
+
+```
+CREATE TABLE IF NOT EXISTS request_keys (
+  client_id TEXT NOT NULL,
+  key TEXT NOT NULL,
+  execution_id TEXT NOT NULL,
+  PRIMARY KEY (client_id, key)
+)
+```
+
+A NAMED client's key is written to `request_keys` in the same batch as
+the execution row, whose legacy `request_key` column stays NULL; the
+DEFAULT profile keeps using the legacy column, raw, exactly as every
+pre-R1 row was written. Uniqueness for named clients is the table's
+primary key; for the default profile it is the shipped single-column
+unique index and its shipped conflict-detection string
+(`manager.ts:628`), both untouched. There is ONE representation per
+key — no logical/stored split, nothing encoded, nothing to double-encode
+on hydrate-then-settle (`sqlite.ts:1064` returns the column unchanged
+and that is correct for default rows; named rows have no column value).
+Lookups: named → `request_keys` by `(client_id, key)`; default → legacy
+column. A `conflict` therefore can only ever find a row of the SAME
+client, so it always carries the existing execution id and the ID-less
+wire variant of rev 8 is withdrawn — the shipped payload guard that
+requires an id for every status (`payloads.ts:453`) stands. Pinned:
+a legacy row holding a NUL-bearing key is untouched and unreachable
+from a named client; a named client's key never collides with any
+default-profile key (row #25). **Ownership** (row #18) is structural:
+the lookup is keyed by the caller's client id.
 
 `ExecutionRepository` gains `invalidatePaused(namespace: string):
 Promise<number>` — flips every `paused` row of EITHER kind whose
@@ -543,7 +570,18 @@ Consequences, each pinned (§9):
   sandbox) but under its own DAEMON-WIDE admission cap,
   `DIRECT_ADMISSION_MAX` (a daemon constant, not client-chosen, not
   per-connection), so the daemon as a whole cannot hold unbounded
-  concurrent upstream calls. Over cap → `code: "busy"` (the same code
+  concurrent upstream calls. **Lifecycle accounting (rev 9, codex #3):**
+  admitted direct drives are tracked DAEMON-WIDE, independently of the
+  connection that admitted them — the shipped drain exits when the
+  sandbox queue is idle and no READY connection remains
+  (`conduitd.ts:795`), and disconnect drops the connection's in-flight
+  set (`connection.ts:305`), so a direct caller that disconnects mid-call
+  would otherwise let an orderly stop exit under a running upstream
+  call. Direct drives count in the drain-idle check, the drain
+  deadline's abandonment path, shutdown cleanup, and the in-flight
+  diagnostics (`daemon.status` `executionsInFlight` includes them).
+  Pinned: disconnect → `daemon stop` while a direct call runs waits the
+  drain grace, then reports the abandonment (row #44). Over cap → `code: "busy"` (the same code
   `execute` uses) with its own text: "daemon busy: N direct calls in
   flight (cap M)". The slot is held until the drive SETTLES — a
   timed-out drive still unwinding keeps its slot; it is released in
@@ -569,9 +607,20 @@ Consequences, each pinned (§9):
   with `completed`/`paused` even across a crash-restart. The timer
   does NOT abandon the continuation: it settles `failed`, then AWAITS
   the continuation (discarding its outcome) before releasing the
-  admission slot and the namespace lock, so resources are held until
-  the work has actually stopped. Pinned: delayed success and delayed
-  refusal arriving after timeout both leave the row `failed`.
+  admission slot, so resources are held until the work has actually
+  stopped. **Two promises (rev 9, codex #3):** the client-visible
+  OUTCOME promise resolves as soon as the timer has settled the row —
+  it never waits on the continuation — while a separate CLEANUP promise
+  awaits the continuation and releases the slot; only the outcome
+  promise feeds the RPC response, so the client deadline holds even
+  when the continuation is blocked on an un-cancellable store read
+  (`invoker.ts:111` awaits with no deadline). The timer starts before
+  any asynchronous preparation (§5.4 step 2), and preparation that
+  completes after expiry never dispatches: the invoker checks
+  `deadline()` before writing the governed frame. Pinned: delayed
+  success and delayed refusal after timeout both leave the row
+  `failed`, AND a store read that never returns still yields the
+  timeout outcome on the wire within budget.
   **Admission is the slot only (rev 8, D10):** no lock is acquired for
   a direct drive, so `DIRECT_ADMISSION_DEADLINE_MS` bounds the slot
   wait alone; provisioning and removal budgets are UNCHANGED from the
@@ -587,8 +636,15 @@ Consequences, each pinned (§9):
 - `search` / `describe`: answered from the shared catalog FILTERED by
   the snapshot's `permits(projection, …)` where projection is the one
   the caller's flag enables (`discovery` for the discovery tools,
-  `code` for in-sandbox use). A `describe` of an out-of-scope tool
-  returns `null`, indistinguishable from a nonexistent tool.
+  `code` for in-sandbox use). **Filter BEFORE rank and limit (rev 9,
+  codex #3):** the shipped search ranks the whole catalog and returns
+  the top ten (`catalog.ts:79`); filtering those ten would hide an
+  allowed tool that ranks below ten disallowed ones. Eligibility is
+  applied to the candidate set first, then ranking, then the limit —
+  for discovery AND in-sandbox search. Pinned: ten higher-ranked
+  disallowed tools plus one matching allowed tool → the allowed tool is
+  returned (row #43). A `describe` of an out-of-scope tool returns
+  `null`, indistinguishable from a nonexistent tool.
 - `catalog.listing { cursor?: string }`: returns the snapshot's
   projection flags, the connections listing as today, and — ONLY when
   `projections.direct` is true — a PAGE of the scoped direct listing:
@@ -622,16 +678,16 @@ Consequences, each pinned (§9):
 - `source.remove`: in one transaction delete the namespace's tools,
   policies, connection, integration, source, and the connection's
   sealed secret if any; then `catalog.removeNamespace`; then
-  `executions.invalidatePausedDirect(namespace)`; respond with counts.
+  `executions.invalidatePaused(namespace)`; respond with counts.
   A missing namespace is a named error, not a silent no-op.
 
 **D3 sweep placement (pinned):** the sweep is anchored to the STORE
 commit, not the in-memory catalog mutation — the invoker resolves
 tools from the store, and `refreshNamespace` only mutates memory and
 never throws. In both provisioning paths (`fetchAndProvision` →
-`provisionSource`) and in `source.remove`, `invalidatePausedDirect`
+`provisionSource`) and in `source.remove`, `invalidatePaused`
 runs AFTER `provisionSource` / the removal transaction has committed,
-inside the same per-namespace source lock, and BEFORE the source
+inside provisioning's own per-namespace anti-oracle chain, and BEFORE the source
 request is answered. A sweep that throws is logged and the request
 still succeeds: the sweep is housekeeping; the generation check (§5.4)
 is the authority.
@@ -670,10 +726,9 @@ Sequence:
 1. `requestKey` present → persist-before-run as `start` does; an
    existing row with that key → `conflict` (unchanged semantics, #11).
 2. Persist `{ kind: "direct", status: "running", clientId, projection,
-   call: { toolName, namespace, request: JSON.stringify(input),
-   sourceGeneration } }` BEFORE any upstream contact;
-   `sourceGeneration` is read from `sources` for the tool's namespace
-   immediately before the put (§4.1).
+   call: { toolName, namespace, request: JSON.stringify(input) } }`
+   BEFORE any upstream contact. The budget timer (§5.3) starts HERE,
+   before any asynchronous preparation, not at invocation (codex #3).
 3. Build the invoker exactly as `start` does (`makeInvoker` with
    executionId, deadline, upstream session scope, `projection`, and
    `scope`) and call `invoke(toolName, input)` once under the
@@ -686,19 +741,24 @@ Sequence:
 5. On the invoker's `require_approval` error (`ConduitCallError` kind
    `policy`, name `ConduitPolicyDenied`, `errors.ts:71-78`, which the
    manager already recognizes by name): write `paused` with
-   `pausedOn = { callId, toolName, input, reason, expiresAt }` —
-   the manager writes it directly, since no sandbox suspension exists.
+   `pausedOn = { callId, toolName, namespace, sourceGeneration, input,
+   reason, expiresAt }` (§4.1, one shape for both kinds; the generation
+   read immediately before the write) — the manager writes it directly,
+   since no sandbox suspension exists.
    The outcome is `{ status: "paused", executionId, pending }`, the
    same shape `start` returns.
 
-`resume(executionId, decision)` on a `direct` row:
+`resume(executionId, decision)` — steps 1–3 run for BOTH kinds (rev 9);
+steps 4–5 are the direct arm, and a code row continues into the
+shipped replay drive after step 3:
 
 1. `claimForResume` (unchanged CAS; lose → `conflict`; TTL lazily
    expires as today). The claim IS the sweep check: a row the sweep
    already failed is no longer `paused`, so the claim loses.
-2. **Generation check (D3 authority):** read the namespace's current
-   `sources.generation`; missing (source removed) or not equal to
-   `call.sourceGeneration` → terminalize `failed` with
+2. **Generation check (D3 authority, both kinds):** read the namespace's
+   current `sources.generation`; missing (source removed), not equal to
+   `pausedOn.sourceGeneration`, or `pausedOn.sourceGeneration` ABSENT
+   (legacy pause) → terminalize `failed` with
    `ConduitCatalogChanged` (`failClaimedResume`), `decisionApplied:
    false`. This runs AFTER the claim, so a provision that commits
    between the sweep and the claim is still caught.
@@ -746,25 +806,38 @@ treat exactly as an unknown tool —
 audited, guest-safe name `ConduitPolicyBlocked`.
 
 **One further host-side change, for §7 — dispatch STATE, not an error
-field (rev 6):** each direct drive owns a host-side, monotonic
-`DispatchState = "none" | "initializing" | "dispatched"` — the
-`dispatch` field of the drive's `DirectDrive` object (§5.3, rev 7) —
-created by the manager and passed through `CreateToolInvokerOptions`
-to the upstream caller. The caller advances it to `initializing` when
-session/handshake traffic starts (`upstream.ts:129` — initialize
-precedes the governed call and must not count as dispatch) and to
-`dispatched` at the moment the governed `tools/call` frame is written
-to the socket. Nothing ever lowers it. The manager classifies at
-settle time by READING THE CELL — not an error field — so it survives
-every wrapping and replacement error (today a post-dispatch upstream
-error whose refusal Trace-append also fails is REPLACED by the audit
-error, `invoker.ts:222-235`, and a field on the original would be
-lost), and the drive timer consults the same cell when it fires. Today
-the timeout is flattened into a plain `ConduitUpstreamError`
-(`upstream.ts:284`) and the error vocabulary has no timeout member
-(`errors.ts:8`); the cell is how effect uncertainty is classified
-WITHOUT parsing messages. Never guest-visible; guest-safe names
-unchanged.
+field (rev 6; generalized to BOTH kinds in rev 9, codex #3):** every
+governed call — not only a direct drive — owns a host-side, monotonic
+`DispatchState = "none" | "initializing" | "dispatched"` cell, created
+by the invoker per call and passed to the upstream caller. The caller
+advances it to `initializing` when session/handshake traffic starts
+(`upstream.ts:129` — initialize precedes the governed call and must not
+count as dispatch) and to `dispatched` at the moment the governed
+`tools/call` frame is written to the socket. Nothing ever lowers it.
+For a DIRECT drive the `DirectDrive` object (§5.3) holds a reference to
+its one call's cell and the manager classifies at settle time by
+READING THE CELL — not an error field — so it survives every wrapping
+and replacement error (today a post-dispatch upstream error whose
+refusal Trace-append also fails is REPLACED by the audit error,
+`invoker.ts:222-235`, and a field on the original would be lost), and
+the drive timer consults the same cell when it fires. For a CODE MODE
+drive, a call whose cell reads `dispatched` at failure time raises a
+HOST-SIDE, GUEST-UNCATCHABLE terminal signal through the journaling
+wrapper — exactly the path `ConduitReplayDivergence` takes today
+(`invoker.ts:89-95`, `manager.ts`): the guest never sees it, the
+manager terminalizes the execution `failed` with
+`ConduitOutcomeAmbiguous`, and a guest `try/catch` around the call
+cannot turn an ambiguous upstream effect into a `completed` execution.
+Without this, the shipped mapper turns a post-dispatch 404 into an
+ordinary guest-catchable `ConduitUpstreamError` (`upstream.ts:294`,
+journaled at `manager.ts:325`) and §7's ambiguity promise had no
+execution path on the Code Mode side. Today the timeout is flattened
+into a plain `ConduitUpstreamError` (`upstream.ts:284`) and the error
+vocabulary has no timeout member (`errors.ts:8`); the cell is how
+effect uncertainty is classified WITHOUT parsing messages. Never
+guest-visible; guest-safe names unchanged. Pinned for both kinds with
+a side-effect-then-404 fixture and, for Code Mode, a guest `try/catch`
+around the call (row #21, #24).
 The §9.2 boundary is untouched: the credential is resolved at step 4
 as today and never enters any projection's response.
 
@@ -838,7 +911,8 @@ identical call again after re-initialization: one consumed approval,
 two dispatches — an inherited defect that contradicts the one-call
 guarantee R1 states. Decision: for a governed `tools/call` the 404
 retry is DISABLED; a session-bearing 404 after dispatch is
-`afterDispatch: true` and settles `ConduitOutcomeAmbiguous`. Session
+post-dispatch (dispatch state `dispatched`, §5.5) and settles
+`ConduitOutcomeAmbiguous`. Session
 renewal may prepare a LATER, separately authorized call; it never
 re-sends this one. The `tools/list` and initialize retries are
 unaffected (no side effects). Applies to Code Mode too — the class is
@@ -870,7 +944,8 @@ code-only with no direct tools (fail closed, never widen).
 
 **Name resolution on `tools/call` (Lane C, rev 8 — D14):** the
 encoding (§8.3) is injective, so the server DECODES the advertised
-name into the qualified name (`--`→`-`, then a lone `-`→`.`) and puts
+name into the qualified name (`_u`→`_`, `_h`→`-`, `_d`→`.`; any other
+`_` pair is invalid) and puts
 the qualified name on `tool.call`; the daemon re-checks `permits` on
 it. No server-side map, no refetch, no stale-name path: an undecodable
 or unpermitted name gets the same refusal. **Pages:** the server walks
@@ -906,19 +981,26 @@ tool under a namespace grant). So the advertised name is a function of
 the qualified name ALONE, injective over the legal character sets, and
 never depends on what else is in the catalog:
 
-`advertisedName(qualified)`: replace every `-` with `--`, then every
-`.` with `-`. Decoding is unambiguous (a run of `-` of length n encodes
-⌊n/2⌋ literal hyphens plus one dot iff n is odd), so two qualified
-names never share an advertised name, and a name can never be
+`advertisedName(qualified)` (rev 9 — codex #3 showed the run-length
+scheme was NOT injective: namespaces may end in `-` and local names may
+hold consecutive dots, so `a-.b` and `a...b` both became `a---b`):
+character-wise, prefix-free escapes with `_` as the escape character —
+`_` → `_u`, `-` → `_h`, `.` → `_d`, every other character literal.
+Decoding is unambiguous because every `_` in an advertised name begins
+exactly one two-character escape and no other character does, so two
+qualified names never share an advertised name and a name can never be
 reassigned — the same qualified name always has the same advertised
 name, and a different qualified name always has a different one.
-Reserved verbs are unreachable by construction: a qualified name always
-contains a `.`, so its advertised form always contains `-`, and none of
-`execute`, `check_execution`, `search`, `describe`, `call` does. If the
-encoded form exceeds 64 characters the tool is EXCLUDED from direct
-advertisement (deterministic, logged once; still reachable via
-discovery `call` and Code Mode) — no truncation, no hash, no
-reassignment surface. The daemon computes the name; the server
+Reserved verbs are unreachable by construction: every advertised name
+is a valid escape string containing `_d` (a qualified name always has a
+dot); `execute`, `search`, `describe`, `call` contain no `_`, and
+`check_execution` contains `_e`, which is not a valid escape, so none
+of the five decodes to any tool. If the encoded form exceeds 64
+characters the tool is EXCLUDED from direct advertisement
+(deterministic, logged once; still reachable via discovery `call` and
+Code Mode) — no truncation, no hash, no reassignment surface. Pinned
+with codex's collision pair, leading and consecutive local dots, and a
+trailing-hyphen namespace (row #7). The daemon computes the name; the server
 decodes it (§8.2); decoding is sound by construction.
 
 Consequence for the accepted-limit sentence of rev 3: there is no
@@ -992,14 +1074,14 @@ approval verb; `approvals.resume` remains reachable only through the
 | 4 | a removed tool becomes uncallable immediately | `daemon/conduitd.test.ts` real processes: remove → next `tool.call` refused |
 | 5 | stale discovery cannot preserve revoked authority (G3) | same file, at the RPC level (Lane B): list → revoke → `tool.call` by the cached qualified name refused; the advertised-name variant is Lane C in `server.test.ts` |
 | 6 | current authority checked on every call | `effectiveScope` unit + connection test (profile edit mid-connection) |
-| 7 | tool names deterministic, injective, MCP-compatible, never reassignable | `server.test.ts` (grammar; the `-`/`--` encoding round-trips; codex's reassignment triple resolves to three distinct names; verbs unreachable; >64 excluded; stability under scope AND catalog change) |
+| 7 | tool names deterministic, injective, MCP-compatible, never reassignable | `server.test.ts` (grammar; the `_u`/`_h`/`_d` escape encoding round-trips; `a-.b` vs `a...b` and codex's earlier triple resolve to distinct names; verbs undecodable; >64 excluded; stability under scope AND catalog change) |
 | 8 | upstream growth cannot silently expand a tool-level grant | `effectiveScope` unit |
 | 9 | profiles only narrow | `effectiveScope` unit (allow ∩ catalog ⊆ allow; default vs named) |
 | 10 | trace semantics comparable across projections | D5 harness over stored `trace_events` rows |
 | 11 | request-conflict and retry defined for direct calls | D5 harness (`requestKey` conflict over both kinds) |
 | 12 | two-tool clients byte-for-byte compatible | `server.test.ts` (default profile `tools/list` snapshot equals today's) |
 | 13 | mid-session narrowing bites on the same connection; no re-handshake re-widens (D4) | `daemon/conduitd.test.ts` / `client.test.ts` real processes (the PR #53 pattern) |
-| 14 | namespace write invalidates paused direct calls; resume fails closed re-approve (D3) — including a provision that commits AFTER the sweep but BEFORE the claim (generation check), and remove-then-re-add | `manager.test.ts` (generation mismatch after claim → `ConduitCatalogChanged`, `decisionApplied:false`; re-add does not revive) + `daemon/provision.test.ts` (sweep runs after `provisionSource` commit, inside the lock) + `source.remove` test |
+| 14 | namespace write invalidates paused rows of BOTH kinds; resume fails closed re-approve (D3) — including a provision that commits AFTER the sweep but BEFORE the claim (generation check), remove-then-re-add, and a LEGACY pause with no provenance | `manager.test.ts` (generation mismatch / absent → `ConduitCatalogChanged`, `decisionApplied:false`; re-add does not revive) + `daemon/provision.test.ts` (sweep runs after `provisionSource` commit) + `source.remove` test |
 | 15 | a Code Mode row that paused under a narrowed profile resumes under that profile (audit P0) | `manager.test.ts` (narrow → pause on allowed tool → approve → out-of-scope call blocked) |
 | 16 | a projection FLAG turned off revokes like a removed tool: a running program's next call and a paused direct call's resume both fail closed with the allowlist unchanged (codex P0) | `manager.test.ts` + `daemon/conduitd.test.ts` |
 | 17 | a generation bump after remove+re-add (incl. deleting the current maximum / every source) never revives a paused row of either kind; the operator-race window is DOCUMENTED as an accepted limit, not pinned (codex P0 ×2; rev 8 D10/D13) | `sqlite.test.ts` (sequence never reused) + `manager.test.ts` (both kinds) |
@@ -1010,14 +1092,17 @@ approval verb; `approvals.resume` remains reachable only through the
 | 22 | a direct drive settles exactly once: a late continuation after the timer cannot overwrite `failed`; the admission slot is released only after the work stops (codex P1, rev 6; lock halves removed rev 8) | `manager.test.ts` (delayed success / delayed refusal after timeout) + `sqlite.test.ts` (attempt-fenced settle) |
 | 23 | two handshakes in one tick on a named-client connection bind exactly once; requests during `validating` are refused (codex P1, rev 6) | `daemon/conduitd.test.ts` real processes |
 | 24 | post-dispatch classification survives error replacement: a dispatched call whose refusal audit also fails still settles `ConduitOutcomeAmbiguous`; initialize traffic never counts as dispatch (codex P1, rev 6) | `manager.test.ts` + `pipeline/upstream.test.ts` |
-| 25 | request-key encoding round-trip: named keys encode once and never decode; a legacy raw key and a default-profile key are the same row; a named client's key never collides with a raw key; a `requestKey` containing U+0000 is refused (D11) | `manager.test.ts` + `daemon/rpc.test.ts` (Lane A/B) |
+| 25 | request keys: a named client's key lives in `request_keys` and never collides with any default-profile key, including a legacy key containing U+0000; a legacy raw key and a default-profile key are the same row; a `conflict` always carries the same-client execution id (codex #3, rev 9) | `sqlite.test.ts` + `manager.test.ts` (Lane A) |
 | 26 | two direct drives on one namespace run concurrently up to `DIRECT_ADMISSION_MAX`; a provision never waits on a drive and a drive never waits on a provision (D10) | `daemon/conduitd.test.ts` (Lane B) |
 | 27 | every trace row carries `projection` and `client_id` (NULL = default profile), on both kinds (D4) | D5 harness (Lane A) |
 | 28 | `DirectDrive` transitions: dispatch monotonic; `settled` taken exactly once; attempt id fences the settle write (D5) | `manager.test.ts` (Lane A) |
 | 29 | versioned scope snapshot: a write without a version bump is impossible; a snapshot built before a write is never served after it; restart starts unversioned (D7) | `daemon/conduitd.test.ts` (Lane B) |
 | 40 | profile and tool writes exist ONLY under `packages/mcp/src/daemon/` — no CLI or SDK path writes them out of process, so the in-memory scope version cannot be bypassed (D15) | a source-scan test in `packages/mcp/src/daemon/` (Lane B) |
-| 41 | a synchronous direct completion persists no `result`; a resumed completion persists it redacted per policy `redactFields` (D12) | `manager.test.ts` + D5 harness (Lane A) |
+| 41 | a synchronous direct completion persists no `result` and polls back as `completed, resultAvailable:false` (never `result:null`); a resumed completion persists it redacted per policy `redactFields`; an oversized completed envelope answers `completed` + `resultTooLarge` (D12; codex #3, rev 9) | `manager.test.ts` + `payloads.test.ts` + D5 harness (Lanes A, B) |
 | 42 | a paused Code Mode row whose namespace is re-provisioned resumes to `ConduitCatalogChanged`, same as a direct row (D13) | D5 harness (Lane A) |
+| 43 | scoped search filters BEFORE ranking and the limit: an allowed tool ranked below ten disallowed ones is still returned, for discovery and in-sandbox search (codex #3, rev 9) | `catalog.test.ts` + `daemon/conduitd.test.ts` (Lanes A, B) |
+| 44 | direct drives are in the daemon's lifecycle accounting: disconnect then `daemon stop` while a direct call runs waits the drain grace and reports abandonment; `executionsInFlight` counts them (codex #3, rev 9) | `daemon/conduitd.test.ts` (Lane B) |
+| 45 | the client-visible timeout outcome resolves within budget even when the continuation is blocked on a store read; late preparation never dispatches after expiry (codex #3, rev 9) | `manager.test.ts` (Lane A) |
 | 30 | decoder: `clientId` on a non-`serve` handshake → `invalid`; `tool.call` without `input` → `invalid`; `describe.includeSchemas` decoded, absent = false | `daemon/rpc.test.ts` (Lane B) |
 | 31 | admin row no-widening: `serve` holds no `profile.*`/`source.*`/`daemon.*`/`approvals.*`; `admin` holds no `execute`/`tool.call`/`search`/`describe` and no approval verb (extends the existing capability pins) | `daemon/rpc.test.ts` (Lane B) |
 | 32 | `conduit remove-mcp` is atomic: tools, policies, connection, integration, source, AND the sealed secret all gone or none; paused direct calls on it invalidated; unknown namespace is a named error | `daemon/provision.test.ts` + `packages/cli/src/remove-mcp.test.ts` (Lane B) |
@@ -1026,14 +1111,15 @@ approval verb; `approvals.resume` remains reachable only through the
 | 35 | direct-cap refusal is `code: "busy"` with the direct-specific text, and the slot is released only after the drive settles | `daemon/conduitd.test.ts` (Lane B) |
 | 36 | daemon listing cursor is stable across pages; the server's full walk returns every allowed tool exactly once; a catalog change mid-walk can only drop a name, never bind it to a different tool | `daemon/conduitd.test.ts` (Lane B) + `server.test.ts` (Lane C) |
 | 37 | a listing carries no schemas when `projections.direct` is false; a listing from an OLDER daemon (no `projections`/`tools`) is read as code-only with no direct tools; the server's page walk terminates and never repeats an entry | `daemon/conduitd.test.ts` + `server.test.ts` (Lanes B, C) |
-| 38 | server name resolution is a pure decode: `decode(encode(q)) === q` for every legal qualified name; an undecodable or unpermitted name → MCP "unknown tool"; the qualified name goes on the wire and the daemon re-checks `permits` | `server.test.ts` (Lane C) |
+| 38 | server name resolution is a pure decode: `decode(encode(q)) === q` for every legal qualified name and an invalid escape (`_e`, trailing `_`) is undecodable; an undecodable or unpermitted name → MCP "unknown tool"; the qualified name goes on the wire and the daemon re-checks `permits` | `server.test.ts` (Lane C) |
 | 39 | `approvals list` renders direct rows with their projection and tool name; `check_execution` payload shape is unchanged for code rows | `packages/cli/src/approvals.test.ts` + `payloads.test.ts` (Lanes B, C) |
 
 Three ambiguity invariants (§7): crash-before-persist (sweep test over a
 `running` direct row, Lane A); keyless-upstream documented limit (Lane
 A: no retry occurs; Lane C: the direct tool description carries the
-statement); timeout-unknown (any timeout settles `failed` with the
-unknown-outcome wording, never re-invoked).
+statement); timeout-unknown (a timeout while dispatch state is
+`dispatched` settles `failed` with the unknown-outcome wording, never
+re-invoked; a pre-dispatch timeout settles under its own name — §7).
 
 Two pins for the data model: the `request` round-trip property (§4.1)
 and the read-side kind guard (corrupt row refused).
@@ -1297,13 +1383,32 @@ regenerated per commit · agent never installs.
   independently confirmed the D7 snapshot and the D4 trace column;
   its remaining feasibility note (clients honouring `nextCursor`)
   dissolves under D14.
+- 2026-09-05 (23:42) — **codex pass #3 on rev 8: 0 P0 / 8 P1 / 1 P2,
+  NOT CONVERGED; all nine folded in rev 9** (none reopens a settled
+  decision): run-length name encoding not injective (`a-.b` vs
+  `a...b`) → prefix-free `_u`/`_h`/`_d` escapes (§8.2, §8.3, rows
+  #7/#38); rev 6 key encoding collides with LEGACY NUL-bearing keys →
+  `request_keys` mapping table, legacy column untouched, ID-less
+  conflict variant withdrawn (§4.1, row #25); provenance stated
+  inconsistently → one `PendingApproval` shape for both kinds, legacy
+  pause = fail closed (§4.1, §5.4, row #14); Code Mode 404 ambiguity had
+  no execution path → per-call dispatch cell + guest-uncatchable
+  terminal signal via the journaling wrapper (§5.5, rows #21/#24);
+  discarded sync result polled as `null` → `result_state` +
+  `resultAvailable:false` + `resultTooLarge` (§4.1, row #41); scoped
+  search order → filter before rank/limit (§5.3, row #43); direct
+  drives absent from drain accounting → daemon-wide tracking (§5.3,
+  row #44); timer awaited its continuation → outcome promise split
+  from cleanup promise, timer starts before prep (§5.3, §5.4, row
+  #45); stale lock/`invalidatePausedDirect`/`afterDispatch` wording
+  swept. Confirming pass #4 follows.
 
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
-| Codex Review | `/codex review` | Independent 2nd opinion | 0 (3 direct `codex exec` passes on revs 3/4/6: two completed, one lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 6: not run |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8; three more runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → folded in rev 9; pass #4 owed |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open (all folded; convergence pass #3 owed) | 15 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
