@@ -1,10 +1,8 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 5 — NOT YET CONVERGED. Codex confirming pass on rev 4
-closed 9 of 14, left 5 partial, and found 1 new P0 + 8 P1 + 2 P2. The
-P0 and both P2 are folded here; the eight P1 are recorded verbatim as
-OPEN in §12 and must be folded (rev 6) BEFORE the in-session eng
-review and before any plan is written.
+Status: revision 6 — all eight P1s from the rev-4 confirming pass
+folded (§12); codex pass #3 (convergence check) and the in-session eng
+review pending. Not converged until pass #3 says so.
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -229,12 +227,19 @@ Status enum shared (D1), per-kind meaning:
 
 A direct execution writes NO `replay_journal` rows.
 
-**Request keys are stored namespaced by client:** the manager persists
-`request_key` as `${clientId ?? ""} ${key}` so uniqueness — and
-therefore `conflict` — is PER CLIENT, and a lookup by key from another
-client finds nothing. No index change; the existing unique index on
-`request_key` does the work. A `conflict` outcome therefore only ever
-discloses an execution id the same client created.
+**Request keys are per client, legacy-compatible (rev 6):** for a NAMED
+client the manager persists `request_key` as `${clientId}\u0000${key}`;
+for the DEFAULT profile it persists the RAW key, exactly as every
+pre-R1 row was written — so no migration exists and a legacy
+`check_execution({requestKey})` or reissue from a default-profile
+client still finds its row. The decoder refuses a `requestKey`
+containing U+0000, and the `clientId` grammar (§4.2) already excludes
+it, so a named key can never be spelled as a raw key or vice versa; a
+key is encoded exactly once, at persist, and decoded nowhere (lookups
+encode the query the same way). No index change. **Ownership before
+disclosure:** a `conflict` carries the existing execution id ONLY when
+that row's `client_id` equals the caller's; otherwise the outcome is
+`conflict` with no id (pinned, row #18).
 
 `ExecutionRepository` gains `invalidatePausedDirect(namespace: string):
 Promise<number>` — flips every `paused` `direct` row whose
@@ -338,6 +343,20 @@ no profile row:
 `code: "invalid", message: 'unknown client id "<id>"'`. The connection
 context stores `clientId` (or `null` for the default profile) — never
 the resolved scope.
+
+**Handshake state machine (rev 6):** the profile lookup is an await,
+and frames on one connection dispatch concurrently
+(`connection.ts:298`), so the shipped synchronous handshake-once guard
+(`:472` check, `:504` assign) would let a second handshake observe an
+unbound connection and overwrite the first binding. The connection
+therefore carries an explicit state, `unbound → validating → bound |
+closed`: the handler sets `validating` SYNCHRONOUSLY before its first
+await; while `validating`, a further handshake and any ordinary request
+are refused `invalid` ("handshake in progress"); a failed lookup moves
+to `closed` and closes the socket; success moves to `bound` with the
+capability and `clientId` assigned together. A default-profile
+handshake (no `clientId`) has no await and binds as today. Pinned with
+two handshakes in one tick.
 
 `serve` gains:
 
@@ -487,16 +506,43 @@ Consequences, each pinned (§9):
   the invoker's `deadline()` reports the remaining budget, so the
   upstream call is bounded by `min(ceiling, remaining)`, and a drive
   whose budget expires while awaiting anything else is settled
-  `failed` with the timeout classification (§7) — the direct arm has
-  no sandbox interrupt, so this timer is its interrupt. The server's
-  `deadlineForRequest` gains a `tool.call` arm,
+  `failed` with the classification §7 gives it — the direct arm has
+  no sandbox interrupt, so this timer is its interrupt.
+  **Exactly-once settlement (rev 6):** the timer and the drive
+  continuation race to settle, and the shipped settle guards handle
+  persistence FAILURE, not competing completions (`manager.ts:442,
+  585`; execution updates are unconditional on status, `sqlite.ts:441`).
+  So each direct drive owns one in-process `settled` latch — the first
+  of {timer, continuation} to take it settles the row; the loser's
+  result is discarded — AND persistence is fenced: every settle write
+  for a direct row is `UPDATE … WHERE status = 'running' AND
+  resume_attempt = ?`, the attempt id written at persist (start) or
+  claim (resume), so a late continuation cannot overwrite `failed`
+  with `completed`/`paused` even across a crash-restart. The timer
+  does NOT abandon the continuation: it settles `failed`, then AWAITS
+  the continuation (discarding its outcome) before releasing the
+  admission slot and the namespace lock, so resources are held until
+  the work has actually stopped. Pinned: delayed success and delayed
+  refusal arriving after timeout both leave the row `failed`.
+  **Admission includes lock acquisition (rev 6):** the source lock
+  waits indefinitely for predecessors (`source-lock.ts:65`), so joining
+  it must be part of bounded admission: `DIRECT_ADMISSION_DEADLINE_MS`
+  covers slot wait AND lock wait; `run` gains a deadline and a
+  cancelled-check, and a waiter whose deadline expired or whose
+  connection closed before the chain reached it NEVER enters its
+  callback (it answers `busy`, and the chain proceeds). The same bound
+  applies to provisioning and removal, which now wait behind a direct
+  drive of up to `DIRECT_DRIVE_BUDGET_MS`: their client budgets
+  (`mcp-fetch.ts:23`, 35 s today) grow by `DIRECT_DRIVE_BUDGET_MS` and
+  their admission deadline bounds the lock wait the same way.
+  The server's `deadlineForRequest` gains a `tool.call` arm,
   `DIRECT_CLIENT_DEADLINE_MS = DIRECT_ADMISSION_DEADLINE_MS +
-  DIRECT_DRIVE_BUDGET_MS + 30_000` — admission + WHOLE drive + margin,
-  the exact shape of the existing `execute` rule (`server.ts:69-107`,
-  ledger L126). `RESUME_CLIENT_DEADLINE_MS` already covers admission +
-  wall clock + margin and applies to direct resumes unchanged since
-  `DIRECT_ADMISSION_DEADLINE_MS ≤ RESUME_ADMISSION_DEADLINE_MS` (plan
-  pins the inequality).
+  DIRECT_DRIVE_BUDGET_MS + 30_000` — admission (slot + lock) + WHOLE
+  drive + margin, the exact shape of the existing `execute` rule
+  (`server.ts:69-107`, ledger L126). `RESUME_CLIENT_DEADLINE_MS`
+  already covers admission + wall clock + margin and applies to direct
+  resumes unchanged since `DIRECT_ADMISSION_DEADLINE_MS ≤
+  RESUME_ADMISSION_DEADLINE_MS` (plan pins the inequality).
 - `search` / `describe`: answered from the shared catalog FILTERED by
   the snapshot's `permits(projection, …)` where projection is the one
   the caller's flag enables (`discovery` for the discovery tools,
@@ -506,19 +552,25 @@ Consequences, each pinned (§9):
   projection flags, the connections listing as today, and — ONLY when
   `projections.direct` is true — a PAGE of the scoped direct listing:
   `{ qualifiedName, advertisedName, description, riskClass,
-  inputSchema }` per tool, `DIRECT_LISTING_PAGE` tools per page
-  (constant, 50), with `nextCursor` (an opaque qualified-name
+  inputSchema }` per tool, with `nextCursor` (an opaque qualified-name
   watermark). Schemas never travel when direct is off, so a default or
   Code-Mode-only profile's listing stays as small as today and the
   IPC frame cap (1 MiB, `frames.ts:23`) cannot be exceeded by catalog
-  growth; a direct listing pages under the cap by construction (the
-  plan pins page-size × max-schema-size < cap, refusing a single tool
-  whose schema alone exceeds the page budget from advertisement, logged).
-  `advertisedName` is computed by the DAEMON over the full catalog
-  (§8.3) — the daemon is the one owner of the mapping; the server never
-  computes names. Pages are consistent because names depend only on
-  the full catalog, not the scope; a catalog change mid-pagination can
-  only make a name unresolvable, which fails closed (§8.3).
+  growth. **Pages are packed by COMPLETE encoded size (rev 6):** the
+  daemon appends entries while the JSON encoding of the WHOLE response
+  so far (flags, connections, entries, cursor) stays under
+  `LISTING_PAGE_BYTES` (512 KiB, half the frame cap), measured on the
+  encoded bytes — a count-based page does not bound the frame (50
+  entries × (<16 KiB schema + 16 KiB description) encodes to
+  1,626,191 bytes). An entry that ALONE exceeds the page budget is
+  excluded from advertisement (logged once, deterministic; still
+  reachable via discovery `call` and Code Mode) and the cursor advances
+  past it, so pagination always progresses. `advertisedName` is
+  computed by the DAEMON (§8.3) — the daemon is the one owner of the
+  mapping; the server never computes names. Pages are consistent
+  because names depend only on the qualified name (§8.3, injective), so
+  a catalog change mid-pagination can only make a name unresolvable,
+  which fails closed.
 - `approvals.resume`: unchanged wire shape. The daemon reads the row's
   `kind` BEFORE admission: a `code` row is admitted through the sandbox
   queue as today; a `direct` row is admitted under `DIRECT_ADMISSION_MAX`
@@ -570,7 +622,8 @@ settle — inside the per-namespace source lock (`source-lock.ts`, the
 promise chain provisioning already uses), so no namespace write can
 interleave with a direct call on that namespace. Cost: a provision of
 a namespace waits behind an in-flight direct call on it (bounded by
-`DIRECT_DRIVE_BUDGET_MS`); rare and acceptable. Code Mode drives are
+`DIRECT_DRIVE_BUDGET_MS`, and itself bounded by its own admission
+deadline — §5.3); rare and acceptable. Code Mode drives are
 NOT serialized against provisioning — a mid-execution catalog change
 for a running program is the previously accepted limit (2026-08-22
 review record) and is unchanged here; the D3 sweep + generation check
@@ -656,16 +709,25 @@ treat exactly as an unknown tool —
 `block` with reason `Tool "<path>" is outside this client's scope.`,
 audited, guest-safe name `ConduitPolicyBlocked`.
 
-**One further host-side change, for §7:** `ConduitCallError` gains a
-host-only field `afterDispatch: boolean` (never crosses into the
-sandbox; guest-safe names unchanged), set `true` by the upstream
-caller on any failure raised AFTER the JSON-RPC request has been
-written to the socket — timeout, connection loss, malformed or capped
-response — and the invoker sets it `true` on a Trace-append failure
-after a successful upstream return. Today the timeout is flattened
-into a plain `ConduitUpstreamError` (`upstream.ts:284`) and the error
-vocabulary has no timeout member (`errors.ts:8`); this field is how
-the manager classifies effect uncertainty WITHOUT parsing messages.
+**One further host-side change, for §7 — dispatch STATE, not an error
+field (rev 6):** each direct drive owns a host-side, monotonic
+`DispatchState = "none" | "initializing" | "dispatched"` cell, created
+by the manager and passed through `CreateToolInvokerOptions` to the
+upstream caller. The caller advances it to `initializing` when
+session/handshake traffic starts (`upstream.ts:129` — initialize
+precedes the governed call and must not count as dispatch) and to
+`dispatched` at the moment the governed `tools/call` frame is written
+to the socket. Nothing ever lowers it. The manager classifies at
+settle time by READING THE CELL — not an error field — so it survives
+every wrapping and replacement error (today a post-dispatch upstream
+error whose refusal Trace-append also fails is REPLACED by the audit
+error, `invoker.ts:222-235`, and a field on the original would be
+lost), and the drive timer consults the same cell when it fires. Today
+the timeout is flattened into a plain `ConduitUpstreamError`
+(`upstream.ts:284`) and the error vocabulary has no timeout member
+(`errors.ts:8`); the cell is how effect uncertainty is classified
+WITHOUT parsing messages. Never guest-visible; guest-safe names
+unchanged.
 The §9.2 boundary is untouched: the credential is resolved at step 4
 as today and never enters any projection's response.
 
@@ -710,12 +772,14 @@ Error format follows `[Module] Operation failed: reason. Context: {…}`.
   through `call` with `requestKey` or through Code Mode.
 - **Post-dispatch failures (timeout, connection loss, malformed or
   capped response, Trace-append failure after return, drive-budget
-  expiry after dispatch, IPC loss).** Any `ConduitCallError` with
-  `afterDispatch: true` (§5.5) settles the row `failed` with error
+  expiry after dispatch, IPC loss).** Any failure settled while the
+  drive's `DispatchState` (§5.5) reads `dispatched` — whatever error
+  object reaches the manager — settles the row `failed` with error
   name `ConduitOutcomeAmbiguous` — the SAME name the crash sweep uses
   — and a message that names the effect as unknown ("the upstream may
-  have performed the call"). A failure before dispatch settles `failed`
-  under its own classification (the upstream did not run). Never
+  have performed the call"). A failure while the state is `none` or
+  `initializing` settles `failed` under its own classification (the
+  governed call was not sent). Never
   retried by Conduit. A settle-write failure after an upstream return
   takes the existing M4 path (synthetic `ConduitPersistError`
   fallback); the drive-budget timer firing while an upstream call is
@@ -796,38 +860,51 @@ Qualified names are `namespace.local` with namespace `[a-z0-9_-]+` and
 local rewritten to `[A-Za-z0-9_.]+` at normalize time; the only
 character MCP-side clients (`^[a-zA-Z0-9_-]{1,64}$`) forbid is the dot.
 
-`advertiseNames(fullCatalog) → Map<qualified, advertised>` — computed
-by the DAEMON over the FULL catalog (never the scope), so a profile
-change never renames a tool:
+**Injective encoding, no hashing (rev 6).** Any scheme that resolves
+collisions by rewriting names lets a later catalog change REASSIGN an
+advertised name to a different tool (codex: remove `a.b_c` + `a.b.c`,
+add `a.b_c_5b8f934a` — its base name equals the removed tool's hashed
+name, and an agent holding the old advertisement invokes a different
+tool under a namespace grant). So the advertised name is a function of
+the qualified name ALONE, injective over the legal character sets, and
+never depends on what else is in the catalog:
 
-1. base name: replace every `.` with `_`; if longer than 64 characters,
-   first 55 characters + `_` + the first 8 hex characters of SHA-256
-   over the qualified name;
-2. a name is COLLIDING if it equals another tool's current name or one
-   of the five reserved verbs (`execute`, `check_execution`, `search`,
-   `describe`, `call`);
-3. every colliding tool takes the hash form (first 55 + `_` + 8 hex);
-4. repeat step 2 over the FINAL names — a hash form can equal another
-   tool's base name (codex reproduced `a.b_c`, `a.b.c`, `a.b_c_5b8f934a`
-   all landing on `a_b_c_5b8f934a`); a tool that still collides after
-   the hash form is EXCLUDED from advertisement, deterministically
-   (both members of the residual set), with one log line naming them.
-   Excluded tools stay reachable through discovery `call` and Code
-   Mode. The map therefore never overwrites an entry, and uniqueness
-   of FINAL names is validated, not assumed.
+`advertisedName(qualified)`: replace every `-` with `--`, then every
+`.` with `-`. Decoding is unambiguous (a run of `-` of length n encodes
+⌊n/2⌋ literal hyphens plus one dot iff n is odd), so two qualified
+names never share an advertised name, and a name can never be
+reassigned — the same qualified name always has the same advertised
+name, and a different qualified name always has a different one.
+Reserved verbs are unreachable by construction: a qualified name always
+contains a `.`, so its advertised form always contains `-`, and none of
+`execute`, `check_execution`, `search`, `describe`, `call` does. If the
+encoded form exceeds 64 characters the tool is EXCLUDED from direct
+advertisement (deterministic, logged once; still reachable via
+discovery `call` and Code Mode) — no truncation, no hash, no
+reassignment surface. The daemon computes the name; the server
+resolves by exact match against the map from its listing (§8.2) and
+never decodes, though decoding would be sound.
 
-The map entry is resolved by exact match — never by parsing. Accepted
-limit, documented: adding a tool that collides with an existing
-advertised name renames the existing one on the next listing;
-`listChanged` stays `false` and the cached list was never authority.
+Consequence for the accepted-limit sentence of rev 3: there is no
+longer a case where adding a tool renames an existing one.
+`listChanged` stays `false`; the cached list was never authority.
 
 **Advertisement eligibility (schema envelope):** the normalizer stores
 whatever schema record the upstream declared (`normalize/mcp.ts:24`),
 including `{}` or non-object schemas, while the MCP tool contract
-requires an object `inputSchema` (`server.ts:246`). A tool whose stored
-`inputSchema` is not `{ "type": "object", … }` is NOT advertised on
-the direct projection (logged once per listing, deterministic), and
-stays reachable through discovery `call` and Code Mode, whose argument
+requires an object `inputSchema` (`server.ts:246`). Checking `type`
+alone is insufficient (`{"type":"object","required":42,"properties":[]}`
+passes it and one such entry invalidates the client's whole `tools/list`
+response), so the FULL MCP tool-definition envelope is validated:
+the daemon applies a structural predicate (object `inputSchema` whose
+`properties`, `required`, and every optional envelope field have the
+types the MCP schema demands) at listing time, and the server
+additionally runs each advertised entry through the MCP SDK's own
+`ToolSchema` parse (already a dependency of `packages/mcp`) before
+returning it — belt and braces at the two layers that each own a
+format. A tool failing either check is NOT advertised on the direct
+projection (logged once per listing, deterministic) and stays
+reachable through discovery `call` and Code Mode, whose argument
 handling is unchanged. This is envelope validation of the
 ADVERTISEMENT, not argument validation (§5.1 parity stands).
 
@@ -878,7 +955,7 @@ approval verb; `approvals.resume` remains reachable only through the
 | 4 | a removed tool becomes uncallable immediately | `daemon/conduitd.test.ts` real processes: remove → next `tool.call` refused |
 | 5 | stale discovery cannot preserve revoked authority (G3) | same file, at the RPC level (Lane B): list → revoke → `tool.call` by the cached qualified name refused; the advertised-name variant is Lane C in `server.test.ts` |
 | 6 | current authority checked on every call | `effectiveScope` unit + connection test (profile edit mid-connection) |
-| 7 | tool names deterministic and MCP-compatible | `server.test.ts` (grammar, length, collision set, stability under scope change) |
+| 7 | tool names deterministic, injective, MCP-compatible, never reassignable | `server.test.ts` (grammar; the `-`/`--` encoding round-trips; codex's reassignment triple resolves to three distinct names; verbs unreachable; >64 excluded; stability under scope AND catalog change) |
 | 8 | upstream growth cannot silently expand a tool-level grant | `effectiveScope` unit |
 | 9 | profiles only narrow | `effectiveScope` unit (allow ∩ catalog ⊆ allow; default vs named) |
 | 10 | trace semantics comparable across projections | D5 harness over stored `trace_events` rows |
@@ -892,7 +969,10 @@ approval verb; `approvals.resume` remains reachable only through the
 | 18 | result access is per client: `execution.get`/`getByRequestKey` answer not-found for a foreign row; request keys conflict only within one client (codex P1) | `daemon/conduitd.test.ts` + `manager.test.ts` |
 | 19 | every new row fails closed on an OLDER build: `code` holds the sentinel, the program lives in `program` (codex P0) | `sqlite.test.ts` (hydrate: program present → used; sentinel in `code`) + a legacy-hydrator simulation |
 | 21 | a governed `tools/call` is dispatched at most once per approval: a 404 after dispatch settles outcome-ambiguous and is never re-sent (codex P0, rev 5) | `pipeline/mcp-client.test.ts` + `upstream.test.ts` (side-effect-then-404 fixture), both projections via the D5 harness |
-| 20 | the direct listing pages under the IPC frame cap; schemas never travel when direct is off; non-object schemas and residual name collisions are excluded from advertisement, deterministically (codex P1 ×3) | `daemon/conduitd.test.ts` (pagination, cap) + `server.test.ts` (name algorithm incl. the reproduced triple) |
+| 20 | the direct listing pages by COMPLETE encoded size under the IPC frame cap and always progresses; schemas never travel when direct is off; malformed MCP envelopes and over-length names are excluded from advertisement, deterministically (codex P1 ×3, rev 6) | `daemon/conduitd.test.ts` (packing vs the 1,626,191-byte reproduction; oversized entry skipped) + `server.test.ts` (SDK `ToolSchema` gate) |
+| 22 | a direct drive settles exactly once: a late continuation after the timer cannot overwrite `failed`; slot and lock are released only after the work stops; lock waiting is inside bounded admission and an expired waiter never runs (codex P1 ×2, rev 6) | `manager.test.ts` (delayed success / delayed refusal after timeout) + `daemon/source-lock.test.ts` (expired waiter skipped) + `sqlite.test.ts` (attempt-fenced settle) |
+| 23 | two handshakes in one tick on a named-client connection bind exactly once; requests during `validating` are refused (codex P1, rev 6) | `daemon/conduitd.test.ts` real processes |
+| 24 | post-dispatch classification survives error replacement: a dispatched call whose refusal audit also fails still settles `ConduitOutcomeAmbiguous`; initialize traffic never counts as dispatch (codex P1, rev 6) | `manager.test.ts` + `pipeline/upstream.test.ts` |
 
 Three ambiguity invariants (§7): crash-before-persist (sweep test over a
 `running` direct row, Lane A); keyless-upstream documented limit (Lane
@@ -964,8 +1044,8 @@ regenerated per commit · agent never installs.
 
 - `DIRECT_ADMISSION_MAX` value (daemon-wide; recommend 4, same order as
   the sandbox queue cap), `DIRECT_ADMISSION_DEADLINE_MS` (must be ≤
-  `RESUME_ADMISSION_DEADLINE_MS`, pinned), `DIRECT_LISTING_PAGE` (50)
-  and the per-page byte budget under the 1 MiB frame cap.
+  `RESUME_ADMISSION_DEADLINE_MS`, pinned) and `LISTING_PAGE_BYTES`
+  (512 KiB, half the frame cap; measured on encoded bytes).
 - Whether `profile.set` validates that every `allow` entry currently
   exists in the catalog (recommend: warn, do not refuse — a profile may
   be written before its source is added).
@@ -1100,5 +1180,23 @@ regenerated per commit · agent never installs.
      further handshakes and ordinary requests refused while
      validating. (§5.1, §5.2/D4)
   Still-partial from the prior round are subsumed by items 1, 2, 3, 6,
-  7 above. Next: rev 6 folds these eight → codex pass #3 → if
-  converged, in-session eng review → founder read → writing-plans.
+  7 above.
+- 2026-09-05 — **rev 6 folds all eight:** (1) named keys
+  `clientId key`, default profile keeps RAW keys → no migration,
+  decoder refuses U+0000, conflict id only to its owner (§4.1); (2)
+  per-drive monotonic `DispatchState` cell read at settle, replacing
+  the `afterDispatch` error field (§5.5, §7); (3) lock acquisition
+  inside bounded admission for direct AND provisioning/removal,
+  expired waiters never run, provisioning budgets grow by the drive
+  budget (§5.3, §5.4); (4) one settlement latch per drive +
+  attempt-fenced `UPDATE … WHERE status='running' AND resume_attempt=?`,
+  timer awaits the continuation before releasing slot and lock (§5.3);
+  (5) INJECTIVE name encoding (`-`→`--`, `.`→`-`), no hashing, >64
+  excluded, verbs unreachable by construction — the reassignment
+  surface is gone (§8.3); (6) full MCP envelope validation at both
+  layers (§8.3); (7) pages packed by complete encoded size under
+  `LISTING_PAGE_BYTES`, oversized entries skipped with progress (§5.3);
+  (8) handshake state machine `unbound → validating → bound | closed`,
+  reserved before the first await (§5.1). Rows #22–#24 added; #7 and
+  #20 reworded. Next: codex pass #3 → if converged, in-session eng
+  review → founder read → writing-plans.
