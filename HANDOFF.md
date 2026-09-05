@@ -74,8 +74,10 @@ conduitspec, INVARIANTS, code — all unchanged. No rebuild needed.
    (scratchpad is gone). Convergence criterion: adversarial-convergence
    rule — a third round of NEW-class breaks means pause for a threat-
    model pass, not a fourth fold.
-2. Converged → the interactive **plan-eng-review** with the founder
-   present (gstack onboarding prompts fire on first run — LEARNINGS
+2. The interactive **plan-eng-review** with the founder present — it is
+   INDEPENDENT of codex #3 (the 2026-08-22 spec ran its three passes in
+   parallel), so run it whenever the founder is available rather than
+   after codex; fold both results together. Prerequisites: founder (gstack onboarding prompts fire on first run — LEARNINGS
    2026-08-30 #1) → founder reads the spec → `superpowers:writing-plans`.
 3. The spec PR (#57) also carries, when converged: the R1 §18 entry in
    `conduitspec.html` (+ `html2md.py`), G1–G3 ledger fixes, and the
