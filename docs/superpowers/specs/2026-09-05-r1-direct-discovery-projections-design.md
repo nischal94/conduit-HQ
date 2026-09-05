@@ -1,8 +1,10 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 4 — codex full pass (4 P0 / 8 P1 / 2 P2) folded on
-top of the fable audit (§12); codex confirming re-run and in-session
-eng review pending
+Status: revision 5 — NOT YET CONVERGED. Codex confirming pass on rev 4
+closed 9 of 14, left 5 partial, and found 1 new P0 + 8 P1 + 2 P2. The
+P0 and both P2 are folded here; the eight P1 are recorded verbatim as
+OPEN in §12 and must be folded (rev 6) BEFORE the in-session eng
+review and before any plan is written.
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -152,7 +154,8 @@ a direct one (§5.4), and what let the projection FLAG — not only the
 tool grant — be re-checked on every call and resume (§5.2): turning
 `direct` off must make a paused direct call unresumable, and turning
 `code` off must stop a running program at its next call. `projection`
-is also what Trace and `check_execution` report after a restart.
+is also what Trace and the approvals list report after a restart
+(`check_execution` does not expose it — §5.1).
 
 **`code` holds a sentinel for EVERY new row; the program moves to
 `program`.** `code` and `seeds` stay `NOT NULL` (SQLite cannot drop a
@@ -343,8 +346,13 @@ the resolved scope.
     requestKey?: string; projection: "direct" | "discovery" }
 ```
 
-`toolName` is the qualified name. `projection` is recorded in Trace
-only; it grants nothing (both values route identically). Decoded
+`toolName` is the qualified name. `projection` names which profile
+FLAG this call requires (`permits(projection, toolName)`, §5.2), is
+persisted on the execution row (§4.1), and labels the Trace row; both
+values route through the same handler. It is NOT exposed on the
+`check_execution` payload — the default-profile wire shape stays
+byte-identical (#12); `conduit trace` and the approvals row are where
+an operator sees it. Decoded
 field-by-field like every other kind; `input` is REQUIRED and must be
 a JSON value — the decoder refuses a frame without it, because
 `JSON.stringify(undefined)` is not a string and would break the §4.1
@@ -721,6 +729,23 @@ Error format follows `[Module] Operation failed: reason. Context: {…}`.
 Concurrent double-resume needs no new mechanism: `claimForResume` is
 the exactly-one-winner CAS (ledger gap G2 closes with its row, §9.3).
 
+**No post-dispatch retry, on any projection (rev 5, codex P0).** The
+shared MCP client retries a session-bearing `tools/call` ONCE after an
+HTTP 404 (`mcp-client.ts:711-727`, wrapping `callToolOnce` at `:929`).
+An untrusted upstream can perform the call, answer 404, and receive the
+identical call again after re-initialization: one consumed approval,
+two dispatches — an inherited defect that contradicts the one-call
+guarantee R1 states. Decision: for a governed `tools/call` the 404
+retry is DISABLED; a session-bearing 404 after dispatch is
+`afterDispatch: true` and settles `ConduitOutcomeAmbiguous`. Session
+renewal may prepare a LATER, separately authorized call; it never
+re-sends this one. The `tools/list` and initialize retries are
+unaffected (no side effects). Applies to Code Mode too — the class is
+projection-neutral (T3). Pinned with an upstream fixture that records
+a side effect before returning 404 (row #21). Ledger rows that
+describe the scoped 404 retry (§18-C4 family) are reworded to "for
+side-effect-free operations only".
+
 ## 8. MCP surface
 
 ### 8.1 Serve
@@ -866,6 +891,7 @@ approval verb; `approvals.resume` remains reachable only through the
 | 17 | a direct drive is linearized against namespace writes: a provision issued mid-drive commits only after the drive settles, and a generation bump after remove+re-add (incl. deleting the current maximum / every source) never revives a paused direct row (codex P0 ×2) | `daemon/provision.test.ts` (lock interleaving) + `sqlite.test.ts` (sequence never reused) |
 | 18 | result access is per client: `execution.get`/`getByRequestKey` answer not-found for a foreign row; request keys conflict only within one client (codex P1) | `daemon/conduitd.test.ts` + `manager.test.ts` |
 | 19 | every new row fails closed on an OLDER build: `code` holds the sentinel, the program lives in `program` (codex P0) | `sqlite.test.ts` (hydrate: program present → used; sentinel in `code`) + a legacy-hydrator simulation |
+| 21 | a governed `tools/call` is dispatched at most once per approval: a 404 after dispatch settles outcome-ambiguous and is never re-sent (codex P0, rev 5) | `pipeline/mcp-client.test.ts` + `upstream.test.ts` (side-effect-then-404 fixture), both projections via the D5 harness |
 | 20 | the direct listing pages under the IPC frame cap; schemas never travel when direct is off; non-object schemas and residual name collisions are excluded from advertisement, deterministically (codex P1 ×3) | `daemon/conduitd.test.ts` (pagination, cap) + `server.test.ts` (name algorithm incl. the reproduced triple) |
 
 Three ambiguity invariants (§7): crash-before-persist (sweep test over a
@@ -943,7 +969,8 @@ regenerated per commit · agent never installs.
 - Whether `profile.set` validates that every `allow` entry currently
   exists in the catalog (recommend: warn, do not refuse — a profile may
   be written before its source is added).
-- (closed in rev 2) `pausedBy` lives inside `direct_call` as `clientId`.
+- (closed in rev 3) client identity is the `client_id` column on
+  `executions`, written for both kinds (§4.1).
 
 ## 12. Decision + review trail
 
@@ -1009,3 +1036,69 @@ regenerated per commit · agent never installs.
   (§4.1, §8.6); harness over `(kind, projection)` pairs (§9.2). Rows
   #16–#20 added. Confirming re-run follows per the
   adversarial-convergence rule.
+- 2026-09-05 — **codex confirming pass on rev 4: NOT CONVERGED** (9 of
+  14 closed, 5 partial; new: 1 P0 / 8 P1 / 2 P2). Folded in rev 5: the
+  P0 (post-dispatch 404 retry → disabled for governed calls, §7, row
+  #21) and both P2 (projection contract wording §5.1/§4.1; stale §11
+  item). **OPEN — fold in rev 6 before the eng review** (codex's
+  finding and fix, condensed; each a genuine in-scope P1):
+  1. *Request-key namespacing breaks upgrade recovery*: legacy rows
+     hold raw `k`; new default-profile rows hold `\0k`; a lookup by
+     `k` misses the old row and a reissue admits a second run; a legacy
+     key containing the separator can collide with an encoded named
+     key. Fix: an atomic, versioned migration of legacy keys, an
+     unambiguous encoding (never encoded twice), and an ownership
+     check before returning a conflict id. (§4.1, §5.2, §5.4)
+  2. *`afterDispatch` lost through wrapping errors*: a post-dispatch
+     upstream error whose refusal Trace-append also fails is REPLACED
+     by the audit error (`invoker.ts:222-235`) and reads pre-dispatch;
+     the drive timer cannot inspect an error not yet produced;
+     initialize traffic precedes the governed call (`upstream.ts:129`).
+     Fix: a monotonic host-side per-drive DISPATCH STATE (not an error
+     field) that every wrapper preserves and the timer consults, with
+     initialization distinguished from the governed call. (§5.5, §7)
+  3. *Source-lock waiting is unbudgeted*: the lock waits indefinitely
+     (`source-lock.ts:65`); direct calls join the chain with no
+     admission bound and no rule that an expired waiter never runs;
+     REVERSE regression: provisioning now waits behind a 60 s direct
+     drive while its client budget is 35 s (`mcp-fetch.ts:23`,
+     `server.ts:182`). Fix: lock acquisition is part of bounded
+     admission for every operation on the chain; expired or
+     disconnected waiters never enter their callback; provisioning and
+     removal budgets account for the wait. (§5.3, §5.4, §11)
+  4. *Drive timer has no exactly-once settlement*: the timer
+     terminalizes while the awaited call can still complete, and the
+     late continuation writes `completed`/`paused` over `failed`
+     (updates are unconditional on status, `sqlite.ts:441`; the settle
+     guards handle persistence failure, not competing completions).
+     Fix: one settlement winner per drive, losing continuations
+     suppressed, persistence fenced by attempt/status; lock and
+     admission slot held until the work has actually stopped; test
+     delayed success and delayed refusal after timeout. (§5.3, §5.4)
+  5. *Advertised names can be REASSIGNED*: remove `a.b_c`+`a.b.c`,
+     add `a.b_c_5b8f934a` → its base name equals the removed tool's
+     hashed name; an agent holding the old advertisement invokes a
+     different tool under a namespace grant. Fix: non-reassignable
+     advertised identities (injective scheme, or persisted
+     assignments/tombstones); refuse ambiguous stale identities rather
+     than rebind. (§5.3, §8.2, §8.3)
+  6. *Schema eligibility checks `type` only*:
+     `{"type":"object","required":42,"properties":[]}` passes and one
+     such entry can invalidate the client's whole listing. Fix:
+     validate the full MCP tool-definition envelope per advertised
+     tool; exclude malformed entries deterministically. (§8.3)
+  7. *Listing size bound omits descriptions and envelope*: 50 tools ×
+     (<16 KiB schema + 16 KiB description) encoded to 1,626,191 bytes
+     > 1 MiB. Fix: pack pages by COMPLETE encoded response size;
+     define handling of an individually oversized entry; pagination
+     must still progress when entries are excluded. (§5.3, §11)
+  8. *Async profile lookup races the handshake-once guard*: frames
+     dispatch concurrently (`connection.ts:298`); an await between
+     check (`:472`) and assignment (`:504`) lets a second handshake
+     overwrite the first binding. Fix: states `unbound → validating →
+     bound/closed`, reserved synchronously before the first await;
+     further handshakes and ordinary requests refused while
+     validating. (§5.1, §5.2/D4)
+  Still-partial from the prior round are subsumed by items 1, 2, 3, 6,
+  7 above. Next: rev 6 folds these eight → codex pass #3 → if
+  converged, in-session eng review → founder read → writing-plans.
