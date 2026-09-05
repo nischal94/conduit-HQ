@@ -21,6 +21,7 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import { bundleDaemonHelper, type HelperBundle } from "./daemon/helpers/bundle.js";
+import { AGENT_VERSION } from "./env.js";
 
 /**
  * Ring-2 integration suite: drives the REAL stdio server over real child
@@ -649,6 +650,20 @@ describe("ring-2: spawned bin integration", () => {
       if (callId === undefined) throw new Error(`[integration] ${executionId} has no pending call`);
       return callId;
     })();
+    // INVARIANT §5.5, pinned against the script itself: a STALE call id is
+    // refused (exit 1) and the pause is untouched. This is what fails if the
+    // script ever goes back to looking the current id up at decide time —
+    // a lookup would find the real pause and approve it regardless of argv.
+    await expect(
+      execFileAsync(
+        "node",
+        ["../../scripts/approve-demo.mjs", executionId, "call_stale_never_issued"],
+        {
+          cwd: process.cwd(),
+          env: { ...process.env, ...baseEnv(), CONDUIT_DB: approvalDb },
+        },
+      ),
+    ).rejects.toMatchObject({ code: 1 });
     await execFileAsync("node", ["../../scripts/approve-demo.mjs", executionId, pendingCallId], {
       cwd: process.cwd(),
       env: { ...process.env, ...baseEnv(), CONDUIT_DB: approvalDb },
@@ -801,7 +816,7 @@ describe("ring-2: bin flag and doctor exit paths", () => {
       env: { ...process.env, ...baseEnv() },
     });
     expect(stdout).toBe("");
-    expect(stderr.trim()).toBe("0.1.0");
+    expect(stderr.trim()).toBe(AGENT_VERSION);
   });
 
   it("--help exits 0, prints to stderr only, stdout empty (INVARIANT M8 stdout purity)", async () => {
