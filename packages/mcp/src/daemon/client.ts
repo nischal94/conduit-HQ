@@ -1181,7 +1181,7 @@ function isPausedRowShape(row: unknown): boolean {
   const r = row as Record<string, unknown>;
   return (
     typeof r.executionId === "string" &&
-    typeof r.callId === "string" &&
+    (r.callId === undefined || typeof r.callId === "string") &&
     typeof r.toolName === "string" &&
     typeof r.startedAt === "number" &&
     Number.isFinite(r.startedAt) &&

@@ -1873,6 +1873,30 @@ describe("conduitd lifecycle", () => {
     expect(existsSync(paths.socket)).toBe(false);
   }, 120_000);
 
+  it(
+    "INVARIANT §5.5: a resume without callId is refused on the wire as invalid, and the connection survives to serve a well-formed request",
+    async () => {
+      // An older `conduit approvals` binary sends exactly this frame. It must
+      // be TOLD (an `invalid` frame naming callId), never bound to whatever is
+      // paused — and the refusal must not tear the connection down.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+      const client = await connectClient(paths.socket);
+      expect(await handshake(client, "approvals")).toMatchObject({ kind: "handshake.ok" });
+
+      client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" } as never);
+      const refused = (await client.next()) as { kind: string; code?: string; message?: string };
+      expect(refused).toMatchObject({ kind: "error", code: "invalid" });
+      expect(refused.message).toContain("callId");
+
+      client.send({ kind: "approvals.list" });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+    },
+    TIMEOUT,
+  );
+
   it("a paused approval created before an RPC stop is resumable after the next start", async () => {
     // Extends the signal-stop invariant above to the RPC path: approvals
     // are durable data, not daemon state, so the way the daemon was
@@ -1921,7 +1945,7 @@ describe("conduitd lifecycle", () => {
     };
     expect(listed.kind).toBe("result");
     const listedRow = listed.payload.find((row) => row.executionId === executionId);
-    expect(listedRow).toBeDefined();
+    expect(typeof listedRow?.callId).toBe("string");
 
     // The decision lands and the row reaches a TERMINAL status — the
     // pause survived the RPC stop as resumable work, not as a corpse. The

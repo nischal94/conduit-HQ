@@ -179,6 +179,14 @@ describe("decodeRequest", () => {
         callId: 7,
       }),
     ).toThrow();
+    expect(() =>
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: "  ",
+      }),
+    ).toThrow(/non-blank/);
     expect(() => decodeRequest({ kind: "source.revalidate", namespace: 5 })).toThrow();
   });
 

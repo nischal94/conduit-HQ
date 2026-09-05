@@ -748,6 +748,25 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           };
         }
         const pausedOn = execution.pausedOn;
+        if (pausedOn.callId !== callId) {
+          // The claim admits a CORRUPT pause (no callId in the stored JSON)
+          // so it can be terminalized here rather than stranded `paused`
+          // forever; a well-formed pause can only have been claimed with
+          // its own callId, so a mismatch is corruption, never a race.
+          await deps.store.executions.failClaimedResume(
+            executionId,
+            "resumed execution's pending approval carries no call id (corrupt state)",
+          );
+          return {
+            status: "failed",
+            executionId,
+            error: {
+              name: "ConduitInternalError",
+              message: `[ExecutionManager] Resumed execution's pending approval carries no call id. Context: { executionId: ${executionId} }`,
+            },
+            decisionApplied: false,
+          };
+        }
 
         // TTL (design D8): lazily expire on resume. `claimForResume` already
         // flipped status to running, so persist the terminal `expired` state.

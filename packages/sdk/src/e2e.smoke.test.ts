@@ -401,7 +401,10 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     const resumed = await manager.resume(
       managerExecId,
       { kind: "approve" },
-      (await manager.get(managerExecId))?.pausedOn?.callId ?? "no-pending-call",
+      (await manager.get(managerExecId))?.pausedOn?.callId ??
+        (() => {
+          throw new Error("[e2e] no pending call to resume");
+        })(),
     );
     expect(resumed.status).toBe("completed");
     if (resumed.status === "completed") {

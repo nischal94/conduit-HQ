@@ -157,8 +157,14 @@ export interface DaemonStopPayload {
  */
 export interface PausedListRow {
   executionId: string;
-  /** The pending call this row is waiting on; `approvals.resume` must name it. */
-  callId: string;
+  /**
+   * The pending call this row is waiting on; `approvals.resume` must name
+   * it. Optional on the WIRE type only because a daemon built before this
+   * field existed omits it — a new CLI still renders that daemon's queue
+   * (as `-`), and its `approve` is then refused by that daemon's own
+   * decoder. The daemon-side projection below always sets it.
+   */
+  callId?: string;
   startedAt: number;
   toolName: string;
   reason: string;

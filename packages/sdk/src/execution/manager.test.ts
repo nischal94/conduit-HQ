@@ -24,14 +24,21 @@ import { createExecutionManager, type ExecutionManagerDeps } from "./manager.js"
 
 /**
  * The callId a resume must name (spec §5.5: an approval binds to ONE pending
- * call). Read from the persisted row, exactly as the CLI reads it from the
- * approvals list. Tests that deliberately break `get` pass a literal instead.
+ * call). Read from the persisted row — the same value the CLI gets from the
+ * approvals list, via a shorter path. Throws when nothing is pending, so a
+ * regression that lost `pausedOn` cannot hide behind a sentinel id. Tests
+ * that break `get`, or that build the paused row by hand, pass the id
+ * directly.
  */
 async function pendingCallOf(
   manager: { get(id: string): Promise<Execution | undefined> },
   executionId: string,
 ): Promise<string> {
-  return (await manager.get(executionId))?.pausedOn?.callId ?? "no-pending-call";
+  const callId = (await manager.get(executionId))?.pausedOn?.callId;
+  if (callId === undefined) {
+    throw new Error(`[manager.test] ${executionId} has no pending call to resume`);
+  }
+  return callId;
 }
 
 /**
@@ -405,9 +412,13 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
 
     // Two concurrent approve-resumes: the atomic claim (F4) guarantees exactly
     // one drives; the other is a no-op conflict.
+    // Read the id ONCE and launch both resumes from the same tick: an
+    // `await` inside the array literal would start the first resume before
+    // the second even began, weakening the interleaving F4 is about.
+    const callId = await pendingCallOf(manager, id);
     const [a, b] = await Promise.all([
-      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
-      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
+      manager.resume(id, { kind: "approve" }, callId),
+      manager.resume(id, { kind: "approve" }, callId),
     ]);
     const statuses = [a.status, b.status].sort();
     expect(statuses).toEqual(["completed", "conflict"]);
@@ -754,7 +765,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Resume with approve. The staged approve is bound to create_issue (A); the
     // first live call on replay is delete_repo (B) → identity mismatch → TERMINAL
     // replay-divergence. The guest CANNOT catch-and-continue; the execution fails.
-    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
+    const outcome = await manager.resume(id, { kind: "approve" }, first.pending.callId);
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitReplayDivergence");
@@ -770,7 +781,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const settled = await manager.get(id);
     expect(settled?.status).toBe("failed");
     expect(settled?.pausedOn).toBeUndefined();
-    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
+    const retry = await manager.resume(id, { kind: "approve" }, first.pending.callId);
     expect(retry.status).toBe("conflict");
   });
 
@@ -824,7 +835,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
 
     // Resume with approve: create_issue reaches upstream (side effect fires),
     // then its journal append throws → outcome-ambiguous terminal failed.
-    const outcome = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
+    const outcome = await manager.resume(id, { kind: "approve" }, first.pending.callId);
     expect(poisoned).toBe(true);
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
@@ -838,7 +849,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const settled = await manager.get(id);
     expect(settled?.status).toBe("failed");
     expect(settled?.pausedOn).toBeUndefined();
-    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
+    const retry = await manager.resume(id, { kind: "approve" }, first.pending.callId);
     expect(retry.status).toBe("conflict");
     expect(h.calls.filter((c) => c.name === "create_issue")).toHaveLength(1);
   });
@@ -891,9 +902,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     });
 
     // Resume must NOT swallow the throw, but it MUST finalize the row first.
-    await expect(
-      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
-    ).rejects.toThrow("corrupt replay state");
+    await expect(manager.resume(id, { kind: "approve" }, pausedOn.callId)).rejects.toThrow(
+      "corrupt replay state",
+    );
     expect(calls).toBe(1);
 
     // The invariant: the row is terminal `failed`, NOT a stranded `running`.
@@ -906,7 +917,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // `running`), a second resume returns `conflict` (claimForResume finds no
     // `paused` row) rather than re-driving — the execution is settled, not
     // half-transitioned.
-    const second = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
+    const second = await manager.resume(id, { kind: "approve" }, pausedOn.callId);
     expect(second.status).toBe("conflict");
   });
 
@@ -997,7 +1008,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Consequence proof: a later resume is a no-op conflict (no `paused` row to
     // claim) — the execution is settled, not half-transitioned into a
     // permanently un-resumable `running`.
-    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
+    const retry = await manager.resume(id, { kind: "approve" }, pausedOn.callId);
     expect(retry.status).toBe("conflict");
   });
 
@@ -1082,6 +1093,57 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(retry.status).toBe("conflict");
   });
 
+  it("INVARIANT §5.5: a pause whose stored JSON carries no callId is claimed and terminalized `failed` (corrupt state), never stranded `paused` or approved", async () => {
+    const store = await makeBareStore();
+    const id = "exec_nocallid";
+    // Written raw with NO callId: the shape a pre-callId fixture (or a
+    // corrupt row) would leave behind. `put` cannot write it.
+    const raw = createClient({ url: ":memory:" });
+    void raw;
+    await store.executions.put({
+      id,
+      code: "return 1;",
+      status: "paused",
+      seeds: { now: 1, random: 2 },
+      pausedOn: {
+        callId: "will-be-stripped",
+        toolName: "github.create_issue",
+        input: {},
+        reason: "r",
+        expiresAt: Date.now() + 3_600_000,
+      },
+      startedAt: Date.now(),
+    });
+    const wrappedStore: ConduitStore = {
+      ...store,
+      executions: {
+        ...store.executions,
+        // The claim runs against the real row; the manager then reads a
+        // pausedOn whose callId does not match what it claimed with.
+        get: async (getId) => {
+          const row = await store.executions.get(getId);
+          if (row?.pausedOn === undefined) return row;
+          return { ...row, pausedOn: { ...row.pausedOn, callId: "" } };
+        },
+      },
+    };
+    const neverSandbox: Sandbox = {
+      execute: () => Promise.reject(new Error("sandbox must not run for a corrupt pause")),
+    };
+    const manager = createExecutionManager(makeStubDeps(wrappedStore, neverSandbox));
+
+    const outcome = await manager.resume(id, { kind: "approve" }, "will-be-stripped");
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitInternalError");
+      expect(outcome.error.message).toContain("no call id");
+    }
+    expect(outcome.decisionApplied).toBe(false);
+    const after = await store.executions.get(id);
+    expect(after?.status).toBe("failed");
+    expect(after?.pausedOn).toBeUndefined();
+  });
+
   it("§5.5 (I-4): the corrupt-state branch (pausedOn undefined after claim) persists terminal `failed` before returning", async () => {
     // (Fix 1) A paused row whose pausedOn is somehow absent after the claim is a
     // corrupt state. The early-return must persist `failed` (not just return a
@@ -1138,7 +1200,7 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const after = await store.executions.get(id);
     expect(after?.status).toBe("failed");
     expect(after?.pausedOn).toBeUndefined();
-    const retry = await manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id));
+    const retry = await manager.resume(id, { kind: "approve" }, "c1");
     expect(retry.status).toBe("conflict");
   });
 
@@ -1773,9 +1835,13 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
     const manager = createExecutionManager(h.deps);
     const id = await pauseOnCreateIssue(manager);
 
+    // Read the id ONCE and launch both resumes from the same tick: an
+    // `await` inside the array literal would start the first resume before
+    // the second even began, weakening the interleaving F4 is about.
+    const callId = await pendingCallOf(manager, id);
     const [a, b] = await Promise.all([
-      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
-      manager.resume(id, { kind: "approve" }, await pendingCallOf(manager, id)),
+      manager.resume(id, { kind: "approve" }, callId),
+      manager.resume(id, { kind: "approve" }, callId),
     ]);
     const loser = a.status === "conflict" ? a : b;
     expect(loser.status).toBe("conflict");

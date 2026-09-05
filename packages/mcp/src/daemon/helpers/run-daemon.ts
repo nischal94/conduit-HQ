@@ -25,6 +25,7 @@ import { writeFileSync } from "node:fs";
 // Explicit .ts extensions: run directly via `process.execPath` under
 // Node's native TypeScript support, never compiled by tsup, so Node's ESM
 // resolver needs the literal on-disk extension.
+import type { PendingApproval } from "@conduithq/sdk";
 import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
 import { FRAME_CAP } from "../frames.ts";
@@ -299,10 +300,10 @@ const createRuntime = pauseExecute
           // test reads back; the TTL is short so it genuinely lapses.
           start: async (code: string) => {
             const id = `exec_paused_${Date.now()}`;
-            // A COMPLETE PendingApproval, as the real manager writes one: the
-            // resume path binds to `callId` (spec §5.5), so a fixture row
+            // Typed so the checker, not a comment, keeps this fixture complete:
+            // the resume path binds to `callId` (spec §5.5), so a fixture row
             // without it would be un-resumable rather than merely paused.
-            const pausedOn = {
+            const pausedOn: PendingApproval = {
               callId: `call_${id}`,
               toolName: "github.delete_repo",
               input: {},

@@ -104,6 +104,8 @@ export interface ExecutionRepository {
    * claim succeeds only while the execution is paused on THAT call, so a
    * queued duplicate approval of an earlier pause can never claim a later
    * pause of the same program (spec §5.5 — an approval binds to one call).
+   * A corrupt pause (NULL, non-JSON, or callId-less `paused_on`) is still
+   * claimable so the manager can terminalize it rather than strand it.
    */
   claimForResume(id: string, resumeAttemptId: string, callId: string): Promise<boolean>;
   /**

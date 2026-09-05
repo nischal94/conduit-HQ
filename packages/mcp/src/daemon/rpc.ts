@@ -95,8 +95,9 @@ export type RpcRequest =
   | { kind: "catalog.listing" }
   | { kind: "approvals.list" }
   /**
-   * `callId` names the pending call the human decided on (the
-   * `PendingApproval.callId` shown on the approvals list). It is REQUIRED:
+   * `callId` names the pending call the human decided on — the `callId`
+   * of the row `approvals.list` returned (`PausedListRow.callId`), which
+   * `conduit approvals list` prints and the operator passes back. REQUIRED:
    * a resume that named only the execution would bind to "whatever is
    * paused now", and a program that was approved, ran on, and paused again
    * could then be approved a second time by a queued duplicate — a call no
@@ -357,9 +358,12 @@ export function decodeRequest(v: unknown): RpcRequest {
       if (v.decision !== "approve" && v.decision !== "deny") {
         throw new InvalidRpcRequest('approvals.resume.decision must be "approve" or "deny"');
       }
-      if (!isString(v.callId)) {
+      // Non-blank, not merely a string: real call ids are UUIDs, so a blank
+      // one can never match and would surface as a state `conflict` instead
+      // of the malformed request it is (Greptile, PR #58).
+      if (!isString(v.callId) || v.callId.trim().length === 0) {
         throw new InvalidRpcRequest(
-          "approvals.resume.callId must be a string (the pending call being decided)",
+          "approvals.resume.callId must be a non-blank string (the pending call being decided)",
         );
       }
       return {

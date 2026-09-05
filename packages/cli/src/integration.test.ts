@@ -790,14 +790,19 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     // second opener. It sees the pause the serve client just produced.
     const listResult = await runApprovals(["list", "--json"]);
     expect(listResult.exitCode).toBe(0);
-    const rows = JSON.parse(listResult.stdout) as Array<{ executionId: string; tool: string }>;
-    expect(rows.some((r) => r.executionId === executionId && r.tool === "github.delete_repo")).toBe(
-      true,
-    );
+    const rows = JSON.parse(listResult.stdout) as Array<{
+      executionId: string;
+      callId: string;
+      tool: string;
+    }>;
+    const listed = rows.find((r) => r.executionId === executionId);
+    expect(listed?.tool).toBe("github.delete_repo");
+    expect(typeof listed?.callId).toBe("string");
 
     // `approvals approve` (another separate process) resumes it — a WRITE
-    // through the approvals capability row, driven inside the daemon.
-    const approveResult = await runApprovals(["approve", executionId]);
+    // through the approvals capability row, driven inside the daemon — and
+    // names the call the list showed (spec §5.5).
+    const approveResult = await runApprovals(["approve", executionId, listed?.callId ?? ""]);
     expect(approveResult.exitCode).toBe(0);
     expect(approveResult.stdout.trim()).toBe("completed");
     expect(upstream.upstreamCalls.some((c) => c.name === "delete_repo")).toBe(true);
@@ -863,7 +868,7 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     // at its own `--state-dir`, which is exactly the property that makes
     // the boundary trustworthy. Closing it would need a sacrificial default
     // state directory (an isolated HOME), not a change to the product.
-    const denied = await runApprovals(["deny", "exec_never_existed"]);
+    const denied = await runApprovals(["deny", "exec_never_existed", "call_never_existed"]);
     expect(denied.exitCode).toBe(1);
     expect(denied.stdout.trim()).toBe("conflict");
     expect(denied.stderr).toMatch(/not in a resumable \(paused\) state/);
