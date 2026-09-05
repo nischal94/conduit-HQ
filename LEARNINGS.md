@@ -2429,3 +2429,17 @@ whole store at open). Both are "fail closed"; only one is proportionate.
 **Lesson: when choosing a fail-closed mechanism, name what it takes
 down — one row, one client, or the store — and pick the smallest unit
 that still closes the hole.**
+
+### 12. The convergence rule's pause branch is a real branch
+
+Passes #3 and #4 each returned a new class of finding (#4: an approval
+or a provenance stamp bound to an INSTANCE that can be replaced across
+time or across daemon versions), and #4's first P0 is live in shipped
+Code Mode: `approvals.resume` binds to the execution, not the pending
+call. Four rounds of fold-and-rerun did not find it because each round
+was scoped by the previous round's findings. **Lesson: when a pass
+returns a NEW class rather than a residual of the last class, stop
+folding and run the dedicated threat-model pass the rule names — the
+class is the finding, and the next fold would only chase its instances.
+The tell was that both P0s share one shape (instance binding) that no
+prior pass had a name for.**

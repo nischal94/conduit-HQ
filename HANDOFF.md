@@ -31,95 +31,100 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-05 night (R1 SPEC at rev 8 on PR #57: eng review DONE and folded, outside voice folded; codex convergence pass #3 STILL OWED — three runs lost to the provider's usage limit; NEXT: codex #3 on rev 8 → founder read → writing-plans)
+## Current handoff — updated 2026-09-06 00:20 (R1 SPEC at rev 10 on PR #57; codex passes #3 and #4 RAN — #4 found two NEW-CLASS P0s (instance binding), folded; the review loop is PAUSED by rule; NEXT: a dedicated threat-model pass on instance binding → codex #5 → founder read → plan)
 
-**WHAT HAPPENED (2026-09-05, one long session):** R1 started through the
-standing machinery and reached a reviewed spec in eight revisions on
-branch `docs/r1-design-spec`, **draft PR #57** (tip `7753f60`):
+**WHAT HAPPENED (2026-09-05 → 06, one long session):** R1 went from
+the design brief to a ten-revision spec on branch `docs/r1-design-spec`,
+**draft PR #57** (tip = the rev 10 commit):
 `docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`.
-Brainstorm settled A1–A7 on top of D1–D6 (widen `serve` with
-`tool.call` + `clientId` on the handshake; allowlist = namespaces +
-exact tool names; `conduit serve --client <id>`; `requestKey` on the
-discovery `call` tool only; one `admin` row + `conduit profiles` +
-`conduit remove-mcp`; direct execution as a manager arm; allowlist
-applies to Code Mode). Review ladder: rev 2 codex interim (recovered
-from stderr after a usage-limit death) → rev 3 fable code-verifying
-audit (1 P0 / 5 P1 / 14 P2) → rev 4 codex full pass (4 P0 / 8 P1 /
-2 P2) → rev 5 codex confirming pass (1 P0: the MCP client's 404 retry
-dispatches an approved call twice → no post-dispatch retry for governed
-calls) → rev 6 its eight P1s → **rev 7 in-session plan-eng-review with
-the founder (D1–D8)** → **rev 8 outside voice (Claude subagent; codex
-blocked), D9–D15.** Net design after the last two rounds: NO drive
-linearization (the check-then-dispatch race needs the trusted OPERATOR
-to re-provision mid-call → accepted Grade-B limit, §3); rev 6
-request-key encoding kept (the composite index was a downgrade hazard:
-the single-column index is recreated on every open); a direct result is
-NEVER persisted unredacted (sync completion not persisted; resumed one
-redacted); the D3 generation check runs on paused rows of BOTH kinds;
-advertised names are an injective encoding the server DECODES (no map);
-the server walks every daemon page into one `tools/list`; versioned
-scope snapshot; `client_id` on Trace; one `DirectDrive` object; 42
-acceptance rows. The spec ends with the GSTACK REVIEW REPORT and eight
-implementation tasks (T1–T8). Main is untouched by R1 code; no rebuild.
+Brainstorm settled A1–A7 on top of D1–D6. Review ladder: rev 2 codex
+interim → rev 3 fable audit → rev 4 codex full (4 P0) → rev 5 codex
+confirming (1 P0: MCP 404 retry double-dispatch) → rev 6 its P1s →
+rev 7 **in-session plan-eng-review with the founder (D1–D8)** → rev 8
+**outside voice (D9–D15)**: no drive lock (operator-created race =
+accepted Grade-B limit), rev 6 keys kept, results never persisted
+unredacted, generation check on both kinds, injective name decode →
+rev 9 **codex #3 on rev 8 (0 P0 / 8 P1)**: prefix-free `_u/_h/_d` name
+escapes, a `request_keys` mapping table (legacy NUL keys), one
+`PendingApproval` provenance shape, Code Mode 404 ambiguity made
+guest-uncatchable, `resultAvailable:false`, filter-before-rank search,
+drain accounting, outcome/cleanup promise split → rev 10 **codex #4 on
+rev 9 (2 P0 / 3 P1 / 1 P2)**: **(P0) `approvals.resume` binds to the
+execution, not the pending call — a queued duplicate approval can
+approve a LATER pause; this is a SHIPPED Code Mode defect** → `callId`
+on the wire + in the CAS predicate (row #46, T9); **(P0) an older
+daemon's provisioning leaves `generation` untouched** → SQLite triggers
+bump it for any writer (row #47, T10); bounded settle writes with an
+`unknown` outcome; bounded connections block; `result_state` modelled.
+48 acceptance rows, tasks T1–T10, GSTACK REVIEW REPORT at the end.
+Main untouched by R1 code; no rebuild.
 
-### NEXT — converge, then plan
+### THE RULE FIRED — read before doing anything
 
-1. **Codex pass #3 on rev 8** per `~/.claude/rules/codex-one-path.md`:
-   long form, detached, `pgrep` liveness OUTSIDE the sandbox (inside it
-   `pgrep` cannot list processes → false DONE). Expect the usage limit:
-   the failure is exit 1 + empty stdout + an `ERROR: … usage limit …
-   try again at HH:MM` line in stderr; queue a `sleep` until that time
-   and re-run rather than diagnosing the empty stdout. Prompt = the
-   standing adversarial brief (threat model, guarantees, exclusions)
-   with the spec inlined and the §12 trail as the closure list.
-   Convergence criterion: adversarial-convergence.md — all findings
-   (a)/(b) → converged; a NEW-class P0 → threat-model pause, not a
-   ninth fold.
-2. Converged → the founder reads the spec (brainstorming skill's
-   review gate: "Spec written and committed to <path>. Please review
-   it…") → `superpowers:writing-plans` from spec §10's three lanes and
-   the T1–T8 task list.
-3. PR #57 also carries, when converged: the R1 §18 entry in
-   `conduitspec.html` (+ `html2md.py`), G1–G3 ledger fixes, and the ⏳
-   rows #1–#42 in INVARIANTS.md. Load-bearing route: explainer + quiz,
-   human-named merge.
+Passes #3 and #4 each surfaced a NEW class of break (#4: binding to an
+INSTANCE that can be replaced across time or across writers).
+`~/.claude/rules/adversarial-convergence.md`: "New-class breaks
+repeatedly → pause for a dedicated threat-model pass before more code."
+So the next session does NOT run a fifth fold-and-rerun first.
 
-**Session quirks worth inheriting:** gstack's plan-eng-review fires two
-onboarding prompts every run (continuous checkpoint, proactive) because
-the marker `touch` under `~/.claude/skills/gstack` and `~/.gstack` is
-denied in the sandbox — run the two `touch` commands UNSANDBOXED once
-to silence them · gstack review-log / test-plan / tasks writes need the
-unsandboxed path (learning on file) · a raw NUL byte in a spec
-paragraph breaks the Edit tool's matching; the spec now spells it
-`<NUL>`.
+### NEXT — threat-model pass, then converge, then plan
 
-**DEFERRED (live list, updated 2026-09-05 night):** `--client` on the
-bare `conduit-mcp` bin (D8; TRIGGER: R3's entry-point decision) ·
-input-schema validation on BOTH projections (parity, spec §5.1; R2
-candidate) · G4 spec absorption of §3.3/§3.3.1 · `--doctor --offline`
-fixture race · `pnpm audit` registry-timeout false-red · `.impeccable/`
-dirs vs `biome check .` (config change, founder approval) · `NOTICE`
-file before first publish · Dependabot 0 HIGH / 6 medium / 1 low · R3
-website publish coupling · §16 flake pins · Linux ACL CI · revision
-pinning (→ R2; `sources.generation` is its base) · CX1/CX2 residuals ·
-display-allowlist helper · ApprovalRuntime type split · doctor log name.
+1. **Threat-model pass on instance binding** (fresh session, its own
+   short design note or a §3 amendment in the spec): enumerate every
+   place R1 binds a decision or a stamp to something that can be
+   replaced — approval ↔ pending call (callId), pause ↔ namespace
+   generation (writer-independent), client ↔ profile row (scope
+   version), advertised name ↔ qualified name (injective), request key
+   ↔ client, execution ↔ daemon build (sentinel) — and for each: what
+   replaces it, who can cause that, and whether the binding is checked
+   at USE time. Route: `/blindspot` codebase mode is the right tool;
+   codex adversarial brief afterwards. Output folds into the spec as
+   rev 11.
+2. **Codex pass #5** on rev 11 per codex-one-path (pgrep OUTSIDE the
+   sandbox; on the usage limit, `sleep` until the retry time it names —
+   four runs were lost to it this session; passes went through at 23:42
+   and 00:05). Converged = only documented-limit findings.
+3. Founder reads the spec → `superpowers:writing-plans` from §10 and
+   T1–T10 → PR #57 also carries the §18 R1 entry, G1–G3, the ⏳ rows.
+4. **Standalone housekeeping candidate:** the approval-rebinding defect
+   (row #46) exists in SHIPPED Code Mode. It can ship as its own small
+   fix PR ahead of R1 (callId on `approvals.resume` + CAS predicate +
+   CLI) — founder's call; it is the only R1 finding that is live today.
 
-**SHELVED (unchanged):** the project-jail plan; reactivated only by the
-founder in chat.
+**Session quirks worth inheriting:** gstack plan-eng-review's two
+onboarding prompts re-fire until the marker `touch` runs UNSANDBOXED ·
+gstack review-log / test-plan / tasks writes need the unsandboxed path
+· a raw NUL byte in a spec paragraph breaks the Edit tool's matching
+(spec spells it `<NUL>`) · codex's usage-limit death is exit 1 + empty
+stdout + an `ERROR … try again at HH:MM` stderr line.
+
+**DEFERRED (live list, updated 2026-09-06):** `--client` on the bare
+`conduit-mcp` bin (D8; TRIGGER: R3's entry-point decision) ·
+input-schema validation on BOTH projections (parity; R2) · G4 spec
+absorption of §3.3/§3.3.1 · `--doctor --offline` fixture race ·
+`pnpm audit` registry-timeout false-red · `.impeccable/` dirs vs `biome
+check .` (config change, founder approval) · `NOTICE` file before
+first publish · Dependabot 0 HIGH / 6 medium / 1 low · R3 website
+publish coupling · §16 flake pins · Linux ACL CI · revision pinning
+(→ R2; `sources.generation` + triggers are its base) · CX1/CX2
+residuals · display-allowlist helper · ApprovalRuntime type split ·
+doctor log name.
+
+**SHELVED (unchanged):** the project-jail plan.
 
 ### KICKOFF PROMPT for the next session
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — PR
 > #57 is the OPEN draft carrying the R1 spec). **State: R1 spec at rev
-> 8 on `docs/r1-design-spec` (`7753f60`), eng review + outside voice
-> folded, 42 acceptance rows, GSTACK REVIEW REPORT appended;
-> convergence NOT yet confirmed — codex pass #3 owed (usage limit
-> blocked three runs). Do NOT write a plan, touch code, or re-open
-> A1–A7 / D1–D15.** NEXT: check out the branch, run codex pass #3 on
-> rev 8 (codex-one-path; pgrep outside the sandbox; queue on the
-> limit's retry time), fold anything in-scope, then hand the spec to
-> the founder to read, then writing-plans. Carry the DEFERRED list.
+> 10 on `docs/r1-design-spec`; codex passes #3 and #4 both ran and are
+> folded; #4 found two NEW-CLASS P0s (instance binding), so the
+> adversarial-convergence rule's PAUSE branch applies. Do NOT run codex
+> #5 first, write a plan, touch code, or reopen A1–A7 / D1–D15.** NEXT:
+> the dedicated threat-model pass on instance binding (HANDOFF NEXT
+> step 1) → fold as rev 11 → codex #5 → founder read → writing-plans.
+> Ask the founder whether row #46 (approval rebinding, live in shipped
+> Code Mode) ships as its own fix PR first. Carry the DEFERRED list.
 ---
 
 ## Superseded handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; its NEXT [R1] was STARTED 2026-09-05 by the section above — spec drafted to rev 5, not converged)
