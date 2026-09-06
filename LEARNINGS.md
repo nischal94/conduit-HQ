@@ -2477,3 +2477,23 @@ OLD two-argument resume from the stale dist and produced a failure that
 looked like a logic bug. **Lesson: any sdk or mcp source change needs a
 `tsup` rebuild before mcp/cli tests mean anything; the tell is a test
 failing on behaviour the source visibly no longer has.**
+
+### 16. Convergence is reached by adjudication, not by a zero
+
+Five codex passes on one small PR: each later pass found something
+real and smaller (docs, wording, a precision point, a test that could
+not fail), and the last one's P1 was a hypothetical consumer that does
+not exist. The rule's stop line is "every remaining finding is out of
+scope by documented decision or in a best-effort layer" — not "the pass
+returns nothing". **Lesson: write the adjudication down (the fact that
+makes it out of scope, and where that fact is recorded) and stop; a
+sixth pass on the same diff is chasing a zero the rule never asked for.**
+
+### 17. Branch protection reads "behind" as blocked
+
+Docs commits pushed to main during a PR's life left the PR branch
+behind, and the merge was refused with a hint about `--auto` that
+misled: auto-merge is disabled on the repo. `gh pr update-branch` plus
+one more CI run was the whole fix. **Lesson: when a session pushes to
+main via the docs path while a PR is open, expect to update the PR
+branch before merging; budget one CI cycle for it.**
