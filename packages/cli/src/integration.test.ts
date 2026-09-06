@@ -871,6 +871,6 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     const denied = await runApprovals(["deny", "exec_never_existed", "call_never_existed"]);
     expect(denied.exitCode).toBe(1);
     expect(denied.stdout.trim()).toBe("conflict");
-    expect(denied.stderr).toMatch(/not in a resumable \(paused\) state/);
+    expect(denied.stderr).toMatch(/is not paused on call .* Run "conduit approvals list"/);
   }, 60_000);
 });

@@ -452,7 +452,9 @@ describe("conduit approvals approve|deny — real runtime", () => {
     const result = await runDecide("approve", executionId, reviewedA, deps);
     expect(result.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("conflict\n");
-    expect(deps.stderrLines.join("")).toMatch(/not in a resumable \(paused\) state/);
+    expect(deps.stderrLines.join("")).toMatch(
+      /is not paused on call .* Run "conduit approvals list"/,
+    );
 
     // Pause B is untouched and only the first delete ran upstream.
     expect((await store.executions.get(executionId))?.pausedOn?.callId).not.toBe(reviewedA);
@@ -553,7 +555,9 @@ describe("conduit approvals approve|deny — real runtime", () => {
     const second = await runDecide("approve", executionId, reviewed, deps);
     expect(second.exitCode).toBe(1);
     expect(deps.stdoutLines.join("")).toBe("completed\nconflict\n");
-    expect(deps.stderrLines.join("")).toMatch(/not in a resumable \(paused\) state/);
+    expect(deps.stderrLines.join("")).toMatch(
+      /is not paused on call .* Run "conduit approvals list"/,
+    );
 
     // The approved tool call fired exactly once — the conflicted second
     // decision never re-executed it.

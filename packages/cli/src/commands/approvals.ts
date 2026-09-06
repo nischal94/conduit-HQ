@@ -347,8 +347,12 @@ export async function runDecide(
     if (outcome.status === "failed") {
       deps.stderr(`[conduit approvals] ${kind} failed: ${formatOutcomeError(outcome.error)}\n`);
     } else {
+      // A conflict means the execution is not paused ON THIS CALL. It may
+      // have been decided already, expired, or — the case the wording must
+      // not hide — paused again on a DIFFERENT call that is still waiting for
+      // a human. Say so, and point back at the list.
       deps.stderr(
-        `[conduit approvals] ${kind}: execution ${executionId} was not in a resumable (paused) state.\n`,
+        `[conduit approvals] ${kind}: execution ${executionId} is not paused on call ${callId} — it was already decided, expired, or has since paused on a different call. Run "conduit approvals list" to see what is pending.\n`,
       );
     }
     return { exitCode: 1 };
