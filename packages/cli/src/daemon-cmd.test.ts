@@ -125,7 +125,7 @@ describe("conduit daemon status", () => {
     expect(printed).toContain("pid:         4242");
     // Both versions: the daemon's build AND this CLI's, so an operator
     // reading a skew warning can see the two numbers it names.
-    expect(printed).toContain("version:     0.1.0 (this CLI: 0.1.0)");
+    expect(printed).toContain(`version:     0.1.0 (this CLI: ${VERSION})`);
     expect(printed).toContain("db:          /state/conduit.db");
     expect(printed).toContain("connections: 3");
     expect(printed).toContain("in flight:   2 running, 5 queued");

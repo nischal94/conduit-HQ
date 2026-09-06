@@ -1,7 +1,7 @@
 import { USAGE as ADD_MCP_USAGE } from "./commands/add-mcp.js";
 import { KEY_USAGE } from "./commands/key.js";
 
-export const VERSION = "0.1.0";
+export const VERSION = "0.1.1";
 
 export const COMMANDS = ["serve", "add-mcp", "approvals", "key", "daemon"] as const;
 

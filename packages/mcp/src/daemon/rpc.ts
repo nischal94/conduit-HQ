@@ -94,7 +94,21 @@ export type RpcRequest =
    */
   | { kind: "catalog.listing" }
   | { kind: "approvals.list" }
-  | { kind: "approvals.resume"; executionId: string; decision: "approve" | "deny" }
+  /**
+   * `callId` names the pending call the human decided on — the `callId`
+   * of the row `approvals.list` returned (`PausedListRow.callId`), which
+   * `conduit approvals list` prints and the operator passes back. REQUIRED:
+   * a resume that named only the execution would bind to "whatever is
+   * paused now", and a program that was approved, ran on, and paused again
+   * could then be approved a second time by a queued duplicate — a call no
+   * human ever saw (spec §5.5, one decision per pending call).
+   */
+  | {
+      kind: "approvals.resume";
+      executionId: string;
+      decision: "approve" | "deny";
+      callId: string;
+    }
   /**
    * The onboarding write. `url` and `secret` are BOTH the operator's own
    * data, supplied together in one request — that is the one case §3.3.1
@@ -337,14 +351,27 @@ export function decodeRequest(v: unknown): RpcRequest {
       return { kind: "approvals.list" };
     }
     case "approvals.resume": {
-      assertNoExtraKeys(v, ["kind", "executionId", "decision"]);
+      assertNoExtraKeys(v, ["kind", "executionId", "decision", "callId"]);
       if (!isString(v.executionId)) {
         throw new InvalidRpcRequest("approvals.resume.executionId must be a string");
       }
       if (v.decision !== "approve" && v.decision !== "deny") {
         throw new InvalidRpcRequest('approvals.resume.decision must be "approve" or "deny"');
       }
-      return { kind: "approvals.resume", executionId: v.executionId, decision: v.decision };
+      // Non-blank, not merely a string: real call ids are UUIDs, so a blank
+      // one can never match and would surface as a state `conflict` instead
+      // of the malformed request it is (Greptile, PR #58).
+      if (!isString(v.callId) || v.callId.trim().length === 0) {
+        throw new InvalidRpcRequest(
+          "approvals.resume.callId must be a non-blank string (the pending call being decided)",
+        );
+      }
+      return {
+        kind: "approvals.resume",
+        executionId: v.executionId,
+        decision: v.decision,
+        callId: v.callId,
+      };
     }
     case "source.provision": {
       assertNoExtraKeys(v, [

@@ -242,6 +242,7 @@ describe("pausedToListRow (the approvals.list projection)", () => {
 
     expect(row).toEqual({
       executionId: "e",
+      callId: "c1",
       startedAt: 1_000,
       toolName: "github.delete_repo",
       reason: "requires approval",

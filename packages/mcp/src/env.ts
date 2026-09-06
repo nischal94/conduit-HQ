@@ -24,7 +24,7 @@ export const KEYGEN_ONE_LINER = `node -e "console.log(require('node:crypto').ran
  * ever made on it — capability scoping is the boundary (`rpc.ts`), and this
  * value never gates anything.
  */
-export const AGENT_VERSION = "0.1.0";
+export const AGENT_VERSION = "0.1.1";
 
 /**
  * The default state directory, anchored to the PASSWD entry for the real

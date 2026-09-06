@@ -473,15 +473,39 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         const row = rs.rows[0];
         return row === undefined ? undefined : hydrateExecutionRow(row, text(row, "id"));
       },
-      async claimForResume(id: string, resumeAttemptId: string): Promise<boolean> {
+      async claimForResume(id: string, resumeAttemptId: string, callId: string): Promise<boolean> {
         // Single guarded UPDATE: the WHERE status = 'paused' clause makes
         // this a compare-and-swap — SQLite serializes writes, so exactly
         // one concurrent caller's UPDATE matches the row and affects it.
         // A read-then-write would race here; this must stay one statement.
+        //
+        // The callId predicate joins the same statement so the identity
+        // check is part of the compare-and-swap rather than a separate
+        // read: an approval is for ONE pending call. A program that is
+        // approved, runs on, and pauses again is `paused` once more — but
+        // on a different call — and a queued duplicate of the first
+        // approval must lose here, not win and approve a call no human saw.
+        //
+        // A CORRUPT pause stays claimable on purpose. `paused_on` NULL,
+        // not JSON, or JSON with no callId can never be legitimately
+        // approved, and refusing it here would leave the row `paused`
+        // forever with no path to a terminal state. Letting the claim win
+        // hands it to the manager's corrupt-state branch, which
+        // terminalizes it `failed` and logs why — the self-healing the
+        // resume path had before the callId predicate existed. A CASE, not
+        // an OR chain: SQLite documents lazy evaluation for CASE only, and
+        // `json_extract` on invalid JSON throws — so the extraction branch
+        // is reached only after `json_valid` has said it is safe.
         const rs = await client.execute({
           sql: `UPDATE executions SET status = 'running', resume_attempt = ?
-                WHERE id = ? AND status = 'paused'`,
-          args: [resumeAttemptId, id],
+                WHERE id = ? AND status = 'paused'
+                  AND CASE
+                        WHEN paused_on IS NULL THEN 1
+                        WHEN json_valid(paused_on) = 0 THEN 1
+                        WHEN json_extract(paused_on, '$.callId') IS NULL THEN 1
+                        ELSE json_extract(paused_on, '$.callId') = ?
+                      END`,
+          args: [resumeAttemptId, id, callId],
         });
         return rs.rowsAffected === 1;
       },

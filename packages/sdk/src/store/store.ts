@@ -98,8 +98,16 @@ export interface ExecutionRepository {
   get(id: string): Promise<Execution | undefined>;
   /** Resolve by the caller-generated correlation key (mcp design M1). */
   getByRequestKey(key: string): Promise<Execution | undefined>;
-  /** Atomic paused→running for a single resume. Returns true iff THIS caller won (design F4). */
-  claimForResume(id: string, resumeAttemptId: string): Promise<boolean>;
+  /**
+   * Atomic paused→running for a single resume. Returns true iff THIS caller
+   * won (design F4). `callId` names the pending call the human approved: the
+   * claim succeeds only while the execution is paused on THAT call, so a
+   * queued duplicate approval of an earlier pause can never claim a later
+   * pause of the same program (spec §5.5 — an approval binds to one call).
+   * A corrupt pause (NULL, non-JSON, or callId-less `paused_on`) is still
+   * claimable so the manager can terminalize it rather than strand it.
+   */
+  claimForResume(id: string, resumeAttemptId: string, callId: string): Promise<boolean>;
   /**
    * Terminalize a row THIS resume claimed but could not finish preparing
    * (design §8/F5, the stranded-running guard). A guarded

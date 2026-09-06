@@ -192,10 +192,11 @@ describe("SqliteStore", () => {
         status: "paused",
         seeds: { now: 0, random: 0 },
         startedAt: 0,
+        pausedOn: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9e12 },
       });
       const [a, b] = await Promise.all([
-        store.executions.claimForResume("e", "attempt-A"),
-        store.executions.claimForResume("e", "attempt-B"),
+        store.executions.claimForResume("e", "attempt-A", "c"),
+        store.executions.claimForResume("e", "attempt-B", "c"),
       ]);
       expect([a, b].filter(Boolean)).toHaveLength(1); // exactly one won
       expect((await store.executions.get("e"))?.status).toBe("running");
@@ -209,7 +210,95 @@ describe("SqliteStore", () => {
         seeds: { now: 0, random: 0 },
         startedAt: 0,
       });
-      expect(await store.executions.claimForResume("e2", "x")).toBe(false);
+      expect(await store.executions.claimForResume("e2", "x", "c")).toBe(false);
+    });
+
+    it("INVARIANT §5.5: claimForResume binds to ONE pending call — a claim naming an earlier pause loses against a later pause of the same execution", async () => {
+      const pause = (callId: string) => ({
+        callId,
+        toolName: "github.create_issue",
+        input: { title: callId },
+        reason: "Policy requires approval",
+        expiresAt: Number.MAX_SAFE_INTEGER,
+      });
+      await store.executions.put({
+        id: "e3",
+        code: "",
+        status: "paused",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+        pausedOn: pause("call_A"),
+      });
+      // A claim for a call this execution is NOT paused on loses.
+      expect(await store.executions.claimForResume("e3", "attempt-1", "call_B")).toBe(false);
+      expect((await store.executions.get("e3"))?.status).toBe("paused");
+      // The claim for the pending call wins.
+      expect(await store.executions.claimForResume("e3", "attempt-2", "call_A")).toBe(true);
+      // The program runs on and pauses AGAIN, on a different call.
+      await store.executions.put({
+        id: "e3",
+        code: "",
+        status: "paused",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+        pausedOn: pause("call_B"),
+      });
+      // A stale approval for call_A must NOT claim the new pause.
+      expect(await store.executions.claimForResume("e3", "attempt-3", "call_A")).toBe(false);
+      expect((await store.executions.get("e3"))?.pausedOn?.callId).toBe("call_B");
+      expect(await store.executions.claimForResume("e3", "attempt-4", "call_B")).toBe(true);
+    });
+
+    it("INVARIANT §5.5: concurrent claims naming DIFFERENT calls — only the one naming the pending call wins", async () => {
+      await store.executions.put({
+        id: "e4",
+        code: "",
+        status: "paused",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+        pausedOn: { callId: "call_A", toolName: "t", input: {}, reason: "r", expiresAt: 9e12 },
+      });
+      const [a, b] = await Promise.all([
+        store.executions.claimForResume("e4", "attempt-A", "call_A"),
+        store.executions.claimForResume("e4", "attempt-B", "call_B"),
+      ]);
+      // Direction matters: the claim for the PENDING call wins, the other is a no-op.
+      expect([a, b]).toEqual([true, false]);
+      expect((await store.executions.get("e4"))?.status).toBe("running");
+    });
+
+    it("INVARIANT §5.5: a CORRUPT pause (NULL, non-JSON, or callId-less paused_on) is still claimable, so the manager can terminalize it instead of stranding it", async () => {
+      // Written raw: `put` cannot produce these shapes.
+      const base = "'', 'paused', '{}', ?, 0";
+      await client.executeMultiple(`
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('p_null', ${base.replace("?", "NULL")});
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('p_junk', ${base.replace("?", "'not json'")});
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('p_nocall', ${base.replace("?", '\'{"toolName":"t"}\'')});
+      `);
+      for (const id of ["p_null", "p_junk", "p_nocall"]) {
+        await expect(store.executions.claimForResume(id, "attempt", "any")).resolves.toBe(true);
+        const rs = await client.execute({
+          sql: "SELECT status FROM executions WHERE id = ?",
+          args: [id],
+        });
+        expect(rs.rows[0]?.status).toBe("running");
+      }
+    });
+
+    it("failClaimedResume is a no-op for a row this caller never claimed (the claim lost)", async () => {
+      await store.executions.put({
+        id: "e5",
+        code: "",
+        status: "paused",
+        seeds: { now: 0, random: 0 },
+        startedAt: 0,
+        pausedOn: { callId: "call_A", toolName: "t", input: {}, reason: "r", expiresAt: 9e12 },
+      });
+      expect(await store.executions.claimForResume("e5", "attempt", "call_B")).toBe(false);
+      await store.executions.failClaimedResume("e5", "prep failed");
+      const row = await store.executions.get("e5");
+      expect(row?.status).toBe("paused");
+      expect(row?.pausedOn?.callId).toBe("call_A");
     });
 
     it("round-trips executions including pause state and seeds", async () => {
@@ -320,7 +409,7 @@ describe("SqliteStore", () => {
         startedAt: 1,
         pausedOn: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
       });
-      await store.executions.claimForResume("exec_f", "attempt");
+      await store.executions.claimForResume("exec_f", "attempt", "c");
       await store.executions.failClaimedResume("exec_f", "prep failed");
       const row = await store.executions.get("exec_f");
       expect(row?.status).toBe("failed");
