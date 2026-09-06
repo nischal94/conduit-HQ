@@ -2443,3 +2443,37 @@ folding and run the dedicated threat-model pass the rule names — the
 class is the finding, and the next fold would only chase its instances.
 The tell was that both P0s share one shape (instance binding) that no
 prior pass had a name for.**
+
+## 2026-09-06 — the approval-rebinding fix (PR #58)
+
+### 13. A binding fix can rebuild the hole one layer up
+
+The first draft bound the store's claim to the pending call and then
+had the CLI LOOK UP that call id at decide time. Two independent
+reviewers (codex, CodeRabbit) saw the same thing: a queued duplicate
+`approve` would list the program's LATER pause and send that id, so the
+CLI rebound the decision exactly as the store used to. **Lesson: when a
+fix binds a decision to an identity, trace where the identity ENTERS —
+if the code derives it at decide time from current state, the binding
+is to "now", not to what the human saw. The identity must come from the
+human's own hand (an argument they read off the list).**
+
+### 14. Fail-closed at the wrong layer strands rows
+
+Refusing corrupt pauses at the claim looked like the safe choice and
+was a silent regression: before the change, the claim won and the
+manager's corrupt-state branch terminalized the row; after, the row
+stayed `paused` forever, re-listed and undecidable, with no log line.
+**Lesson: before adding a refusal, find the existing branch that
+HANDLES the bad state and check whether the refusal now starves it. The
+fix was to let the claim admit corrupt rows on purpose and treat a
+post-claim identity mismatch as corruption.**
+
+### 15. Stale dists hide arity changes from downstream packages
+
+mcp and cli import the sdk and mcp packages from their built `dist`.
+After changing `resume`'s arity in sdk source, the CLI suite ran the
+OLD two-argument resume from the stale dist and produced a failure that
+looked like a logic bug. **Lesson: any sdk or mcp source change needs a
+`tsup` rebuild before mcp/cli tests mean anything; the tell is a test
+failing on behaviour the source visibly no longer has.**
