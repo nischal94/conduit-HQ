@@ -64,8 +64,9 @@ export interface ExecutionManager {
  *
  * Every arm carries `executionId` so the caller can act on the result — the
  * §4.1 agent-facing pause contract returns `exec_id` to the agent, and the
- * CLI's `conduit approvals approve|deny <exec_id>` maps onto
- * `resume(executionId, …)`. A `conflict` still carries the id it raced on.
+ * CLI's `conduit approvals approve|deny <exec_id> <call_id>` maps onto
+ * `resume(executionId, decision, callId)`. A `conflict` still carries the id
+ * it raced on.
  */
 export type ExecutionOutcome =
   | { status: "completed"; executionId: string; value: unknown }

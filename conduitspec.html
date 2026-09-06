@@ -770,8 +770,9 @@ own working directory and fail to start.</li>
 for a safe-classified tool). See <code>packages/cli/README.md</code> for the full flag reference,
 <code>CONDUIT_ADD_SECRET</code> credential onboarding, and the retarget refusal.</li>
 <li><strong>Approve/resume a paused call:</strong> <code>conduit approvals list</code> /
-<code>conduit approvals approve &lt;execId&gt;</code> (or <code>deny</code>), run from a separate
-process while the agent is waiting.</li>
+<code>conduit approvals approve &lt;execId&gt; &lt;callId&gt;</code> (or <code>deny</code>), run from a
+separate process while the agent is waiting. The call id is the <code>CALL ID</code> column of
+<code>list</code>: a decision names the ONE pending call the operator reviewed (§5.5).</li>
 <li><strong>Restart the client</strong> after editing its config — the startup-reload caveat above
 applies here too.</li>
 </ol>

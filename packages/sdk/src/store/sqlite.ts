@@ -492,16 +492,19 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         // forever with no path to a terminal state. Letting the claim win
         // hands it to the manager's corrupt-state branch, which
         // terminalizes it `failed` and logs why — the self-healing the
-        // resume path had before the callId predicate existed. The OR is
-        // ordered so `json_extract` never runs on invalid JSON (SQLite
-        // short-circuits), which would otherwise throw out of the claim.
+        // resume path had before the callId predicate existed. A CASE, not
+        // an OR chain: SQLite documents lazy evaluation for CASE only, and
+        // `json_extract` on invalid JSON throws — so the extraction branch
+        // is reached only after `json_valid` has said it is safe.
         const rs = await client.execute({
           sql: `UPDATE executions SET status = 'running', resume_attempt = ?
                 WHERE id = ? AND status = 'paused'
-                  AND (paused_on IS NULL
-                       OR NOT json_valid(paused_on)
-                       OR json_extract(paused_on, '$.callId') IS NULL
-                       OR json_extract(paused_on, '$.callId') = ?)`,
+                  AND CASE
+                        WHEN paused_on IS NULL THEN 1
+                        WHEN json_valid(paused_on) = 0 THEN 1
+                        WHEN json_extract(paused_on, '$.callId') IS NULL THEN 1
+                        ELSE json_extract(paused_on, '$.callId') = ?
+                      END`,
           args: [resumeAttemptId, id, callId],
         });
         return rs.rowsAffected === 1;

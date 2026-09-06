@@ -547,8 +547,9 @@ own working directory and fail to start.
 for a safe-classified tool). See `packages/cli/README.md` for the full flag reference,
 `CONDUIT_ADD_SECRET` credential onboarding, and the retarget refusal.
 4. **Approve/resume a paused call:** `conduit approvals list` /
-`conduit approvals approve <execId>` (or `deny`), run from a separate
-process while the agent is waiting.
+`conduit approvals approve <execId> <callId>` (or `deny`), run from a
+separate process while the agent is waiting. The call id is the `CALL ID` column of
+`list`: a decision names the ONE pending call the operator reviewed (§5.5).
 5. **Restart the client** after editing its config — the startup-reload caveat above
 applies here too.
 

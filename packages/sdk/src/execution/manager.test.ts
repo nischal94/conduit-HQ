@@ -1093,55 +1093,50 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(retry.status).toBe("conflict");
   });
 
-  it("INVARIANT §5.5: a pause whose stored JSON carries no callId is claimed and terminalized `failed` (corrupt state), never stranded `paused` or approved", async () => {
-    const store = await makeBareStore();
-    const id = "exec_nocallid";
-    // Written raw with NO callId: the shape a pre-callId fixture (or a
-    // corrupt row) would leave behind. `put` cannot write it.
-    const raw = createClient({ url: ":memory:" });
-    void raw;
-    await store.executions.put({
-      id,
-      code: "return 1;",
-      status: "paused",
-      seeds: { now: 1, random: 2 },
-      pausedOn: {
-        callId: "will-be-stripped",
-        toolName: "github.create_issue",
-        input: {},
-        reason: "r",
-        expiresAt: Date.now() + 3_600_000,
-      },
-      startedAt: Date.now(),
+  it("INVARIANT §5.5: a pause whose STORED JSON carries no callId is claimed through the real SQL and terminalized `failed` (corrupt state), never stranded `paused` or approved", async () => {
+    // Raw SQL against the same client the store uses: `put` cannot write a
+    // pausedOn without a callId, and a mocked `get` would not exercise the
+    // claim's own corruption allowance — which is the thing under test.
+    const scratch = mkdtempSync(join(tmpdir(), "conduit-nocallid-"));
+    const client = createClient({ url: `file:${join(scratch, "nocallid.db")}` });
+    bareClients.push(client);
+    const store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
     });
-    const wrappedStore: ConduitStore = {
-      ...store,
-      executions: {
-        ...store.executions,
-        // The claim runs against the real row; the manager then reads a
-        // pausedOn whose callId does not match what it claimed with.
-        get: async (getId) => {
-          const row = await store.executions.get(getId);
-          if (row?.pausedOn === undefined) return row;
-          return { ...row, pausedOn: { ...row.pausedOn, callId: "" } };
-        },
-      },
-    };
+    const id = "exec_nocallid";
+    await client.execute({
+      sql: `INSERT INTO executions (id, code, status, seeds, paused_on, started_at)
+            VALUES (?, 'return 1;', 'paused', '{"now":1,"random":2}', ?, ?)`,
+      args: [
+        id,
+        JSON.stringify({
+          toolName: "github.create_issue",
+          input: {},
+          reason: "r",
+          expiresAt: Date.now() + 3_600_000,
+        }),
+        Date.now(),
+      ],
+    });
     const neverSandbox: Sandbox = {
       execute: () => Promise.reject(new Error("sandbox must not run for a corrupt pause")),
     };
-    const manager = createExecutionManager(makeStubDeps(wrappedStore, neverSandbox));
+    const manager = createExecutionManager(makeStubDeps(store, neverSandbox));
 
-    const outcome = await manager.resume(id, { kind: "approve" }, "will-be-stripped");
+    const outcome = await manager.resume(id, { kind: "approve" }, "any-id-the-operator-typed");
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitInternalError");
       expect(outcome.error.message).toContain("no call id");
     }
     expect(outcome.decisionApplied).toBe(false);
-    const after = await store.executions.get(id);
-    expect(after?.status).toBe("failed");
-    expect(after?.pausedOn).toBeUndefined();
+    const after = await client.execute({
+      sql: "SELECT status, paused_on FROM executions WHERE id = ?",
+      args: [id],
+    });
+    expect(after.rows[0]?.status).toBe("failed");
+    expect(after.rows[0]?.paused_on).toBeNull();
   });
 
   it("§5.5 (I-4): the corrupt-state branch (pausedOn undefined after claim) persists terminal `failed` before returning", async () => {
