@@ -285,6 +285,50 @@ describe("SqliteStore", () => {
       }
     });
 
+    it("INVARIANT §5.5: a pause whose stored callId is PRESENT but can never be named by an operator (non-text, or blank) is still claimable, exactly like an absent one", async () => {
+      // The wire decoder (rpc.ts) refuses a callId that is not a string or
+      // is blank, so no well-formed request can ever match a stored callId
+      // of these shapes. Without the allowance such a row lists forever and
+      // `conflict`s on every decide — the strand the corrupt-pause branch
+      // exists to prevent. Written raw: `put` cannot produce these shapes.
+      const shapes: Record<string, unknown> = {
+        p_number: 123,
+        p_bool: true,
+        p_jsonnull: null,
+        p_empty: "",
+        p_blank: " \t\n\v\f\r",
+        p_array: [],
+        p_object: {},
+      };
+      for (const [id, callId] of Object.entries(shapes)) {
+        await client.execute({
+          sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES (?, '', 'paused', '{}', ?, 0)",
+          args: [id, JSON.stringify({ callId, toolName: "t" })],
+        });
+      }
+      for (const id of Object.keys(shapes)) {
+        await expect(store.executions.claimForResume(id, "attempt", "any")).resolves.toBe(true);
+        const rs = await client.execute({
+          sql: "SELECT status FROM executions WHERE id = ?",
+          args: [id],
+        });
+        expect(rs.rows[0]?.status).toBe("running");
+      }
+      // Control: a well-formed callId is decidable, so a claim naming a
+      // DIFFERENT call must still lose — the allowance is for shapes no
+      // operator can name, never a wildcard.
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('p_wellformed', '', 'paused', '{}', ?, 0)",
+        args: [JSON.stringify({ callId: "call_A", toolName: "t" })],
+      });
+      await expect(
+        store.executions.claimForResume("p_wellformed", "attempt", "call_B"),
+      ).resolves.toBe(false);
+      await expect(
+        store.executions.claimForResume("p_wellformed", "attempt", "call_A"),
+      ).resolves.toBe(true);
+    });
+
     it("failClaimedResume is a no-op for a row this caller never claimed (the claim lost)", async () => {
       await store.executions.put({
         id: "e5",

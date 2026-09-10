@@ -187,6 +187,17 @@ describe("decodeRequest", () => {
         callId: "  ",
       }),
     ).toThrow(/non-blank/);
+    // "Blank" is ASCII whitespace only — the SAME set the store's claim
+    // treats as un-nameable (sqlite.ts claimForResume), so every stored
+    // callId is either matchable by some request or admitted as corrupt.
+    expect(() =>
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: " \t\n\v\f\r",
+      }),
+    ).toThrow(/non-blank/);
     expect(() => decodeRequest({ kind: "source.revalidate", namespace: 5 })).toThrow();
   });
 

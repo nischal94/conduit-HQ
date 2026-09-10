@@ -486,23 +486,37 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         // on a different call — and a queued duplicate of the first
         // approval must lose here, not win and approve a call no human saw.
         //
-        // A CORRUPT pause stays claimable on purpose. `paused_on` NULL,
-        // not JSON, or JSON with no callId can never be legitimately
-        // approved, and refusing it here would leave the row `paused`
-        // forever with no path to a terminal state. Letting the claim win
-        // hands it to the manager's corrupt-state branch, which
-        // terminalizes it `failed` and logs why — the self-healing the
-        // resume path had before the callId predicate existed. A CASE, not
-        // an OR chain: SQLite documents lazy evaluation for CASE only, and
-        // `json_extract` on invalid JSON throws — so the extraction branch
-        // is reached only after `json_valid` has said it is safe.
+        // A CORRUPT pause stays claimable on purpose. A pause no operator
+        // can ever name — `paused_on` NULL, not JSON, or a callId that is
+        // absent, not text, or blank — can never be legitimately approved,
+        // and refusing it here would leave the row `paused` forever with
+        // no path to a terminal state. Letting the claim win hands it to
+        // the manager's corrupt-state branch, which terminalizes it
+        // `failed` and logs why — the self-healing the resume path had
+        // before the callId predicate existed.
+        //
+        // "Un-nameable" is defined by what the wire decoder refuses
+        // (rpc.ts: not a string, or blank), and "blank" is ASCII whitespace
+        // in BOTH places so the sets are identical: every stored callId is
+        // either matchable by some well-formed request or admitted here.
+        // A present-but-unmatchable callId (a JSON number, `""`) would
+        // otherwise fall through to the equality arm, never match, and
+        // strand the row listed-but-undecidable (found by the R1 spec's
+        // fifth codex pass, 2026-09-11).
+        //
+        // A CASE, not an OR chain: SQLite documents lazy evaluation for
+        // CASE only, and `json_extract` on invalid JSON throws — so the
+        // extraction arms are reached only after `json_valid` has said it
+        // is safe. `json_type` is NULL for a missing path and 'null' for a
+        // JSON null; both are `IS NOT 'text'`.
         const rs = await client.execute({
           sql: `UPDATE executions SET status = 'running', resume_attempt = ?
                 WHERE id = ? AND status = 'paused'
                   AND CASE
                         WHEN paused_on IS NULL THEN 1
                         WHEN json_valid(paused_on) = 0 THEN 1
-                        WHEN json_extract(paused_on, '$.callId') IS NULL THEN 1
+                        WHEN json_type(paused_on, '$.callId') IS NOT 'text' THEN 1
+                        WHEN trim(json_extract(paused_on, '$.callId'), ' ' || char(9, 10, 11, 12, 13)) = '' THEN 1
                         ELSE json_extract(paused_on, '$.callId') = ?
                       END`,
           args: [resumeAttemptId, id, callId],

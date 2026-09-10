@@ -1093,6 +1093,53 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(retry.status).toBe("conflict");
   });
 
+  it("INVARIANT §5.5: a pause whose STORED callId is a JSON number is claimed through the real SQL and terminalized `failed` (corrupt state), never stranded `paused`", async () => {
+    // A number can never equal the text the decoder admits, so no operator
+    // can name this call; the claim must still win so the corrupt-state
+    // branch below can terminalize it instead of leaving it listed forever.
+    const scratch = mkdtempSync(join(tmpdir(), "conduit-numcallid-"));
+    const client = createClient({ url: `file:${join(scratch, "numcallid.db")}` });
+    bareClients.push(client);
+    const store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+    });
+    const id = "exec_numcallid";
+    await client.execute({
+      sql: `INSERT INTO executions (id, code, status, seeds, paused_on, started_at)
+            VALUES (?, 'return 1;', 'paused', '{"now":1,"random":2}', ?, ?)`,
+      args: [
+        id,
+        JSON.stringify({
+          callId: 123,
+          toolName: "github.create_issue",
+          input: {},
+          reason: "r",
+          expiresAt: Date.now() + 3_600_000,
+        }),
+        Date.now(),
+      ],
+    });
+    const neverSandbox: Sandbox = {
+      execute: () => Promise.reject(new Error("sandbox must not run for a corrupt pause")),
+    };
+    const manager = createExecutionManager(makeStubDeps(store, neverSandbox));
+
+    const outcome = await manager.resume(id, { kind: "approve" }, "123");
+    expect(outcome.status).toBe("failed");
+    if (outcome.status === "failed") {
+      expect(outcome.error.name).toBe("ConduitInternalError");
+      expect(outcome.error.message).toContain("call id");
+    }
+    expect(outcome.decisionApplied).toBe(false);
+    const after = await client.execute({
+      sql: "SELECT status, paused_on FROM executions WHERE id = ?",
+      args: [id],
+    });
+    expect(after.rows[0]?.status).toBe("failed");
+    expect(after.rows[0]?.paused_on).toBeNull();
+  });
+
   it("INVARIANT §5.5: a pause whose STORED JSON carries no callId is claimed through the real SQL and terminalized `failed` (corrupt state), never stranded `paused` or approved", async () => {
     // Raw SQL against the same client the store uses: `put` cannot write a
     // pausedOn without a callId, and a mocked `get` would not exercise the

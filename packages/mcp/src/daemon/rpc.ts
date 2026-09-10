@@ -361,7 +361,13 @@ export function decodeRequest(v: unknown): RpcRequest {
       // Non-blank, not merely a string: real call ids are UUIDs, so a blank
       // one can never match and would surface as a state `conflict` instead
       // of the malformed request it is (Greptile, PR #58).
-      if (!isString(v.callId) || v.callId.trim().length === 0) {
+      //
+      // "Blank" is ASCII whitespace ONLY — not `trim()`, which is
+      // Unicode-aware. The store's claim admits a stored callId of exactly
+      // this set as un-nameable corruption (sqlite.ts claimForResume), so
+      // the two definitions must be one set: a value refused here but not
+      // admitted there would be a row no operator could ever decide.
+      if (!isString(v.callId) || /^[ \t\n\v\f\r]*$/.test(v.callId)) {
         throw new InvalidRpcRequest(
           "approvals.resume.callId must be a non-blank string (the pending call being decided)",
         );
