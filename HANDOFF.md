@@ -74,8 +74,24 @@ T1 is moot; T9/T9b shipped (#58/#59); T2, T3, T10, T11, T12 open.
    D5 harness, and the ⏳ INVARIANTS rows for Lane A's claims in the
    same PR. Lane A is a one-way door (§10) — the explainer quiz covers
    the 404-retry removal and the `code` sentinel. Plans are TWEAKABLE:
-   lead with the data-model and interface decisions.
-2. Lane B, then Lane C, per §10; each its own PR with the full gauntlet.
+   lead with the data-model and interface decisions. **Plan Lane A
+   ONLY** — per the §18 entry of 2026-09-11 the sequence after Lane A
+   is R3a → alpha → profiles decision, not Lane B.
+2. **R3a preview packaging** (§18, 2026-09-11): a versioned packed
+   artifact, alpha install notes, and one demonstrable governance
+   property in the first run (approve → exact call once; deny →
+   nothing ran). Plan it after Lane A lands. Then a **three-week alpha
+   window, counted from the day the R3a artifact is first given to
+   someone outside the repo, with a default**: no adopter needs
+   profiles → public R3 with Code Mode only, Lanes B/C wait for a named
+   pull; adopter needs profiles → B and C before public R3. Reversal
+   trigger: an adopter committing to Code Mode without profiles but
+   needing npm → R3a is still built (it IS the release), only the
+   three-week wait is skipped; public R3 follows R3a directly. Not in
+   the minimum: trace
+   viewer, GraphQL, cloud, desktop, SSO. (Basis: executor.sh
+   competitive read + codex second opinion, 2026-09-11; the decision
+   text is in conduitspec §18.)
 3. **R3 note (unchanged):** the store interface changed in #58/#59;
    the first published version records it plus §3.1's writer-floor
    rule in its release checklist.
