@@ -31,28 +31,44 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~12:50 (interim: **R1 spec rev 11 PUSHED `85a9df7`** on `docs/r1-design-spec` / PR #57; codex pass #6 in flight; PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec)
+## Current handoff — updated 2026-09-11 ~13:40 (interim: **R1 spec rev 12 PUSHED `7431791`**, branch updated from main → `fe20139`, PR #57 title says rev 12-pending; codex #6 folded, **codex #7 QUEUED for 15:22** (usage limit); PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec)
 
-**Interim (12:50, mid-session — the section below it is the 12:30 state
-and still accurate):** rev 11 folded every NEXT-item-2 bullet
-(§3.1 new, §4.1 one validator, §4.1a INSERT trigger + three pins + N+1,
-§5.3 operator-passes-the-id + display contract, §5.4 claim-admits +
-step-2 guard + disposition table, §6 row, §9.1 #46/#49 shipped, #47
-extended, #50 new, tasks T9/T9b done, T10 extended, T11 new, T2 open,
-§12 codex #5 + PR #59 runs). **Deviation:** `provisionSource`'s explicit
-ledger insert was REMOVED (double bump once the INSERT trigger exists;
-triggers fire in the same transaction) — one-line reversal if the
-founder wants it kept. **Codex #6** (`gpt-5.6-sol` high; trigger:
-authorization boundary + convergence verdict) launched 12:47 against
-`85a9df7`, prompt told it to read #58/#59 code via `git show main:…`;
-result not yet recorded — if this section is still "interim" when you
-read it, the session ended before the verdict: re-run pass #6 per
-`~/.claude/rules/codex-one-path.md` and record it in spec §12.
-**PENDING, need the founder's word (asked in chat, not yet answered):**
-(a) `gh pr edit 57 --title` → rev 11 wording; (b) `gh pr update-branch 57`
-+ `git pull --ff-only` — the branch trails main by 11 commits
-(non-ff merge on the remote branch; one CI cycle, LEARNINGS #17) —
-do it after codex #6 reports, before the founder read.
+**Interim (13:40, mid-session — the "Merge record" section below is the
+12:30 state and still accurate):**
+- **Rev 11 (`85a9df7`)** folded every NEXT-item-2 bullet (§3.1 new,
+  §4.1 one validator, §4.1a INSERT trigger + three pins + N+1, §5.3
+  operator-passes-the-id + display contract, §5.4 claim-admits + step-2
+  guard + disposition table, §6 row, §9.1 #46/#49 shipped, #47
+  extended, #50 new, tasks T9/T9b done, T10 extended, T11 new, T2 open,
+  §12 codex #5 + PR #59 runs). **Deviation:** `provisionSource`'s
+  explicit ledger insert REMOVED (double bump once the INSERT trigger
+  exists; triggers fire in the same transaction) — one-line reversal if
+  the founder wants it kept.
+- **Codex #6 on rev 11** (`gpt-5.6-sol` high; trigger: authorization
+  boundary + convergence verdict; 932 s): 2 P0 / 2 P1 / 1 P2, all in
+  scope — the guard compared the grammar prefix while dispatch uses the
+  stored `tools.namespace` column; `direct_call.request` was never
+  cross-bound to `pausedOn.input`; the update trigger's DDL lacked the
+  `WHEN` guard the prose claimed (codex reproduced N+2 / recursion);
+  the validator's TS predicate would lie about legacy rows; §5.3 tense.
+  **Rev 12 (`7431791`) folds all five** (recorded in spec §12).
+- **Codex #7 (confirming, on rev 12)** first attempt died on the
+  provider usage limit at ~13:30 ("try again at 3:21 PM"); the SAME run
+  is queued behind a sleep (pid 82109, starts 15:22; prompt in the
+  session scratchpad `codex7-prompt.txt`, output `codex7-out.txt`). If
+  this section still reads "QUEUED" next session, the session ended
+  first: re-run pass #7 per `~/.claude/rules/codex-one-path.md` with
+  the prompt shape of §12's pass-#6 entry (list passes #5/#6 as
+  adjudicated; ask for a CONVERGED/NOT verdict), then record it in §12.
+- Founder authorized (chat, 13:00) both pending actions: PR #57 title
+  updated; `gh pr update-branch 57` + `git pull --ff-only` done →
+  branch tip `fe20139` (merge of main), nothing behind main; CI on it
+  not yet confirmed green (`gh pr checks 57`).
+- **NEXT after codex #7:** CONVERGED → record run #7 in §12, push,
+  confirm CI, founder read of rev 12, then writing-plans (Lane A
+  first, §10). NOT CONVERGED with class (c) → rev 13 + one confirming
+  pass; a recurring class → stop and bring the shape question to the
+  founder (adversarial-convergence rule).
 
 **Merge record (12:20):** `gh pr update-branch 59` was needed first (the
 docs push had moved main); CI green; squash `cce91ae`, tree identical to
