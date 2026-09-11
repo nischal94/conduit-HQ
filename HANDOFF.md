@@ -31,7 +31,25 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~15:45 (**R1 spec at rev 13 `b2c7037` on PR #57, CODEX LOOP CLOSED** by adjudication after passes #5–#7; branch is up to date with main, CI green (one flake rerun); PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec · NEXT: founder read of rev 13 → writing-plans)
+## Current handoff — updated 2026-09-11 ~17:20 (**R1 spec at rev 14 `7cab9a4` on PR #57, CODEX LOOP CLOSED at rev 13, READ PASS DONE** (agent, on the founder's instruction); branch up to date with main; PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec · NEXT: founder says "merge #57" → mark ready, CodeRabbit, merge → writing-plans)
+
+**Read pass (17:00 → 17:20, rev 14 `7cab9a4`):** the founder delegated
+the rev-13 read to the agent ("do the review, find errors or
+discrepancies"). Full-document read, every step/row/task/sha
+cross-reference checked, current-section line citations checked
+against the tree. Six precision findings, none semantic: §4.1 said
+"step 3 narrows the legacy arm" (it is step 2 → 3); a stray empty
+code fence; four stale line citations (`sqlite.ts` 689→800, 727→838,
+129-138→198-205; `manager.ts` 628→653); §5.3's "step 2" ambiguous
+after the resume renumbering (now "`startDirect` step 2"); T1 marked
+MOOT (the lock it would remove never existed in code); eng-review
+report row still said "pass #3 owed". All folded as rev 14 (§12
+entry). **Codex pass #8: decided NOT to run** — rev 14 changes no
+boundary, type, or DDL; pass #7 already returned zero new findings on
+the semantics rev 14 carries. Pre-commit hook flaked once (QuickJS
+overflow-recovery test timed out at 9.5 s under machine load; whole
+suite took 110 s vs the usual 45 s); the retry passed 466/466. PR #57
+title says rev 14. **NEXT item 1 is now: the founder names the merge.**
 
 **Session record (12:30 → 15:45):** rev 11 (`85a9df7`) folded the
 threat-model pass; codex #6 on it found 2 P0 / 2 P1 / 1 P2 (all real:
@@ -61,11 +79,14 @@ trigger exists; same transaction) — one-line reversal if wanted.
 
 ### NEXT
 
-1. **Founder read of rev 13** (PR #57, `docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`).
-   Start at the Status line, then §3.1, §4.1a, §5.4 steps 1–4 + the
-   disposition table, §9.1 rows #46–#50, tasks. Anything the founder
-   wants changed → rev 14 (no codex pass required unless it changes a
-   boundary; an eighth confirming pass is the founder's call).
+1. **Merge #57 on the founder's word** (read pass DONE as rev 14, see
+   above). Sequence once named: `gh pr ready 57` → CodeRabbit runs on
+   the now-non-draft PR → read its review, fold anything real as rev
+   15 → squash-merge → verify the squash tree equals the branch tip →
+   delete the branch local + remote → mark the merge in HANDOFF. The
+   spec is docs-only: no explainer quiz is required by CLAUDE.md
+   (load-bearing = product code / sandbox boundary / supply chain), and
+   the seven codex passes + eng review are its review record (§12).
 2. **writing-plans** (`superpowers:writing-plans`) from the spec's §10
    build shape: Lane A first (store + manager — T10 triggers, T11 guard,
    T2 request keys, T3, T5, T6, D5 harness, rows in §10's Lane A list).
@@ -104,11 +125,12 @@ next housekeeping pass, never silently.
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — #57 is
-> the OPEN draft spec PR at **rev 13 `b2c7037`**, codex loop CLOSED;
-> #59 merged `cce91ae`). **Do NOT re-run codex on rev 13 unless the
-> founder asks.** NEXT: the founder reads rev 13 (start at the Status
-> line, §3.1, §4.1a, §5.4, §9.1 #46–#50) → fold any read notes as rev
-> 14 → `superpowers:writing-plans` from §10, Lane A first. Carry the
+> the OPEN draft spec PR at **rev 14 `7cab9a4`**, codex loop CLOSED,
+> read pass DONE; #59 merged `cce91ae`). **Do NOT re-run codex on the
+> spec unless the founder asks.** NEXT: when the founder names the
+> merge, `gh pr ready 57` → CodeRabbit → fold real findings as rev 15
+> → squash-merge, verify the tree, delete the branch → then
+> `superpowers:writing-plans` from §10, Lane A first. Carry the
 > DEFERRED list.
 
 ---
