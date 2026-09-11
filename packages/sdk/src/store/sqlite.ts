@@ -601,12 +601,21 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             log(
               `[SqliteStore] listPaused: row failed to hydrate; listed as an unreadable pause. Context: { id: ${JSON.stringify(id)}, cause: ${String(cause)} }`,
             );
+            // Hydration may have failed on a SIBLING column (`seeds`) while
+            // `paused_on` holds a nameable call id — and the claim admits
+            // that row only by its exact id. Carry the SQL-side id so the
+            // list can advertise it; the partial pause fails the shared
+            // validator, so it still projects as a recovery row.
+            const claimCallId = maybeText(row, "claim_call_id");
             return {
               id,
               code: "",
               status: "paused",
               seeds: { now: 0, random: 0 },
               startedAt: maybeInteger(row, "started_at") ?? 0,
+              ...(claimCallId === undefined
+                ? {}
+                : { pausedOn: { callId: claimCallId } as PendingApproval }),
             };
           }
         });

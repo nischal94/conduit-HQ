@@ -370,6 +370,26 @@ describe("SqliteStore", () => {
       );
     });
 
+    it("INVARIANT §5.5: a row whose SIBLING column fails hydration still lists with the nameable call id the claim would accept", async () => {
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_badseeds', '', 'paused', 'not json', ?, 8)",
+        args: [
+          JSON.stringify({
+            callId: "call_S",
+            toolName: "t",
+            input: {},
+            reason: "r",
+            expiresAt: 9e12,
+          }),
+        ],
+      });
+      const row = (await store.executions.listPaused()).find((r) => r.id === "lp_badseeds");
+      expect(row?.pausedOn?.callId).toBe("call_S");
+      await expect(
+        store.executions.claimForResume("lp_badseeds", "attempt", "call_S"),
+      ).resolves.toBe(true);
+    });
+
     it("INVARIANT §5.5: claimCallId is the id the claim compares — text only; a non-text first key, invalid JSON, or NULL is undefined", async () => {
       await client.executeMultiple(`
         INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_text', '', 'paused', '{}', '{"callId":"call_A"}', 0);
