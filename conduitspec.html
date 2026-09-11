@@ -1020,6 +1020,25 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). <strong>Next
 <h2 id="18-open-questions-decisions-to-lock">18. Open questions / decisions to lock</h2>
 <p><strong>Resolved (locked):</strong></p>
 <ul>
+<li><strong>R1 sequencing amended — Lane A, then preview packaging, then decide profiles (decided 2026-09-11):</strong> ✅
+The R1 build shape stays Lane A → B → C (R1 design spec §10), but publication moves between A and B.
+<strong>Lane A first, while nothing is published:</strong> it changes pause-path storage (the <code>code</code>
+sentinel, <code>direct_call</code>, <code>program</code>, the provenance fields, <code>request_keys</code>), and the
+R1 spec&#39;s §3.1 writer-floor rule makes such changes cheap only before a first release. <strong>Then R3a —
+preview packaging:</strong> a versioned, packed artifact with alpha install notes and ONE governance property
+demonstrable in the first-run path (approve → the exact approved call runs once; deny → nothing ran) — not a
+public npm release; full R3 (lifecycle, install/upgrade/recovery guidance, docs) is unchanged. <strong>Alpha
+window: three weeks, with a default outcome</strong> — if no adopter needs per-client profiles by then, public
+R3 ships Code Mode only and Lanes B/C wait for a named pull; if an adopter needs profiles, Lanes B and C land
+before public R3. <strong>Reversal trigger:</strong> a qualified adopter committing to Code Mode without
+profiles but requiring npm install → skip the alpha, public R3 directly after Lane A. Not in the minimum:
+trace viewer, GraphQL, cloud, desktop, SSO. Basis: a competitive read of executor.sh (same code-mode gateway
+thesis, published and priced, code-mode only, per-tool allow/approve/block policy, no published
+approval-binding, replay, egress, or invariant story) and a codex cross-model review (<code>gpt-5.6-sol</code>,
+medium) that confirmed the Lane-A-first constraint, rejected &quot;packaging only&quot; as a description of R3, and
+noted that Lanes B/C set compatibility expectations once published even without schema changes. The bounded
+window with a default outcome is the agent&#39;s addition: without it both the alpha and the profiles decision
+wait on an adopter who does not yet exist.</li>
 <li><strong>Repositioning — governed execution authority; projection model; roadmap re-sequence (decided 2026-08-30):</strong> ✅
 Conduit&#39;s identity is the <em>governed execution authority for AI agents</em>: controlled access
 to real tools with credentials, policy, approvals, network controls, and execution evidence
