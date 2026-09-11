@@ -907,7 +907,12 @@ describe("conduitd lifecycle", () => {
 
       // approvals.resume is administrative — a `serve` client may not
       // reach it by method name (§3.3).
-      client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
+      client.send({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: "c1",
+      });
       expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
     },
     TIMEOUT,
@@ -1136,7 +1141,12 @@ describe("conduitd lifecycle", () => {
       expect(await handshake(client, "serve")).toMatchObject({ kind: "handshake.ok" });
 
       // Refused: administrative verb, outside `serve`.
-      client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
+      client.send({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: "c1",
+      });
       expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
 
       // `handshake` is in EVERY capability set, so re-handshaking is the
@@ -1150,7 +1160,12 @@ describe("conduitd lifecycle", () => {
 
       // The escalated request is still refused — the connection is still
       // `serve`, not `approvals`.
-      client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
+      client.send({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: "c1",
+      });
       expect(await client.next()).toMatchObject({ kind: "error", code: "invalid" });
     },
     TIMEOUT,
@@ -1343,7 +1358,12 @@ describe("conduitd lifecycle", () => {
     // Now a resume, on an `approvals` connection (§3.3 capability row).
     const approver = await connectClient(paths.socket);
     await handshake(approver, "approvals");
-    approver.send({ kind: "approvals.resume", executionId: "exec_x", decision: "approve" });
+    approver.send({
+      kind: "approvals.resume",
+      executionId: "exec_x",
+      decision: "approve",
+      callId: "call_x",
+    });
 
     // The daemon logs queue depth on every admission, so a depth>0 line
     // is positive evidence the resume was ADMITTED TO THE QUEUE rather
@@ -1853,6 +1873,30 @@ describe("conduitd lifecycle", () => {
     expect(existsSync(paths.socket)).toBe(false);
   }, 120_000);
 
+  it(
+    "INVARIANT §5.5: a resume without callId is refused on the wire as invalid, and the connection survives to serve a well-formed request",
+    async () => {
+      // An older `conduit approvals` binary sends exactly this frame. It must
+      // be TOLD (an `invalid` frame naming callId), never bound to whatever is
+      // paused — and the refusal must not tear the connection down.
+      const stateDir = newStateDir();
+      const paths = daemonPaths(stateDir);
+      const daemon = spawnDaemon(stateDir);
+      await daemon.waitForLine("listening");
+      const client = await connectClient(paths.socket);
+      expect(await handshake(client, "approvals")).toMatchObject({ kind: "handshake.ok" });
+
+      client.send({ kind: "approvals.resume", executionId: "e1", decision: "approve" } as never);
+      const refused = (await client.next()) as { kind: string; code?: string; message?: string };
+      expect(refused).toMatchObject({ kind: "error", code: "invalid" });
+      expect(refused.message).toContain("callId");
+
+      client.send({ kind: "approvals.list" });
+      expect(await client.next()).toMatchObject({ kind: "result" });
+    },
+    TIMEOUT,
+  );
+
   it("a paused approval created before an RPC stop is resumable after the next start", async () => {
     // Extends the signal-stop invariant above to the RPC path: approvals
     // are durable data, not daemon state, so the way the daemon was
@@ -1897,14 +1941,21 @@ describe("conduitd lifecycle", () => {
     approver.send({ kind: "approvals.list" });
     const listed = (await approver.next()) as {
       kind: string;
-      payload: { executionId: string }[];
+      payload: { executionId: string; callId: string }[];
     };
     expect(listed.kind).toBe("result");
-    expect(listed.payload.map((row) => row.executionId)).toContain(executionId);
+    const listedRow = listed.payload.find((row) => row.executionId === executionId);
+    expect(typeof listedRow?.callId).toBe("string");
 
     // The decision lands and the row reaches a TERMINAL status — the
-    // pause survived the RPC stop as resumable work, not as a corpse.
-    approver.send({ kind: "approvals.resume", executionId, decision: "approve" });
+    // pause survived the RPC stop as resumable work, not as a corpse. The
+    // resume names the pending call the list showed (spec §5.5).
+    approver.send({
+      kind: "approvals.resume",
+      executionId,
+      decision: "approve",
+      callId: listedRow?.callId ?? "",
+    });
     const resumed = (await approver.next()) as {
       kind: string;
       payload: { status: string; decisionApplied: boolean };

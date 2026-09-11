@@ -129,3 +129,4 @@ export type {
   Tool,
   TraceEvent,
 } from "./types.js";
+export { isPendingApproval, NOT_NAMEABLE_CALL_ID } from "./types.js";

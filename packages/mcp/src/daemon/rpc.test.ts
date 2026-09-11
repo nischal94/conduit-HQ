@@ -28,11 +28,26 @@ describe("decodeRequest", () => {
     });
     expect(decodeRequest({ kind: "approvals.list" })).toEqual({ kind: "approvals.list" });
     expect(
-      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "approve" }),
-    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "approve" });
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: "call_1",
+      }),
+    ).toEqual({
+      kind: "approvals.resume",
+      executionId: "e1",
+      decision: "approve",
+      callId: "call_1",
+    });
     expect(
-      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "deny" }),
-    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "deny" });
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "deny",
+        callId: "call_1",
+      }),
+    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "deny", callId: "call_1" });
     expect(
       decodeRequest({
         kind: "source.provision",
@@ -144,8 +159,57 @@ describe("decodeRequest", () => {
     expect(() => decodeRequest({ kind: "search", query: 42 })).toThrow();
     expect(() => decodeRequest({ kind: "describe", toolName: null })).toThrow();
     expect(() =>
-      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "maybe" }),
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "maybe",
+        callId: "call_1",
+      }),
     ).toThrow();
+    // INVARIANT §5.5: an approval names the pending call it approves — a
+    // resume without a callId is refused, never bound to "whatever is paused".
+    expect(() =>
+      decodeRequest({ kind: "approvals.resume", executionId: "e1", decision: "approve" }),
+    ).toThrow();
+    expect(() =>
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: 7,
+      }),
+    ).toThrow();
+    expect(() =>
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: "  ",
+      }),
+    ).toThrow(/non-blank/);
+    // "Blank" is ASCII whitespace only — the SAME set the store's claim
+    // treats as un-nameable (sqlite.ts claimForResume), so every stored
+    // callId is either matchable by some request or admitted as corrupt.
+    expect(() =>
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: " \t\n\v\f\r",
+      }),
+    ).toThrow(/non-blank/);
+    // The boundary of that set: a NON-ASCII whitespace callId is not blank
+    // here, exactly as the store's claim treats it as a nameable text value
+    // — a Unicode-aware `trim()` would refuse it and leave such a stored
+    // row undecidable through the wire.
+    expect(
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: " ",
+      }),
+    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "approve", callId: " " });
     expect(() => decodeRequest({ kind: "source.revalidate", namespace: 5 })).toThrow();
   });
 

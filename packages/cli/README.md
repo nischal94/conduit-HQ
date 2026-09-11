@@ -113,8 +113,9 @@ in this package). `--help` and `--version` are available at the top level.
    agent waits:
 
    ```bash
-   conduit approvals list                 # oldest-first queue: id · tool · waiting-since · expiry
-   conduit approvals approve <execId>     # or: deny <execId>
+   conduit approvals list                        # oldest-first queue: exec id · CALL ID · tool · waiting-since · expiry
+   conduit approvals approve <execId> <callId>   # or: deny <execId> <callId> — names the ONE pending call you reviewed;
+                                                 # a call id the execution is no longer paused on is refused as a conflict
    ```
 
    - A row past its TTL shows `EXPIRED (finalizes on next resume)` — the label

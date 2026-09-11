@@ -31,7 +31,254 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; branches = main only; NEXT: R1)
+## Current handoff — updated 2026-09-11 ~12:50 (interim: **R1 spec rev 11 PUSHED `85a9df7`** on `docs/r1-design-spec` / PR #57; codex pass #6 in flight; PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec)
+
+**Interim (12:50, mid-session — the section below it is the 12:30 state
+and still accurate):** rev 11 folded every NEXT-item-2 bullet
+(§3.1 new, §4.1 one validator, §4.1a INSERT trigger + three pins + N+1,
+§5.3 operator-passes-the-id + display contract, §5.4 claim-admits +
+step-2 guard + disposition table, §6 row, §9.1 #46/#49 shipped, #47
+extended, #50 new, tasks T9/T9b done, T10 extended, T11 new, T2 open,
+§12 codex #5 + PR #59 runs). **Deviation:** `provisionSource`'s explicit
+ledger insert was REMOVED (double bump once the INSERT trigger exists;
+triggers fire in the same transaction) — one-line reversal if the
+founder wants it kept. **Codex #6** (`gpt-5.6-sol` high; trigger:
+authorization boundary + convergence verdict) launched 12:47 against
+`85a9df7`, prompt told it to read #58/#59 code via `git show main:…`;
+result not yet recorded — if this section is still "interim" when you
+read it, the session ended before the verdict: re-run pass #6 per
+`~/.claude/rules/codex-one-path.md` and record it in spec §12.
+**PENDING, need the founder's word (asked in chat, not yet answered):**
+(a) `gh pr edit 57 --title` → rev 11 wording; (b) `gh pr update-branch 57`
++ `git pull --ff-only` — the branch trails main by 11 commits
+(non-ff merge on the remote branch; one CI cycle, LEARNINGS #17) —
+do it after codex #6 reports, before the founder read.
+
+**Merge record (12:20):** `gh pr update-branch 59` was needed first (the
+docs push had moved main); CI green; squash `cce91ae`, tree identical to
+branch tip `9fe608e` (the update-branch merge commit). INVARIANTS §5.5
+liveness half is now on main. NEXT item 1 below is DONE; start at item 2.
+
+**WHAT HAPPENED (2026-09-11, 00:45 → 12:00):** the instance-binding
+threat-model pass the previous handoff named. (1) `/blindspot` codebase
+mode → eight cards (artifact "Instance Binding Blindspots", 2026-09-11):
+the binding has a claim-time half (CAS + post-claim checks) and a
+live-resolution half (D10, adjudicated); version skew is a warning and
+the schema has no version gate; the CAS admitted absent but not
+present-but-unmatchable call ids; the operator binds to what was
+PAUSED, not shown; the trigger floor covers only today's statements;
+namespace agreement rests on the name grammar; replayed discovery is
+D4 by design; `serve` can read call ids, only `approvals` can spend
+them. (2) **codex #5 threat-model pass** (gpt-5.6-sol high, trigger:
+authorization boundary): 3 P0 / 1 P1 / 1 P2, not converged — founder
+adjudicated: P0-1 (a pre-R1 daemon resuming against an R1 database)
+**OUT OF SCOPE via "nothing is published"** (npm 404) + a standing rule
+for R3+: any schema-semantic change on the pause path ships a
+DB-enforced writer floor, never a stderr warning; P0-2 (tool name ↔
+namespace agreement rests on the grammar; `direct_call` ↔ `pausedOn`
+equality) → fold into rev 11 as a post-claim read-side guard; P0-3
+(no `AFTER INSERT ON sources` trigger; remove + standalone re-add
+resurrects generation 0 — no production caller today, `sources.upsert`
+is a test seed) → add the INSERT trigger + pins in rev 11; **P1
+(present-but-malformed callId strands the row — shipped code) → its
+own fix PR, precedent #46→#58**; P2 (downgrade terminalizes a pending
+approval) accepted, record. Display correction: the CLI drops `reason`
+from the list. Spec correction: provisioning creates N+1 ledger rows,
+not one. T2 (`request_keys`) is NOT on main — only its text fix is
+done; T9 shipped in #58.
+
+**PR #59 (`fix/cas-malformed-callid`, OPEN at `aed9825`, 7 commits, CI
+green on every push through `aed9825`):** the
+§5.5 liveness half. The CAS admits any callId the wire could never
+carry (`json_type … IS NOT 'text'`; ASCII-blank `trim`); ONE blank set
+at four gates (CLI, decoder, manager entry, SQL) — `NOT_NAMEABLE_CALL_ID`
+in sdk `types.ts`; ONE validator `isPendingApproval` shared by the
+manager (post-claim, pre-stage) and the `approvals.list` projection;
+every corrupt pause lists as a RECOVERY row carrying the id the claim
+accepts (nameable kept, un-nameable absent → `-`); `listPaused` never
+throws on one row and advertises the SQL-extracted id; the manager
+also requires `claimCallId` (the identity the CAS compared, text only)
+to equal the operator's argument — SQLite keeps the FIRST duplicate
+JSON key, `JSON.parse` the LAST; `corruptPause` host-side flag drives
+the daemon log. **Gauntlet:** pr-review-toolkit ×5 (code, tests,
+comments, silent-failure, simplifier) · `/security-review` no findings
+· Aikido clean (excerpts) · `/code-review` 5 agents (all folded) ·
+Greptile (1 live finding, folded in `aed9825`) · **codex ×5 → CONVERGED
+on `9cf3e6e`** (1: 0/2/2 → 2: 0/2/1 same class → shape fix → 3: 0/2/2 →
+4: 0/1/1 → 5: none). Accepted (class a): CLI option parser intercepting
+a corrupt `--` id; unparseable JSON terminalizes via the pinned I-3
+catch without `corruptPause`; the redundant `IS NULL` arm. Explainer
+"The Un-nameable Call Id" published 2026-09-11; **the founder has NOT
+yet taken the quiz.** INVARIANTS §5.5 row carries the liveness half.
+
+**Incident (honest):** the simplifier subagent ran `git stash push` on
+the uncommitted fold to get a test baseline — a destructive-tier git op
+without confirmation; nothing lost, the founder ran `git stash pop`
+by hand. LEARNINGS #17. Also: a reviewer's mutation testing changed a
+file mid-read; three parallel-Bash cwd drifts built the wrong package
+or ran no tests (caught by timestamps / empty output each time).
+
+### NEXT
+
+1. **Merge #59** — only on the founder's word after a full quiz pass;
+   confirm `aed9825`'s CI run is green first (`gh pr checks 59`); squash
+   tree must equal the branch; delete the branch local + remote; mark
+   the merge in the spec's row (see 2).
+2. **R1 rev 11** on `docs/r1-design-spec` (PR #57) — fold: §3 gains the
+   instance-binding subsection (three writer versions; the
+   "nothing published" adjudication + the R3+ writer-floor rule); §4.1a
+   adds `AFTER INSERT ON sources`, corrects "one row per provision" to
+   N+1, pins zero-tool revalidate / retarget / trigger survival; §5.4
+   step 2 gains the namespace-agreement guard and `direct_call` ↔
+   `pausedOn` equality, and states the malformed-field disposition per
+   field (absent/malformed → claim then terminalize); §5.3 amends to
+   "the operator passes the call id"; row #46 SHIPPED via `4c75b05`,
+   new row for #59's liveness half (shipped via its merge sha); the
+   display contract (list shows executionId, callId, toolName, expiry —
+   `reason` is on the wire but the CLI drops it); §12 trail records
+   codex #5 (model/effort/trigger/counts) and PR #59's five runs; T9
+   done, T2 open. Then **codex #6 confirming** (Sol high) → founder read
+   → writing-plans.
+3. **R3 note (unchanged):** the SDK store interface changed shape in #58
+   and again in #59 (`claimCallId`); the first published version
+   records it.
+
+**Session quirks worth inheriting:** everything from 2026-09-06, plus:
+`npx` is blocked by the install guard — run `./node_modules/.bin/<bin>`
+· sdk manager/cli real-runtime suites need the unsandboxed path
+(`listen EPERM 127.0.0.1`) · the pre-commit hook needs it too (`mktemp`
+in `/var/folders`) · **parallel Bash calls share one cwd — a `cd` in one
+call moves the next; use absolute `cd` in every segment** (bit three
+times) · reviewer subagents with write tools may mutate or stash the
+tree mid-run — `git status`/`git diff HEAD` before trusting a Read ·
+codex stderr "SecItemCopyMatching failed -50" is keychain noise, not a
+failure · CI `client.test.ts` auto-start flake ("rotation-in-progress")
+recurred; `gh run rerun <id> --failed` once.
+
+**DEFERRED (live list, updated 2026-09-11):** carry the 2026-09-06 list,
+plus: recovery rows render `EXPIRED` (expiresAt 0) — display accuracy ·
+`NOT_NAMEABLE_CALL_ID` literal duplicated in mcp/cli (could import from
+sdk) · the prep-window catch's stored reason is a bare `String(cause)`
+(error-format) · a daemon-side test for the two recovery-row log lines
+· `/code-review`'s eligibility haiku contradicted its own answers
+(answers all "No" → it said NOT ELIGIBLE) — trust the answers.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #59 is
+> MERGED at `cce91ae`; #57 is the OPEN draft spec PR at rev 10).
+> **State: the §5.5 liveness fix is on main; branches = main only. Do
+> NOT re-review #59 or reopen its accepted exceptions.** NEXT: R1 rev 11
+> on `docs/r1-design-spec` per NEXT item 2 (fold the threat-model
+> adjudications, §5.3 amendment, rows #46 shipped via `4c75b05` / #59's
+> liveness half shipped via `cce91ae`, T9 done / T2 open) → codex #6
+> confirming (Sol high) → founder read → writing-plans. Carry the
+> DEFERRED list.
+---
+
+## Superseded handoff — updated 2026-09-06 ~06:30 (PR #58 MERGED `4c75b05`, founder-named, six review rounds, codex converged; branches = main only · #57 R1 spec rev 10 OPEN, loop PAUSED by rule; its NEXT [threat-model pass] was DONE 2026-09-11 by the section above)
+
+**WHAT HAPPENED (2026-09-06, 00:30 → 06:30):** the approval-rebinding
+defect (R1 spec row #46; live in shipped Code Mode) shipped as its own
+fix: **PR #58 → main `4c75b05`**, squash tree verified identical to the
+branch, branch deleted local + remote. The fix: an approval binds to the
+ONE pending call — `approvals.resume` requires a non-blank `callId`; the
+store's paused→running CAS checks it in the same statement, with a lazy
+`CASE` allowance so NULL / invalid / call-id-less `paused_on` is claimed
+and TERMINALIZED by the manager (never stranded `paused`); a post-claim
+id mismatch is corruption; the list row carries `callId` (optional on
+the wire so a new CLI still renders an old daemon's queue, as `-`);
+**`conduit approvals approve|deny <execution-id> <call-id>`** — the
+OPERATOR passes the id read off the new CALL ID column, never looked up
+at decide time; spec §5.5 states the rule; **release 0.1.1**
+(`AGENT_VERSION`, CLI `VERSION`, three manifests; `workspace:*`, lockfile
+untouched) so the skew warning fires for a mixed pair; the demo
+approver script takes `<callId>` too. INVARIANTS: one §5.5 row naming
+11 pins. **Gauntlet (all folded):** 5 reviewer agents · Aikido clean ·
+`/security-review` no findings · CodeRabbit · Greptile · codex ×5 —
+astra medium ×2 (P1 CLI rebinding; P1 demo-script rebinding + P2) then
+**gpt-5.6-sol high ×3** (P1 READMEs + 2 P2; P1 spec pair + 2 P2; P2
+message + a P1 adjudicated OUT OF SCOPE: a third-party store adapter
+keeping the two-arg claim — nothing is published, so no adapter exists;
+R3 records the interface change) → CONVERGED by the
+adversarial-convergence rule. Explainer "One Decision Per Call"
+published; **founder passed the quiz and named the merge.** CI green on
+every push; two known flakes re-run once each (`--doctor --offline`
+fixture race; auto-start client table). Dists were rebuilt on the
+branch at the final source; main's source is identical.
+
+**Announce with the release:** restart the daemon after upgrading
+(older CLI → new daemon refused `invalid`; new CLI → older daemon lists
+with `-` and is refused on decide).
+
+**Codex workflow, settled today:** model `gpt-5.6-sol`; effort `medium`
+default with seven NAMED, project-free triggers for `high` (security
+boundary; supply-chain surface; concurrency/CAS; persistence invariant
+or state machine; >8 non-doc files or a shared interface; spec
+convergence verdict; untraceable regression); record model/effort/
+trigger/counts on every run; queue behind the usage limit's retry time.
+Verified loaded in a fresh session. Founder kept the codex config
+default at `low` (the rule's `-c` flag carries the policy). **Data so
+far:** the limit is per account, not per model; Sol high's five
+findings on #58 were all real (docs, wording, a lazy-CASE precision, a
+test that could not fail) and none was a guarantee break.
+
+### NEXT
+
+1. **R1 (PR #57, rev 10):** the convergence rule's PAUSE branch applies
+   (two new-class P0s on pass #4). Next: the dedicated threat-model pass
+   on instance binding (approval ↔ pending call ↔ provenance ↔ writer
+   version; `/blindspot` codebase mode, then a codex brief) → **rev 11**,
+   which ALSO (a) amends §5.3 to "the operator passes the call id" and
+   marks row #46 SHIPPED via `4c75b05`, (b) folds the T2/T9 tasks as done
+   → codex #5 (Sol high, calibrate first against astra's known pass-4
+   findings) → founder read → writing-plans.
+2. **R3 note:** the SDK store interface changed shape in #58
+   (`claimForResume(id, attempt, callId)`, `resume(id, decision,
+   callId)`); the first published version records it.
+
+**Session quirks worth inheriting:** (unchanged from 01:50) gstack
+onboarding markers need an unsandboxed `touch` · gstack writes need the
+unsandboxed path · NUL bytes break Edit matching · codex limit death =
+exit 1 + empty stdout + `try again at HH:MM` · `pgrep` false DONE in
+the sandbox · **mcp/cli test against BUILT dists — rebuild sdk (`tsup
+src/index.ts --format esm --dts --sourcemap`) then mcp/cli (`tsup`)
+after any sdk/mcp source change, or downstream tests run stale code**
+(bit twice today) · branch protection requires an up-to-date branch:
+`gh pr update-branch <n>` then wait for CI, and auto-merge is disabled
+on the repo · zsh has `pipestatus`, not `PIPESTATUS`.
+
+**DEFERRED (live list, updated 2026-09-06):** brand `CallId` as a
+nominal type (→ R1 Lane A) · `--client` on the bare `conduit-mcp` bin
+(→ R3) · input-schema validation on BOTH projections (→ R2) · G4 spec
+absorption · `--doctor --offline` fixture race (flaked again today) ·
+auto-start client-table flake (flaked today; #53 fixed the daemon side)
+· `pnpm audit` registry-timeout false-red · `.impeccable/` dirs vs
+`biome check .` · `NOTICE` file · Dependabot 0 HIGH / 6 medium / 1 low
+· R3 website publish coupling · §16 flake pins · Linux ACL CI ·
+revision pinning (→ R2) · CX1/CX2 residuals · display-allowlist helper
+· ApprovalRuntime type split · doctor log name.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #57 is
+> the OPEN draft spec PR; #58 is MERGED). **State: the approval-binding
+> fix is on main (`4c75b05`); R1 spec at rev 10, loop PAUSED by the
+> convergence rule. Do NOT re-review #58, reopen A1–A7 / D1–D15, or
+> write a plan.** NEXT: the instance-binding threat-model pass for R1 →
+> rev 11 (amend §5.3 to "operator passes the call id", mark row #46
+> shipped, fold T2/T9) → codex #5 under gpt-5.6-sol high (calibrate
+> against astra's known pass-4 findings first) → founder read →
+> writing-plans. Carry the DEFERRED list.
+---
+
+## Superseded handoff — updated 2026-09-04 evening (ALL FOUR landed, human-named: #53 flake root-cause `370f847` · #54 audit gate `f163135` · #56 timer-bound `13d1732` · #55 license manifests + guard `002b9a2`; its NEXT [R1] was STARTED 2026-09-05 by the section above — spec drafted to rev 5, not converged)
 
 **Later the same day:** the license PR landed — three manifests now say
 `Apache-2.0`, the plan-doc template is amended, and

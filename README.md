@@ -107,8 +107,8 @@ No key in the config: the server resolves it from `~/.conduit/master-key`.
 it's waiting; you decide from your terminal:
 
 ```bash
-conduit approvals list              # oldest-first queue: id · tool · waiting-since · expiry
-conduit approvals approve EXEC_ID   # or: deny EXEC_ID
+conduit approvals list                      # oldest-first queue: exec id · CALL ID · tool · waiting-since · expiry
+conduit approvals approve EXEC_ID CALL_ID   # or: deny EXEC_ID CALL_ID — the call id names the ONE pending call you reviewed
 ```
 
 Verified live against real upstreams (2026-08-03 dogfood run, recorded in
@@ -138,7 +138,7 @@ commit.
 | `conduit serve` | Run the stdio MCP server (same startup as the `conduit-mcp` bin) |
 | `conduit add-mcp` | Onboard or re-sync an upstream MCP source (`--replace` to retarget, `--clear-credential` to deauth) |
 | `conduit approvals list` | Show the pending approval queue |
-| `conduit approvals approve\|deny EXEC_ID` | Decide a paused call; exit codes track the decision |
+| `conduit approvals approve\|deny EXEC_ID CALL_ID` | Decide the ONE paused call you reviewed (the CALL ID column of `list`); a stale call id is refused as a conflict; exit codes track the decision |
 | `conduit key generate` | Mint the master key (refuses to overwrite) |
 | `conduit key rotate` | Rotate the key and re-seal every credential in one transaction, with crash recovery |
 

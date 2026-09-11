@@ -1,4 +1,4 @@
-import { buildExecuteTool, type ExecutionOutcome } from "@conduithq/sdk";
+import { buildExecuteTool, type Execution, type ExecutionOutcome } from "@conduithq/sdk";
 import { describe, expect, it } from "vitest";
 import {
   CHECK_BODY_STATUSES,
@@ -242,6 +242,7 @@ describe("pausedToListRow (the approvals.list projection)", () => {
 
     expect(row).toEqual({
       executionId: "e",
+      callId: "c1",
       startedAt: 1_000,
       toolName: "github.delete_repo",
       reason: "requires approval",
@@ -252,8 +253,56 @@ describe("pausedToListRow (the approvals.list projection)", () => {
     expect(JSON.stringify(row)).not.toContain("should-never-cross-the-socket");
   });
 
-  it("returns undefined for a corrupt paused row with no pausedOn (caller logs, never silently drops)", () => {
-    expect(pausedToListRow({ ...base, status: "paused" })).toBeUndefined();
+  it.each([
+    // The client's row validator refuses a non-string callId for the ENTIRE
+    // answer; absent is a shape it accepts (older daemons omit the field).
+    [
+      "a non-text callId",
+      { callId: 123, toolName: "github.delete_repo", input: {}, reason: "r", expiresAt: 9 },
+    ],
+    ["absent (hydration failed or paused_on NULL)", undefined],
+    ["the JSON literal null", null],
+    ["a blank callId", { callId: " \t", toolName: "t", input: {}, reason: "r", expiresAt: 9 }],
+  ])("INVARIANT §5.5: a stored pause that is %s lists as a RECOVERY row with the call id ABSENT — any id decides it — never as a refused queue", (_shape, pausedOn) => {
+    // One validator (`isPendingApproval`) decides "corrupt" for both this
+    // projection and the manager. The claim admits these shapes for ANY
+    // call id, so none is advertised.
+    const row = pausedToListRow({
+      ...base,
+      status: "paused",
+      pausedOn: pausedOn as unknown as NonNullable<Execution["pausedOn"]>,
+    });
+    expect(row).toEqual({
+      executionId: "e",
+      startedAt: 1_000,
+      toolName: "(unreadable pause)",
+      reason: "stored pause is corrupt; deciding it with any call id terminalizes it",
+      expiresAt: 0,
+    });
+  });
+
+  it("INVARIANT §5.5: a nameable callId beside a corrupt field lists as a RECOVERY row that KEEPS the id — the claim admits that row only by its exact value", () => {
+    // The store's CAS looks only at `$.callId`. Withholding a nameable id
+    // would advertise a row no operator could ever decide.
+    const row = pausedToListRow({
+      ...base,
+      status: "paused",
+      pausedOn: {
+        callId: "call_A",
+        toolName: "t",
+        input: {},
+        reason: "r",
+        expiresAt: "bogus",
+      } as unknown as NonNullable<Execution["pausedOn"]>,
+    });
+    expect(row).toEqual({
+      executionId: "e",
+      callId: "call_A",
+      startedAt: 1_000,
+      toolName: "(unreadable pause)",
+      reason: "stored pause is corrupt; deciding this call id terminalizes it",
+      expiresAt: 0,
+    });
   });
 });
 

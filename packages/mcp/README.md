@@ -89,8 +89,8 @@ sessions.
    ```bash
    # Pre-publish, invoke the built CLI directly (same form as step 2); once
    # published, `conduit approvals …` is the installed alias.
-   node <abs path>/packages/cli/dist/bin.js approvals list             # oldest-first queue
-   node <abs path>/packages/cli/dist/bin.js approvals approve <execId> # or: deny <execId>
+   node <abs path>/packages/cli/dist/bin.js approvals list                      # oldest-first queue, with a CALL ID column
+   node <abs path>/packages/cli/dist/bin.js approvals approve <execId> <callId> # or: deny <execId> <callId>
    ```
 
    See `packages/cli/README.md` for the full `conduit` command reference.

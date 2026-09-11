@@ -129,6 +129,38 @@ export interface PendingApproval {
   expiresAt: number;
 }
 
+/**
+ * A call id no operator could have read off `approvals list`: empty or
+ * ASCII whitespace only. ONE set, shared by the store's claim (SQL `trim`
+ * over the same six characters), the wire decoder, the CLI argument check,
+ * and the manager's entry check — deliberately not `trim()`, which is
+ * Unicode-aware. Change all or none.
+ */
+export const NOT_NAMEABLE_CALL_ID = /^[ \t\n\v\f\r]*$/;
+
+/**
+ * The ONE definition of a well-formed stored pause (spec §5.5). The store
+ * hydrates `paused_on` without validating it and the resume claim admits
+ * any corrupt pause on purpose, so every reader that acts on a pending
+ * approval — the manager before it stages a decision, the daemon's
+ * `approvals.list` projection — must agree on what "corrupt" means, or a
+ * row can be listed as decidable and then refused, or the reverse. A
+ * corrupt pause is terminalized on resume and listed as a recovery row.
+ */
+export function isPendingApproval(value: unknown): value is PendingApproval {
+  if (typeof value !== "object" || value === null) return false;
+  const v = value as Record<string, unknown>;
+  return (
+    typeof v.callId === "string" &&
+    !NOT_NAMEABLE_CALL_ID.test(v.callId) &&
+    typeof v.toolName === "string" &&
+    "input" in v &&
+    typeof v.reason === "string" &&
+    typeof v.expiresAt === "number" &&
+    Number.isFinite(v.expiresAt)
+  );
+}
+
 /** One tool call as recorded for audit (spec §11). NOT the replay source —
  * that is the separate replay journal (§5.5 design D4). */
 export interface TraceEvent {

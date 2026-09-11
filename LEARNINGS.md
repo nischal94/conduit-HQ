@@ -2366,3 +2366,192 @@ to the founder, and a shelved design is recorded as inert documentation
 (private folder, explicit do-not-act banner, one HANDOFF pointer that
 names the only reactivation trigger) so no future session mistakes it
 for a task.**
+
+## 2026-09-05 — R1 spec drafted to rev 5 (PR #57, not converged)
+
+### 7. A spec review that finds a P0 per round is still finding, not converging
+
+Five revisions in one session: a self-review caught two defects, the
+fable audit found a P0 (Code Mode resume ignored the profile), the codex
+full pass found four P0s in the fixes for the previous round (the
+generation check moved a race instead of closing it; `MAX(generation)`
+is reusable after a delete; a flag turned off revoked nothing; the
+downgrade sentinel covered one kind), and the confirming pass found one
+more P0 in INHERITED code (the MCP client's 404 retry dispatches an
+approved call twice). **Lesson: when each fold produces a new P0 in the
+fold itself, the design is still being discovered — record the open
+findings verbatim in the spec's own trail and stop the session there;
+a fourth fold at 90% of the usage window would have been the worst
+place to reason about exactly-once settlement.** The
+adversarial-convergence rule's "new-class breaks repeatedly → pause"
+branch applies to specs exactly as it does to code.
+
+### 8. `pgrep` lies inside the sandbox
+
+The codex wait loop (`pgrep -f "codex exec" || break`) exited on its
+first iteration with "DONE" and zero stdout while codex was still
+reading the tree: inside the sandbox `pgrep` cannot get the process
+list, so the liveness probe failed closed as "not running". Exactly the
+false-green shape. **Lesson: the liveness probe from codex-one-path runs
+with the sandbox OFF, or it proves nothing; the tell was `pgrep: Cannot
+get process list` on stderr, which the loop discarded.** Also: a run
+that dies on the provider's usage limit leaves its reasoning on stderr —
+four real findings were recovered from it before the re-run.
+
+### 9. The brief's drift table over-promised; the spec must say so
+
+The R1 brief's "a stricter policy is never bypassed by an old approval"
+is not true of the shipped D6 branch: a staged approval skips the policy
+engine for its one byte-identical call, for Code Mode today and for
+direct calls now. **Lesson: a design brief's "starting position" rows
+are claims to verify against code before they become spec text; the
+spec now states the inherited behaviour plainly and routes the rule to
+R2 with the policy version it needs.**
+
+### 10. The outside voice earned its cost by reversing two of my own recommendations
+
+The eng review's architecture and code-quality picks (a readers-writer
+lock; a composite request-key index) were each reversed an hour later by
+a fresh-context reviewer with two facts I had not checked: the spec's
+own threat model makes the locked race operator-created, and the
+single-column unique index is recreated on every store open, so the
+composite index turned a one-row downgrade failure into a bricked open.
+**Lesson: a recommendation made inside a long review inherits that
+review's blind spots; the outside voice is not a formality, and its
+value is highest exactly where the in-session reviewer was most
+confident.** Both reversals were smaller diffs than what they replaced.
+
+### 11. Fail-closed has a blast radius too
+
+Two fixes this session protected against daemon downgrade: a sentinel
+program in `code` (fails one new row) and a composite index (fails the
+whole store at open). Both are "fail closed"; only one is proportionate.
+**Lesson: when choosing a fail-closed mechanism, name what it takes
+down — one row, one client, or the store — and pick the smallest unit
+that still closes the hole.**
+
+### 12. The convergence rule's pause branch is a real branch
+
+Passes #3 and #4 each returned a new class of finding (#4: an approval
+or a provenance stamp bound to an INSTANCE that can be replaced across
+time or across daemon versions), and #4's first P0 is live in shipped
+Code Mode: `approvals.resume` binds to the execution, not the pending
+call. Four rounds of fold-and-rerun did not find it because each round
+was scoped by the previous round's findings. **Lesson: when a pass
+returns a NEW class rather than a residual of the last class, stop
+folding and run the dedicated threat-model pass the rule names — the
+class is the finding, and the next fold would only chase its instances.
+The tell was that both P0s share one shape (instance binding) that no
+prior pass had a name for.**
+
+## 2026-09-06 — the approval-rebinding fix (PR #58)
+
+### 13. A binding fix can rebuild the hole one layer up
+
+The first draft bound the store's claim to the pending call and then
+had the CLI LOOK UP that call id at decide time. Two independent
+reviewers (codex, CodeRabbit) saw the same thing: a queued duplicate
+`approve` would list the program's LATER pause and send that id, so the
+CLI rebound the decision exactly as the store used to. **Lesson: when a
+fix binds a decision to an identity, trace where the identity ENTERS —
+if the code derives it at decide time from current state, the binding
+is to "now", not to what the human saw. The identity must come from the
+human's own hand (an argument they read off the list).**
+
+### 14. Fail-closed at the wrong layer strands rows
+
+Refusing corrupt pauses at the claim looked like the safe choice and
+was a silent regression: before the change, the claim won and the
+manager's corrupt-state branch terminalized the row; after, the row
+stayed `paused` forever, re-listed and undecidable, with no log line.
+**Lesson: before adding a refusal, find the existing branch that
+HANDLES the bad state and check whether the refusal now starves it. The
+fix was to let the claim admit corrupt rows on purpose and treat a
+post-claim identity mismatch as corruption.**
+
+### 15. Stale dists hide arity changes from downstream packages
+
+mcp and cli import the sdk and mcp packages from their built `dist`.
+After changing `resume`'s arity in sdk source, the CLI suite ran the
+OLD two-argument resume from the stale dist and produced a failure that
+looked like a logic bug. **Lesson: any sdk or mcp source change needs a
+`tsup` rebuild before mcp/cli tests mean anything; the tell is a test
+failing on behaviour the source visibly no longer has.**
+
+## 2026-09-11 — the instance-binding threat-model pass and PR #59
+
+### 16. "Two definitions are one set" is a claim to grep, not to write
+
+The first commit of #59 asserted that the store and the wire decoder
+shared one definition of "blank"; the CLI still used the Unicode-aware
+`trim()`, and the manager relied on the decoder alone for "the argument
+is a string". Both were caught by reviewers within the hour. **Lesson:
+when a fix asserts N sites agree on a value, grep for every site that
+reads that value before writing "identical" — the count in the comment
+is a testable claim, and the test is `grep`.**
+
+### 17. A subagent with write tools is a writer — treat the tree as dirty while it runs
+
+The simplifier ran `git stash push` on uncommitted work to get a test
+baseline; a reviewer's mutation testing changed a source file between
+my Read and my Edit. Neither lost anything, but one needed a
+confirmation-tier `git stash pop` from the founder's own hand and the
+other nearly produced a false diagnosis. **Lesson: while any subagent
+that holds write tools is running, a Read of the working tree is not
+evidence — check `git status` and `git diff HEAD` first; and a
+subagent brief that needs a baseline must say how to get one (a
+worktree or a copy), never leave it to improvise a git operation.**
+
+### 18. When two review passes return the same class, the second fold must change the shape
+
+Codex passes 2 and 3 on #59 each found "the manager and the list
+disagree on what corrupt means" in a new instance (a valid id beside a
+bad field; an unparseable root; a blank id; duplicate keys). Folding
+instances produced the next instance. The pass that converged was the
+one that replaced per-field checks with one validator and one identity
+(`isPendingApproval`; "the listed id is the id the claim accepts";
+`claimCallId`). **Lesson: the adversarial-convergence rule's
+"canonicalize-then-check" applies inside one PR too — a second finding
+of the same class is the signal to stop adding conditions and name the
+single source of truth the conditions were approximating.**
+
+### 19. Two parsers, one blob: the identity you compare is the identity you must decide on
+
+SQLite's `json_extract` keeps the first of duplicate JSON keys;
+`JSON.parse` keeps the last. A row the claim admitted through its
+corrupt arm hydrated to a value that passed the manager's strict check,
+and the call would have run. **Lesson: when a compare-and-swap decides
+on a value read by one parser and the post-claim logic reads the same
+bytes with another, the post-claim logic must re-read the CAS's own
+view of the value — never trust that two parsers agree on adversarial
+bytes.**
+
+### 20. Parallel Bash calls share one working directory
+
+Three times in one session a `cd` in one parallel call moved the cwd
+for the next: the wrong package's dist was built, a typecheck ran where
+no `tsc` existed, and a test run matched no files and printed nothing —
+each read as success until a timestamp or an empty output exposed it.
+**Lesson: every segment of a chained or parallel shell command starts
+with an absolute `cd`; an empty test summary is "not run", never
+"passed".**
+
+### 16. Convergence is reached by adjudication, not by a zero
+
+Five codex passes on one small PR: each later pass found something
+real and smaller (docs, wording, a precision point, a test that could
+not fail), and the last one's P1 was a hypothetical consumer that does
+not exist. The rule's stop line is "every remaining finding is out of
+scope by documented decision or in a best-effort layer" — not "the pass
+returns nothing". **Lesson: write the adjudication down (the fact that
+makes it out of scope, and where that fact is recorded) and stop; a
+sixth pass on the same diff is chasing a zero the rule never asked for.**
+
+### 17. Branch protection reads "behind" as blocked
+
+Docs commits pushed to main during a PR's life left the PR branch
+behind, and the merge was refused with a hint about `--auto` that
+misled: auto-merge is disabled on the repo. `gh pr update-branch` plus
+one more CI run was the whole fix. **Lesson: when a session pushes to
+main via the docs path while a PR is open, expect to update the PR
+branch before merging; budget one CI cycle for it.**

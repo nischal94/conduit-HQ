@@ -204,6 +204,11 @@ first run and replayed verbatim on resume.
 - **Approval TTL:** a pending approval expires after a configurable window
 (`CONDUIT_APPROVAL_TTL`, default 72h); the Execution then fails with a policy-timeout
 error, recorded in Trace.
+- **One decision per pending call (2026-09-06):** a pending approval is identified by
+the paused call's `callId`. A resume names that call, and the paused→running claim
+succeeds only while the Execution is paused on it — a decision naming a call the Execution is no
+longer paused on (already decided, or paused again on a later call) is refused as a conflict,
+never applied to another call.
 
 ---
 
@@ -542,8 +547,9 @@ own working directory and fail to start.
 for a safe-classified tool). See `packages/cli/README.md` for the full flag reference,
 `CONDUIT_ADD_SECRET` credential onboarding, and the retarget refusal.
 4. **Approve/resume a paused call:** `conduit approvals list` /
-`conduit approvals approve <execId>` (or `deny`), run from a separate
-process while the agent is waiting.
+`conduit approvals approve <execId> <callId>` (or `deny`), run from a
+separate process while the agent is waiting. The call id is the `CALL ID` column of
+`list`: a decision names the ONE pending call the operator reviewed (§5.5).
 5. **Restart the client** after editing its config — the startup-reload caveat above
 applies here too.
 

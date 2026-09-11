@@ -18,6 +18,7 @@
  */
 import type { Socket } from "node:net";
 import type { ConduitStore, Tool } from "@conduithq/sdk";
+import { isPendingApproval } from "@conduithq/sdk";
 import {
   buildCatalogListing,
   executionToCheckPayload,
@@ -996,13 +997,15 @@ async function handleRequest(
       const rows: PausedListRow[] = [];
       for (const execution of paused) {
         const row = pausedToListRow(execution);
-        if (row === undefined) {
-          // Defensive: a paused row with no pausedOn is corrupt state. Log it
-          // rather than silently shrinking the queue an operator is reading.
+        if (!isPendingApproval(execution.pausedOn)) {
+          // The row is still listed, with `-` for the call id, so the
+          // operator can see it and decide it — any call id terminalizes
+          // it. The log is where they learn why the column is empty.
           log(
-            `[conduitd] Paused execution has no pausedOn; omitted from approvals.list. Context: {executionId: ${execution.id}}`,
+            row.callId === undefined
+              ? `[conduitd] Listing paused execution: stored pause is corrupt and its call id is un-nameable, listed as '-'; deciding it with any call id terminalizes it. Context: {executionId: ${execution.id}}`
+              : `[conduitd] Listing paused execution: stored pause is corrupt beside a nameable call id, listed with that id; deciding that id terminalizes it. Context: {executionId: ${execution.id}, callId: ${JSON.stringify(row.callId)}}`,
           );
-          continue;
         }
         rows.push(row);
       }
@@ -1032,9 +1035,22 @@ async function handleRequest(
           // `pending.input`, and the projection also pins `decisionApplied`
           // as a deliberate wire field rather than an incidental one — the
           // CLI's verb reporting is unimplementable without it.
-          return resumeToPayload(
-            await manager.resume(request.executionId, { kind: request.decision }),
+          const outcome = await manager.resume(
+            request.executionId,
+            { kind: request.decision },
+            request.callId,
           );
+          if (outcome.status === "failed" && outcome.corruptPause === true) {
+            // The row left the operator's queue without its decision
+            // applying. The RPC answer says so to THIS caller; the log is
+            // what an operator reads later, asking where an execution went.
+            // Keyed on the manager's host-side flag, never on `error.name`,
+            // which a guest can forge into any ordinary failure.
+            log(
+              `[conduitd] Resume failed: terminalized a corrupt pause, the pending call did not run. Context: {executionId: ${request.executionId}, callId: ${JSON.stringify(request.callId)}, reason: ${JSON.stringify(outcome.error.message)}}`,
+            );
+          }
+          return resumeToPayload(outcome);
         },
         deps,
       );
