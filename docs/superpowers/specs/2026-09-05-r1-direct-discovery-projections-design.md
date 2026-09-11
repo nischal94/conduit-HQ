@@ -1,7 +1,9 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 13 — REVIEW LOOP CLOSED by adjudication (§12,
-2026-09-11). Rev 11 folded the instance-binding threat-model pass
+Status: revision 14 — REVIEW LOOP CLOSED by adjudication at rev 13 (§12,
+2026-09-11); rev 14 is the founder-read pass (cross-references, stale
+line citations refreshed to `fe20139`, T1 marked moot; no semantic
+change). Rev 11 folded the instance-binding threat-model pass
 (`/blindspot` eight cards; codex #5, 3 P0 / 1 P1 / 1 P2; two findings
 SHIPPED on main as PR #58 `4c75b05` and PR #59 `cce91ae`, one out of
 scope by decision, §3.1). Rev 12 folded codex #6 (2 P0 / 2 P1 / 1 P2).
@@ -252,8 +254,8 @@ is NULL or whose `result`/`result_state` combination is inconsistent.
 
 Fresh DDL adds `CHECK (kind IN ('code','direct'))` and
 `CHECK (projection IN ('code','direct','discovery'))`. The ALTER shape
-has precedent through `tolerateSchemaRace` (`sqlite.ts:129-138`, the
-`redact_fields` retrofit).
+has precedent through `tolerateSchemaRace` (`sqlite.ts:198-205`, the
+`redact_fields` retrofit; line numbers as of `fe20139`).
 
 `client_id` and `projection` are written for BOTH kinds at
 `start`/`startDirect` (`client_id` NULL for the default profile). They
@@ -308,8 +310,8 @@ predicate narrows to a UNION, not to `PendingApproval` (rev 12, codex
 #6 P1):** `StoredPendingApproval = PendingApproval |
 LegacyPendingApproval`, where the legacy arm has NEITHER provenance
 field, so no reader can use an `undefined` namespace or generation
-without the compiler objecting; §5.4 step 3 narrows the legacy arm
-explicitly and fails it closed. On resume,
+without the compiler objecting; §5.4 step 2 branches the legacy arm
+explicitly to step 3, which fails it closed. On resume,
 after `claimForResume`, the manager compares
 `pausedOn.sourceGeneration` with the namespace's CURRENT
 `sources.generation`; missing source or mismatch → `ConduitCatalogChanged`.
@@ -337,9 +339,9 @@ TypeScript:
 interface ExecutionBase {
   id: string; status: ExecutionStatus;
   pausedOn?: StoredPendingApproval;   // rev 13: the UNION, never bare PendingApproval —
-                                      // the hydrator casts parsed JSON (sqlite.ts:1153-1157);
-                                      // readers narrow through isPendingApproval / the
-                                      // "sourceGeneration" in pausedOn legacy check
+                                      // the hydrator casts parsed JSON without validating;
+                                      // readers narrow through isPendingApproval, then
+                                      // "sourceGeneration" in pausedOn for the legacy arm
   startedAt: number; endedAt?: number; requestKey?: string;
   clientId: string | null;                // null = default profile
   projection: "code" | "direct" | "discovery";
@@ -365,9 +367,6 @@ The direct arm's failure payload is the SDK's `ExecutionError`
 (`types.ts`), not the sandbox package's structurally identical
 `SandboxError`: the manager's direct arm must not import from
 `sandbox/`.
-
-```
-```
 
 Status enum shared (D1), per-kind meaning:
 
@@ -401,7 +400,7 @@ DEFAULT profile keeps using the legacy column, raw, exactly as every
 pre-R1 row was written. Uniqueness for named clients is the table's
 primary key; for the default profile it is the shipped single-column
 unique index and its shipped conflict-detection string
-(`manager.ts:628`), both untouched. There is ONE representation per
+(`manager.ts:653`), both untouched. There is ONE representation per
 key — no logical/stored split, nothing encoded, nothing to double-encode
 on hydrate-then-settle (`sqlite.ts:1064` returns the column unchanged
 and that is correct for default rows; named rows have no column value).
@@ -444,8 +443,8 @@ CREATE TABLE IF NOT EXISTS source_generations (
 **Generation advancement is enforced INSIDE SQLite, not by the R1
 writer (rev 10, codex #4 P0):** an OLDER daemon run temporarily after
 R1 has persisted a pause at generation 42 would provision or revalidate
-through the shipped statements (`sqlite.ts:689` updates source fields
-and leaves unknown columns untouched; `:727` replaces tools) without
+through the shipped statements (`sqlite.ts:800` upserts source fields
+and leaves unknown columns untouched; `:838-840` replaces tools) without
 touching `generation`, and the R1 daemon would then accept the obsolete
 provenance on resume. Triggers close this for every writer version:
 
@@ -478,7 +477,7 @@ standalone `sources.upsert` (`sqlite.ts:269` — a test seed with no
 production caller today, but a statement any writer can run) left the
 row at the column DEFAULT, generation 0, with no ledger row. The upsert
 shape `provisionSource` uses (`INSERT … ON CONFLICT DO UPDATE`,
-`sqlite.ts:689`) fires the INSERT trigger on a fresh row and the UPDATE
+`sqlite.ts:800`) fires the INSERT trigger on a fresh row and the UPDATE
 trigger on a conflict, so every statement that creates or changes a
 source row now allocates a fresh sequence value. Any provision, replace,
 or revalidate — by any daemon build that opens the database after R1's
@@ -802,7 +801,7 @@ Consequences, each pinned (§9):
   promise feeds the RPC response, so the client deadline holds even
   when the continuation is blocked on an un-cancellable store read
   (`invoker.ts:111` awaits with no deadline). The timer starts before
-  any asynchronous preparation (§5.4 step 2), and preparation that
+  any asynchronous preparation (§5.4 `startDirect` step 2), and preparation that
   completes after expiry never dispatches: the invoker checks
   `deadline()` before writing the governed frame. Pinned: delayed
   success and delayed refusal after timeout both leave the row
@@ -1026,7 +1025,7 @@ into the shipped replay drive after step 4:
      `.`) — AND must equal the `namespace` column of the tool row
      `pausedOn.toolName` resolves to in the store, because `tools.name`
      and `tools.namespace` are stored and hydrated independently
-     (`sqlite.ts:369-380`) and the invoker dispatches connection and
+     (`sqlite.ts:369` and `:840`) and the invoker dispatches connection and
      source through the COLUMN (`tool.namespace`, `invoker.ts:178,
      190`), not the name. A row `{ name: "a.x", namespace: "b" }` must
      not validate generation A and dispatch through B. The tool read
@@ -1818,6 +1817,16 @@ regenerated per commit · agent never installs.
   named the only remaining window as D10 (class a). The loop STOPS
   here: next is the founder's read of rev 13, then writing-plans. An
   eighth pass is the founder's call, not the rule's.
+- 2026-09-11 (15:50) — **rev 14, the read pass (agent, on the founder's
+  instruction; no semantic change):** §4.1 cross-reference fixed (the
+  legacy branch is step 2 → step 3, not "step 3 narrows"); a stray
+  empty code fence removed; line citations in current sections
+  refreshed to the branch tip `fe20139` (`sqlite.ts` 689→800, 727→838,
+  129-138→198-205, `manager.ts` 628→653; trail entries keep their
+  historical numbers); §5.3's timer-start reference disambiguated to
+  `startDirect` step 2; T1 marked MOOT (the lock it would remove was
+  never implemented); the eng-review report row updated. Codex pass
+  #8 NOT run: no boundary, type, or DDL changed in this revision.
 
 ## GSTACK REVIEW REPORT
 
@@ -1825,7 +1834,7 @@ regenerated per commit · agent never installs.
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
 | Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8/9 and the 2026-09-11 threat-model pass #5; three early runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → rev 9; rev 9: 2 P0/3 P1/1 P2 → rev 10; pass #5 (threat model, on rev 10): 3 P0/1 P1/1 P2 → rev 11 + PRs #58/#59 on main; pass #6 (rev 11): 2 P0/2 P1/1 P2 → rev 12; pass #7 (rev 12): 0 new, 1 residual P1 → rev 13; loop closed by adjudication |
-| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open (all folded; convergence pass #3 owed) | 15 issues, 0 critical gaps |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_folded (codex loop closed at rev 13) | 15 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
@@ -1836,7 +1845,7 @@ regenerated per commit · agent never installs.
 ### Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above.
 
-- [ ] **T1 (P1, human: ~1d / CC: ~15min)** — sdk/execution — Remove drive linearization; keep sweep + post-claim generation check on BOTH kinds — Surfaced by: D10, D13 — Files: `packages/sdk/src/execution/manager.ts`, `packages/mcp/src/daemon/connection.ts` — Verify: rows #17, #42
+- [x] **T1 — MOOT (rev 14):** "remove drive linearization" was a spec-level reversal (rev 8 deleted the lock before any code existed); nothing to remove. The surviving obligations — sweep + post-claim generation check on BOTH kinds, rows #17, #42 — are carried by T10, T11, and T8.
 - [ ] **T2 (P1, human: ~4h / CC: ~15min)** — sdk/store — Request keys: the `request_keys` mapping table for named clients, written atomically with the execution row; legacy column untouched for the default profile — Surfaced by: D11 → codex #3 (rev 9) — Verify: row #25 — **Status (rev 11): OPEN.** Its spec text was fixed in rev 10; no code is on main.
 - [x] **T9 (P1, human: ~1d / CC: ~20min)** — sdk/store + mcp/daemon + cli — Approval instance binding: `callId` on `approvals.resume` and in the `claimForResume` predicate; the operator passes the call id — Surfaced by: codex #4 P0 (rev 10) — Verify: row #46 — **SHIPPED: PR #58 `4c75b05` (2026-09-05)**
 - [x] **T9b (P1, shipped)** — sdk/store + sdk/execution + mcp/daemon + cli — Liveness half of T9: the claim admits a `callId` no operator can name; the manager terminalizes it (`claimCallId`, `isPendingApproval`, `corruptPause`); `approvals.list` ships recovery rows — Surfaced by: codex #5 P1 (threat-model pass, rev 11) — Verify: row #49 — **SHIPPED: PR #59 `cce91ae` (2026-09-11)**
