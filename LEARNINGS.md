@@ -2555,3 +2555,52 @@ misled: auto-merge is disabled on the repo. `gh pr update-branch` plus
 one more CI run was the whole fix. **Lesson: when a session pushes to
 main via the docs path while a PR is open, expect to update the PR
 branch before merging; budget one CI cycle for it.**
+
+## 2026-09-11 (afternoon) — R1 spec revs 11–13; codex #6/#7; loop closed
+
+### 21. A fold has seams of its own — the confirming pass reviews the fix, not only the finding
+
+Rev 11 answered "namespace agreement" by comparing the name's grammar
+prefix; codex #6 showed dispatch uses the independently stored
+`tools.namespace` column, so the guard checked the wrong thing. Rev 12
+answered "the validator lies about legacy rows" with a union type;
+codex #7 showed the union never reached `ExecutionBase.pausedOn`, so no
+reader saw it. Each fix was right in spirit and wrong at one seam.
+**Lesson: when folding a finding, trace the fix to the exact read site
+(the column dispatch reads, the type the reader holds), not to the
+concept; the confirming pass is worth running precisely because it
+reads the fold with fresh eyes.**
+
+### 22. A confirming pass that EXECUTES the design is worth more than one that reads it
+
+Codex #7 ran the §4.1a trigger DDL in a real SQLite (fresh insert,
+upsert-update, tool insert, `recursive_triggers` both ways) and
+reported exactly one allocation per path — the same DDL codex #6 had
+shown, one revision earlier, produced N+2 or infinite recursion when
+the `WHEN` guard was in the prose but not the statement. **Lesson: ask
+the adversarial pass to execute any DDL, regex, or grammar the spec
+states; a claim about database semantics is testable in seconds and
+prose-only review missed it once.**
+
+### 23. The codex usage limit is a schedule, not a failure; the sandbox cannot see the run
+
+Pass #7's first attempt died at 13:06 with the documented signature
+(exit 1, empty stdout, "try again at 3:21 PM"); queuing the identical
+run behind `sleep` to that time completed on the first try. Meanwhile a
+watch script's failure branch used `pgrep`/`kill -0` from inside the
+sandbox, which cannot see processes launched outside it, and reported
+a running pass as dead. **Lesson: treat the limit line as a timer and
+queue; check codex liveness only unsandboxed, and never let a watch's
+failure branch depend on a sandboxed process check. And do not switch
+branches while a pass runs — it reads the working tree.**
+
+### 24. A CI flake on a merge commit is diagnosed against the base's history, not re-run blind
+
+`gh pr update-branch` produced a merge commit whose only new content
+was the spec document, and CI failed on `--doctor --offline performs
+ZERO writes` (db mtime moved 13 ms, 4 KB → 104 KB). Main had passed the
+identical code three times that day, so the failure could not be the
+branch's; one `gh run rerun --failed` was green. **Lesson: before
+re-running, confirm the base passed the same code — that turns "flaky"
+from a hope into evidence, and names the fixture (baseline fingerprint
+taken before setup settles) for the deferred list.**

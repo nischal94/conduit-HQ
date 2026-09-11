@@ -31,28 +31,145 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~12:50 (interim: **R1 spec rev 11 PUSHED `85a9df7`** on `docs/r1-design-spec` / PR #57; codex pass #6 in flight; PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec)
+## Current handoff — updated 2026-09-11 ~17:20 (**R1 spec at rev 14 `7cab9a4` on PR #57, CODEX LOOP CLOSED at rev 13, READ PASS DONE** (agent, on the founder's instruction); branch up to date with main; PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec · NEXT: founder says "merge #57" → mark ready, CodeRabbit, merge → writing-plans)
 
-**Interim (12:50, mid-session — the section below it is the 12:30 state
-and still accurate):** rev 11 folded every NEXT-item-2 bullet
-(§3.1 new, §4.1 one validator, §4.1a INSERT trigger + three pins + N+1,
-§5.3 operator-passes-the-id + display contract, §5.4 claim-admits +
-step-2 guard + disposition table, §6 row, §9.1 #46/#49 shipped, #47
-extended, #50 new, tasks T9/T9b done, T10 extended, T11 new, T2 open,
-§12 codex #5 + PR #59 runs). **Deviation:** `provisionSource`'s explicit
-ledger insert was REMOVED (double bump once the INSERT trigger exists;
-triggers fire in the same transaction) — one-line reversal if the
-founder wants it kept. **Codex #6** (`gpt-5.6-sol` high; trigger:
-authorization boundary + convergence verdict) launched 12:47 against
-`85a9df7`, prompt told it to read #58/#59 code via `git show main:…`;
-result not yet recorded — if this section is still "interim" when you
-read it, the session ended before the verdict: re-run pass #6 per
-`~/.claude/rules/codex-one-path.md` and record it in spec §12.
-**PENDING, need the founder's word (asked in chat, not yet answered):**
-(a) `gh pr edit 57 --title` → rev 11 wording; (b) `gh pr update-branch 57`
-+ `git pull --ff-only` — the branch trails main by 11 commits
-(non-ff merge on the remote branch; one CI cycle, LEARNINGS #17) —
-do it after codex #6 reports, before the founder read.
+**Read pass (17:00 → 17:20, rev 14 `7cab9a4`):** the founder delegated
+the rev-13 read to the agent ("do the review, find errors or
+discrepancies"). Full-document read, every step/row/task/sha
+cross-reference checked, current-section line citations checked
+against the tree. Six precision findings, none semantic: §4.1 said
+"step 3 narrows the legacy arm" (it is step 2 → 3); a stray empty
+code fence; four stale line citations (`sqlite.ts` 689→800, 727→838,
+129-138→198-205; `manager.ts` 628→653); §5.3's "step 2" ambiguous
+after the resume renumbering (now "`startDirect` step 2"); T1 marked
+MOOT (the lock it would remove never existed in code); eng-review
+report row still said "pass #3 owed". All folded as rev 14 (§12
+entry). **Codex pass #8: decided NOT to run** — rev 14 changes no
+boundary, type, or DDL; pass #7 already returned zero new findings on
+the semantics rev 14 carries. Pre-commit hook flaked once (QuickJS
+overflow-recovery test timed out at 9.5 s under machine load; whole
+suite took 110 s vs the usual 45 s); the retry passed 466/466. PR #57
+title says rev 14. **NEXT item 1 is now: the founder names the merge.**
+
+**Session record (12:30 → 15:45):** rev 11 (`85a9df7`) folded the
+threat-model pass; codex #6 on it found 2 P0 / 2 P1 / 1 P2 (all real:
+guard compared the name prefix while dispatch uses the stored
+`tools.namespace` column; `direct_call.request` not cross-bound to
+`pausedOn.input`; the update trigger's DDL lacked its `WHEN` guard —
+codex reproduced N+2 and recursion; the extended validator's TS
+predicate lied about legacy rows; §5.3 tense) → rev 12 (`7431791`);
+codex #7 on rev 12: 0 new findings, 1 residual precision P1 (the union
+never reached `ExecutionBase.pausedOn`; step 2 lacked the explicit
+legacy branch) → rev 13 (`b2c7037`), and the loop closed per
+LEARNINGS #16 — the residual was a defect of the fold, not a class.
+Codex #7 also EXECUTED the §4.1a DDL in SQLite 3.51.0 (fresh insert,
+upsert-update, tool insert; `recursive_triggers` on/off): one
+allocation each. All three runs `gpt-5.6-sol` `high`, trigger:
+authorization boundary + convergence verdict; #7's first attempt died
+on the provider usage limit and was re-queued behind a sleep (the
+codex rule's prescribed handling — it worked). Branch updated from
+main (`gh pr update-branch 57` → `fe20139`, founder-authorized); CI
+failed once on a NEW flake (`packages/mcp/src/integration.test.ts:1457`,
+`--doctor --offline` zero-writes mtime assertion, db 4 KB → 104 KB
+inside 13 ms — the fixture's own setup racing the baseline read; main
+had passed the same code three times) → `gh run rerun --failed` once →
+green. PR #57 title says rev 13. **Deviation to know:** rev 11 removed
+`provisionSource`'s explicit ledger insert (double bump once the INSERT
+trigger exists; same transaction) — one-line reversal if wanted.
+
+### NEXT
+
+1. **Merge #57 on the founder's word** (read pass DONE as rev 14, see
+   above). Sequence once named: `gh pr ready 57` → CodeRabbit runs on
+   the now-non-draft PR → read its review, fold anything real as rev
+   15 → squash-merge → verify the squash tree equals the branch tip →
+   delete the branch local + remote → mark the merge in HANDOFF. The
+   spec is docs-only: no explainer quiz is required by CLAUDE.md
+   (load-bearing = product code / sandbox boundary / supply chain), and
+   the seven codex passes + eng review are its review record (§12).
+2. **writing-plans** (`superpowers:writing-plans`) from the spec's §10
+   build shape: Lane A first (store + manager — T10 triggers, T11 guard,
+   T2 request keys, T3, T5, T6, D5 harness, rows in §10's Lane A list).
+   Lane A is a one-way door (§10); its explainer quiz covers that.
+3. Merge #57 only on the founder's word after their read (it is a
+   docs-only draft PR; CodeRabbit skips drafts — mark ready first).
+4. **R3 note (unchanged):** the SDK store interface changed shape in
+   #58 and #59 (`claimForResume(callId)`, `claimCallId`,
+   `isPendingApproval`); the first published version records it, plus
+   the §3.1 writer-floor rule in its release checklist.
+
+**Session quirks worth inheriting:** everything from 2026-09-06/11
+above, plus: `pgrep`/`kill -0` inside the sandbox cannot see processes
+launched outside it — check codex liveness UNSANDBOXED, and never let a
+watch script's failure branch depend on a sandboxed process check ·
+codex usage-limit death = exit 1, empty stdout, `ERROR: … usage limit …
+try again at HH:MM` — queue the same run behind `sleep` to that time
+(worked first try) · a codex run reads the WORKING TREE: do not switch
+branches (the spec file exists only on the branch) or pull a merge
+while a pass is running · new CI flake class: `--doctor --offline`
+zero-writes mtime (`integration.test.ts:1457`) — one `gh run rerun
+--failed`, then suspect the fixture if it recurs · the spec branch
+trails main after every docs push; `gh pr update-branch` + `git pull
+--ff-only` before any read/merge, one CI cycle.
+
+**DEFERRED (live list, updated 2026-09-11 15:45):** carry the 2026-09-06
+and 12:30 lists, plus: the `--doctor --offline` mtime flake — if it
+recurs, the fixture should fingerprint AFTER the daemon's setup write
+settles (or assert on content, not mtime) · LEARNINGS numbering in the
+2026-09-11 section is non-monotonic (17–20 then 16–17); renumber on the
+next housekeeping pass, never silently.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #57 is
+> the OPEN draft spec PR at **rev 14 `7cab9a4`**, codex loop CLOSED,
+> read pass DONE; #59 merged `cce91ae`). **Do NOT re-run codex on the
+> spec unless the founder asks.** NEXT: when the founder names the
+> merge, `gh pr ready 57` → CodeRabbit → fold real findings as rev 15
+> → squash-merge, verify the tree, delete the branch → then
+> `superpowers:writing-plans` from §10, Lane A first. Carry the
+> DEFERRED list.
+
+---
+
+**Superseded interim (13:40) — kept for the record:**
+- **Rev 11 (`85a9df7`)** folded every NEXT-item-2 bullet (§3.1 new,
+  §4.1 one validator, §4.1a INSERT trigger + three pins + N+1, §5.3
+  operator-passes-the-id + display contract, §5.4 claim-admits + step-2
+  guard + disposition table, §6 row, §9.1 #46/#49 shipped, #47
+  extended, #50 new, tasks T9/T9b done, T10 extended, T11 new, T2 open,
+  §12 codex #5 + PR #59 runs). **Deviation:** `provisionSource`'s
+  explicit ledger insert REMOVED (double bump once the INSERT trigger
+  exists; triggers fire in the same transaction) — one-line reversal if
+  the founder wants it kept.
+- **Codex #6 on rev 11** (`gpt-5.6-sol` high; trigger: authorization
+  boundary + convergence verdict; 932 s): 2 P0 / 2 P1 / 1 P2, all in
+  scope — the guard compared the grammar prefix while dispatch uses the
+  stored `tools.namespace` column; `direct_call.request` was never
+  cross-bound to `pausedOn.input`; the update trigger's DDL lacked the
+  `WHEN` guard the prose claimed (codex reproduced N+2 / recursion);
+  the validator's TS predicate would lie about legacy rows; §5.3 tense.
+  **Rev 12 (`7431791`) folds all five** (recorded in spec §12).
+- **Codex #7 (confirming, on rev 12)** first attempt died on the
+  provider usage limit at ~13:30 ("try again at 3:21 PM"); the SAME run
+  is queued behind a sleep (pid 82109, starts 15:22; prompt in the
+  session scratchpad `codex7-prompt.txt`, output `codex7-out.txt`). If
+  this section still reads "QUEUED" next session, the session ended
+  first: re-run pass #7 per `~/.claude/rules/codex-one-path.md` with
+  the prompt shape of §12's pass-#6 entry (list passes #5/#6 as
+  adjudicated; ask for a CONVERGED/NOT verdict), then record it in §12.
+- Founder authorized (chat, 13:00) both pending actions: PR #57 title
+  updated; `gh pr update-branch 57` + `git pull --ff-only` done →
+  branch tip `fe20139` (merge of main), nothing behind main; CI on it
+  not yet confirmed green (`gh pr checks 57`).
+- **NEXT after codex #7:** CONVERGED → record run #7 in §12, push,
+  confirm CI, founder read of rev 12, then writing-plans (Lane A
+  first, §10). NOT CONVERGED with class (c) → rev 13 + one confirming
+  pass; a recurring class → stop and bring the shape question to the
+  founder (adversarial-convergence rule).
 
 **Merge record (12:20):** `gh pr update-branch 59` was needed first (the
 docs push had moved main); CI green; squash `cce91ae`, tree identical to
@@ -118,7 +235,7 @@ by hand. LEARNINGS #17. Also: a reviewer's mutation testing changed a
 file mid-read; three parallel-Bash cwd drifts built the wrong package
 or ran no tests (caught by timestamps / empty output each time).
 
-### NEXT
+#### NEXT (12:30 state — superseded by the section above)
 
 1. **Merge #59** — only on the founder's word after a full quiz pass;
    confirm `aed9825`'s CI run is green first (`gh pr checks 59`); squash
@@ -165,7 +282,7 @@ sdk) · the prep-window catch's stored reason is a bare `String(cause)`
 
 **SHELVED (unchanged):** the project-jail plan.
 
-### KICKOFF PROMPT for the next session
+#### KICKOFF PROMPT (12:30 — superseded; use the one above)
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — #59 is
