@@ -31,10 +31,89 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~13:40 (interim: **R1 spec rev 12 PUSHED `7431791`**, branch updated from main → `fe20139`, PR #57 title says rev 12-pending; codex #6 folded, **codex #7 QUEUED for 15:22** (usage limit); PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec)
+## Current handoff — updated 2026-09-11 ~15:45 (**R1 spec at rev 13 `b2c7037` on PR #57, CODEX LOOP CLOSED** by adjudication after passes #5–#7; branch is up to date with main, CI green (one flake rerun); PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec · NEXT: founder read of rev 13 → writing-plans)
 
-**Interim (13:40, mid-session — the "Merge record" section below is the
-12:30 state and still accurate):**
+**Session record (12:30 → 15:45):** rev 11 (`85a9df7`) folded the
+threat-model pass; codex #6 on it found 2 P0 / 2 P1 / 1 P2 (all real:
+guard compared the name prefix while dispatch uses the stored
+`tools.namespace` column; `direct_call.request` not cross-bound to
+`pausedOn.input`; the update trigger's DDL lacked its `WHEN` guard —
+codex reproduced N+2 and recursion; the extended validator's TS
+predicate lied about legacy rows; §5.3 tense) → rev 12 (`7431791`);
+codex #7 on rev 12: 0 new findings, 1 residual precision P1 (the union
+never reached `ExecutionBase.pausedOn`; step 2 lacked the explicit
+legacy branch) → rev 13 (`b2c7037`), and the loop closed per
+LEARNINGS #16 — the residual was a defect of the fold, not a class.
+Codex #7 also EXECUTED the §4.1a DDL in SQLite 3.51.0 (fresh insert,
+upsert-update, tool insert; `recursive_triggers` on/off): one
+allocation each. All three runs `gpt-5.6-sol` `high`, trigger:
+authorization boundary + convergence verdict; #7's first attempt died
+on the provider usage limit and was re-queued behind a sleep (the
+codex rule's prescribed handling — it worked). Branch updated from
+main (`gh pr update-branch 57` → `fe20139`, founder-authorized); CI
+failed once on a NEW flake (`packages/mcp/src/integration.test.ts:1457`,
+`--doctor --offline` zero-writes mtime assertion, db 4 KB → 104 KB
+inside 13 ms — the fixture's own setup racing the baseline read; main
+had passed the same code three times) → `gh run rerun --failed` once →
+green. PR #57 title says rev 13. **Deviation to know:** rev 11 removed
+`provisionSource`'s explicit ledger insert (double bump once the INSERT
+trigger exists; same transaction) — one-line reversal if wanted.
+
+### NEXT
+
+1. **Founder read of rev 13** (PR #57, `docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`).
+   Start at the Status line, then §3.1, §4.1a, §5.4 steps 1–4 + the
+   disposition table, §9.1 rows #46–#50, tasks. Anything the founder
+   wants changed → rev 14 (no codex pass required unless it changes a
+   boundary; an eighth confirming pass is the founder's call).
+2. **writing-plans** (`superpowers:writing-plans`) from the spec's §10
+   build shape: Lane A first (store + manager — T10 triggers, T11 guard,
+   T2 request keys, T3, T5, T6, D5 harness, rows in §10's Lane A list).
+   Lane A is a one-way door (§10); its explainer quiz covers that.
+3. Merge #57 only on the founder's word after their read (it is a
+   docs-only draft PR; CodeRabbit skips drafts — mark ready first).
+4. **R3 note (unchanged):** the SDK store interface changed shape in
+   #58 and #59 (`claimForResume(callId)`, `claimCallId`,
+   `isPendingApproval`); the first published version records it, plus
+   the §3.1 writer-floor rule in its release checklist.
+
+**Session quirks worth inheriting:** everything from 2026-09-06/11
+above, plus: `pgrep`/`kill -0` inside the sandbox cannot see processes
+launched outside it — check codex liveness UNSANDBOXED, and never let a
+watch script's failure branch depend on a sandboxed process check ·
+codex usage-limit death = exit 1, empty stdout, `ERROR: … usage limit …
+try again at HH:MM` — queue the same run behind `sleep` to that time
+(worked first try) · a codex run reads the WORKING TREE: do not switch
+branches (the spec file exists only on the branch) or pull a merge
+while a pass is running · new CI flake class: `--doctor --offline`
+zero-writes mtime (`integration.test.ts:1457`) — one `gh run rerun
+--failed`, then suspect the fixture if it recurs · the spec branch
+trails main after every docs push; `gh pr update-branch` + `git pull
+--ff-only` before any read/merge, one CI cycle.
+
+**DEFERRED (live list, updated 2026-09-11 15:45):** carry the 2026-09-06
+and 12:30 lists, plus: the `--doctor --offline` mtime flake — if it
+recurs, the fixture should fingerprint AFTER the daemon's setup write
+settles (or assert on content, not mtime) · LEARNINGS numbering in the
+2026-09-11 section is non-monotonic (17–20 then 16–17); renumber on the
+next housekeeping pass, never silently.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #57 is
+> the OPEN draft spec PR at **rev 13 `b2c7037`**, codex loop CLOSED;
+> #59 merged `cce91ae`). **Do NOT re-run codex on rev 13 unless the
+> founder asks.** NEXT: the founder reads rev 13 (start at the Status
+> line, §3.1, §4.1a, §5.4, §9.1 #46–#50) → fold any read notes as rev
+> 14 → `superpowers:writing-plans` from §10, Lane A first. Carry the
+> DEFERRED list.
+
+---
+
+**Superseded interim (13:40) — kept for the record:**
 - **Rev 11 (`85a9df7`)** folded every NEXT-item-2 bullet (§3.1 new,
   §4.1 one validator, §4.1a INSERT trigger + three pins + N+1, §5.3
   operator-passes-the-id + display contract, §5.4 claim-admits + step-2
@@ -134,7 +213,7 @@ by hand. LEARNINGS #17. Also: a reviewer's mutation testing changed a
 file mid-read; three parallel-Bash cwd drifts built the wrong package
 or ran no tests (caught by timestamps / empty output each time).
 
-### NEXT
+#### NEXT (12:30 state — superseded by the section above)
 
 1. **Merge #59** — only on the founder's word after a full quiz pass;
    confirm `aed9825`'s CI run is green first (`gh pr checks 59`); squash
@@ -181,7 +260,7 @@ sdk) · the prep-window catch's stored reason is a bare `String(cause)`
 
 **SHELVED (unchanged):** the project-jail plan.
 
-### KICKOFF PROMPT for the next session
+#### KICKOFF PROMPT (12:30 — superseded; use the one above)
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — #59 is
