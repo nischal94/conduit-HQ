@@ -1,10 +1,12 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 10 — codex pass #4 (on rev 9: 2 P0 / 3 P1 / 1 P2, NOT
-CONVERGED; both P0s a NEW class: binding to an INSTANCE across time and
-across writers) folded, §12. Per the adversarial-convergence rule, the
-next step is a dedicated threat-model pass on instance binding, NOT a
-fifth fold-and-rerun. Not converged.
+Status: revision 11 — the instance-binding threat-model pass rev 10
+called for (2026-09-11: `/blindspot`, eight cards; codex pass #5, 3 P0 /
+1 P1 / 1 P2, founder-adjudicated) folded: §3.1, §4.1, §4.1a, §5.3, §5.4,
+§6, §9.1, §12. Two findings of this loop are SHIPPED code on main (PR
+#58 `4c75b05`, PR #59 `cce91ae`); one is out of scope by decision
+(§3.1); the rest are folded here. Codex pass #6 (confirming) is owed.
+Not converged.
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -137,6 +139,89 @@ New surfaces and their answers:
 - **T3 projection asymmetry** → the D5 harness (§9.2) runs the §9.2
   hygiene, trace-comparability, and request-key tests over both kinds.
 - **T4 direct-execution ambiguity windows** → §7.
+- **T5 instance binding across time and across writers** (rev 11) →
+  §3.1.
+
+### 3.1 Instance binding (threat-model pass, 2026-09-11)
+
+Rev 10's two P0s were one class: an approval or a provenance stamp
+binding to an INSTANCE that can be replaced across TIME (a later pause
+of the same execution) or across WRITERS (an older daemon build). Per
+the adversarial-convergence rule the loop paused and the class was
+mapped before more code: `/blindspot` (codebase mode, eight cards)
+then codex pass #5 (§12). What the map says, and what R1 does about
+each part:
+
+- **The binding has two halves.** The CLAIM-TIME half is
+  `claimForResume`'s CAS plus the post-claim checks (§5.4 steps 1–2):
+  they decide WHICH pending call, and whether the stored pause is one
+  an operator could have named. The LIVE-RESOLUTION half is everything
+  the invoker reads AFTER the claim — tool, connection, credential,
+  source (`invoker.ts:111, 178, 190`) — and it is deliberately unbound
+  (D10, the accepted limit above): an operator who rewrites a namespace
+  under an approved call does so by their own hand. R1 hardens the
+  first half and documents the second.
+- **Three writer versions can open one database:** the shipped pre-R1
+  daemon, the R1 daemon, and any later build. Version skew is a stderr
+  warning today (`packages/cli/src/skew.ts`); the schema carries no
+  version gate. R1's defences against an OLDER writer are the `code`
+  sentinel (§4.1: an old build fails every new row closed) and the
+  generation triggers (§4.1a: an old build's provisioning still bumps).
+  What R1 does NOT defend: a pre-R1 daemon that opens an R1 database
+  while the R1 daemon is stopped and RESUMES a pre-R1-shaped pause
+  under pre-R1 rules (codex #5 P0-1). **Adjudicated OUT OF SCOPE,
+  2026-09-11, on one fact: nothing is published.** No Conduit version
+  exists on npm (the package name answers 404), so no installed pre-R1
+  daemon exists outside this repository's own checkouts, and the only
+  downgrade path is a developer checking out an older commit against
+  their own state directory. **Standing rule, from the first published
+  version onward:** any schema-semantic change on the pause path — the
+  shape of `paused_on`, the claim predicate, the provenance fields —
+  ships with a DB-ENFORCED writer floor (a check the database itself
+  applies to an older writer, in the pattern of §4.1a's triggers and
+  §4.1's sentinel), never a stderr warning. R3, the first published
+  version, records the store-interface changes PR #58 and #59 made and
+  carries this rule into its release checklist.
+- **Namespace agreement rests on the name grammar.** `pausedOn.namespace`
+  is stored as its own field (§4.1) so the sweep matches by equality;
+  but the generation check (§5.4 step 3) reads `sources.generation` FOR
+  THAT FIELD, while the invoker dispatches BY `pausedOn.toolName` and
+  takes the namespace from the tool row it resolves (`tool.namespace`).
+  If the two disagree — a corrupt row, or a defect in either pause
+  path — provenance is validated against one source and the call runs
+  against another. Rev 11 closes it with a read-side guard (codex #5
+  P0-2; §5.4 step 2, row #50): the namespace of `pausedOn.toolName`
+  under the §8.3 grammar must equal `pausedOn.namespace`, and on a
+  direct row `direct_call` must equal `pausedOn` on `{ toolName,
+  namespace }`.
+- **The trigger floor covers only the statements it names.** Rev 10's
+  triggers fire on `UPDATE sources` and `INSERT tools`; a fresh `INSERT
+  INTO sources` fired nothing, so remove-then-standalone-re-add (the
+  `sources.upsert` seed path — no production caller today) produced a
+  row at generation 0 (codex #5 P0-3). Rev 11 adds the INSERT trigger
+  and three pins (§4.1a, row #47).
+- **The operator binds to what was PAUSED, not to what was SHOWN.** The
+  approval names a call id; the list is a projection of the same row
+  and can lag, or show a recovery row. §5.3 states the consequence: the
+  operator passes the id, and the CLI selects nothing.
+- **A call id is not a capability.** Whoever learns one — a `serve`
+  client polling its own execution, a log line — cannot decide it: only
+  the `approvals` row carries `approvals.resume` (§5.1 no-widening
+  pins). Replayed discovery output is D4 by design: authority is
+  recomputed on every call, never read from what was advertised.
+- **Accepted (codex #5 P2):** a daemon DOWNGRADE terminalizes a pending
+  approval — an older build that resumes an R1 row runs the `code`
+  sentinel and fails it closed, so a pause taken under R1 is lost
+  across a downgrade, never resumed under the wrong rules. Recorded
+  here; pinned only as far as row #19 already does.
+- **Shipped-code findings are fix PRs against main, not spec text**
+  (precedent: rev 10's P0 → PR #58). Codex #5's P1 — a stored `callId`
+  that is present but not text, or blank, fell through the claim's
+  equality arm and stranded the row `paused` forever — shipped as PR
+  #59 (`cce91ae`, 2026-09-11), the liveness half of §5.5's binding rule
+  (row #49). Both PRs changed the SDK store interface (`claimForResume`
+  gained `callId`; `claimCallId` and `isPendingApproval` were added);
+  the first published version records them.
 
 ## 4. Data model
 
@@ -211,7 +296,14 @@ pause paths — the sandbox-suspension path (`start`, the manager's
 from `sources.generation` for `pausedOn.toolName`'s namespace, read
 immediately before the `paused` row is written. The persisted JSON is
 `{ callId, toolName, namespace, sourceGeneration, input, reason,
-expiresAt }`. On resume, after `claimForResume`, the manager compares
+expiresAt }`. **One validator (rev 11):** `isPendingApproval` (sdk
+`types.ts`, shipped in `cce91ae`) is the ONE definition of a well-formed
+stored pause, applied by every reader that acts on one — the manager
+after the claim and the `approvals.list` projection — and R1 extends it
+with the two provenance fields: present together (`namespace` text,
+`sourceGeneration` a finite number) or absent together (a legacy
+pause); any other combination is corrupt (§5.4 step 2). On resume,
+after `claimForResume`, the manager compares
 `pausedOn.sourceGeneration` with the namespace's CURRENT
 `sources.generation`; missing source or mismatch → `ConduitCatalogChanged`.
 **Legacy pauses (rows written before R1) lack both fields:** hydration
@@ -348,6 +440,11 @@ BEGIN
   INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
   UPDATE sources SET generation = last_insert_rowid() WHERE id = NEW.id;
 END;
+CREATE TRIGGER IF NOT EXISTS sources_gen_on_insert AFTER INSERT ON sources
+BEGIN
+  INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
+  UPDATE sources SET generation = last_insert_rowid() WHERE id = NEW.id;
+END;
 CREATE TRIGGER IF NOT EXISTS sources_gen_on_tools AFTER INSERT ON tools
 BEGIN
   INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
@@ -356,20 +453,42 @@ END;
 ```
 
 (`sources_gen_on_update` is guarded `WHEN NEW.generation = OLD.generation`
-so the trigger's own write does not recurse.) Any provision, replace,
+so the trigger's own write does not recurse; the same guard keeps the
+generation writes of the other two triggers from firing it a second
+time.) **`sources_gen_on_insert` (rev 11, codex #5 P0-3):** rev 10's
+floor covered `UPDATE sources` and `INSERT tools` only. A source row
+CREATED without tools fired nothing: remove, then re-add through the
+standalone `sources.upsert` (`sqlite.ts:269` — a test seed with no
+production caller today, but a statement any writer can run) left the
+row at the column DEFAULT, generation 0, with no ledger row. The upsert
+shape `provisionSource` uses (`INSERT … ON CONFLICT DO UPDATE`,
+`sqlite.ts:689`) fires the INSERT trigger on a fresh row and the UPDATE
+trigger on a conflict, so every statement that creates or changes a
+source row now allocates a fresh sequence value. Any provision, replace,
 or revalidate — by any daemon build that opens the database after R1's
 schema has run once — bumps the namespace's generation because the
 database does it, not the code. Pinned: R1 pause → provision through
 the SHIPPED pre-R1 SQL against the same database → R1 resume →
-`ConduitCatalogChanged` (row #47). R1's own `provisionSource` still
-inserts its row explicitly (below) so the bump is visible in the
-transaction it belongs to; the triggers make it a floor.
+`ConduitCatalogChanged` (row #47). **Three more pins (rev 11, row #47):**
+(1) *zero-tool revalidate* — a revalidate that yields no tools fires
+`sources_gen_on_tools` zero times, so the source-row trigger must bump
+alone; (2) *retarget* — a provision that changes `location` /
+`base_url` under the same source id takes the `DO UPDATE` path and
+bumps; (3) *trigger survival* — the triggers live in the database file
+(`CREATE … IF NOT EXISTS` in the schema ladder), and a pre-R1 build's
+ladder knows no triggers and drops none, so the pin runs the R1 ladder,
+then the SHIPPED pre-R1 provisioning SQL, then reads a bumped
+generation through R1. R1's own `provisionSource` inserts NO ledger row
+of its own (rev 11 — rev 10's explicit insert became a second bump of
+the same provision once the INSERT trigger existed): the triggers fire
+inside `provisionSource`'s single `client.batch` transaction, so the
+bump is visible in the transaction it belongs to, and `provisionSource`
+reads `sources.generation` back after the batch to populate
+`Source.generation`.
 
-`provisionSource` inserts one `source_generations` row inside its
-existing single transaction (`sqlite.ts` `client.batch`; both provision
-and revalidate reach it through `fetchAndProvision`, `provision.ts:837`,
-so one insert covers both) and writes the returned `gen` into
-`sources.generation`. `AUTOINCREMENT` allocates from `sqlite_sequence`,
+Both provision and revalidate reach `provisionSource` through
+`fetchAndProvision` (`provision.ts:837`), so the triggers cover both.
+`AUTOINCREMENT` allocates from `sqlite_sequence`,
 a durable high-water mark that row deletion never lowers — the
 property a per-row counter (restarts at 0 on re-add) and a table-wide
 `MAX(generation)` (reusable once the highest row is deleted; codex
@@ -377,9 +496,15 @@ reproduced `1 → absent → 1` with one source) both lack. `source.remove`
 deletes the `sources` row, so a later lookup finds no generation at
 all. Pinned: "remove then re-add does not revive a paused direct row",
 including deletion of the current maximum and deletion of every
-source. The `source_generations` table is append-only and tiny (one
-row per provision); no GC in R1. `Source` gains `generation:
-number`. This is the R1 provenance field the brief anticipated; R2 adds
+source. The `source_generations` table is append-only; no GC in R1. **Its growth
+(rev 11, spec correction):** a provision writes N+1 ledger rows, not
+one — one from the source-row trigger (INSERT or UPDATE) and one per
+tool inserted, because `provisionSource` deletes and re-inserts the
+namespace's tools and `sources_gen_on_tools` fires per row. Only the
+LAST allocation is the namespace's generation; the intermediate rows
+are the price of a floor the database enforces. Bounded by provisions ×
+tools, still small, and monotonic is the only property anything reads.
+`Source` gains `generation: number`. This is the R1 provenance field the brief anticipated; R2 adds
 tool-level revision on top of it.
 
 ### 4.2 Profiles (D2)
@@ -740,8 +865,18 @@ Consequences, each pinned (§9):
   stages whatever `pausedOn` it reads (`manager.ts:784`) — so two
   queued approvals for pause A let the second one approve a LATER
   pause B of the same program. Codex reproduced it; it is a defect in
-  shipped Code Mode, not only R1. `conduit approvals approve|deny`
-  reads `callId` from the list row it already displays and sends it.
+  shipped Code Mode, not only R1 — **SHIPPED as PR #58 (`4c75b05`,
+  2026-09-05)**: the wire shape, the CAS predicate, and the CLI below
+  are the ones R1 inherits. **The operator passes the call id (rev 11,
+  §3.1):** `conduit approvals approve|deny <execution-id> <call-id>` —
+  the CLI sends the argument verbatim and selects nothing on the
+  operator's behalf, so the decision binds to what was PAUSED, never to
+  what a list happened to show. **Display contract:** `approvals list`
+  renders `EXEC ID · CALL ID · TOOL · WAITING SINCE · EXPIRY` per row;
+  `reason` travels on the wire but the CLI does not render it; a
+  corrupt pause renders as a RECOVERY row whose CALL ID is the id the
+  claim accepts, or `-` when none is nameable (PR #59 `cce91ae`; §5.4
+  step 2). R1 adds the projection to the row (row #39).
   The daemon reads the row's
   `kind` BEFORE admission: a `code` row is admitted through the sandbox
   queue as today; a `direct` row is admitted under `DIRECT_ADMISSION_MAX`
@@ -775,8 +910,8 @@ startDirect(toolName: string, input: unknown, opts: {
 }): Promise<ExecutionOutcome>;
 start(code: string, opts?: { limits?; requestKey?;
   clientId?: string | null; scope?: ScopeResolver }): Promise<ExecutionOutcome>;
-resume(executionId: string, decision: ApprovalDecision,
-  scope: ScopeResolver): Promise<ResumeOutcome>;
+resume(executionId: string, decision: ApprovalDecision, callId: string,
+  scope: ScopeResolver): Promise<ResumeOutcome>;   // callId: shipped, 4c75b05
 ```
 
 `start` without `clientId`/`scope` (legacy callers, tests) behaves as
@@ -822,32 +957,86 @@ Sequence:
    The outcome is `{ status: "paused", executionId, pending }`, the
    same shape `start` returns.
 
-`resume(executionId, decision)` — steps 1–3 run for BOTH kinds (rev 9);
-steps 4–5 are the direct arm, and a code row continues into the
-shipped replay drive after step 3:
+`resume(executionId, decision, callId)` — steps 1–4 run for BOTH kinds
+(rev 9, rev 11); steps 5–6 are the direct arm, and a code row continues
+into the shipped replay drive after step 4:
 
-1. `claimForResume(id, attempt, callId)` — the CAS predicate gains the
-   pending call: `WHERE id = ? AND status = 'paused' AND
-   json_extract(paused_on, '$.callId') = ?` (rev 10). A stale approval
-   for an earlier pause CONFLICTS even when the execution is paused
-   again on a different call; lose → `conflict`; TTL lazily expires as
-   today. The claim IS the sweep check: a row the sweep already failed
-   is no longer `paused`, so the claim loses. Pinned with two queued
-   approvals against a program with two approval gates (row #46; G2's
-   ledger row is reworded to "exactly one winner PER PENDING CALL").
-2. **Generation check (D3 authority, both kinds):** read the namespace's
+1. `claimForResume(id, attempt, callId)` — the CAS predicate names the
+   pending call (rev 10; **shipped, `4c75b05`**): `WHERE id = ? AND
+   status = 'paused' AND json_extract(paused_on, '$.callId') = ?`. A
+   stale approval for an earlier pause CONFLICTS even when the
+   execution is paused again on a different call; lose → `conflict`;
+   TTL lazily expires as today. The claim IS the sweep check: a row the
+   sweep already failed is no longer `paused`, so the claim loses.
+   Pinned with two queued approvals against a program with two approval
+   gates (row #46; G2's ledger row is reworded to "exactly one winner
+   PER PENDING CALL"). **The claim ADMITS a pause no operator could
+   name (rev 11; shipped, `cce91ae`, row #49):** `paused_on` NULL or not
+   JSON, or `callId` absent, not text, or ASCII-blank — the ONE set
+   `NOT_NAMEABLE_CALL_ID` (sdk `types.ts`), mirrored by the CLI
+   argument check, the wire decoder, the manager's entry check, and
+   the SQL `trim` arm — wins the claim for ANY operator argument (a
+   `CASE`, so `json_extract` never runs on invalid JSON) and is handed
+   to step 2 for terminalization, so no row is ever `paused` and
+   undecidable. The manager refuses a non-string or blank `callId`
+   BEFORE the claim: the SDK entrypoint is public, and a bound number
+   could equal a stored numeric id inside SQL.
+2. **Post-claim read-side guard (rev 11; the shipped half is
+   `cce91ae`, the R1 half is row #50):** before any source read and
+   before any decision is staged, in this order. Every failure
+   terminalizes `failed` through `failClaimedResume` with
+   `decisionApplied: false` and the host-side `corruptPause` flag (the
+   daemon log keys on the flag, never on an error name), and the call
+   never runs:
+   - `claimCallId(id)` — the text-only value THE CLAIM COMPARED
+     (`json_extract`; SQLite keeps the FIRST of duplicate JSON keys,
+     `JSON.parse` the LAST) — must equal the operator's argument;
+   - `isPendingApproval(pausedOn)` (§4.1, the one validator) must hold,
+     and `pausedOn.callId` must equal the argument;
+   - **namespace agreement (codex #5 P0-2):** `pausedOn.namespace` must
+     equal the namespace of `pausedOn.toolName` under the §8.3 grammar
+     (`namespace.local`; the namespace alphabet has no dot, so it is
+     the text before the first `.`). Step 3 reads `sources.generation`
+     for the FIELD while the invoker dispatches by the NAME and takes
+     its namespace from the resolved tool row (`tool.namespace`,
+     `invoker.ts:178, 190`); the two must name the same source;
+   - **direct rows:** `direct_call.toolName` and `direct_call.namespace`
+     must equal `pausedOn.toolName` and `pausedOn.namespace` — a direct
+     execution performs exactly one call, so the call it was started
+     for and the call it paused on are the same, or the row is corrupt.
+
+   Disposition per stored field (the claim decides on `callId` only;
+   this step decides the rest):
+
+   | field | absent | present but malformed | disposition |
+   | --- | --- | --- | --- |
+   | `callId` | claimed by the corrupt arm | not text, or ASCII-blank: claimed by the corrupt arm | terminalize corrupt (shipped) |
+   | `toolName`, `reason` | claimed | not text | terminalize corrupt |
+   | `input` | claimed | — (any JSON value is legal) | terminalize corrupt when absent |
+   | `expiresAt` | claimed | not a finite number | terminalize corrupt |
+   | `namespace` + `sourceGeneration` | BOTH absent → a legacy (pre-R1) pause: step 3 terminalizes `ConduitCatalogChanged` (re-approve), before any source read | one absent, `namespace` not text, or `sourceGeneration` not a finite number | terminalize corrupt |
+   | `namespace` vs `toolName` | — | disagree under the grammar | terminalize corrupt |
+   | `direct_call` vs `pausedOn` | — | disagree on `{ toolName, namespace }` | terminalize corrupt |
+
+   "Terminalize corrupt" is `failed` with error name
+   `ConduitInternalError`, the shipped corrupt-state message, and
+   `corruptPause: true`. A pause whose JSON does not PARSE terminalizes
+   through the prep-window catch with the parse error as its reason
+   and no flag — the accepted I-3 exception (INVARIANTS §5.5). Pinned
+   one test per row of the table (row #50; the `callId` row is #49).
+3. **Generation check (D3 authority, both kinds):** read the namespace's
    current `sources.generation`; missing (source removed), not equal to
-   `pausedOn.sourceGeneration`, or `pausedOn.sourceGeneration` ABSENT
-   (legacy pause) → terminalize `failed` with
+   `pausedOn.sourceGeneration`, or the provenance pair ABSENT (legacy
+   pause, step 2) → terminalize `failed` with
    `ConduitCatalogChanged` (`failClaimedResume`), `decisionApplied:
    false`. This runs AFTER the claim, so a provision that commits
    between the sweep and the claim is still caught.
-3. Revalidate the grant AND the flag: `(await scope(row.clientId))
+4. Revalidate the grant AND the flag: `(await scope(row.clientId))
    .permits(row.projection, call.toolName)`; false → terminalize
    `failed` with `ConduitScopeRevoked`, `decisionApplied: false`. A
    profile turned off, narrowed, or removed since the pause all land
    here.
-4. Stage the decision bound to `{ op: "call", toolName: call.toolName,
+5. Stage the decision bound to `{ op: "call", toolName: call.toolName,
    request: call.request }`, build the invoker with `decisions`, and
    invoke with `(call.toolName, JSON.parse(call.request))`. The
    invoker's existing identity check consumes the decision only on an
@@ -856,7 +1045,7 @@ shipped replay drive after step 3:
    when no decision is staged — with a staged decision, the D6 branch
    applies, exactly as for Code Mode. `decisionApplied` is reported
    host-side as today.
-5. Settle as in `startDirect`.
+6. Settle as in `startDirect`.
 
 **Scope on resume, both kinds:** `resume` binds the resolver to the
 ROW's `clientId` and `projection` and threads it into `makeInvoker`
@@ -931,9 +1120,10 @@ start for both kinds).
 | element | R1 rule | mechanism |
 | --- | --- | --- |
 | principal, client id, projection | immutable | stored on the row; a resume comes only via the `approvals` row (human), never via a client |
-| qualified tool identity, canonical arguments | immutable | decisions seam exact-match; byte-identical rebuild (§4.1) |
+| qualified tool identity, canonical arguments | immutable | decisions seam exact-match; byte-identical rebuild (§4.1); post-claim read-side guard on the stored row — namespace agreement, `direct_call` ↔ `pausedOn` (§5.4 step 2, rev 11) |
+| pending-call identity | immutable, one call per approval | `claimForResume` CAS keyed by (execution, `callId`) — shipped `4c75b05`; a pause no operator can name is claimed and terminalized, never stranded — shipped `cce91ae` (§5.4 steps 1–2) |
 | decision | immutable, one-shot | decisions seam `take` |
-| effective capability grant | revalidate on resume | §5.4 step 3 |
+| effective capability grant | revalidate on resume | §5.4 step 4 |
 | policy version | R1 INHERITS D6: a staged approval applies to exactly one byte-identical call and skips the policy engine, for Code Mode today and for direct now. The brief's "a stricter policy is never bypassed by an old approval" rule needs a policy version to compare against and is R2 work; stated here so it is not read as shipped. | invoker (unchanged) |
 | credential secret version | resolve live if connection unchanged | invoker step 4 (unchanged) |
 | tool/source revision | **fail closed on any namespace write (D3)** | `sources.generation` compared after the resume claim (authority, both kinds) + `invalidatePaused` sweep (housekeeping); triggers make the bump writer-independent |
@@ -1183,9 +1373,11 @@ approval verb; `approvals.resume` remains reachable only through the
 | 43 | scoped search filters BEFORE ranking and the limit: an allowed tool ranked below ten disallowed ones is still returned, for discovery and in-sandbox search (codex #3, rev 9) | `catalog.test.ts` + `daemon/conduitd.test.ts` (Lanes A, B) |
 | 44 | direct drives are in the daemon's lifecycle accounting: disconnect then `daemon stop` while a direct call runs waits the drain grace and reports abandonment; `executionsInFlight` counts them (codex #3, rev 9) | `daemon/conduitd.test.ts` (Lane B) |
 | 45 | the client-visible timeout outcome resolves within budget even when the continuation OR the settle write is blocked; a stalled write yields `status:"unknown"` with the id, never a claimed terminalization; late preparation never dispatches after expiry (codex #3/#4) | `manager.test.ts` (Lane A) |
-| 46 | an approval binds to ONE pending call: two queued approvals for pause A against a program with two gates → the second `conflict`s, never approves pause B; `claimForResume` predicate includes `callId` (codex #4 P0, rev 10; shipped-code defect) | `sqlite.test.ts` + `manager.test.ts` + `packages/cli/src/approvals.test.ts` (Lane A, B) |
-| 47 | a provision or revalidate through the SHIPPED pre-R1 SQL against an R1 database still bumps the namespace generation (triggers), so a pause taken before a daemon downgrade fails closed on resume after the upgrade (codex #4 P0, rev 10) | `sqlite.test.ts` (Lane A) |
+| 46 | an approval binds to ONE pending call: two queued approvals for pause A against a program with two gates → the second `conflict`s, never approves pause B; `claimForResume` predicate includes `callId` (codex #4 P0, rev 10; shipped-code defect) — **SHIPPED: PR #58 `4c75b05`, 2026-09-05; INVARIANTS §5.5 row ✅** | `sqlite.test.ts` + `manager.test.ts` + `packages/cli/src/approvals.test.ts` (on main) |
+| 47 | a provision or revalidate through the SHIPPED pre-R1 SQL against an R1 database still bumps the namespace generation (triggers), so a pause taken before a daemon downgrade fails closed on resume after the upgrade (codex #4 P0, rev 10); a source row CREATED without tools (remove, then standalone re-add), a zero-tool revalidate, and a retarget under the same source id all bump, and the triggers survive a pre-R1 build opening the database (codex #5 P0-3, rev 11) | `sqlite.test.ts` (Lane A) |
 | 48 | the connections block of a listing is bounded at `LISTING_CONNECTIONS_MAX` with a truncation flag and is counted in the page budget; an empty-tool page and a direct-disabled listing both fit the frame cap with 20,000 connections (codex #4, rev 10) | `daemon/conduitd.test.ts` (Lane B) |
+| 49 | the liveness half of #46: a pause whose stored `callId` no operator can name — row not an object, `callId` absent, not text, or ASCII-blank — is claimed and terminalized `failed` with `corruptPause`, never stranded `paused`; ONE validator `isPendingApproval` decides "corrupt" for the manager and `approvals.list`; every corrupt pause lists as a recovery row carrying the SQL-extracted id, or none; the manager requires `claimCallId` to equal the operator's argument (codex #5 P1, threat-model pass) — **SHIPPED: PR #59 `cce91ae`, 2026-09-11; INVARIANTS §5.5 row ✅** | `sqlite.test.ts` + `manager.test.ts` + `payloads.test.ts` + `packages/cli/src/approvals.test.ts` (on main) |
+| 50 | post-claim read-side guard, R1 half: `pausedOn.namespace` equals the grammar-derived namespace of `pausedOn.toolName`; a direct row's `direct_call` equals its `pausedOn` on `{ toolName, namespace }`; the provenance pair is present together (typed) or absent together (legacy → `ConduitCatalogChanged`); every other combination terminalizes corrupt with `corruptPause`, `decisionApplied:false`, and the call never runs — one pin per row of the §5.4 disposition table, both kinds (codex #5 P0-2, rev 11) | `manager.test.ts` + a `types.test.ts` case per validator branch (Lane A) |
 | 30 | decoder: `clientId` on a non-`serve` handshake → `invalid`; `tool.call` without `input` → `invalid`; `describe.includeSchemas` decoded, absent = false | `daemon/rpc.test.ts` (Lane B) |
 | 31 | admin row no-widening: `serve` holds no `profile.*`/`source.*`/`daemon.*`/`approvals.*`; `admin` holds no `execute`/`tool.call`/`search`/`describe` and no approval verb (extends the existing capability pins) | `daemon/rpc.test.ts` (Lane B) |
 | 32 | `conduit remove-mcp` is atomic: tools, policies, connection, integration, source, AND the sealed secret all gone or none; paused direct calls on it invalidated; unknown namespace is a named error | `daemon/provision.test.ts` + `packages/cli/src/remove-mcp.test.ts` (Lane B) |
@@ -1195,7 +1387,7 @@ approval verb; `approvals.resume` remains reachable only through the
 | 36 | daemon listing cursor is stable across pages; the server's full walk returns every allowed tool exactly once; a catalog change mid-walk can only drop a name, never bind it to a different tool | `daemon/conduitd.test.ts` (Lane B) + `server.test.ts` (Lane C) |
 | 37 | a listing carries no schemas when `projections.direct` is false; a listing from an OLDER daemon (no `projections`/`tools`) is read as code-only with no direct tools; the server's page walk terminates and never repeats an entry | `daemon/conduitd.test.ts` + `server.test.ts` (Lanes B, C) |
 | 38 | server name resolution is a pure decode: `decode(encode(q)) === q` for every legal qualified name and an invalid escape (`_e`, trailing `_`) is undecodable; an undecodable or unpermitted name → MCP "unknown tool"; the qualified name goes on the wire and the daemon re-checks `permits` | `server.test.ts` (Lane C) |
-| 39 | `approvals list` renders direct rows with their projection and tool name; `check_execution` payload shape is unchanged for code rows | `packages/cli/src/approvals.test.ts` + `payloads.test.ts` (Lanes B, C) |
+| 39 | `approvals list` renders direct rows with their projection, call id, and tool name, and does not render `reason` (§5.3 display contract); `check_execution` payload shape is unchanged for code rows | `packages/cli/src/approvals.test.ts` + `payloads.test.ts` (Lanes B, C) |
 
 Three ambiguity invariants (§7): crash-before-persist (sweep test over a
 `running` direct row, Lane A); keyless-upstream documented limit (Lane
@@ -1242,7 +1434,8 @@ explainer + quiz, human-named merge):
    the per-call dispatch cell), the `EffectiveScope`/`ScopeResolver` types,
    client-namespaced request keys, D5 harness, ambiguity invariants
    (manager side), rows #1–#3, #9 (unit), #15, #16 (manager half),
-   #17, #18 (manager half), #19, #21, #25, #41, #42, G1–G3. No wire
+   #17, #18 (manager half), #19, #21, #25, #41, #42, #47, #50, G1–G3
+   (#46 and #49 are already on main). No wire
    change — but NOT "serve behaviour unchanged" (rev 8, D15): Lane A
    removes the governed-call 404 retry for Code Mode too (#21) and
    writes the sentinel into `code` for every new row (§4.1), so from
@@ -1507,28 +1700,74 @@ regenerated per commit · agent never installs.
   threat-model pass on instance binding (approval ↔ pending call ↔
   provenance ↔ writer version), then pass #5 — not a fifth
   fold-and-rerun.**
+- 2026-09-11 (00:45 → 12:00) — **instance-binding threat-model pass, the
+  step rev 10 named.** (1) `/blindspot` codebase mode → eight cards
+  (artifact "Instance Binding Blindspots", 2026-09-11; §3.1 carries
+  them). (2) **codex pass #5** (`gpt-5.6-sol`, effort `high`; trigger:
+  authorization boundary; 3 P0 / 1 P1 / 1 P2, NOT CONVERGED),
+  founder-adjudicated: **P0-1** a pre-R1 daemon resuming against an R1
+  database → OUT OF SCOPE on the fact that nothing is published (npm
+  404), plus the standing writer-floor rule from the first published
+  version onward (§3.1); **P0-2** tool-name ↔ namespace agreement
+  rests on the grammar → post-claim read-side guard with
+  `direct_call` ↔ `pausedOn` equality (§5.4 step 2, row #50); **P0-3**
+  no `AFTER INSERT ON sources` trigger, so remove + standalone re-add
+  resurrects generation 0 → INSERT trigger + three pins (§4.1a, row
+  #47); **P1** a present-but-malformed `callId` strands the row —
+  SHIPPED code, so a fix PR against main (precedent rev 10 → #58):
+  **PR #59 `cce91ae`** (row #49). Its own gauntlet: five codex runs,
+  all `gpt-5.6-sol` `high` (trigger: authorization boundary +
+  persistence invariant) — 0 P0/2 P1/2 P2 on `1aef6aa` → 0/2/1 on
+  `0997d76`, same class → shape fix, ONE validator → 0/2/2 on
+  `677ddd5` → 0/1/1 on `fbda698` (duplicate-key parser disagreement →
+  `claimCallId`) → **CONVERGED on `9cf3e6e`**, 0/0/0; accepted (class
+  a): the CLI option parser intercepting a corrupt `--` id,
+  unparseable JSON terminalizing via the I-3 catch without the flag,
+  the redundant `IS NULL` arm; pr-review-toolkit ×5, `/security-review`
+  clean, Aikido clean, `/code-review` five agents folded, Greptile one
+  finding folded in `aed9825`; explainer "The Un-nameable Call Id",
+  quiz passed, founder-named merge. **P2** a daemon downgrade
+  terminalizes a pending approval → accepted, recorded (§3.1).
+  Corrections the pass surfaced: the CLI list does not render `reason`
+  (§5.3 display contract); a provision writes N+1 ledger rows, not one
+  (§4.1a); `provisionSource`'s explicit ledger insert removed as a
+  duplicate bump (§4.1a). Task state: T9 SHIPPED via #58 (`4c75b05`);
+  T2 (`request_keys`) is NOT on main — only its rev-10 text fix is
+  done.
+- 2026-09-11 — **rev 11 folds the above:** §3.1 (new), §4.1 (one
+  validator, provenance pair), §4.1a (INSERT trigger, three pins, N+1,
+  no explicit insert), §5.3 (operator passes the id; display
+  contract; #58 shipped), §5.4 (claim admits the un-nameable; step 2
+  guard + disposition table; steps renumbered), §6 (pending-call row),
+  §9.1 (#46 shipped, #47 extended, #49 shipped, #50 new, #39
+  reworded), §10 (Lane A rows), tasks (T9 done, T9b done, T10
+  extended, T11 new, T2 status). **Codex pass #6 (confirming;
+  `gpt-5.6-sol` `high`, trigger: authorization boundary) follows, then
+  the founder's read, then writing-plans.**
 
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
-| Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8; three more runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → folded in rev 9; pass #4 owed |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8/9 and the 2026-09-11 threat-model pass #5; three early runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → rev 9; rev 9: 2 P0/3 P1/1 P2 → rev 10; pass #5 (threat model, on rev 10): 3 P0/1 P1/1 P2 → rev 11 + PRs #58/#59 on main; pass #6 (confirming) owed |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open (all folded; convergence pass #3 owed) | 15 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **CODEX:** the direct passes (not `/codex review`) drove revs 2–6; all their findings are folded; the confirming pass on rev 6 has not run (usage limit).
+- **CODEX:** the direct passes (not `/codex review`) drove revs 2–11 (passes #1–#5); every finding is folded, shipped, or out of scope by a recorded decision; pass #6 (confirming, on rev 11) is owed.
 - **CROSS-MODEL:** outside voice (Claude subagent, fresh context) vs the eng review: 9 findings, 7 tensions put to the founder — 6 accepted (D10–D15), 1 rejected (D9); it independently confirmed D4 and D7.
-- **VERDICT:** ENG REVIEW COMPLETE, findings folded — eng review required to re-clear after codex pass #3 (convergence) runs on rev 8.
+- **VERDICT:** ENG REVIEW COMPLETE, findings folded — eng review re-clears after codex pass #6 (confirming) on rev 11.
 
 ### Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above.
 
 - [ ] **T1 (P1, human: ~1d / CC: ~15min)** — sdk/execution — Remove drive linearization; keep sweep + post-claim generation check on BOTH kinds — Surfaced by: D10, D13 — Files: `packages/sdk/src/execution/manager.ts`, `packages/mcp/src/daemon/connection.ts` — Verify: rows #17, #42
-- [ ] **T2 (P1, human: ~4h / CC: ~15min)** — sdk/store — Request keys: the `request_keys` mapping table for named clients, written atomically with the execution row; legacy column untouched for the default profile — Surfaced by: D11 → codex #3 (rev 9) — Verify: row #25
-- [ ] **T9 (P1, human: ~1d / CC: ~20min)** — sdk/store + mcp/daemon + cli — Approval instance binding: `callId` on `approvals.resume` and in the `claimForResume` predicate; CLI sends the listed call id — Surfaced by: codex #4 P0 (rev 10) — Verify: row #46
-- [ ] **T10 (P1, human: ~2h / CC: ~10min)** — sdk/store — SQLite triggers that bump `sources.generation` on any source update or tool insert, writer-independent — Surfaced by: codex #4 P0 (rev 10) — Verify: row #47
+- [ ] **T2 (P1, human: ~4h / CC: ~15min)** — sdk/store — Request keys: the `request_keys` mapping table for named clients, written atomically with the execution row; legacy column untouched for the default profile — Surfaced by: D11 → codex #3 (rev 9) — Verify: row #25 — **Status (rev 11): OPEN.** Its spec text was fixed in rev 10; no code is on main.
+- [x] **T9 (P1, human: ~1d / CC: ~20min)** — sdk/store + mcp/daemon + cli — Approval instance binding: `callId` on `approvals.resume` and in the `claimForResume` predicate; the operator passes the call id — Surfaced by: codex #4 P0 (rev 10) — Verify: row #46 — **SHIPPED: PR #58 `4c75b05` (2026-09-05)**
+- [x] **T9b (P1, shipped)** — sdk/store + sdk/execution + mcp/daemon + cli — Liveness half of T9: the claim admits a `callId` no operator can name; the manager terminalizes it (`claimCallId`, `isPendingApproval`, `corruptPause`); `approvals.list` ships recovery rows — Surfaced by: codex #5 P1 (threat-model pass, rev 11) — Verify: row #49 — **SHIPPED: PR #59 `cce91ae` (2026-09-11)**
+- [ ] **T10 (P1, human: ~2h / CC: ~10min)** — sdk/store — SQLite triggers that bump `sources.generation` on any source INSERT or UPDATE and any tool insert, writer-independent; `provisionSource` writes no ledger row of its own — Surfaced by: codex #4 P0 (rev 10), codex #5 P0-3 (rev 11) — Verify: row #47 (incl. zero-tool revalidate, retarget, trigger survival)
+- [ ] **T11 (P1, human: ~3h / CC: ~10min)** — sdk/execution + sdk types — Post-claim read-side guard, R1 half: extend `isPendingApproval` with the provenance pair (together or absent together); namespace agreement under the §8.3 grammar; `direct_call` ↔ `pausedOn` equality; one test per row of the §5.4 disposition table — Surfaced by: codex #5 P0-2 (rev 11) — Verify: row #50
 - [ ] **T3 (P1, human: ~4h / CC: ~15min)** — sdk/execution — Persist a direct result only on the resume path, redacted; synchronous completion not persisted — Surfaced by: D12 — Verify: row #41
 - [ ] **T4 (P1, human: ~4h / CC: ~15min)** — mcp/server — Decode advertised names; walk all daemon pages into one tools/list — Surfaced by: D14 — Verify: rows #36, #38
 - [ ] **T5 (P2, human: ~30min / CC: ~3min)** — sdk/store — `client_id` on trace_events; invoker writes projection + client_id — Surfaced by: D4 — Verify: row #27
