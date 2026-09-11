@@ -263,15 +263,10 @@ describe("pausedToListRow (the approvals.list projection)", () => {
     ["absent (hydration failed or paused_on NULL)", undefined],
     ["the JSON literal null", null],
     ["a blank callId", { callId: " \t", toolName: "t", input: {}, reason: "r", expiresAt: 9 }],
-    [
-      "a valid callId beside a corrupt field",
-      { callId: "call_A", toolName: "t", input: {}, reason: "r", expiresAt: "bogus" },
-    ],
-  ])("INVARIANT §5.5: a stored pause that is %s lists as a RECOVERY row — call id absent — never as a decidable row or a refused queue", (_shape, pausedOn) => {
+  ])("INVARIANT §5.5: a stored pause that is %s lists as a RECOVERY row with the call id ABSENT — any id decides it — never as a refused queue", (_shape, pausedOn) => {
     // One validator (`isPendingApproval`) decides "corrupt" for both this
-    // projection and the manager, so a row is never shown as decidable
-    // and then refused — or shown with a call id the manager would
-    // accept beside a field it would not.
+    // projection and the manager. The claim admits these shapes for ANY
+    // call id, so none is advertised.
     const row = pausedToListRow({
       ...base,
       status: "paused",
@@ -282,6 +277,30 @@ describe("pausedToListRow (the approvals.list projection)", () => {
       startedAt: 1_000,
       toolName: "(unreadable pause)",
       reason: "stored pause is corrupt; deciding it with any call id terminalizes it",
+      expiresAt: 0,
+    });
+  });
+
+  it("INVARIANT §5.5: a nameable callId beside a corrupt field lists as a RECOVERY row that KEEPS the id — the claim admits that row only by its exact value", () => {
+    // The store's CAS looks only at `$.callId`. Withholding a nameable id
+    // would advertise a row no operator could ever decide.
+    const row = pausedToListRow({
+      ...base,
+      status: "paused",
+      pausedOn: {
+        callId: "call_A",
+        toolName: "t",
+        input: {},
+        reason: "r",
+        expiresAt: "bogus",
+      } as unknown as NonNullable<Execution["pausedOn"]>,
+    });
+    expect(row).toEqual({
+      executionId: "e",
+      callId: "call_A",
+      startedAt: 1_000,
+      toolName: "(unreadable pause)",
+      reason: "stored pause is corrupt; deciding this call id terminalizes it",
       expiresAt: 0,
     });
   });

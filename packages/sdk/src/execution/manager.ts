@@ -726,8 +726,8 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // passing a bound NUMBER could equal a stored numeric callId in the
       // claim's SQL and then pass the strict-equality check below, driving
       // a call no human named. Refuse BEFORE the claim, so no row is
-      // touched. The blank set is the store's own (sqlite.ts
-      // claimForResume): change all three or none.
+      // touched. The blank set is `NOT_NAMEABLE_CALL_ID` (types.ts), the
+      // one the store's claim and the wire decoder mirror.
       if (typeof callId !== "string" || NOT_NAMEABLE_CALL_ID.test(callId)) {
         throw new Error(
           `[ExecutionManager] Resume refused: callId must be a non-blank string. Context: { executionId: ${executionId} }`,

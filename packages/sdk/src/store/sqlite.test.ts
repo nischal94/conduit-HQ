@@ -353,6 +353,23 @@ describe("SqliteStore", () => {
       ]);
     });
 
+    it("INVARIANT §5.5: listPaused advertises the call id the CLAIM sees — duplicate JSON keys (SQLite keeps the first, JSON.parse the last) resolve to the claimable one", async () => {
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_dup', '', 'paused', '{}', ?, 7)",
+        args: [
+          '{"callId":"call_A","callId":"call_B","toolName":"t","input":{},"reason":"r","expiresAt":9000000000000}',
+        ],
+      });
+      const row = (await store.executions.listPaused()).find((r) => r.id === "lp_dup");
+      expect(row?.pausedOn?.callId).toBe("call_A");
+      await expect(store.executions.claimForResume("lp_dup", "attempt", "call_B")).resolves.toBe(
+        false,
+      );
+      await expect(store.executions.claimForResume("lp_dup", "attempt", "call_A")).resolves.toBe(
+        true,
+      );
+    });
+
     it("failClaimedResume is a no-op for a row this caller never claimed (the claim lost)", async () => {
       await store.executions.put({
         id: "e5",

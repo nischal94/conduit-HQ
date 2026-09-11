@@ -18,6 +18,7 @@
  */
 import type { Socket } from "node:net";
 import type { ConduitStore, Tool } from "@conduithq/sdk";
+import { isPendingApproval } from "@conduithq/sdk";
 import {
   buildCatalogListing,
   executionToCheckPayload,
@@ -996,7 +997,7 @@ async function handleRequest(
       const rows: PausedListRow[] = [];
       for (const execution of paused) {
         const row = pausedToListRow(execution);
-        if (row.callId === undefined) {
+        if (!isPendingApproval(execution.pausedOn)) {
           // The row is still listed, with `-` for the call id, so the
           // operator can see it and decide it — any call id terminalizes
           // it. The log is where they learn why the column is empty.

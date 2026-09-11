@@ -1142,6 +1142,15 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       operatorArg: "call_A",
     },
     {
+      // SQLite's extractor claims by the FIRST duplicate key; JSON.parse
+      // hydrates the LAST. The list advertises the first, the operator
+      // sends it, the claim wins, and the strict check terminalizes.
+      shape: "duplicate callId keys (claimed by the first, hydrated as the last)",
+      pausedOnJson:
+        '{"callId":"call_A","callId":"call_B","toolName":"t","input":{},"reason":"r","expiresAt":9000000000000}',
+      operatorArg: "call_A",
+    },
+    {
       shape: "a JSON number",
       pausedOnJson: JSON.stringify({
         callId: 123,

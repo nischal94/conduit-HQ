@@ -497,12 +497,13 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         //
         // "Un-nameable" is exactly what the wire decoder refuses (mcp
         // rpc.ts: not a string, or blank), and "blank" is ASCII whitespace
-        // — deliberately not `trim()`, which is Unicode-aware. This is the
-        // canonical definition of that set; it is repeated at three other
-        // sites (mcp rpc.ts decoder, sdk execution/manager.ts
-        // NOT_NAMEABLE_CALL_ID, cli commands/approvals.ts argument check)
-        // and all four MUST stay identical, or a stored callId becomes one
-        // no request can match and no claim will admit. A present-but-
+        // — deliberately not `trim()`, which is Unicode-aware. The set is
+        // defined ONCE as `NOT_NAMEABLE_CALL_ID` in sdk types.ts (used by
+        // the manager's entry check and `isPendingApproval`); this SQL
+        // `trim` set, the mcp rpc.ts decoder literal, and the cli
+        // commands/approvals.ts literal MUST stay identical to it, or a
+        // stored callId becomes one no request can match and no claim will
+        // admit. A present-but-
         // unmatchable callId (a JSON number, `""`) would otherwise fall
         // through to the equality arm, never match, and strand the row
         // listed-but-undecidable (codex review, 2026-09-11).
@@ -547,8 +548,16 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         });
       },
       async listPaused(): Promise<Execution[]> {
+        // `claim_call_id` is the call id THE CLAIM SEES: `claimForResume`
+        // compares `json_extract(paused_on, '$.callId')`, and SQLite's
+        // extractor keeps the FIRST of duplicate JSON keys where
+        // `JSON.parse` keeps the LAST. The list must advertise the id the
+        // claim accepts, so when the two disagree the SQL value wins here
+        // and the manager's post-claim strict check then terminalizes the
+        // row as corrupt. Guarded: `json_extract` throws on invalid JSON.
         const rs = await client.execute(
-          "SELECT * FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC",
+          `SELECT *, CASE WHEN json_valid(paused_on) THEN json_extract(paused_on, '$.callId') END AS claim_call_id
+           FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC`,
         );
         // One row whose JSON will not parse must not hide the whole queue:
         // the resume claim admits such a pause so an operator can
@@ -558,7 +567,21 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         return rs.rows.map((row) => {
           const id = text(row, "id");
           try {
-            return hydrateExecutionRow(row, id);
+            const execution = hydrateExecutionRow(row, id);
+            const claimCallId = maybeText(row, "claim_call_id");
+            const pausedOn: unknown = execution.pausedOn;
+            if (
+              claimCallId !== undefined &&
+              typeof pausedOn === "object" &&
+              pausedOn !== null &&
+              (pausedOn as { callId?: unknown }).callId !== claimCallId
+            ) {
+              log(
+                `[SqliteStore] listPaused: stored pause carries a call id the claim would not accept (duplicate JSON key); listing the claimable one. Context: { id: ${JSON.stringify(id)} }`,
+              );
+              (pausedOn as { callId?: unknown }).callId = claimCallId;
+            }
+            return execution;
           } catch (cause) {
             log(
               `[SqliteStore] listPaused: row failed to hydrate; listed as an unreadable pause. Context: { id: ${JSON.stringify(id)}, cause: ${String(cause)} }`,

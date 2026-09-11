@@ -365,8 +365,9 @@ export function decodeRequest(v: unknown): RpcRequest {
       // "Blank" is ASCII whitespace ONLY — deliberately not `trim()`, which
       // is Unicode-aware. A value refused here but not admitted by the
       // store's claim is a row no operator could ever decide, so one shared
-      // set, defined in sdk store/sqlite.ts `claimForResume`; change all
-      // four sites or none.
+      // set: `NOT_NAMEABLE_CALL_ID` in sdk types.ts, mirrored by the
+      // store's SQL `trim` set and the cli argument check. Change all or
+      // none.
       if (!isString(v.callId) || /^[ \t\n\v\f\r]*$/.test(v.callId)) {
         throw new InvalidRpcRequest(
           "approvals.resume.callId must be a non-blank string (the pending call being decided)",
