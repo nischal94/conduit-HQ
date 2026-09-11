@@ -1,14 +1,14 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 15 — codex loop closed by adjudication at rev 13
-(§12); rev 14 was the read pass; rev 15 folds the PR #57 bot reviews
-(CodeRabbit ×10, Greptile ×5 — §12 adjudicates each): `requestKey` on
-the discovery arm only (A4 at the wire), `result_state: 'discarded'`,
-bounded admission-slot retention, a byte cap on the connections block,
-an advertisement budget on the aggregated `tools/list`, `DispatchState`
-flips before the body write, and D12's unacknowledged delivery stated
-as the accepted consequence. Codex pass #8 (confirming) follows on
-this revision. Rev 11 folded the instance-binding threat-model pass
+Status: revision 16 — codex loop closed by adjudication at rev 13
+(§12); rev 14 was the read pass; rev 15 folded the PR #57 bot reviews
+(CodeRabbit ×10, Greptile ×5); codex pass #8 on rev 15 found 1 P0 /
+3 P1 in those folds, all folded here: the discard decision moves to
+settle time (`RESULT_BYTES_MAX`, one write), abandoned continuations
+are QUARANTINED against the cap rather than released, the aggregated
+`tools/list` walk carries one absolute deadline, and the IPC-loss
+recovery wording is per projection (keyless direct has no handle).
+Codex pass #9 (confirming) follows on this revision, then the merge. Rev 11 folded the instance-binding threat-model pass
 (`/blindspot` eight cards; codex #5, 3 P0 / 1 P1 / 1 P2; two findings
 SHIPPED on main as PR #58 `4c75b05` and PR #59 `cce91ae`, one out of
 scope by decision, §3.1). Rev 12 folded codex #6 (2 P0 / 2 P1 / 1 P2).
@@ -258,10 +258,26 @@ ALTER TABLE executions ADD COLUMN result_state TEXT
 NULL for code rows and for any non-terminal row; on a `completed`
 DIRECT row exactly one of `'delivered'` (result returned on the wire,
 not stored — `result` IS NULL), `'retained'` (resumed path; `result`
-holds the redacted value), or `'discarded'` (the completed envelope
-exceeded the IPC frame cap: the effect landed, the payload was dropped,
-`result` IS NULL, and the wire answer was `completed` +
-`resultTooLarge: true` — §4.1 status table). Fresh DDL adds
+holds the redacted value), or `'discarded'` (the result was too large
+to deliver: the effect landed, the payload was dropped, `result` IS
+NULL, and the wire answer was `completed` + `resultTooLarge: true` —
+§4.1 status table). **The discard decision is made AT SETTLE TIME by
+the manager, never after (rev 16, codex #8 P0):** the daemon discovers
+frame oversize only after encoding a response (`connection.ts:538-599`,
+`frames.ts:63-70`), which is after the settle write, and every settle
+write is fenced `status = 'running'` — so a post-settle refinement
+from `delivered` to `discarded` has no path. Instead the manager
+measures `JSON.stringify(result)` when the upstream returns and, if it
+exceeds `RESULT_BYTES_MAX` (256 KiB — a quarter of the IPC frame cap,
+leaving the envelope, `executionId`, and framing far inside 1 MiB),
+settles `completed` with `result_state: 'discarded'` in ONE write and
+hands the daemon a payload that carries no result. The daemon's frame
+check therefore never fires on a completed direct envelope; if it
+still did (a defect), the shipped `invalid` error would be the answer
+and the row would already be a consistent `delivered`/`retained` —
+never a lie about the effect. Applies to the resumed path too: a
+result over the cap is neither retained nor redacted; it is
+discarded. Fresh DDL adds
 `CHECK (result_state IN ('delivered','retained','discarded'))`; the
 read-side guard refuses a completed direct row whose `result_state` is
 NULL or whose `result`/`result_state` combination is inconsistent.
@@ -369,7 +385,7 @@ type Execution =
   | (ExecutionBase & { kind: "code"; code: string; seeds: { now: number; random: number } })
   | (ExecutionBase & { kind: "direct";
       call: { toolName: string; namespace: string; request: string };
-      resultState?: "delivered" | "retained" });   // set iff completed
+      resultState?: "delivered" | "retained" | "discarded" });   // set iff completed (rev 16)
 
 interface PendingApproval {                 // both kinds, written by R1
   callId: string; toolName: string; namespace: string; sourceGeneration: number;
@@ -392,7 +408,7 @@ Status enum shared (D1), per-kind meaning:
 | --- | --- | --- |
 | running | sandbox driving the program | performing the one governed upstream call |
 | paused | suspended on a pending call; replay on resume | approved-or-not canonical call stored; perform on resume |
-| completed | program returned | upstream returned. **At rest (rev 8, D12):** a SYNCHRONOUS direct completion returns the upstream result on the wire and persists NO `result` (`executions.result` is not on the §11 redaction path; an upstream that returns tokens or PII must not land in SQLite in the clear); a completion reached through RESUME persists `result` passed through `redactSensitiveFields` with the tool's policy `redactFields`, because `check_execution` must deliver it later. **Polling a direct row (rev 9, codex #3):** the shipped projection turns an absent result into `null` (`payloads.ts:408`), which would INVENT a value for a discarded synchronous result. A direct row therefore persists `result_state: 'delivered' \| 'retained'`; `check_execution` on a `delivered` direct row answers `completed` with `resultAvailable: false` and no `result` key, and a `retained` one answers with the redacted result. Code rows keep today's shape exactly. **Oversized result:** if the completed envelope exceeds the IPC frame cap, the daemon answers `completed` with `executionId` and `resultTooLarge: true` and persists `result_state: 'discarded'` (the effect landed; the payload is discarded — `connection.ts:575` today emits an `invalid` error after completion, which read as failure). The credential-echo tripwire still REFUSES a result rather than redacting it. **Delivery is not acknowledged (rev 15, Greptile — the D12 consequence, accepted):** a `delivered` result exists only in the one RPC response; if the daemon connection is lost after the row is settled and before the response lands, the caller has an execution id whose `check_execution` answers `completed, resultAvailable: false` — the effect happened, the value is gone. R1 does NOT retain a redacted copy until acknowledgement (that reintroduces the at-rest exposure D12 removed, for every call, to cover an IPC failure window). The server's outcome-unknown wording for a DIRECT call therefore says so: "the call may have completed; its result cannot be recovered — check `check_execution` for the outcome, and re-issue only if the operation is safe to repeat". |
+| completed | program returned | upstream returned. **At rest (rev 8, D12):** a SYNCHRONOUS direct completion returns the upstream result on the wire and persists NO `result` (`executions.result` is not on the §11 redaction path; an upstream that returns tokens or PII must not land in SQLite in the clear); a completion reached through RESUME persists `result` passed through `redactSensitiveFields` with the tool's policy `redactFields`, because `check_execution` must deliver it later. **Polling a direct row (rev 9, codex #3):** the shipped projection turns an absent result into `null` (`payloads.ts:408`), which would INVENT a value for a discarded synchronous result. A direct row therefore persists `result_state: 'delivered' \| 'retained'`; `check_execution` on a `delivered` direct row answers `completed` with `resultAvailable: false` and no `result` key, and a `retained` one answers with the redacted result. Code rows keep today's shape exactly. **Oversized result:** if the upstream result exceeds `RESULT_BYTES_MAX` the manager settles `completed` with `result_state: 'discarded'` (one write, at settle — §4.1 above, rev 16) and the daemon answers `completed` with `executionId` and `resultTooLarge: true` (the effect landed; the payload is discarded — today `connection.ts:575` emits an `invalid` error after completion, which read as failure). The credential-echo tripwire still REFUSES a result rather than redacting it. **Delivery is not acknowledged (rev 15, Greptile — the D12 consequence, accepted):** a `delivered` result exists only in the one RPC response; if the daemon connection is lost after the row is settled and before the response lands, the value is gone — the effect happened. R1 does NOT retain a redacted copy until acknowledgement (that reintroduces the at-rest exposure D12 removed, for every call, to cover an IPC failure window). **The recovery handle differs by projection (rev 16, codex #8 P1):** a KEYLESS direct call has NO handle — the lost response was the only carrier of the execution id (§7, keyless-upstream limit), so the server's wording for a direct call is "the call may have completed; there is no way to look it up — re-issue only if the operation is safe to repeat"; a discovery `call` with `requestKey` recovers by re-issuing with the SAME key: the `conflict` answer carries the execution id (§4.1), and `check_execution` on it reports the outcome (with `resultAvailable: false` for a delivered result). §7 and §8.6 carry this wording; the shipped generic "check `check_execution`" text is replaced for both direct arms (Lane C, row #39). |
 | failed | program threw / infra / divergence | policy block, credential/upstream/infra failure, D3 invalidation, or outcome-unknown |
 | expired | pause TTL elapsed | pause TTL elapsed |
 
@@ -824,14 +840,29 @@ Consequences, each pinned (§9):
   slot until daemon restart, and `DIRECT_ADMISSION_MAX` such drives
   make every later direct call `busy`. The cleanup promise therefore
   waits at most `DIRECT_SLOT_RETENTION_MS` (30 s, half the drive
-  budget) after the row is settled; on expiry it releases the slot,
-  logs the continuation as ABANDONED (the same vocabulary as the drain
-  deadline's abandonment path), and lets it run to completion
-  unobserved — safe because the settle write is attempt-fenced, so a
-  late completion can never change the row. Pinned: `DIRECT_ADMISSION_MAX`
-  drives stuck on a never-returning store read release their slots
-  within the retention window and a fresh direct call is admitted
-  (row #22). **Two promises (rev 9, codex #3):** the client-visible
+  budget) after the row is settled; on expiry it moves the continuation
+  to a bounded QUARANTINE and logs it ABANDONED (the same vocabulary as
+  the drain deadline's abandonment path). **Quarantine, not release
+  (rev 16, codex #8 P1):** an abandoned continuation is still live work
+  — it may hold a store read, and the attempt fence protects only the
+  execution row, not a Trace append or session teardown — so releasing
+  its slot outright would turn the cap into a replenishing counter.
+  Admission is therefore refused `busy` while `live + quarantined ≥
+  DIRECT_ADMISSION_MAX`; a quarantined continuation leaves the count
+  only when its promise actually settles. What a quarantined
+  continuation can still DO is bounded by the deadline gate it already
+  carries: its `deadline()` expired at settle, the invoker checks it
+  before writing the governed frame (§5.3 above) and before resolving
+  credentials, so it can never dispatch upstream or touch a secret; it
+  may append at most one refusal Trace row; session disposal runs under
+  the same expired deadline and does not wait on initialization. Net
+  effect: a stuck store read costs one slot until it returns — the
+  cap stays a BOUND on live work; a read that never returns is a
+  store defect the cap correctly surfaces as `busy`, not one it hides
+  by admitting more. Pinned: `DIRECT_ADMISSION_MAX`
+  drives stuck on a never-returning store read stay `busy` (the cap
+  is a bound, not a counter), a returning read frees its slot without
+  dispatching, and a late completion never changes the row (row #22). **Two promises (rev 9, codex #3):** the client-visible
   OUTCOME promise resolves as soon as the timer has settled the row —
   it never waits on the continuation — while a separate CLEANUP promise
   awaits the continuation and releases the slot; only the outcome
@@ -1258,8 +1289,12 @@ Error format follows `[Module] Operation failed: reason. Context: {…}`.
   and server keeps the server's existing outcome-unknown wording,
   pointing at `check_execution`.
 - **Outcome-unknown on the IPC hop** (daemon connection lost after
-  send): the server's existing wording, verbatim, pointing at
-  `check_execution`.
+  send): for `execute` the server's existing wording, verbatim,
+  pointing at `check_execution`; for the direct arms the
+  projection-specific wording of the §4.1 status table (rev 16) —
+  keyless direct: no lookup handle exists, re-issue only if safe;
+  discovery `call` with `requestKey`: re-issue with the same key and
+  read the execution id off the `conflict` answer.
 
 Concurrent double-resume needs no new mechanism: `claimForResume` is
 the exactly-one-winner CAS (ledger gap G2 closes with its row, §9.3).
@@ -1320,8 +1355,17 @@ walking at the budget, logs once per listing (the count dropped), and
 the remaining tools stay reachable through discovery `call` and Code
 Mode. The cut is deterministic because pages are in qualified-name
 order (§5.3), so the same catalog always advertises the same prefix.
-A multi-source catalog can therefore never make `tools/list` exceed
-memory or the request deadline (rows #36, #37).
+**The walk is time-bounded as well as size-bounded (rev 16, codex #8
+P1):** each daemon page carries its own 30 s read deadline
+(`runtime-stdio.ts:96-102`, `server.ts:110-122`), so a count budget
+alone still permits hundreds of sequential deadlines. The server holds
+ONE absolute `ADVERTISE_WALK_DEADLINE_MS` (30 s) for the whole
+`tools/list`, passes the REMAINING budget to every page request, and
+on expiry FAILS the listing with the server's existing timeout wording
+— never a latency-dependent partial prefix, which would make the
+advertised set depend on daemon speed. A multi-source catalog can
+therefore never make `tools/list` exceed memory or the walk deadline
+(rows #36, #37).
 
 | projection flag | tools advertised |
 | --- | --- |
@@ -1425,7 +1469,8 @@ the invoker returned it, on the wire only (a synchronous direct result
 is never persisted; a resumed one is persisted redacted — §4.1 status
 table, D12) as content; paused → the pending shape with `executionId` and the human
 step spelled out; failed → the guest-safe error; outcome-unknown → the
-existing wording. The client polls `check_execution` after a pause; no
+projection-specific wording of §7 (rev 16: keyless direct has no
+handle; discovery recovers by `requestKey`). The client polls `check_execution` after a pause; no
 push channel in R1.
 
 M1 restated per projection: no projection advertises or accepts an
@@ -1464,7 +1509,7 @@ then this table is the ledger's staging area.)
 | 19 | every new row fails closed on an OLDER build: `code` holds the sentinel, the program lives in `program` (codex P0) | `sqlite.test.ts` (hydrate: program present → used; sentinel in `code`) + a legacy-hydrator simulation |
 | 21 | a governed `tools/call` is dispatched at most once per approval: a 404 after dispatch settles outcome-ambiguous and is never re-sent (codex P0, rev 5) | `pipeline/mcp-client.test.ts` + `upstream.test.ts` (side-effect-then-404 fixture), both projections via the D5 harness |
 | 20 | the direct listing pages by COMPLETE encoded size under the IPC frame cap and always progresses; schemas never travel when direct is off; malformed MCP envelopes and over-length names are excluded from advertisement, deterministically (codex P1 ×3, rev 6) | `daemon/conduitd.test.ts` (packing vs the 1,626,191-byte reproduction; oversized entry skipped) + `server.test.ts` (SDK `ToolSchema` gate) |
-| 22 | a direct drive settles exactly once: a late continuation after the timer cannot overwrite `failed`; the admission slot is released only after the work stops — or after `DIRECT_SLOT_RETENTION_MS`, whichever is first: `DIRECT_ADMISSION_MAX` drives stuck on a never-returning store read release their slots within the window, the continuations are logged ABANDONED, and a fresh direct call is admitted (codex P1, rev 6; lock halves removed rev 8; retention rev 15) | `manager.test.ts` (delayed success / delayed refusal after timeout; stuck-continuation slot release) + `sqlite.test.ts` (attempt-fenced settle) |
+| 22 | a direct drive settles exactly once: a late continuation after the timer cannot overwrite `failed`; the admission slot is released only after the work stops — or after `DIRECT_SLOT_RETENTION_MS`, whichever is first — and an abandoned continuation is QUARANTINED, still counted against the cap until it settles: `DIRECT_ADMISSION_MAX` drives stuck on a never-returning store read keep the daemon `busy` (a bound, not a counter), a returning read frees its slot without dispatching (the expired deadline gate), and a late completion never changes the row (codex P1, rev 6; lock halves removed rev 8; retention rev 15; quarantine rev 16) | `manager.test.ts` (delayed success / delayed refusal after timeout; stuck-continuation quarantine; no dispatch after abandonment) + `sqlite.test.ts` (attempt-fenced settle) |
 | 23 | two handshakes in one tick on a named-client connection bind exactly once; requests during `validating` are refused (codex P1, rev 6) | `daemon/conduitd.test.ts` real processes |
 | 24 | post-dispatch classification survives error replacement: a dispatched call whose refusal audit also fails still settles `ConduitOutcomeAmbiguous`; initialize traffic never counts as dispatch; the cell flips BEFORE the body write, so connection loss injected inside `req.end(payload)` (partial or zero-byte) settles ambiguous and is never re-sent (codex P1, rev 6; write boundary rev 15) | `manager.test.ts` + `pipeline/upstream.test.ts` + `pipeline/mcp-client.test.ts` (loss-inside-write fixture) |
 | 25 | request keys: a named client's key lives in `request_keys` and never collides with any default-profile key, including a legacy key containing U+0000; a legacy raw key and a default-profile key are the same row; a `conflict` always carries the same-client execution id (codex #3, rev 9) | `sqlite.test.ts` + `manager.test.ts` (Lane A) |
@@ -1473,7 +1518,7 @@ then this table is the ledger's staging area.)
 | 28 | `DirectDrive` transitions: dispatch monotonic; `settled` taken exactly once; attempt id fences the settle write (D5) | `manager.test.ts` (Lane A) |
 | 29 | versioned scope snapshot: a write without a version bump is impossible; a snapshot built before a write is never served after it; restart starts unversioned (D7) | `daemon/conduitd.test.ts` (Lane B) |
 | 40 | profile and tool writes exist ONLY under `packages/mcp/src/daemon/` — no CLI or SDK path writes them out of process, so the in-memory scope version cannot be bypassed (D15) | a source-scan test in `packages/mcp/src/daemon/` (Lane B) |
-| 41 | a synchronous direct completion persists no `result` and polls back as `completed, resultAvailable:false` (never `result:null`); a resumed completion persists it redacted per policy `redactFields`; an oversized completed envelope answers `completed` + `resultTooLarge`, persists `result_state:'discarded'`, and polls back as `completed, resultAvailable:false, resultTooLarge:true`; the read-side guard refuses a completed direct row with no `result_state` (D12; codex #3, rev 9; `'discarded'` rev 15) | `manager.test.ts` + `payloads.test.ts` + `sqlite.test.ts` + D5 harness (Lanes A, B) |
+| 41 | a synchronous direct completion persists no `result` and polls back as `completed, resultAvailable:false` (never `result:null`); a resumed completion persists it redacted per policy `redactFields`; a result over `RESULT_BYTES_MAX` is settled `completed` + `result_state:'discarded'` in ONE write by the manager (both the synchronous and the resumed path), answers `completed` + `resultTooLarge`, and polls back as `completed, resultAvailable:false, resultTooLarge:true`; the daemon's frame check never fires on a completed direct envelope; the read-side guard refuses a completed direct row with no `result_state` or an inconsistent `result`/`result_state` pair (D12; codex #3, rev 9; `'discarded'` rev 15; settle-time decision rev 16) | `manager.test.ts` + `payloads.test.ts` + `sqlite.test.ts` + D5 harness (Lanes A, B) |
 | 42 | a paused Code Mode row whose namespace is re-provisioned resumes to `ConduitCatalogChanged`, same as a direct row (D13) | D5 harness (Lane A) |
 | 43 | scoped search filters BEFORE ranking and the limit: an allowed tool ranked below ten disallowed ones is still returned, for discovery and in-sandbox search (codex #3, rev 9) | `catalog.test.ts` + `daemon/conduitd.test.ts` (Lanes A, B) |
 | 44 | direct drives are in the daemon's lifecycle accounting: disconnect then `daemon stop` while a direct call runs waits the drain grace and reports abandonment; `executionsInFlight` counts them (codex #3, rev 9) | `daemon/conduitd.test.ts` (Lane B) |
@@ -1489,7 +1534,7 @@ then this table is the ledger's staging area.)
 | 33 | `conduit profiles set\|list\|remove`: argv parsing, `clientId` grammar rejection, `allow`/`projections` JSON round-trip, exit codes, and no credential-bearing output | `packages/cli/src/profiles.test.ts` (Lane B) |
 | 34 | `conduit serve --client <unknown>` exits non-zero naming the id and never serves the default profile | `packages/cli/src/integration.test.ts` (Lane C) |
 | 35 | direct-cap refusal is `code: "busy"` with the direct-specific text, and the slot is released only after the drive settles | `daemon/conduitd.test.ts` (Lane B) |
-| 36 | daemon listing cursor is stable across pages; the server's full walk returns every allowed tool exactly once up to the advertisement budget (`ADVERTISE_TOOLS_MAX` / `ADVERTISE_BYTES_MAX`), stops deterministically at the budget with one log line, and a catalog change mid-walk can only drop a name, never bind it to a different tool (budget rev 15) | `daemon/conduitd.test.ts` (Lane B) + `server.test.ts` (Lane C; a catalog past both budgets) |
+| 36 | daemon listing cursor is stable across pages; the server's full walk returns every allowed tool exactly once up to the advertisement budget (`ADVERTISE_TOOLS_MAX` / `ADVERTISE_BYTES_MAX`), stops deterministically at the budget with one log line, fails the whole listing when `ADVERTISE_WALK_DEADLINE_MS` expires (never a partial prefix), and a catalog change mid-walk can only drop a name, never bind it to a different tool (budget rev 15; walk deadline rev 16) | `daemon/conduitd.test.ts` (Lane B) + `server.test.ts` (Lane C; a catalog past both budgets; slow pages past the walk deadline) |
 | 37 | a listing carries no schemas when `projections.direct` is false; a listing from an OLDER daemon (no `projections`/`tools`) is read as code-only with no direct tools; the server's page walk terminates and never repeats an entry | `daemon/conduitd.test.ts` + `server.test.ts` (Lanes B, C) |
 | 38 | server name resolution is a pure decode: `decode(encode(q)) === q` for every legal qualified name and an invalid escape (`_e`, trailing `_`) is undecodable; an undecodable or unpermitted name → MCP "unknown tool"; the qualified name goes on the wire and the daemon re-checks `permits` | `server.test.ts` (Lane C) |
 | 39 | `approvals list` renders direct rows with their projection, call id, and tool name, and does not render `reason` (§5.3 display contract); `check_execution` payload shape is unchanged for code rows | `packages/cli/src/approvals.test.ts` + `payloads.test.ts` (Lanes B, C) |
@@ -1576,9 +1621,11 @@ regenerated per commit · agent never installs.
   `RESUME_ADMISSION_DEADLINE_MS`, pinned), `LISTING_PAGE_BYTES`
   (512 KiB, half the frame cap; measured on encoded bytes),
   `LISTING_CONNECTIONS_BYTES` (128 KiB), `DIRECT_SLOT_RETENTION_MS`
-  (30 s), and `ADVERTISE_TOOLS_MAX` / `ADVERTISE_BYTES_MAX` (500 tools
-  / 4 MiB) — the last four added rev 15; values are recommendations,
-  the bounds themselves are pinned.
+  (30 s), `ADVERTISE_TOOLS_MAX` / `ADVERTISE_BYTES_MAX` (500 tools /
+  4 MiB), `ADVERTISE_WALK_DEADLINE_MS` (30 s, absolute across pages),
+  and `RESULT_BYTES_MAX` (256 KiB, measured on `JSON.stringify(result)`
+  at settle) — added rev 15–16; values are recommendations, the bounds
+  themselves are pinned.
 - Whether `profile.set` validates that every `allow` entry currently
   exists in the catalog (recommend: warn, do not refuse — a profile may
   be written before its source is added).
@@ -1930,6 +1977,32 @@ regenerated per commit · agent never installs.
   bounds. **Codex pass #8 (confirming, `gpt-5.6-sol` `high`; trigger:
   the rev-15 changes touch resource limits and the dispatch boundary)
   runs on this revision before the merge.**
+- 2026-09-11 (17:35 → 17:47) — **codex pass #8 on rev 15: 1 P0 / 3 P1
+  class (c), 1 P1 class (a), 1 P2 class (b); NOT CONVERGED** — every
+  (c) a seam of a rev-15 fold (`gpt-5.6-sol`, effort `high`; trigger:
+  resource limits + dispatch boundary). **P0** `'discarded'` had no
+  persistence path: the manager settles before the daemon can see
+  frame oversize, and the running-only fence forbids refinement → the
+  manager decides at settle time against `RESULT_BYTES_MAX`, one
+  write, both paths; TS union fixed (§4.1, row #41). **P1** releasing
+  an abandoned slot made the cap a replenishing counter and the
+  attempt fence covers only the row, not Trace or teardown →
+  QUARANTINE: abandoned work stays counted until it settles; the
+  expired deadline gate means it can never dispatch (§5.3, row #22).
+  **P1** the walk budget bounded count and bytes but not time (500
+  pages × 30 s) → `ADVERTISE_WALK_DEADLINE_MS`, expiry fails the
+  listing (§8.2, row #36). **P1** the IPC-loss wording assumed an
+  execution id a keyless direct caller cannot have → per-projection
+  wording; discovery recovers via `requestKey` → `conflict` (§4.1
+  status table, §7, §8.6, row #39). **(a)** an older build conflates
+  `discarded`/`delivered` as `result: null` — under §3.1's
+  nothing-published decision. **(b)** a provably zero-byte `req.end`
+  failure is classified ambiguous — conservative by §7's design, fails
+  safe, no duplicate dispatch. **Rev 16 folds the four; codex pass #9
+  (confirming) runs before the merge.** Two passes in a row have found
+  seams in the previous fold and nothing else (LEARNINGS #21); if #9
+  returns another fold-seam only, it is folded and the loop stops
+  there by the rev-13 adjudication — a tenth pass is not the rule's.
 
 ## GSTACK REVIEW REPORT
 
@@ -1956,7 +2029,7 @@ Synthesized from this review's findings. Each task derives from a specific findi
 - [ ] **T10 (P1, human: ~2h / CC: ~10min)** — sdk/store — SQLite triggers that bump `sources.generation` on any source INSERT or UPDATE and any tool insert, writer-independent; `provisionSource` writes no ledger row of its own — Surfaced by: codex #4 P0 (rev 10), codex #5 P0-3 (rev 11) — Verify: row #47 (incl. zero-tool revalidate, retarget, trigger survival)
 - [ ] **T11 (P1, human: ~4h / CC: ~15min)** — sdk/execution + sdk types — Post-claim read-side guard, R1 half: `isPendingApproval` narrows to `StoredPendingApproval` (provenance pair together, or the legacy arm without both); namespace agreement under the §8.3 grammar AND against the resolved tool row's `namespace` column; `direct_call` ↔ `pausedOn` equality on name, namespace, and `request === JSON.stringify(input)`; one test per row of the §5.4 disposition table — Surfaced by: codex #5 P0-2 (rev 11), codex #6 P0 + P1 ×2 (rev 12) — Verify: row #50
 - [ ] **T3 (P1, human: ~4h / CC: ~15min)** — sdk/execution — Persist a direct result only on the resume path, redacted; synchronous completion not persisted; `result_state` ∈ {delivered, retained, discarded} with the read-side guard — Surfaced by: D12, CodeRabbit (rev 15) — Verify: row #41
-- [ ] **T12 (P1, human: ~3h / CC: ~10min)** — sdk/execution + mcp/daemon + mcp/server — Rev-15 bounds: `DIRECT_SLOT_RETENTION_MS` abandonment; `LISTING_CONNECTIONS_BYTES` packing; `ADVERTISE_TOOLS_MAX` / `ADVERTISE_BYTES_MAX` walk budget; `DispatchState` flips before `req.end`; decoder refuses `requestKey` on the direct arm — Surfaced by: Greptile P1 ×2, CodeRabbit ×3 (PR #57 review, rev 15) — Verify: rows #22, #24, #30, #36, #48
+- [ ] **T12 (P1, human: ~4h / CC: ~15min)** — sdk/execution + mcp/daemon + mcp/server — Rev-15/16 bounds: `DIRECT_SLOT_RETENTION_MS` quarantine (counted, not released; expired-deadline gate blocks dispatch); `RESULT_BYTES_MAX` settle-time discard; `LISTING_CONNECTIONS_BYTES` packing; `ADVERTISE_TOOLS_MAX` / `ADVERTISE_BYTES_MAX` + `ADVERTISE_WALK_DEADLINE_MS`; `DispatchState` flips before `req.end`; decoder refuses `requestKey` on the direct arm; projection-specific outcome-unknown wording — Surfaced by: Greptile P1 ×2, CodeRabbit ×3 (rev 15), codex #8 P0 + P1 ×3 (rev 16) — Verify: rows #22, #24, #30, #36, #39, #41, #48
 - [ ] **T4 (P1, human: ~4h / CC: ~15min)** — mcp/server — Decode advertised names; walk all daemon pages into one tools/list — Surfaced by: D14 — Verify: rows #36, #38
 - [ ] **T5 (P2, human: ~30min / CC: ~3min)** — sdk/store — `client_id` on trace_events; invoker writes projection + client_id — Surfaced by: D4 — Verify: row #27
 - [ ] **T6 (P2, human: ~1h / CC: ~5min)** — sdk/execution — One `DirectDrive` object — Surfaced by: D5 — Verify: row #28
