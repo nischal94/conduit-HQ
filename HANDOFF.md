@@ -92,27 +92,6 @@ every docs push to main puts an open PR behind → `gh pr update-branch`
 tests time out in the pre-commit hook under machine load (suite 110 s
 vs 45 s); retry once before suspecting anything.
 
-**OPEN DECISION for the founder (2026-09-11 18:40, competitive read —
-NOT yet a §18 entry):** `executor.sh` (github.com/RhysSullivan/executor,
-MIT, TypeScript, created 2026-02-07, 3.7k stars, v1.6.8 on 2026-09-05,
-~100 commits in the last two weeks) ships the SAME core thesis as
-Conduit's Code Mode — one `execute` tool over a normalized MCP /
-OpenAPI / GraphQL catalog, QuickJS sandbox, host-side credential
-injection "never entering the sandbox heap … the agent, or the model"
-— plus what Conduit lacks: npm-published CLI, desktop app, hosted
-cloud with pricing, self-host (Docker/Cloudflare), SSO, 1Password,
-registry onboarding, Codex plugin discovery. Its governance is
-three-mode per-tool policy (allow / require approval / block) with
-spec-derived defaults; tracing is "coming soon"; no published
-approval-binding, replay, egress-pinning, or invariant story. Decision
-needed before writing-plans commits three lanes of R1: (a) hold the
-R1–R5 order (R1 projections first); (b) pull R3 (publish) forward with
-a minimal CLI so the product exists in public; (c) re-scope R1 to the
-governance surface Executor does not have (approval binding + replay,
-evidence, egress, invariants) and drop the parts that only reach
-parity. Agent's recommendation: (c) then (b) — see the 2026-09-11
-debrief "Direction check". Record the outcome as a §18 entry.
-
 **DEFERRED (live list, updated 2026-09-11 18:20):** carry the earlier
 lists, plus: the `--doctor --offline` mtime flake fixture note ·
 LEARNINGS numbering in the 2026-09-11 sections is non-monotonic ·
