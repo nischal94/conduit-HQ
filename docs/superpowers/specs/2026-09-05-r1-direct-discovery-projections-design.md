@@ -1,14 +1,13 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 12 — rev 11 folded the instance-binding threat-model
-pass (2026-09-11: `/blindspot`, eight cards; codex pass #5, 3 P0 / 1 P1
-/ 1 P2, founder-adjudicated; two findings SHIPPED on main as PR #58
-`4c75b05` and PR #59 `cce91ae`, one out of scope by decision, §3.1).
-Codex pass #6 on rev 11 (2 P0 / 2 P1 / 1 P2, all in scope) is folded
-here: §4.1 (`StoredPendingApproval`), §4.1a (`WHEN` guard in the DDL,
-Σ(Nᵢ+1)), §5.3 (tense), §5.4 step 2 (tool-row namespace, request
-equality), row #50, T11, §12. Codex pass #7 (confirming) is owed. Not
-converged.
+Status: revision 13 — REVIEW LOOP CLOSED by adjudication (§12,
+2026-09-11). Rev 11 folded the instance-binding threat-model pass
+(`/blindspot` eight cards; codex #5, 3 P0 / 1 P1 / 1 P2; two findings
+SHIPPED on main as PR #58 `4c75b05` and PR #59 `cce91ae`, one out of
+scope by decision, §3.1). Rev 12 folded codex #6 (2 P0 / 2 P1 / 1 P2).
+Codex #7 on rev 12: 0 new findings, 1 residual precision P1, folded
+here (§4.1 `pausedOn: StoredPendingApproval`; §5.4 step 2 legacy
+branch). Next: founder read, then writing-plans (§10, Lane A first).
 Date: 2026-09-05
 Scope: spec §17 R1 (re-sequenced 2026-08-30, §18 repositioning entry)
 Builds on: `2026-08-15-daemon-ownership-design.md` (capability rows, UDS
@@ -336,7 +335,11 @@ TypeScript:
 
 ```ts
 interface ExecutionBase {
-  id: string; status: ExecutionStatus; pausedOn?: PendingApproval;
+  id: string; status: ExecutionStatus;
+  pausedOn?: StoredPendingApproval;   // rev 13: the UNION, never bare PendingApproval —
+                                      // the hydrator casts parsed JSON (sqlite.ts:1153-1157);
+                                      // readers narrow through isPendingApproval / the
+                                      // "sourceGeneration" in pausedOn legacy check
   startedAt: number; endedAt?: number; requestKey?: string;
   clientId: string | null;                // null = default profile
   projection: "code" | "direct" | "discovery";
@@ -1008,6 +1011,14 @@ into the shipped replay drive after step 4:
      `JSON.parse` the LAST) — must equal the operator's argument;
    - `isPendingApproval(pausedOn)` (§4.1, the one validator) must hold,
      and `pausedOn.callId` must equal the argument;
+   - **legacy branch (rev 13, codex #7):** if the narrowed value is the
+     `LegacyPendingApproval` arm (no provenance pair), SKIP the two
+     provenance-dependent checks below and go straight to step 3, which
+     terminalizes `ConduitCatalogChanged` — the checks below read
+     `pausedOn.namespace`, which the legacy arm does not have, and the
+     compiler enforces the branch because `pausedOn` is typed as the
+     union (§4.1). Pinned: a compile-time narrowing test and a runtime
+     legacy-row test (row #50);
    - **namespace agreement (codex #5 P0-2; tightened rev 12, codex
      #6):** `pausedOn.namespace` must equal the namespace of
      `pausedOn.toolName` under the §8.3 grammar (`namespace.local`; the
@@ -1789,20 +1800,38 @@ regenerated per commit · agent never installs.
   as "today" → reworded. Confirmed converged from pass #5: P0-1 (a),
   P0-3, P1 (#59), P2 (a). **Rev 12 folds all five; codex pass #7
   (confirming) follows.**
+- 2026-09-11 (15:22 → 15:33) — **codex pass #7 on rev 12: 0 new
+  findings; 9 of 10 adjudicated items CONVERGED; 1 residual P1 (c)**
+  (`gpt-5.6-sol`, effort `high`; trigger: authorization boundary +
+  convergence verdict; the first attempt at 13:06 died on the
+  provider's usage limit, re-run as queued). It executed the §4.1a DDL
+  in SQLite 3.51.0 (fresh INSERT, conflict-upsert UPDATE, tool INSERT,
+  `recursive_triggers` off and on): exactly one allocation each — the
+  trigger design is confirmed. Residual: rev 12 introduced the
+  `StoredPendingApproval` union but left `ExecutionBase.pausedOn`
+  typed as `PendingApproval`, so the union reached no reader, and
+  step 2 did not state that the legacy arm skips the
+  provenance-dependent checks. **Rev 13 folds it** (§4.1 type block,
+  §5.4 step 2 legacy branch). **Adjudication (LEARNINGS #16):** the
+  residual is a precision defect in the previous fold, not a new class;
+  pass #7 found nothing else across time, writers, or the guard, and
+  named the only remaining window as D10 (class a). The loop STOPS
+  here: next is the founder's read of rev 13, then writing-plans. An
+  eighth pass is the founder's call, not the rule's.
 
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
-| Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8/9 and the 2026-09-11 threat-model pass #5; three early runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → rev 9; rev 9: 2 P0/3 P1/1 P2 → rev 10; pass #5 (threat model, on rev 10): 3 P0/1 P1/1 P2 → rev 11 + PRs #58/#59 on main; pass #6 (rev 11): 2 P0/2 P1/1 P2 → rev 12; pass #7 (confirming) owed |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8/9 and the 2026-09-11 threat-model pass #5; three early runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → rev 9; rev 9: 2 P0/3 P1/1 P2 → rev 10; pass #5 (threat model, on rev 10): 3 P0/1 P1/1 P2 → rev 11 + PRs #58/#59 on main; pass #6 (rev 11): 2 P0/2 P1/1 P2 → rev 12; pass #7 (rev 12): 0 new, 1 residual P1 → rev 13; loop closed by adjudication |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_open (all folded; convergence pass #3 owed) | 15 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
 
-- **CODEX:** the direct passes (not `/codex review`) drove revs 2–12 (passes #1–#6); every finding is folded, shipped, or out of scope by a recorded decision; pass #7 (confirming, on rev 12) is owed.
+- **CODEX:** the direct passes (not `/codex review`) drove revs 2–13 (passes #1–#7); every finding is folded, shipped, or out of scope by a recorded decision; pass #7 returned no new finding and the loop is closed (§12 adjudication).
 - **CROSS-MODEL:** outside voice (Claude subagent, fresh context) vs the eng review: 9 findings, 7 tensions put to the founder — 6 accepted (D10–D15), 1 rejected (D9); it independently confirmed D4 and D7.
-- **VERDICT:** ENG REVIEW COMPLETE, findings folded — eng review re-clears after codex pass #7 (confirming) on rev 12.
+- **VERDICT:** ENG REVIEW COMPLETE, CODEX LOOP CLOSED (rev 13) — ready for the founder's read, then writing-plans.
 
 ### Implementation Tasks
 Synthesized from this review's findings. Each task derives from a specific finding above.
