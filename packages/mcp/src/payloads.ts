@@ -7,6 +7,7 @@ import type {
   PendingApproval,
   ResumeOutcome,
 } from "@conduithq/sdk";
+import { isPendingApproval, NOT_NAMEABLE_CALL_ID } from "@conduithq/sdk";
 import type { ProvisionPayload } from "./daemon/provision.js";
 import type { RpcRequest } from "./daemon/rpc.js";
 
@@ -159,10 +160,11 @@ export interface PausedListRow {
   executionId: string;
   /**
    * The pending call this row is waiting on; `approvals.resume` must name
-   * it. Optional on the WIRE type only because a daemon built before this
+   * it. Optional on the wire for two reasons: a daemon built before this
    * field existed omits it — a new CLI still renders that daemon's queue
    * (as `-`), and its `approve` is then refused by that daemon's own
-   * decoder. The daemon-side projection below always sets it.
+   * decoder — and the projection below omits it on a RECOVERY row whose
+   * stored id no operator could name, where any call id decides the row.
    */
   callId?: string;
   startedAt: number;
@@ -216,14 +218,52 @@ export type RpcPayloadFor<K extends RpcRequest["kind"]> = K extends "catalog.lis
 /**
  * Projects one paused `Execution` for the `approvals.list` response.
  *
- * Returns `undefined` for a row with no `pausedOn`. The daemon lists only
- * `status: "paused"` rows, which always carry it (manager.ts invariant), so
- * this is defensive — but dropping such a row silently would tell an operator
- * that nothing awaits them, so the caller logs it rather than swallowing it.
+ * Always returns a row. A pause the shared validator rejects — absent, not an
+ * object, or with a corrupt field — is projected as a RECOVERY row (see the
+ * comment inside) so the operator can see and decide it; the caller logs
+ * that case rather than the row being silently dropped.
  */
-export function pausedToListRow(execution: Execution): PausedListRow | undefined {
-  const pausedOn = execution.pausedOn;
-  if (pausedOn === undefined) return undefined;
+/**
+ * The stored call id iff it is one the store's claim would accept by exact
+ * value — text and not ASCII-blank (`NOT_NAMEABLE_CALL_ID`, the set shared
+ * with the claim's SQL `trim`). Anything else the claim admits for any id.
+ */
+function claimableCallId(pausedOn: unknown): string | undefined {
+  if (typeof pausedOn !== "object" || pausedOn === null) return undefined;
+  const callId = (pausedOn as { callId?: unknown }).callId;
+  return typeof callId === "string" && !NOT_NAMEABLE_CALL_ID.test(callId) ? callId : undefined;
+}
+
+export function pausedToListRow(execution: Execution): PausedListRow {
+  const pausedOn: unknown = execution.pausedOn;
+  // The store hydrates `paused_on` without validating it, and the resume
+  // claim admits any corrupt pause so the manager can terminalize it. The
+  // list must still SHOW such a row: an operator can only decide an
+  // execution they can see. "Corrupt" is decided by the ONE validator the
+  // manager also uses (`isPendingApproval`, sdk types.ts) — never by a
+  // per-field check here that could disagree with it. A corrupt pause
+  // becomes a RECOVERY ROW: placeholder tool name and reason, expiry 0.
+  //
+  // The call id on that row is THE ID THE CLAIM ACCEPTS. The store's CAS
+  // looks only at `$.callId`: a nameable text id is admitted only by its
+  // exact value, so it must be shown; an un-nameable one (absent, not
+  // text, blank) is admitted by any id, so it is shown ABSENT (the CLI
+  // renders `-`). Withholding a nameable id would list a row no operator
+  // could ever decide — the strand this whole path exists to prevent.
+  if (!isPendingApproval(pausedOn)) {
+    const callId = claimableCallId(pausedOn);
+    return {
+      executionId: execution.id,
+      ...(callId === undefined ? {} : { callId }),
+      startedAt: execution.startedAt,
+      toolName: "(unreadable pause)",
+      reason:
+        callId === undefined
+          ? "stored pause is corrupt; deciding it with any call id terminalizes it"
+          : "stored pause is corrupt; deciding this call id terminalizes it",
+      expiresAt: 0,
+    };
+  }
   return {
     executionId: execution.id,
     callId: pausedOn.callId,

@@ -470,6 +470,15 @@ describe("conduit approvals approve|deny — real runtime", () => {
     expect(daemon).not.toHaveBeenCalled();
   });
 
+  it("INVARIANT §5.5: an ASCII-blank call id is 'missing' — the same set the daemon refuses and the store admits as corrupt", async () => {
+    const daemon = vi.fn();
+    const deps = makeDeps({ daemon: daemon as unknown as ApprovalsDeps["daemon"] });
+    const result = await runDecide("approve", "exec_1", " \t\n\v\f\r", deps);
+    expect(result.exitCode).toBe(1);
+    expect(deps.stderrLines.join("")).toMatch(/missing required <call-id>/);
+    expect(daemon).not.toHaveBeenCalled();
+  });
+
   it("INVARIANT /cli deny-verb-truth: a REAL applied deny prints 'denied' and exits 0 — the operator's verb succeeded, no tool call", async () => {
     await setup();
     const executionId = await pauseOne();

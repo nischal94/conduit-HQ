@@ -14,7 +14,12 @@ import type {
 } from "../sandbox/sandbox.js";
 import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "../sandbox/sandbox.js";
 import type { ConduitStore } from "../store/store.js";
-import type { Execution, PendingApproval } from "../types.js";
+import {
+  type Execution,
+  isPendingApproval,
+  NOT_NAMEABLE_CALL_ID,
+  type PendingApproval,
+} from "../types.js";
 import type { ApprovalDecision, ApprovalDecisions } from "./decisions.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
 import { toSandboxJournal } from "./journal.js";
@@ -87,7 +92,17 @@ export type ExecutionOutcome =
  * never on the outcome's error name — error names are guest-reachable and
  * therefore spoofable; consumption is recorded host-side by the invoker.
  */
-export type ResumeOutcome = ExecutionOutcome & { decisionApplied: boolean };
+export type ResumeOutcome = ExecutionOutcome & {
+  decisionApplied: boolean;
+  /**
+   * Set ONLY by the manager's corrupt-state branches: the claimed row had no
+   * pending call an operator could have named, so it was terminalized
+   * `failed` without staging a decision. Host-side truth, like
+   * `decisionApplied` — a caller that logs or reports "corrupt pause" must
+   * key on this, never on `error.name`, which a guest can forge.
+   */
+  corruptPause?: true;
+};
 
 /**
  * The wiring the manager composes. The manager depends on the `ConduitStore`,
@@ -705,6 +720,19 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     },
 
     async resume(executionId, decision, callId) {
+      // The argument must be a call id an operator could have read off the
+      // list: text, not ASCII-blank. The wire decoder (mcp rpc.ts) refuses
+      // anything else, but this is a public SDK entrypoint — an embedder
+      // passing a bound NUMBER could equal a stored numeric callId in the
+      // claim's SQL and then pass the strict-equality check below, driving
+      // a call no human named. Refuse BEFORE the claim, so no row is
+      // touched. The blank set is `NOT_NAMEABLE_CALL_ID` (types.ts), the
+      // one the store's claim and the wire decoder mirror.
+      if (typeof callId !== "string" || NOT_NAMEABLE_CALL_ID.test(callId)) {
+        throw new Error(
+          `[ExecutionManager] Resume refused: callId must be a non-blank string. Context: { executionId: ${executionId} }`,
+        );
+      }
       // FIRST: atomic paused→running claim (design F4), bound to the ONE
       // pending call the decision is for. Lose → conflict no-op — including
       // when the execution is paused again on a LATER call than the one
@@ -746,28 +774,42 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               message: `[ExecutionManager] Resumed execution has no pending approval. Context: { executionId: ${executionId} }`,
             },
             decisionApplied: false,
+            corruptPause: true,
           };
         }
-        const pausedOn = execution.pausedOn;
-        if (pausedOn.callId !== callId) {
-          // The claim admits a CORRUPT pause (no callId in the stored JSON)
-          // so it can be terminalized here rather than stranded `paused`
-          // forever; a well-formed pause can only have been claimed with
-          // its own callId, so a mismatch is corruption, never a race.
+        // The hydrator casts `paused_on` without validating it, and the
+        // claim admits any CORRUPT pause on purpose — a stored value that
+        // is not an object (the JSON literal `null`, a bare string), or
+        // whose callId is absent, not text, or blank — so it can be
+        // terminalized HERE rather than stranded `paused` forever. Check
+        // the shape before touching a property: `null.callId` would throw
+        // into the generic catch below and bury the reason. A well-formed
+        // pause can only have been claimed with its own callId, so a
+        // mismatch is corruption, never a race.
+        // Decide on the identity THE CLAIM COMPARED (the SQL-extracted call
+        // id), not only the hydrated one: SQLite's extractor and JSON.parse
+        // can disagree on the same bytes (duplicate keys — first vs last),
+        // and a claim the corrupt arm admitted must never look well-formed
+        // here just because JSON.parse produced a matching string.
+        const claimCallId = await deps.store.executions.claimCallId(executionId);
+        const stored: unknown = execution.pausedOn;
+        if (claimCallId !== callId || !isPendingApproval(stored) || stored.callId !== callId) {
           await deps.store.executions.failClaimedResume(
             executionId,
-            "resumed execution's pending approval carries no call id (corrupt state)",
+            "resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run",
           );
           return {
             status: "failed",
             executionId,
             error: {
               name: "ConduitInternalError",
-              message: `[ExecutionManager] Resumed execution's pending approval carries no call id. Context: { executionId: ${executionId} }`,
+              message: `[ExecutionManager] Resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run. Context: { executionId: ${executionId} }`,
             },
             decisionApplied: false,
+            corruptPause: true,
           };
         }
+        const pausedOn: PendingApproval = stored;
 
         // TTL (design D8): lazily expire on resume. `claimForResume` already
         // flipped status to running, so persist the terminal `expired` state.

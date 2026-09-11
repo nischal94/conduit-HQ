@@ -361,7 +361,14 @@ export function decodeRequest(v: unknown): RpcRequest {
       // Non-blank, not merely a string: real call ids are UUIDs, so a blank
       // one can never match and would surface as a state `conflict` instead
       // of the malformed request it is (Greptile, PR #58).
-      if (!isString(v.callId) || v.callId.trim().length === 0) {
+      //
+      // "Blank" is ASCII whitespace ONLY — deliberately not `trim()`, which
+      // is Unicode-aware. A value refused here but not admitted by the
+      // store's claim is a row no operator could ever decide, so one shared
+      // set: `NOT_NAMEABLE_CALL_ID` in sdk types.ts, mirrored by the
+      // store's SQL `trim` set and the cli argument check. Change all or
+      // none.
+      if (!isString(v.callId) || /^[ \t\n\v\f\r]*$/.test(v.callId)) {
         throw new InvalidRpcRequest(
           "approvals.resume.callId must be a non-blank string (the pending call being decided)",
         );

@@ -486,28 +486,63 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         // on a different call — and a queued duplicate of the first
         // approval must lose here, not win and approve a call no human saw.
         //
-        // A CORRUPT pause stays claimable on purpose. `paused_on` NULL,
-        // not JSON, or JSON with no callId can never be legitimately
-        // approved, and refusing it here would leave the row `paused`
-        // forever with no path to a terminal state. Letting the claim win
-        // hands it to the manager's corrupt-state branch, which
-        // terminalizes it `failed` and logs why — the self-healing the
-        // resume path had before the callId predicate existed. A CASE, not
-        // an OR chain: SQLite documents lazy evaluation for CASE only, and
-        // `json_extract` on invalid JSON throws — so the extraction branch
-        // is reached only after `json_valid` has said it is safe.
+        // A CORRUPT pause stays claimable on purpose. A pause no operator
+        // can ever name — `paused_on` NULL, not JSON, or a callId that is
+        // absent, not text, or blank — can never be legitimately approved,
+        // and refusing it here would leave the row `paused` forever with
+        // no path to a terminal state. Letting the claim win hands it to
+        // the manager's corrupt-state branch, which terminalizes it
+        // `failed` — the self-healing the resume path had before the
+        // callId predicate existed.
+        //
+        // "Un-nameable" is exactly what the wire decoder refuses (mcp
+        // rpc.ts: not a string, or blank), and "blank" is ASCII whitespace
+        // — deliberately not `trim()`, which is Unicode-aware. The set is
+        // defined ONCE as `NOT_NAMEABLE_CALL_ID` in sdk types.ts (used by
+        // the manager's entry check and `isPendingApproval`); this SQL
+        // `trim` set, the mcp rpc.ts decoder literal, and the cli
+        // commands/approvals.ts literal MUST stay identical to it, or a
+        // stored callId becomes one no request can match and no claim will
+        // admit. A present-but-
+        // unmatchable callId (a JSON number, `""`) would otherwise fall
+        // through to the equality arm, never match, and strand the row
+        // listed-but-undecidable (codex review, 2026-09-11).
+        //
+        // A CASE, not an OR chain: SQLite documents lazy evaluation for
+        // CASE only, and `json_extract` on invalid JSON throws — so the
+        // extraction arms are reached only after `json_valid` has said it
+        // is safe. `json_type` is NULL for a missing path and 'null' for a
+        // JSON null. `IS NOT`, never `!=`: `!=` against that NULL is NULL,
+        // not true, so a missing callId would fall through to the equality
+        // arm — the exact strand this arm prevents.
         const rs = await client.execute({
           sql: `UPDATE executions SET status = 'running', resume_attempt = ?
                 WHERE id = ? AND status = 'paused'
                   AND CASE
                         WHEN paused_on IS NULL THEN 1
                         WHEN json_valid(paused_on) = 0 THEN 1
-                        WHEN json_extract(paused_on, '$.callId') IS NULL THEN 1
+                        WHEN json_type(paused_on, '$.callId') IS NOT 'text' THEN 1
+                        WHEN trim(json_extract(paused_on, '$.callId'), ' ' || char(9, 10, 11, 12, 13)) = '' THEN 1
                         ELSE json_extract(paused_on, '$.callId') = ?
                       END`,
           args: [resumeAttemptId, id, callId],
         });
         return rs.rowsAffected === 1;
+      },
+      async claimCallId(id: string): Promise<string | undefined> {
+        // The same extraction the claim's equality arm performs, guarded the
+        // same way (`json_extract` throws on invalid JSON). Text only: a
+        // non-text value is one the claim admitted through a corrupt arm,
+        // and the manager must treat it as such regardless of what
+        // `JSON.parse` made of the same bytes.
+        const rs = await client.execute({
+          sql: `SELECT CASE WHEN json_valid(paused_on) AND json_type(paused_on, '$.callId') = 'text'
+                       THEN json_extract(paused_on, '$.callId') END AS claim_call_id
+                FROM executions WHERE id = ?`,
+          args: [id],
+        });
+        const row = rs.rows[0];
+        return row === undefined ? undefined : maybeText(row, "claim_call_id");
       },
       async failClaimedResume(
         id: string,
@@ -528,10 +563,62 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         });
       },
       async listPaused(): Promise<Execution[]> {
+        // `claim_call_id` is the call id THE CLAIM SEES: `claimForResume`
+        // compares `json_extract(paused_on, '$.callId')`, and SQLite's
+        // extractor keeps the FIRST of duplicate JSON keys where
+        // `JSON.parse` keeps the LAST. The list must advertise the id the
+        // claim accepts, so when the two disagree the SQL value wins here
+        // and the manager's post-claim strict check then terminalizes the
+        // row as corrupt. Guarded: `json_extract` throws on invalid JSON.
         const rs = await client.execute(
-          "SELECT * FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC",
+          `SELECT *, CASE WHEN json_valid(paused_on) THEN json_extract(paused_on, '$.callId') END AS claim_call_id
+           FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC`,
         );
-        return rs.rows.map((row) => hydrateExecutionRow(row, text(row, "id")));
+        // One row whose JSON will not parse must not hide the whole queue:
+        // the resume claim admits such a pause so an operator can
+        // terminalize it, and they can only do that if they can SEE its id.
+        // A row that fails hydration is returned with no `pausedOn` (the
+        // list projection renders it as a recovery row) and logged here.
+        return rs.rows.map((row) => {
+          const id = text(row, "id");
+          try {
+            const execution = hydrateExecutionRow(row, id);
+            const claimCallId = maybeText(row, "claim_call_id");
+            const pausedOn: unknown = execution.pausedOn;
+            if (
+              claimCallId !== undefined &&
+              typeof pausedOn === "object" &&
+              pausedOn !== null &&
+              (pausedOn as { callId?: unknown }).callId !== claimCallId
+            ) {
+              log(
+                `[SqliteStore] listPaused: stored pause carries a call id the claim would not accept (duplicate JSON key); listing the claimable one. Context: { id: ${JSON.stringify(id)} }`,
+              );
+              (pausedOn as { callId?: unknown }).callId = claimCallId;
+            }
+            return execution;
+          } catch (cause) {
+            log(
+              `[SqliteStore] listPaused: row failed to hydrate; listed as an unreadable pause. Context: { id: ${JSON.stringify(id)}, cause: ${String(cause)} }`,
+            );
+            // Hydration may have failed on a SIBLING column (`seeds`) while
+            // `paused_on` holds a nameable call id — and the claim admits
+            // that row only by its exact id. Carry the SQL-side id so the
+            // list can advertise it; the partial pause fails the shared
+            // validator, so it still projects as a recovery row.
+            const claimCallId = maybeText(row, "claim_call_id");
+            return {
+              id,
+              code: "",
+              status: "paused",
+              seeds: { now: 0, random: 0 },
+              startedAt: maybeInteger(row, "started_at") ?? 0,
+              ...(claimCallId === undefined
+                ? {}
+                : { pausedOn: { callId: claimCallId } as PendingApproval }),
+            };
+          }
+        });
       },
       async listRunningIds(): Promise<string[]> {
         // Ids only, never hydrated: the crash-terminal sweep's whole job

@@ -285,6 +285,125 @@ describe("SqliteStore", () => {
       }
     });
 
+    it("INVARIANT §5.5: a pause whose stored callId is PRESENT but can never be named by an operator (non-text, or blank) is still claimable, exactly like an absent one", async () => {
+      // The wire decoder (rpc.ts) refuses a callId that is not a string or
+      // is blank, so no well-formed request can ever match a stored callId
+      // of these shapes. Without the allowance such a row lists forever and
+      // `conflict`s on every decide — the strand the corrupt-pause branch
+      // exists to prevent. Written raw: `put` cannot produce these shapes.
+      const shapes: Record<string, unknown> = {
+        p_number: 123,
+        p_bool: true,
+        p_jsonnull: null,
+        p_empty: "",
+        p_blank: " \t\n\v\f\r",
+        p_array: [],
+        p_object: {},
+      };
+      for (const [id, callId] of Object.entries(shapes)) {
+        await client.execute({
+          sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES (?, '', 'paused', '{}', ?, 0)",
+          args: [id, JSON.stringify({ callId, toolName: "t" })],
+        });
+      }
+      for (const id of Object.keys(shapes)) {
+        await expect(store.executions.claimForResume(id, "attempt", "any")).resolves.toBe(true);
+        const rs = await client.execute({
+          sql: "SELECT status FROM executions WHERE id = ?",
+          args: [id],
+        });
+        expect(rs.rows[0]?.status).toBe("running");
+      }
+      // Boundary of the blank set: NON-ASCII whitespace is text an operator
+      // can name (the decoder admits it), so it is NOT admitted as corrupt
+      // and stays claimable only by its exact value.
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('p_nbsp', '', 'paused', '{}', ?, 0)",
+        args: [JSON.stringify({ callId: " ", toolName: "t" })],
+      });
+      await expect(store.executions.claimForResume("p_nbsp", "attempt", "any")).resolves.toBe(
+        false,
+      );
+      await expect(store.executions.claimForResume("p_nbsp", "attempt", " ")).resolves.toBe(true);
+      // Control: a well-formed callId is decidable, so a claim naming a
+      // DIFFERENT call must still lose — the allowance is for shapes no
+      // operator can name, never a wildcard.
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('p_wellformed', '', 'paused', '{}', ?, 0)",
+        args: [JSON.stringify({ callId: "call_A", toolName: "t" })],
+      });
+      await expect(
+        store.executions.claimForResume("p_wellformed", "attempt", "call_B"),
+      ).resolves.toBe(false);
+      await expect(
+        store.executions.claimForResume("p_wellformed", "attempt", "call_A"),
+      ).resolves.toBe(true);
+    });
+
+    it("INVARIANT §5.5: listPaused never lets one unparseable row hide the queue — it is returned without pausedOn, alongside the readable rows", async () => {
+      await client.executeMultiple(`
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_bad', '', 'paused', '{}', 'not json', 5);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_ok', '', 'paused', '{}', '{"callId":"c","toolName":"t","input":{},"reason":"r","expiresAt":9}', 6);
+      `);
+      const rows = await store.executions.listPaused();
+      const ids = rows.filter((r) => r.id.startsWith("lp_")).map((r) => [r.id, r.pausedOn?.callId]);
+      expect(ids).toEqual([
+        ["lp_bad", undefined],
+        ["lp_ok", "c"],
+      ]);
+    });
+
+    it("INVARIANT §5.5: listPaused advertises the call id the CLAIM sees — duplicate JSON keys (SQLite keeps the first, JSON.parse the last) resolve to the claimable one", async () => {
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_dup', '', 'paused', '{}', ?, 7)",
+        args: [
+          '{"callId":"call_A","callId":"call_B","toolName":"t","input":{},"reason":"r","expiresAt":9000000000000}',
+        ],
+      });
+      const row = (await store.executions.listPaused()).find((r) => r.id === "lp_dup");
+      expect(row?.pausedOn?.callId).toBe("call_A");
+      await expect(store.executions.claimForResume("lp_dup", "attempt", "call_B")).resolves.toBe(
+        false,
+      );
+      await expect(store.executions.claimForResume("lp_dup", "attempt", "call_A")).resolves.toBe(
+        true,
+      );
+    });
+
+    it("INVARIANT §5.5: a row whose SIBLING column fails hydration still lists with the nameable call id the claim would accept", async () => {
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_badseeds', '', 'paused', 'not json', ?, 8)",
+        args: [
+          JSON.stringify({
+            callId: "call_S",
+            toolName: "t",
+            input: {},
+            reason: "r",
+            expiresAt: 9e12,
+          }),
+        ],
+      });
+      const row = (await store.executions.listPaused()).find((r) => r.id === "lp_badseeds");
+      expect(row?.pausedOn?.callId).toBe("call_S");
+      await expect(
+        store.executions.claimForResume("lp_badseeds", "attempt", "call_S"),
+      ).resolves.toBe(true);
+    });
+
+    it("INVARIANT §5.5: claimCallId is the id the claim compares — text only; a non-text first key, invalid JSON, or NULL is undefined", async () => {
+      await client.executeMultiple(`
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_text', '', 'paused', '{}', '{"callId":"call_A"}', 0);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_asym', '', 'paused', '{}', '{"callId":123,"callId":"123"}', 0);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_junk', '', 'paused', '{}', 'not json', 0);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_null', '', 'paused', '{}', NULL, 0);
+      `);
+      expect(await store.executions.claimCallId("cc_text")).toBe("call_A");
+      expect(await store.executions.claimCallId("cc_asym")).toBeUndefined();
+      expect(await store.executions.claimCallId("cc_junk")).toBeUndefined();
+      expect(await store.executions.claimCallId("cc_null")).toBeUndefined();
+      expect(await store.executions.claimCallId("cc_missing")).toBeUndefined();
+    });
+
     it("failClaimedResume is a no-op for a row this caller never claimed (the claim lost)", async () => {
       await store.executions.put({
         id: "e5",
