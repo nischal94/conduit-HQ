@@ -2604,3 +2604,34 @@ branch's; one `gh run rerun --failed` was green. **Lesson: before
 re-running, confirm the base passed the same code — that turns "flaky"
 from a hope into evidence, and names the fixture (baseline fingerprint
 taken before setup settles) for the deferred list.**
+
+### 25. Review surfaces are complementary — the bots found a class nine codex passes had not looked at
+
+Marking the spec PR ready triggered CodeRabbit and Greptile. Between
+them they found fifteen items; the real ones were a different CLASS
+from anything the codex loop had raised: resource bounds on the new
+surfaces (an unbounded aggregated `tools/list`, admission slots held
+until restart, a connections block with an entry cap but no byte cap,
+a result state with no persistence path). The codex prompts had been
+steering at instance binding and the dispatch boundary — the class
+the loop was opened for — and so had converged on that class while
+the bots read the whole document cold. **Lesson: a converged
+adversarial loop is converged on the classes its prompts named; a
+cold reader with no prompt is a different instrument, not a redundant
+one. Budget a fold round for the bots before merge, even on prose.**
+
+### 26. Three fold-seam passes in a row is the stop signal, and each seam was the same shape
+
+Passes #7, #8, #9 each found only defects in the immediately previous
+fold: a type declared but not applied to its reader; a measure taken
+on the raw value when the delivered value is the redacted one; a
+budget on count and bytes but not on time; a slot "released" when the
+work it bounded was still live. Every one was a correct idea wired to
+the wrong seam — the exact shape LEARNINGS #21 named the day before.
+The rev-16 stop line ("if #9 returns another fold-seam only, fold it
+and stop") kept the loop from chasing a zero. **Lesson: when writing a
+fold, trace the fix to the read site, the measured value, the unit
+(count/bytes/time), and the lifetime of what it bounds — four checks
+that would have caught all four seams before the pass did. And write
+the stop line BEFORE the next pass runs, so stopping is a decision
+already made, not a judgment under pressure.**

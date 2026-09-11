@@ -31,7 +31,89 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~17:20 (**R1 spec at rev 14 `7cab9a4` on PR #57, CODEX LOOP CLOSED at rev 13, READ PASS DONE** (agent, on the founder's instruction); branch up to date with main; PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec · NEXT: founder says "merge #57" → mark ready, CodeRabbit, merge → writing-plans)
+## Current handoff — updated 2026-09-11 ~18:20 (**PR #57 MERGED `0cba1da` — R1 design spec at rev 17 is on main**, founder-named merge; branches = main only; PR #59 MERGED `cce91ae` · NEXT: `superpowers:writing-plans` from spec §10, Lane A first)
+
+**Merge record (18:15):** founder said "merge #57" at ~17:25. Marking
+the PR ready triggered CodeRabbit (10 findings) and Greptile (5);
+all adjudicated in spec §12 → **rev 15** (`a5739ff`). Because rev 15
+changed semantics (result states, admission retention, listing
+budget, dispatch boundary), codex **#8** ran on it: 1 P0 / 3 P1, all
+seams of the rev-15 folds → **rev 16** (`6038785`); codex **#9** on
+rev 16: 0 P0 / 2 P1, again seams of the previous fold, no new class →
+**rev 17** (`88022df`) and the loop STOPPED per the stop line recorded
+in §12 at rev 16 (three consecutive passes found only the previous
+fold's seams; the §3.1 class map is unchanged since rev 11). CI green
+on every push (one QuickJS-timeout hook flake under load, retry clean).
+Merge needed `gh pr update-branch 57` once more (docs pushes to main,
+LEARNINGS #17) → `d732d55`, CI green → squash `0cba1da`; the spec blob
+on main is byte-identical to rev 17; branch deleted local + remote.
+Nine codex passes total on this spec, all `gpt-5.6-sol` `high`; two
+usage-limit deaths (both re-queued per the codex rule, both succeeded).
+
+**What rev 15–17 added that the plan must carry (all in §11 constants
+and task T12):** `requestKey` only on the discovery `tool.call` arm
+(decoder refuses it on direct); `result_state: 'discarded'` decided AT
+SETTLE by the manager against `RESULT_BYTES_MAX` on the DELIVERABLE
+(redacted on the resume path — redaction can expand); abandoned
+continuations QUARANTINED against `DIRECT_ADMISSION_MAX` (counted, not
+released; the expired-deadline gate blocks dispatch);
+`LISTING_CONNECTIONS_BYTES`; `ADVERTISE_TOOLS_MAX` /
+`ADVERTISE_BYTES_MAX` + one absolute `ADVERTISE_WALK_DEADLINE_MS`
+(expiry fails the listing); `DispatchState` flips BEFORE `req.end`;
+per-projection IPC-loss wording (keyless direct: no handle; discovery:
+re-issue with the same key → `conflict` carries the id); §8.6 lists
+`conflict`; ⏳ rows enter INVARIANTS with the Lane A PR, not the spec.
+T1 is moot; T9/T9b shipped (#58/#59); T2, T3, T10, T11, T12 open.
+
+### NEXT
+
+1. **`superpowers:writing-plans`** from spec §10 — Lane A first (store +
+   manager): T10 triggers (with the three §4.1a pins), T11 read-side
+   guard, T2 request keys, T3 result states incl. `'discarded'`, T5,
+   T6, T12's Lane A parts (`RESULT_BYTES_MAX` settle, quarantine), the
+   D5 harness, and the ⏳ INVARIANTS rows for Lane A's claims in the
+   same PR. Lane A is a one-way door (§10) — the explainer quiz covers
+   the 404-retry removal and the `code` sentinel. Plans are TWEAKABLE:
+   lead with the data-model and interface decisions.
+2. Lane B, then Lane C, per §10; each its own PR with the full gauntlet.
+3. **R3 note (unchanged):** the store interface changed in #58/#59;
+   the first published version records it plus §3.1's writer-floor
+   rule in its release checklist.
+
+**Session quirks worth inheriting (2026-09-11 evening additions):**
+marking a draft PR ready is what triggers CodeRabbit AND Greptile —
+budget a fold round for their findings before merging, even on a
+spec-only PR (they found a real class the codex loop had not looked
+at: resource bounds on new surfaces) · a watch script must grep the
+EXACT codex limit line (`^ERROR: You've hit your usage limit`) — the
+spec's own §12 text contains "usage limit" and false-alarmed twice ·
+every docs push to main puts an open PR behind → `gh pr update-branch`
++ one CI cycle before merge, every time · QuickJS overflow-recovery
+tests time out in the pre-commit hook under machine load (suite 110 s
+vs 45 s); retry once before suspecting anything.
+
+**DEFERRED (live list, updated 2026-09-11 18:20):** carry the earlier
+lists, plus: the `--doctor --offline` mtime flake fixture note ·
+LEARNINGS numbering in the 2026-09-11 sections is non-monotonic ·
+CodeRabbit's "decoder does not accept the new fields" finding is Lane B
+work (row #30), not a defect — do not re-litigate.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #57
+> is MERGED `0cba1da`, the R1 design spec at rev 17 is on main at
+> `docs/superpowers/specs/2026-09-05-r1-direct-discovery-projections-design.md`;
+> branches = main only). **Do NOT re-run codex on the spec.** NEXT:
+> `superpowers:writing-plans` from the spec's §10, Lane A first, per
+> HANDOFF NEXT item 1 (carry §11's constants and task T12). Carry the
+> DEFERRED list.
+
+---
+
+**Superseded (17:20) — kept for the record:**
 
 **Read pass (17:00 → 17:20, rev 14 `7cab9a4`):** the founder delegated
 the rev-13 read to the agent ("do the review, find errors or
@@ -77,7 +159,7 @@ green. PR #57 title says rev 13. **Deviation to know:** rev 11 removed
 `provisionSource`'s explicit ledger insert (double bump once the INSERT
 trigger exists; same transaction) — one-line reversal if wanted.
 
-### NEXT
+#### NEXT (17:20 state — superseded by the section above)
 
 1. **Merge #57 on the founder's word** (read pass DONE as rev 14, see
    above). Sequence once named: `gh pr ready 57` → CodeRabbit runs on
@@ -121,7 +203,7 @@ next housekeeping pass, never silently.
 
 **SHELVED (unchanged):** the project-jail plan.
 
-### KICKOFF PROMPT for the next session
+#### KICKOFF PROMPT (17:20 — superseded; use the one above)
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — #57 is
