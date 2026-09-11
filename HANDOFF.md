@@ -31,7 +31,12 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~12:00 (threat-model pass DONE → PR #59 OPEN at `aed9825`, 7 commits, codex ×5 CONVERGED, explainer published, merge waits on the founder's quiz + word · #57 R1 spec still rev 10; NEXT: merge #59 on the founder's word, then rev 11)
+## Current handoff — updated 2026-09-11 ~12:30 (threat-model pass DONE → **PR #59 MERGED `cce91ae`**, founder passed the quiz and named the merge; squash tree verified equal to the branch tip; branch deleted local + remote; branches = main only · #57 R1 spec still rev 10; NEXT: rev 11)
+
+**Merge record (12:20):** `gh pr update-branch 59` was needed first (the
+docs push had moved main); CI green; squash `cce91ae`, tree identical to
+branch tip `9fe608e` (the update-branch merge commit). INVARIANTS §5.5
+liveness half is now on main. NEXT item 1 below is DONE; start at item 2.
 
 **WHAT HAPPENED (2026-09-11, 00:45 → 12:00):** the instance-binding
 threat-model pass the previous handoff named. (1) `/blindspot` codebase
@@ -143,15 +148,14 @@ sdk) · the prep-window catch's stored reason is a bare `String(cause)`
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — #59 is
-> the OPEN fix PR at `aed9825`; #57 is the OPEN draft spec PR at rev 10).
-> **State: PR #59 is review-complete (codex ×5 converged, all reviewers
-> folded, explainer published); it merges ONLY on the founder's word
-> after a full quiz pass. Do NOT re-review #59 or reopen its accepted
-> exceptions.** If the founder names the merge: check CI on `aed9825`,
-> merge, verify the squash tree, delete the branch. Then R1 rev 11 per
-> NEXT item 2 (fold the threat-model adjudications, §5.3 amendment, rows
-> #46/#59, T9 done / T2 open) → codex #6 confirming → founder read →
-> writing-plans. Carry the DEFERRED list.
+> MERGED at `cce91ae`; #57 is the OPEN draft spec PR at rev 10).
+> **State: the §5.5 liveness fix is on main; branches = main only. Do
+> NOT re-review #59 or reopen its accepted exceptions.** NEXT: R1 rev 11
+> on `docs/r1-design-spec` per NEXT item 2 (fold the threat-model
+> adjudications, §5.3 amendment, rows #46 shipped via `4c75b05` / #59's
+> liveness half shipped via `cce91ae`, T9 done / T2 open) → codex #6
+> confirming (Sol high) → founder read → writing-plans. Carry the
+> DEFERRED list.
 ---
 
 ## Superseded handoff — updated 2026-09-06 ~06:30 (PR #58 MERGED `4c75b05`, founder-named, six review rounds, codex converged; branches = main only · #57 R1 spec rev 10 OPEN, loop PAUSED by rule; its NEXT [threat-model pass] was DONE 2026-09-11 by the section above)
