@@ -996,14 +996,6 @@ async function handleRequest(
       const rows: PausedListRow[] = [];
       for (const execution of paused) {
         const row = pausedToListRow(execution);
-        if (row === undefined) {
-          // Defensive: a paused row with no pausedOn is corrupt state. Log it
-          // rather than silently shrinking the queue an operator is reading.
-          log(
-            `[conduitd] Paused execution has no pausedOn; omitted from approvals.list. Context: {executionId: ${execution.id}}`,
-          );
-          continue;
-        }
         if (row.callId === undefined) {
           // The row is still listed, with `-` for the call id, so the
           // operator can see it and decide it — any call id terminalizes

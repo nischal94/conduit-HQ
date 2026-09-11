@@ -14,7 +14,12 @@ import type {
 } from "../sandbox/sandbox.js";
 import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "../sandbox/sandbox.js";
 import type { ConduitStore } from "../store/store.js";
-import type { Execution, PendingApproval } from "../types.js";
+import {
+  type Execution,
+  isPendingApproval,
+  NOT_NAMEABLE_CALL_ID,
+  type PendingApproval,
+} from "../types.js";
 import type { ApprovalDecision, ApprovalDecisions } from "./decisions.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
 import { toSandboxJournal } from "./journal.js";
@@ -162,19 +167,6 @@ export interface ExecutionManagerDeps {
  * MVP; a background sweep is deferred — design D8).
  */
 const DEFAULT_APPROVAL_TTL_MS = 259_200_000; // 72h
-
-/**
- * A call id no operator could have read off `approvals list`: empty or
- * ASCII whitespace only — deliberately not `trim()`, which is
- * Unicode-aware. One shared set, defined in store/sqlite.ts
- * `claimForResume`; change all four sites or none.
- */
-const NOT_NAMEABLE_CALL_ID = /^[ \t\n\v\f\r]*$/;
-
-/** Narrows a hydrated-but-unvalidated value before any property is read. */
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null;
-}
 
 function resolveApprovalTtlMs(): number {
   const raw = process.env.CONDUIT_APPROVAL_TTL;
@@ -795,7 +787,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // pause can only have been claimed with its own callId, so a
         // mismatch is corruption, never a race.
         const stored: unknown = execution.pausedOn;
-        if (!isRecord(stored) || stored.callId !== callId) {
+        if (!isPendingApproval(stored) || stored.callId !== callId) {
           await deps.store.executions.failClaimedResume(
             executionId,
             "resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run",
@@ -811,7 +803,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             corruptPause: true,
           };
         }
-        const pausedOn = execution.pausedOn;
+        const pausedOn: PendingApproval = stored;
 
         // TTL (design D8): lazily expire on resume. `claimForResume` already
         // flipped status to running, so persist the terminal `expired` state.

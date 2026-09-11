@@ -1128,6 +1128,20 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
 
   it.each([
     {
+      // The one validator the list projection also uses: a matching call
+      // id beside a corrupt field is still corrupt, so the TTL check can
+      // never run against `"bogus"` and stage a decision.
+      shape: "a VALID callId beside a corrupt expiresAt",
+      pausedOnJson: JSON.stringify({
+        callId: "call_A",
+        toolName: "t",
+        input: {},
+        reason: "r",
+        expiresAt: "bogus",
+      }),
+      operatorArg: "call_A",
+    },
+    {
       shape: "a JSON number",
       pausedOnJson: JSON.stringify({
         callId: 123,

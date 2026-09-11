@@ -253,44 +253,29 @@ describe("pausedToListRow (the approvals.list projection)", () => {
     expect(JSON.stringify(row)).not.toContain("should-never-cross-the-socket");
   });
 
-  it("returns undefined for a corrupt paused row with no pausedOn (caller logs, never silently drops)", () => {
-    expect(pausedToListRow({ ...base, status: "paused" })).toBeUndefined();
-  });
-
-  it("INVARIANT §5.5: a stored callId that is not text is shipped ABSENT, so one corrupt row cannot hide the whole queue", () => {
-    // The client's row validator refuses a non-string callId for the entire
-    // answer. Absent is a shape it accepts (older daemons omit the field),
-    // the CLI renders it `-`, and the operator can still decide the row —
-    // any call id terminalizes it (sqlite.ts claimForResume).
+  it.each([
+    // The client's row validator refuses a non-string callId for the ENTIRE
+    // answer; absent is a shape it accepts (older daemons omit the field).
+    [
+      "a non-text callId",
+      { callId: 123, toolName: "github.delete_repo", input: {}, reason: "r", expiresAt: 9 },
+    ],
+    ["absent (hydration failed or paused_on NULL)", undefined],
+    ["the JSON literal null", null],
+    ["a blank callId", { callId: " \t", toolName: "t", input: {}, reason: "r", expiresAt: 9 }],
+    [
+      "a valid callId beside a corrupt field",
+      { callId: "call_A", toolName: "t", input: {}, reason: "r", expiresAt: "bogus" },
+    ],
+  ])("INVARIANT §5.5: a stored pause that is %s lists as a RECOVERY row — call id absent — never as a decidable row or a refused queue", (_shape, pausedOn) => {
+    // One validator (`isPendingApproval`) decides "corrupt" for both this
+    // projection and the manager, so a row is never shown as decidable
+    // and then refused — or shown with a call id the manager would
+    // accept beside a field it would not.
     const row = pausedToListRow({
       ...base,
       status: "paused",
-      pausedOn: {
-        callId: 123 as unknown as string,
-        toolName: "github.delete_repo",
-        input: {},
-        reason: "requires approval",
-        expiresAt: 9,
-      },
-    });
-    expect(row).toEqual({
-      executionId: "e",
-      startedAt: 1_000,
-      toolName: "github.delete_repo",
-      reason: "requires approval",
-      expiresAt: 9,
-    });
-    expect(row && "callId" in row).toBe(false);
-  });
-
-  it("INVARIANT §5.5: a stored pause that is not an object (the JSON literal null) still lists as a recovery row the operator can decide", () => {
-    // Hydration yields JS null for `paused_on = 'null'`; reading `.callId`
-    // off it would throw and take the whole list request down. The row is
-    // shown with stand-ins so the execution id is discoverable.
-    const row = pausedToListRow({
-      ...base,
-      status: "paused",
-      pausedOn: null as unknown as NonNullable<Execution["pausedOn"]>,
+      pausedOn: pausedOn as unknown as NonNullable<Execution["pausedOn"]>,
     });
     expect(row).toEqual({
       executionId: "e",

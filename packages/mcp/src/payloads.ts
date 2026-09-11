@@ -7,6 +7,7 @@ import type {
   PendingApproval,
   ResumeOutcome,
 } from "@conduithq/sdk";
+import { isPendingApproval } from "@conduithq/sdk";
 import type { ProvisionPayload } from "./daemon/provision.js";
 import type { RpcRequest } from "./daemon/rpc.js";
 
@@ -221,31 +222,33 @@ export type RpcPayloadFor<K extends RpcRequest["kind"]> = K extends "catalog.lis
  * this is defensive — but dropping such a row silently would tell an operator
  * that nothing awaits them, so the caller logs it rather than swallowing it.
  */
-export function pausedToListRow(execution: Execution): PausedListRow | undefined {
-  const raw: unknown = execution.pausedOn;
-  if (raw === undefined) return undefined;
-  // The hydrator casts `paused_on` without validating it, and the store's
-  // claim admits any corrupt pause so the manager can terminalize it (sdk
-  // store/sqlite.ts claimForResume). The list must still SHOW such a row:
-  // an operator can only decide an execution they can see. So every field
-  // is type-checked here and a corrupt one gets a stable stand-in — the
-  // call id ABSENT (the CLI renders `-`; deciding with any id terminalizes
-  // the row), a placeholder tool name and reason — rather than a value the
-  // client's row validator would refuse, taking the whole queue down with
-  // it. A root that is not an object (the JSON literal `null`) is the same
-  // case with every field missing.
-  const fields = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
-  const { callId, toolName, reason, expiresAt } = fields;
+export function pausedToListRow(execution: Execution): PausedListRow {
+  const pausedOn: unknown = execution.pausedOn;
+  // The store hydrates `paused_on` without validating it, and the resume
+  // claim admits any corrupt pause so the manager can terminalize it. The
+  // list must still SHOW such a row: an operator can only decide an
+  // execution they can see. "Corrupt" is decided by the ONE validator the
+  // manager also uses (`isPendingApproval`, sdk types.ts) — never by a
+  // per-field check here that could disagree with it. A corrupt pause
+  // (absent, not an object, a bad or blank call id, a bad field) becomes a
+  // RECOVERY ROW: call id absent (the CLI renders `-`; deciding with any
+  // id terminalizes the row), placeholder tool name and reason, expiry 0.
+  if (!isPendingApproval(pausedOn)) {
+    return {
+      executionId: execution.id,
+      startedAt: execution.startedAt,
+      toolName: "(unreadable pause)",
+      reason: "stored pause is corrupt; deciding it with any call id terminalizes it",
+      expiresAt: 0,
+    };
+  }
   return {
     executionId: execution.id,
-    ...(typeof callId === "string" ? { callId } : {}),
+    callId: pausedOn.callId,
     startedAt: execution.startedAt,
-    toolName: typeof toolName === "string" ? toolName : "(unreadable pause)",
-    reason:
-      typeof reason === "string"
-        ? reason
-        : "stored pause is corrupt; deciding it with any call id terminalizes it",
-    expiresAt: typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : 0,
+    toolName: pausedOn.toolName,
+    reason: pausedOn.reason,
+    expiresAt: pausedOn.expiresAt,
   };
 }
 

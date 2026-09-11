@@ -340,6 +340,19 @@ describe("SqliteStore", () => {
       ).resolves.toBe(true);
     });
 
+    it("INVARIANT §5.5: listPaused never lets one unparseable row hide the queue — it is returned without pausedOn, alongside the readable rows", async () => {
+      await client.executeMultiple(`
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_bad', '', 'paused', '{}', 'not json', 5);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('lp_ok', '', 'paused', '{}', '{"callId":"c","toolName":"t","input":{},"reason":"r","expiresAt":9}', 6);
+      `);
+      const rows = await store.executions.listPaused();
+      const ids = rows.filter((r) => r.id.startsWith("lp_")).map((r) => [r.id, r.pausedOn?.callId]);
+      expect(ids).toEqual([
+        ["lp_bad", undefined],
+        ["lp_ok", "c"],
+      ]);
+    });
+
     it("failClaimedResume is a no-op for a row this caller never claimed (the claim lost)", async () => {
       await store.executions.put({
         id: "e5",

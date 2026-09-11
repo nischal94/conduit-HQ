@@ -550,7 +550,28 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         const rs = await client.execute(
           "SELECT * FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC",
         );
-        return rs.rows.map((row) => hydrateExecutionRow(row, text(row, "id")));
+        // One row whose JSON will not parse must not hide the whole queue:
+        // the resume claim admits such a pause so an operator can
+        // terminalize it, and they can only do that if they can SEE its id.
+        // A row that fails hydration is returned with no `pausedOn` (the
+        // list projection renders it as a recovery row) and logged here.
+        return rs.rows.map((row) => {
+          const id = text(row, "id");
+          try {
+            return hydrateExecutionRow(row, id);
+          } catch (cause) {
+            log(
+              `[SqliteStore] listPaused: row failed to hydrate; listed as an unreadable pause. Context: { id: ${JSON.stringify(id)}, cause: ${String(cause)} }`,
+            );
+            return {
+              id,
+              code: "",
+              status: "paused",
+              seeds: { now: 0, random: 0 },
+              startedAt: maybeInteger(row, "started_at") ?? 0,
+            };
+          }
+        });
       },
       async listRunningIds(): Promise<string[]> {
         // Ids only, never hydrated: the crash-terminal sweep's whole job
