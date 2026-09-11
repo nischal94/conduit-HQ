@@ -31,7 +31,28 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~12:30 (threat-model pass DONE → **PR #59 MERGED `cce91ae`**, founder passed the quiz and named the merge; squash tree verified equal to the branch tip; branch deleted local + remote; branches = main only · #57 R1 spec still rev 10; NEXT: rev 11)
+## Current handoff — updated 2026-09-11 ~12:50 (interim: **R1 spec rev 11 PUSHED `85a9df7`** on `docs/r1-design-spec` / PR #57; codex pass #6 in flight; PR #59 MERGED `cce91ae`; branches = main + docs/r1-design-spec)
+
+**Interim (12:50, mid-session — the section below it is the 12:30 state
+and still accurate):** rev 11 folded every NEXT-item-2 bullet
+(§3.1 new, §4.1 one validator, §4.1a INSERT trigger + three pins + N+1,
+§5.3 operator-passes-the-id + display contract, §5.4 claim-admits +
+step-2 guard + disposition table, §6 row, §9.1 #46/#49 shipped, #47
+extended, #50 new, tasks T9/T9b done, T10 extended, T11 new, T2 open,
+§12 codex #5 + PR #59 runs). **Deviation:** `provisionSource`'s explicit
+ledger insert was REMOVED (double bump once the INSERT trigger exists;
+triggers fire in the same transaction) — one-line reversal if the
+founder wants it kept. **Codex #6** (`gpt-5.6-sol` high; trigger:
+authorization boundary + convergence verdict) launched 12:47 against
+`85a9df7`, prompt told it to read #58/#59 code via `git show main:…`;
+result not yet recorded — if this section is still "interim" when you
+read it, the session ended before the verdict: re-run pass #6 per
+`~/.claude/rules/codex-one-path.md` and record it in spec §12.
+**PENDING, need the founder's word (asked in chat, not yet answered):**
+(a) `gh pr edit 57 --title` → rev 11 wording; (b) `gh pr update-branch 57`
++ `git pull --ff-only` — the branch trails main by 11 commits
+(non-ff merge on the remote branch; one CI cycle, LEARNINGS #17) —
+do it after codex #6 reports, before the founder read.
 
 **Merge record (12:20):** `gh pr update-branch 59` was needed first (the
 docs push had moved main); CI green; squash `cce91ae`, tree identical to
