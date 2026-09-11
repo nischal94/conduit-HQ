@@ -2478,6 +2478,64 @@ looked like a logic bug. **Lesson: any sdk or mcp source change needs a
 `tsup` rebuild before mcp/cli tests mean anything; the tell is a test
 failing on behaviour the source visibly no longer has.**
 
+## 2026-09-11 — the instance-binding threat-model pass and PR #59
+
+### 16. "Two definitions are one set" is a claim to grep, not to write
+
+The first commit of #59 asserted that the store and the wire decoder
+shared one definition of "blank"; the CLI still used the Unicode-aware
+`trim()`, and the manager relied on the decoder alone for "the argument
+is a string". Both were caught by reviewers within the hour. **Lesson:
+when a fix asserts N sites agree on a value, grep for every site that
+reads that value before writing "identical" — the count in the comment
+is a testable claim, and the test is `grep`.**
+
+### 17. A subagent with write tools is a writer — treat the tree as dirty while it runs
+
+The simplifier ran `git stash push` on uncommitted work to get a test
+baseline; a reviewer's mutation testing changed a source file between
+my Read and my Edit. Neither lost anything, but one needed a
+confirmation-tier `git stash pop` from the founder's own hand and the
+other nearly produced a false diagnosis. **Lesson: while any subagent
+that holds write tools is running, a Read of the working tree is not
+evidence — check `git status` and `git diff HEAD` first; and a
+subagent brief that needs a baseline must say how to get one (a
+worktree or a copy), never leave it to improvise a git operation.**
+
+### 18. When two review passes return the same class, the second fold must change the shape
+
+Codex passes 2 and 3 on #59 each found "the manager and the list
+disagree on what corrupt means" in a new instance (a valid id beside a
+bad field; an unparseable root; a blank id; duplicate keys). Folding
+instances produced the next instance. The pass that converged was the
+one that replaced per-field checks with one validator and one identity
+(`isPendingApproval`; "the listed id is the id the claim accepts";
+`claimCallId`). **Lesson: the adversarial-convergence rule's
+"canonicalize-then-check" applies inside one PR too — a second finding
+of the same class is the signal to stop adding conditions and name the
+single source of truth the conditions were approximating.**
+
+### 19. Two parsers, one blob: the identity you compare is the identity you must decide on
+
+SQLite's `json_extract` keeps the first of duplicate JSON keys;
+`JSON.parse` keeps the last. A row the claim admitted through its
+corrupt arm hydrated to a value that passed the manager's strict check,
+and the call would have run. **Lesson: when a compare-and-swap decides
+on a value read by one parser and the post-claim logic reads the same
+bytes with another, the post-claim logic must re-read the CAS's own
+view of the value — never trust that two parsers agree on adversarial
+bytes.**
+
+### 20. Parallel Bash calls share one working directory
+
+Three times in one session a `cd` in one parallel call moved the cwd
+for the next: the wrong package's dist was built, a typecheck ran where
+no `tsc` existed, and a test run matched no files and printed nothing —
+each read as success until a timestamp or an empty output exposed it.
+**Lesson: every segment of a chained or parallel shell command starts
+with an absolute `cd`; an empty test summary is "not run", never
+"passed".**
+
 ### 16. Convergence is reached by adjudication, not by a zero
 
 Five codex passes on one small PR: each later pass found something

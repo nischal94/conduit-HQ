@@ -31,7 +31,130 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-06 ~06:30 (PR #58 MERGED `4c75b05`, founder-named, six review rounds, codex converged; branches = main only · #57 R1 spec rev 10 OPEN, loop PAUSED by rule; NEXT: instance-binding threat-model pass for R1)
+## Current handoff — updated 2026-09-11 ~12:00 (threat-model pass DONE → PR #59 OPEN at `aed9825`, 7 commits, codex ×5 CONVERGED, explainer published, merge waits on the founder's quiz + word · #57 R1 spec still rev 10; NEXT: merge #59 on the founder's word, then rev 11)
+
+**WHAT HAPPENED (2026-09-11, 00:45 → 12:00):** the instance-binding
+threat-model pass the previous handoff named. (1) `/blindspot` codebase
+mode → eight cards (artifact "Instance Binding Blindspots", 2026-09-11):
+the binding has a claim-time half (CAS + post-claim checks) and a
+live-resolution half (D10, adjudicated); version skew is a warning and
+the schema has no version gate; the CAS admitted absent but not
+present-but-unmatchable call ids; the operator binds to what was
+PAUSED, not shown; the trigger floor covers only today's statements;
+namespace agreement rests on the name grammar; replayed discovery is
+D4 by design; `serve` can read call ids, only `approvals` can spend
+them. (2) **codex #5 threat-model pass** (gpt-5.6-sol high, trigger:
+authorization boundary): 3 P0 / 1 P1 / 1 P2, not converged — founder
+adjudicated: P0-1 (a pre-R1 daemon resuming against an R1 database)
+**OUT OF SCOPE via "nothing is published"** (npm 404) + a standing rule
+for R3+: any schema-semantic change on the pause path ships a
+DB-enforced writer floor, never a stderr warning; P0-2 (tool name ↔
+namespace agreement rests on the grammar; `direct_call` ↔ `pausedOn`
+equality) → fold into rev 11 as a post-claim read-side guard; P0-3
+(no `AFTER INSERT ON sources` trigger; remove + standalone re-add
+resurrects generation 0 — no production caller today, `sources.upsert`
+is a test seed) → add the INSERT trigger + pins in rev 11; **P1
+(present-but-malformed callId strands the row — shipped code) → its
+own fix PR, precedent #46→#58**; P2 (downgrade terminalizes a pending
+approval) accepted, record. Display correction: the CLI drops `reason`
+from the list. Spec correction: provisioning creates N+1 ledger rows,
+not one. T2 (`request_keys`) is NOT on main — only its text fix is
+done; T9 shipped in #58.
+
+**PR #59 (`fix/cas-malformed-callid`, OPEN at `aed9825`, 7 commits, CI
+green on every push through `aed9825`):** the
+§5.5 liveness half. The CAS admits any callId the wire could never
+carry (`json_type … IS NOT 'text'`; ASCII-blank `trim`); ONE blank set
+at four gates (CLI, decoder, manager entry, SQL) — `NOT_NAMEABLE_CALL_ID`
+in sdk `types.ts`; ONE validator `isPendingApproval` shared by the
+manager (post-claim, pre-stage) and the `approvals.list` projection;
+every corrupt pause lists as a RECOVERY row carrying the id the claim
+accepts (nameable kept, un-nameable absent → `-`); `listPaused` never
+throws on one row and advertises the SQL-extracted id; the manager
+also requires `claimCallId` (the identity the CAS compared, text only)
+to equal the operator's argument — SQLite keeps the FIRST duplicate
+JSON key, `JSON.parse` the LAST; `corruptPause` host-side flag drives
+the daemon log. **Gauntlet:** pr-review-toolkit ×5 (code, tests,
+comments, silent-failure, simplifier) · `/security-review` no findings
+· Aikido clean (excerpts) · `/code-review` 5 agents (all folded) ·
+Greptile (1 live finding, folded in `aed9825`) · **codex ×5 → CONVERGED
+on `9cf3e6e`** (1: 0/2/2 → 2: 0/2/1 same class → shape fix → 3: 0/2/2 →
+4: 0/1/1 → 5: none). Accepted (class a): CLI option parser intercepting
+a corrupt `--` id; unparseable JSON terminalizes via the pinned I-3
+catch without `corruptPause`; the redundant `IS NULL` arm. Explainer
+"The Un-nameable Call Id" published 2026-09-11; **the founder has NOT
+yet taken the quiz.** INVARIANTS §5.5 row carries the liveness half.
+
+**Incident (honest):** the simplifier subagent ran `git stash push` on
+the uncommitted fold to get a test baseline — a destructive-tier git op
+without confirmation; nothing lost, the founder ran `git stash pop`
+by hand. LEARNINGS #17. Also: a reviewer's mutation testing changed a
+file mid-read; three parallel-Bash cwd drifts built the wrong package
+or ran no tests (caught by timestamps / empty output each time).
+
+### NEXT
+
+1. **Merge #59** — only on the founder's word after a full quiz pass;
+   confirm `aed9825`'s CI run is green first (`gh pr checks 59`); squash
+   tree must equal the branch; delete the branch local + remote; mark
+   the merge in the spec's row (see 2).
+2. **R1 rev 11** on `docs/r1-design-spec` (PR #57) — fold: §3 gains the
+   instance-binding subsection (three writer versions; the
+   "nothing published" adjudication + the R3+ writer-floor rule); §4.1a
+   adds `AFTER INSERT ON sources`, corrects "one row per provision" to
+   N+1, pins zero-tool revalidate / retarget / trigger survival; §5.4
+   step 2 gains the namespace-agreement guard and `direct_call` ↔
+   `pausedOn` equality, and states the malformed-field disposition per
+   field (absent/malformed → claim then terminalize); §5.3 amends to
+   "the operator passes the call id"; row #46 SHIPPED via `4c75b05`,
+   new row for #59's liveness half (shipped via its merge sha); the
+   display contract (list shows executionId, callId, toolName, expiry —
+   `reason` is on the wire but the CLI drops it); §12 trail records
+   codex #5 (model/effort/trigger/counts) and PR #59's five runs; T9
+   done, T2 open. Then **codex #6 confirming** (Sol high) → founder read
+   → writing-plans.
+3. **R3 note (unchanged):** the SDK store interface changed shape in #58
+   and again in #59 (`claimCallId`); the first published version
+   records it.
+
+**Session quirks worth inheriting:** everything from 2026-09-06, plus:
+`npx` is blocked by the install guard — run `./node_modules/.bin/<bin>`
+· sdk manager/cli real-runtime suites need the unsandboxed path
+(`listen EPERM 127.0.0.1`) · the pre-commit hook needs it too (`mktemp`
+in `/var/folders`) · **parallel Bash calls share one cwd — a `cd` in one
+call moves the next; use absolute `cd` in every segment** (bit three
+times) · reviewer subagents with write tools may mutate or stash the
+tree mid-run — `git status`/`git diff HEAD` before trusting a Read ·
+codex stderr "SecItemCopyMatching failed -50" is keychain noise, not a
+failure · CI `client.test.ts` auto-start flake ("rotation-in-progress")
+recurred; `gh run rerun <id> --failed` once.
+
+**DEFERRED (live list, updated 2026-09-11):** carry the 2026-09-06 list,
+plus: recovery rows render `EXPIRED` (expiresAt 0) — display accuracy ·
+`NOT_NAMEABLE_CALL_ID` literal duplicated in mcp/cli (could import from
+sdk) · the prep-window catch's stored reason is a bare `String(cause)`
+(error-format) · a daemon-side test for the two recovery-row log lines
+· `/code-review`'s eligibility haiku contradicted its own answers
+(answers all "No" → it said NOT ELIGIBLE) — trust the answers.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #59 is
+> the OPEN fix PR at `aed9825`; #57 is the OPEN draft spec PR at rev 10).
+> **State: PR #59 is review-complete (codex ×5 converged, all reviewers
+> folded, explainer published); it merges ONLY on the founder's word
+> after a full quiz pass. Do NOT re-review #59 or reopen its accepted
+> exceptions.** If the founder names the merge: check CI on `aed9825`,
+> merge, verify the squash tree, delete the branch. Then R1 rev 11 per
+> NEXT item 2 (fold the threat-model adjudications, §5.3 amendment, rows
+> #46/#59, T9 done / T2 open) → codex #6 confirming → founder read →
+> writing-plans. Carry the DEFERRED list.
+---
+
+## Superseded handoff — updated 2026-09-06 ~06:30 (PR #58 MERGED `4c75b05`, founder-named, six review rounds, codex converged; branches = main only · #57 R1 spec rev 10 OPEN, loop PAUSED by rule; its NEXT [threat-model pass] was DONE 2026-09-11 by the section above)
 
 **WHAT HAPPENED (2026-09-06, 00:30 → 06:30):** the approval-rebinding
 defect (R1 spec row #46; live in shipped Code Mode) shipped as its own
