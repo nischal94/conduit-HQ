@@ -1045,14 +1045,12 @@ async function handleRequest(
             { kind: request.decision },
             request.callId,
           );
-          if (
-            outcome.status === "failed" &&
-            !outcome.decisionApplied &&
-            outcome.error.name === "ConduitInternalError"
-          ) {
+          if (outcome.status === "failed" && outcome.corruptPause === true) {
             // The row left the operator's queue without its decision
             // applying. The RPC answer says so to THIS caller; the log is
             // what an operator reads later, asking where an execution went.
+            // Keyed on the manager's host-side flag, never on `error.name`,
+            // which a guest can forge into any ordinary failure.
             log(
               `[conduitd] Resume failed: terminalized a corrupt pause, the pending call did not run. Context: {executionId: ${request.executionId}, callId: ${JSON.stringify(request.callId)}, reason: ${JSON.stringify(outcome.error.message)}}`,
             );

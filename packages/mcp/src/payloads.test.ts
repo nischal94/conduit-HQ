@@ -1,4 +1,4 @@
-import { buildExecuteTool, type ExecutionOutcome } from "@conduithq/sdk";
+import { buildExecuteTool, type Execution, type ExecutionOutcome } from "@conduithq/sdk";
 import { describe, expect, it } from "vitest";
 import {
   CHECK_BODY_STATUSES,
@@ -281,6 +281,24 @@ describe("pausedToListRow (the approvals.list projection)", () => {
       expiresAt: 9,
     });
     expect(row && "callId" in row).toBe(false);
+  });
+
+  it("INVARIANT §5.5: a stored pause that is not an object (the JSON literal null) still lists as a recovery row the operator can decide", () => {
+    // Hydration yields JS null for `paused_on = 'null'`; reading `.callId`
+    // off it would throw and take the whole list request down. The row is
+    // shown with stand-ins so the execution id is discoverable.
+    const row = pausedToListRow({
+      ...base,
+      status: "paused",
+      pausedOn: null as unknown as NonNullable<Execution["pausedOn"]>,
+    });
+    expect(row).toEqual({
+      executionId: "e",
+      startedAt: 1_000,
+      toolName: "(unreadable pause)",
+      reason: "stored pause is corrupt; deciding it with any call id terminalizes it",
+      expiresAt: 0,
+    });
   });
 });
 

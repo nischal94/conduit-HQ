@@ -87,7 +87,17 @@ export type ExecutionOutcome =
  * never on the outcome's error name — error names are guest-reachable and
  * therefore spoofable; consumption is recorded host-side by the invoker.
  */
-export type ResumeOutcome = ExecutionOutcome & { decisionApplied: boolean };
+export type ResumeOutcome = ExecutionOutcome & {
+  decisionApplied: boolean;
+  /**
+   * Set ONLY by the manager's corrupt-state branches: the claimed row had no
+   * pending call an operator could have named, so it was terminalized
+   * `failed` without staging a decision. Host-side truth, like
+   * `decisionApplied` — a caller that logs or reports "corrupt pause" must
+   * key on this, never on `error.name`, which a guest can forge.
+   */
+  corruptPause?: true;
+};
 
 /**
  * The wiring the manager composes. The manager depends on the `ConduitStore`,
@@ -772,6 +782,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               message: `[ExecutionManager] Resumed execution has no pending approval. Context: { executionId: ${executionId} }`,
             },
             decisionApplied: false,
+            corruptPause: true,
           };
         }
         // The hydrator casts `paused_on` without validating it, and the
@@ -797,6 +808,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               message: `[ExecutionManager] Resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run. Context: { executionId: ${executionId} }`,
             },
             decisionApplied: false,
+            corruptPause: true,
           };
         }
         const pausedOn = execution.pausedOn;

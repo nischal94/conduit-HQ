@@ -1173,6 +1173,8 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       expect(outcome.error.message).toContain("did not run");
     }
     expect(outcome.decisionApplied).toBe(false);
+    // Host-side discriminator the daemon log keys on — never the error name.
+    expect(outcome.corruptPause).toBe(true);
     const after = await client.execute({
       sql: "SELECT status, paused_on, error FROM executions WHERE id = ?",
       args: [id],

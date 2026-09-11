@@ -222,21 +222,30 @@ export type RpcPayloadFor<K extends RpcRequest["kind"]> = K extends "catalog.lis
  * that nothing awaits them, so the caller logs it rather than swallowing it.
  */
 export function pausedToListRow(execution: Execution): PausedListRow | undefined {
-  const pausedOn = execution.pausedOn;
-  if (pausedOn === undefined) return undefined;
-  // A stored callId that is not text is corruption the store's claim admits
-  // so the manager can terminalize it (sdk store/sqlite.ts claimForResume).
-  // Ship it ABSENT — the CLI renders `-` — rather than as a non-string the
+  const raw: unknown = execution.pausedOn;
+  if (raw === undefined) return undefined;
+  // The hydrator casts `paused_on` without validating it, and the store's
+  // claim admits any corrupt pause so the manager can terminalize it (sdk
+  // store/sqlite.ts claimForResume). The list must still SHOW such a row:
+  // an operator can only decide an execution they can see. So every field
+  // is type-checked here and a corrupt one gets a stable stand-in — the
+  // call id ABSENT (the CLI renders `-`; deciding with any id terminalizes
+  // the row), a placeholder tool name and reason — rather than a value the
   // client's row validator would refuse, taking the whole queue down with
-  // it. The operator can still decide the row with any call id.
-  const callId: unknown = pausedOn.callId;
+  // it. A root that is not an object (the JSON literal `null`) is the same
+  // case with every field missing.
+  const fields = (typeof raw === "object" && raw !== null ? raw : {}) as Record<string, unknown>;
+  const { callId, toolName, reason, expiresAt } = fields;
   return {
     executionId: execution.id,
     ...(typeof callId === "string" ? { callId } : {}),
     startedAt: execution.startedAt,
-    toolName: pausedOn.toolName,
-    reason: pausedOn.reason,
-    expiresAt: pausedOn.expiresAt,
+    toolName: typeof toolName === "string" ? toolName : "(unreadable pause)",
+    reason:
+      typeof reason === "string"
+        ? reason
+        : "stored pause is corrupt; deciding it with any call id terminalizes it",
+    expiresAt: typeof expiresAt === "number" && Number.isFinite(expiresAt) ? expiresAt : 0,
   };
 }
 
