@@ -81,11 +81,14 @@ T1 is moot; T9/T9b shipped (#58/#59); T2, T3, T10, T11, T12 open.
    artifact, alpha install notes, and one demonstrable governance
    property in the first run (approve → exact call once; deny →
    nothing ran). Plan it after Lane A lands. Then a **three-week alpha
-   window with a default**: no adopter needs profiles → public R3 with
-   Code Mode only, Lanes B/C wait for a named pull; adopter needs
-   profiles → B and C before public R3. Reversal trigger: an adopter
-   committing to Code Mode without profiles but needing npm → skip the
-   alpha, public R3 straight after Lane A. Not in the minimum: trace
+   window, counted from the day the R3a artifact is first given to
+   someone outside the repo, with a default**: no adopter needs
+   profiles → public R3 with Code Mode only, Lanes B/C wait for a named
+   pull; adopter needs profiles → B and C before public R3. Reversal
+   trigger: an adopter committing to Code Mode without profiles but
+   needing npm → R3a is still built (it IS the release), only the
+   three-week wait is skipped; public R3 follows R3a directly. Not in
+   the minimum: trace
    viewer, GraphQL, cloud, desktop, SSO. (Basis: executor.sh
    competitive read + codex second opinion, 2026-09-11; the decision
    text is in conduitspec §18.)

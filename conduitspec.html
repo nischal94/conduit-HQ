@@ -1028,10 +1028,12 @@ R1 spec&#39;s §3.1 writer-floor rule makes such changes cheap only before a fir
 preview packaging:</strong> a versioned, packed artifact with alpha install notes and ONE governance property
 demonstrable in the first-run path (approve → the exact approved call runs once; deny → nothing ran) — not a
 public npm release; full R3 (lifecycle, install/upgrade/recovery guidance, docs) is unchanged. <strong>Alpha
-window: three weeks, with a default outcome</strong> — if no adopter needs per-client profiles by then, public
-R3 ships Code Mode only and Lanes B/C wait for a named pull; if an adopter needs profiles, Lanes B and C land
-before public R3. <strong>Reversal trigger:</strong> a qualified adopter committing to Code Mode without
-profiles but requiring npm install → skip the alpha, public R3 directly after Lane A. Not in the minimum:
+window: three weeks from the day the R3a artifact is first distributed to someone outside the repo, with a
+default outcome</strong> — if no adopter needs per-client profiles by then, public R3 ships Code Mode only and
+Lanes B/C wait for a named pull; if an adopter needs profiles, Lanes B and C land before public R3.
+<strong>Reversal trigger:</strong> a qualified adopter committing to Code Mode without profiles but requiring
+npm install → the R3a packaging and its governance demonstration are still built (they are the release), but
+the three-week wait is skipped: public R3 follows R3a directly. Not in the minimum:
 trace viewer, GraphQL, cloud, desktop, SSO. Basis: a competitive read of executor.sh (same code-mode gateway
 thesis, published and priced, code-mode only, per-tool allow/approve/block policy, no published
 approval-binding, replay, egress, or invariant story) and a codex cross-model review (<code>gpt-5.6-sol</code>,
