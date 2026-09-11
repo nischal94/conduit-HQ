@@ -256,6 +256,32 @@ describe("pausedToListRow (the approvals.list projection)", () => {
   it("returns undefined for a corrupt paused row with no pausedOn (caller logs, never silently drops)", () => {
     expect(pausedToListRow({ ...base, status: "paused" })).toBeUndefined();
   });
+
+  it("INVARIANT §5.5: a stored callId that is not text is shipped ABSENT, so one corrupt row cannot hide the whole queue", () => {
+    // The client's row validator refuses a non-string callId for the entire
+    // answer. Absent is a shape it accepts (older daemons omit the field),
+    // the CLI renders it `-`, and the operator can still decide the row —
+    // any call id terminalizes it (sqlite.ts claimForResume).
+    const row = pausedToListRow({
+      ...base,
+      status: "paused",
+      pausedOn: {
+        callId: 123 as unknown as string,
+        toolName: "github.delete_repo",
+        input: {},
+        reason: "requires approval",
+        expiresAt: 9,
+      },
+    });
+    expect(row).toEqual({
+      executionId: "e",
+      startedAt: 1_000,
+      toolName: "github.delete_repo",
+      reason: "requires approval",
+      expiresAt: 9,
+    });
+    expect(row && "callId" in row).toBe(false);
+  });
 });
 
 /**

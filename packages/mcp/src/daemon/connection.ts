@@ -1004,6 +1004,14 @@ async function handleRequest(
           );
           continue;
         }
+        if (row.callId === undefined) {
+          // The row is still listed, with `-` for the call id, so the
+          // operator can see it and decide it — any call id terminalizes
+          // it. The log is where they learn why the column is empty.
+          log(
+            `[conduitd] Listing paused execution: stored call id is not text, listed as '-'; deciding it with any call id terminalizes it. Context: {executionId: ${execution.id}}`,
+          );
+        }
         rows.push(row);
       }
       sendResult(ctx, requestId, rows, log);
@@ -1032,9 +1040,24 @@ async function handleRequest(
           // `pending.input`, and the projection also pins `decisionApplied`
           // as a deliberate wire field rather than an incidental one — the
           // CLI's verb reporting is unimplementable without it.
-          return resumeToPayload(
-            await manager.resume(request.executionId, { kind: request.decision }, request.callId),
+          const outcome = await manager.resume(
+            request.executionId,
+            { kind: request.decision },
+            request.callId,
           );
+          if (
+            outcome.status === "failed" &&
+            !outcome.decisionApplied &&
+            outcome.error.name === "ConduitInternalError"
+          ) {
+            // The row left the operator's queue without its decision
+            // applying. The RPC answer says so to THIS caller; the log is
+            // what an operator reads later, asking where an execution went.
+            log(
+              `[conduitd] Resume failed: terminalized a corrupt pause, the pending call did not run. Context: {executionId: ${request.executionId}, callId: ${JSON.stringify(request.callId)}, reason: ${JSON.stringify(outcome.error.message)}}`,
+            );
+          }
+          return resumeToPayload(outcome);
         },
         deps,
       );

@@ -20,7 +20,11 @@ import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
 import type { Execution } from "../types.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
-import { createExecutionManager, type ExecutionManagerDeps } from "./manager.js";
+import {
+  createExecutionManager,
+  type ExecutionManager,
+  type ExecutionManagerDeps,
+} from "./manager.js";
 
 /**
  * The callId a resume must name (spec §5.5: an approval binds to ONE pending
@@ -1093,83 +1097,121 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(retry.status).toBe("conflict");
   });
 
-  it("INVARIANT §5.5: a pause whose STORED callId is a JSON number is claimed through the real SQL and terminalized `failed` (corrupt state), never stranded `paused`", async () => {
-    // A number can never equal the text the decoder admits, so no operator
-    // can name this call; the claim must still win so the corrupt-state
-    // branch below can terminalize it instead of leaving it listed forever.
-    const scratch = mkdtempSync(join(tmpdir(), "conduit-numcallid-"));
-    const client = createClient({ url: `file:${join(scratch, "numcallid.db")}` });
+  /**
+   * A `paused` row seeded through raw SQL against the same client the store
+   * uses: `put` cannot write a malformed `pausedOn`, and a mocked `get` would
+   * not exercise the claim's own corruption allowance — the thing under test.
+   * The sandbox rejects, so any resume that runs the pending call fails loudly.
+   */
+  async function seedPausedRow(
+    label: string,
+    pausedOnJson: string,
+  ): Promise<{ client: ReturnType<typeof createClient>; manager: ExecutionManager; id: string }> {
+    const scratch = mkdtempSync(join(tmpdir(), `conduit-${label}-`));
+    const client = createClient({ url: `file:${join(scratch, `${label}.db`)}` });
     bareClients.push(client);
     const store = await openSqliteStore({
       client,
       secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
     });
-    const id = "exec_numcallid";
+    const id = `exec_${label}`;
     await client.execute({
       sql: `INSERT INTO executions (id, code, status, seeds, paused_on, started_at)
             VALUES (?, 'return 1;', 'paused', '{"now":1,"random":2}', ?, ?)`,
-      args: [
-        id,
-        JSON.stringify({
-          callId: 123,
-          toolName: "github.create_issue",
-          input: {},
-          reason: "r",
-          expiresAt: Date.now() + 3_600_000,
-        }),
-        Date.now(),
-      ],
+      args: [id, pausedOnJson, Date.now()],
     });
     const neverSandbox: Sandbox = {
       execute: () => Promise.reject(new Error("sandbox must not run for a corrupt pause")),
     };
-    const manager = createExecutionManager(makeStubDeps(store, neverSandbox));
+    return { client, manager: createExecutionManager(makeStubDeps(store, neverSandbox)), id };
+  }
 
-    const outcome = await manager.resume(id, { kind: "approve" }, "123");
+  it.each([
+    {
+      shape: "a JSON number",
+      pausedOnJson: JSON.stringify({
+        callId: 123,
+        toolName: "t",
+        input: {},
+        reason: "r",
+        expiresAt: 9e12,
+      }),
+      operatorArg: "123",
+    },
+    {
+      shape: "a blank string",
+      pausedOnJson: JSON.stringify({
+        callId: " \t",
+        toolName: "t",
+        input: {},
+        reason: "r",
+        expiresAt: 9e12,
+      }),
+      operatorArg: "x",
+    },
+    {
+      shape: "the JSON literal null (no object at all)",
+      pausedOnJson: "null",
+      operatorArg: "x",
+    },
+  ])("INVARIANT §5.5: a pause whose STORED callId is $shape is claimed through the real SQL and terminalized `failed` (corrupt state), never stranded `paused`", async ({
+    pausedOnJson,
+    operatorArg,
+  }) => {
+    // None of these can equal the text the decoder admits, so no operator
+    // can name the call; the claim must still win so the corrupt-state
+    // branch can terminalize it instead of leaving it listed forever. The
+    // `null` literal hydrates to JS null, not undefined — it must be
+    // caught by the shape check, not by a property read that throws.
+    const { client, manager, id } = await seedPausedRow("badcallid", pausedOnJson);
+
+    const outcome = await manager.resume(id, { kind: "approve" }, operatorArg);
     expect(outcome.status).toBe("failed");
     if (outcome.status === "failed") {
       expect(outcome.error.name).toBe("ConduitInternalError");
-      expect(outcome.error.message).toContain("call id");
+      expect(outcome.error.message).toContain("corrupt state");
+      expect(outcome.error.message).toContain("did not run");
     }
     expect(outcome.decisionApplied).toBe(false);
     const after = await client.execute({
-      sql: "SELECT status, paused_on FROM executions WHERE id = ?",
+      sql: "SELECT status, paused_on, error FROM executions WHERE id = ?",
       args: [id],
     });
     expect(after.rows[0]?.status).toBe("failed");
     expect(after.rows[0]?.paused_on).toBeNull();
+    expect(String(after.rows[0]?.error)).toContain("corrupt state");
+  });
+
+  it("INVARIANT §5.5: resume refuses a callId that is not a non-blank string BEFORE the claim — no row is touched", async () => {
+    // Public SDK entrypoint: an embedder bypasses the wire decoder. A bound
+    // number could equal a stored numeric callId in the claim's SQL and
+    // then pass the manager's strict-equality check — so refuse first.
+    const { client, manager, id } = await seedPausedRow(
+      "badarg",
+      JSON.stringify({ callId: 123, toolName: "t", input: {}, reason: "r", expiresAt: 9e12 }),
+    );
+    for (const bad of [123, " \t\n", ""] as unknown[]) {
+      await expect(manager.resume(id, { kind: "approve" }, bad as string)).rejects.toThrow(
+        /non-blank string/,
+      );
+    }
+    const after = await client.execute({
+      sql: "SELECT status FROM executions WHERE id = ?",
+      args: [id],
+    });
+    expect(after.rows[0]?.status).toBe("paused");
   });
 
   it("INVARIANT §5.5: a pause whose STORED JSON carries no callId is claimed through the real SQL and terminalized `failed` (corrupt state), never stranded `paused` or approved", async () => {
-    // Raw SQL against the same client the store uses: `put` cannot write a
-    // pausedOn without a callId, and a mocked `get` would not exercise the
-    // claim's own corruption allowance — which is the thing under test.
-    const scratch = mkdtempSync(join(tmpdir(), "conduit-nocallid-"));
-    const client = createClient({ url: `file:${join(scratch, "nocallid.db")}` });
-    bareClients.push(client);
-    const store = await openSqliteStore({
-      client,
-      secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
-    });
-    const id = "exec_nocallid";
-    await client.execute({
-      sql: `INSERT INTO executions (id, code, status, seeds, paused_on, started_at)
-            VALUES (?, 'return 1;', 'paused', '{"now":1,"random":2}', ?, ?)`,
-      args: [
-        id,
-        JSON.stringify({
-          toolName: "github.create_issue",
-          input: {},
-          reason: "r",
-          expiresAt: Date.now() + 3_600_000,
-        }),
-        Date.now(),
-      ],
-    });
-    const neverSandbox: Sandbox = {
-      execute: () => Promise.reject(new Error("sandbox must not run for a corrupt pause")),
-    };
-    const manager = createExecutionManager(makeStubDeps(store, neverSandbox));
+    const { client, manager, id } = await seedPausedRow(
+      "nocallid",
+      JSON.stringify({
+        toolName: "github.create_issue",
+        input: {},
+        reason: "r",
+        expiresAt: Date.now() + 3_600_000,
+      }),
+    );
 
     const outcome = await manager.resume(id, { kind: "approve" }, "any-id-the-operator-typed");
     expect(outcome.status).toBe("failed");

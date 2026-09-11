@@ -281,7 +281,10 @@ export async function runDecide(
   // pending NOW: a program approved on pause A that ran on to pause B would
   // have B approved by a second, queued `approve` of A — a call no human
   // looked at. The daemon's claim refuses a stale id as `conflict`.
-  if (callId === undefined || callId.trim() === "") {
+  // "Missing" is empty or ASCII whitespace — deliberately not `trim()`,
+  // which is Unicode-aware. One shared set, defined in sdk store/sqlite.ts
+  // `claimForResume`; change all four sites or none.
+  if (callId === undefined || /^[ \t\n\v\f\r]*$/.test(callId)) {
     deps.stderr(
       `[conduit approvals] ${kind}: missing required <call-id> — the CALL ID column of "conduit approvals list" for execution ${executionId}.\n`,
     );

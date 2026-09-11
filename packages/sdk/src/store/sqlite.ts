@@ -492,23 +492,28 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         // and refusing it here would leave the row `paused` forever with
         // no path to a terminal state. Letting the claim win hands it to
         // the manager's corrupt-state branch, which terminalizes it
-        // `failed` and logs why — the self-healing the resume path had
-        // before the callId predicate existed.
+        // `failed` — the self-healing the resume path had before the
+        // callId predicate existed.
         //
-        // "Un-nameable" is defined by what the wire decoder refuses
-        // (rpc.ts: not a string, or blank), and "blank" is ASCII whitespace
-        // in BOTH places so the sets are identical: every stored callId is
-        // either matchable by some well-formed request or admitted here.
-        // A present-but-unmatchable callId (a JSON number, `""`) would
-        // otherwise fall through to the equality arm, never match, and
-        // strand the row listed-but-undecidable (found by the R1 spec's
-        // fifth codex pass, 2026-09-11).
+        // "Un-nameable" is exactly what the wire decoder refuses (mcp
+        // rpc.ts: not a string, or blank), and "blank" is ASCII whitespace
+        // — deliberately not `trim()`, which is Unicode-aware. This is the
+        // canonical definition of that set; it is repeated at three other
+        // sites (mcp rpc.ts decoder, sdk execution/manager.ts
+        // NOT_NAMEABLE_CALL_ID, cli commands/approvals.ts argument check)
+        // and all four MUST stay identical, or a stored callId becomes one
+        // no request can match and no claim will admit. A present-but-
+        // unmatchable callId (a JSON number, `""`) would otherwise fall
+        // through to the equality arm, never match, and strand the row
+        // listed-but-undecidable (codex review, 2026-09-11).
         //
         // A CASE, not an OR chain: SQLite documents lazy evaluation for
         // CASE only, and `json_extract` on invalid JSON throws — so the
         // extraction arms are reached only after `json_valid` has said it
         // is safe. `json_type` is NULL for a missing path and 'null' for a
-        // JSON null; both are `IS NOT 'text'`.
+        // JSON null. `IS NOT`, never `!=`: `!=` against that NULL is NULL,
+        // not true, so a missing callId would fall through to the equality
+        // arm — the exact strand this arm prevents.
         const rs = await client.execute({
           sql: `UPDATE executions SET status = 'running', resume_attempt = ?
                 WHERE id = ? AND status = 'paused'

@@ -224,9 +224,15 @@ export type RpcPayloadFor<K extends RpcRequest["kind"]> = K extends "catalog.lis
 export function pausedToListRow(execution: Execution): PausedListRow | undefined {
   const pausedOn = execution.pausedOn;
   if (pausedOn === undefined) return undefined;
+  // A stored callId that is not text is corruption the store's claim admits
+  // so the manager can terminalize it (sdk store/sqlite.ts claimForResume).
+  // Ship it ABSENT — the CLI renders `-` — rather than as a non-string the
+  // client's row validator would refuse, taking the whole queue down with
+  // it. The operator can still decide the row with any call id.
+  const callId: unknown = pausedOn.callId;
   return {
     executionId: execution.id,
-    callId: pausedOn.callId,
+    ...(typeof callId === "string" ? { callId } : {}),
     startedAt: execution.startedAt,
     toolName: pausedOn.toolName,
     reason: pausedOn.reason,

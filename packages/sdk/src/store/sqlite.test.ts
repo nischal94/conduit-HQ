@@ -314,6 +314,17 @@ describe("SqliteStore", () => {
         });
         expect(rs.rows[0]?.status).toBe("running");
       }
+      // Boundary of the blank set: NON-ASCII whitespace is text an operator
+      // can name (the decoder admits it), so it is NOT admitted as corrupt
+      // and stays claimable only by its exact value.
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('p_nbsp', '', 'paused', '{}', ?, 0)",
+        args: [JSON.stringify({ callId: " ", toolName: "t" })],
+      });
+      await expect(store.executions.claimForResume("p_nbsp", "attempt", "any")).resolves.toBe(
+        false,
+      );
+      await expect(store.executions.claimForResume("p_nbsp", "attempt", " ")).resolves.toBe(true);
       // Control: a well-formed callId is decidable, so a claim naming a
       // DIFFERENT call must still lose — the allowance is for shapes no
       // operator can name, never a wildcard.

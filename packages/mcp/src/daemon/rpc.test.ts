@@ -198,6 +198,18 @@ describe("decodeRequest", () => {
         callId: " \t\n\v\f\r",
       }),
     ).toThrow(/non-blank/);
+    // The boundary of that set: a NON-ASCII whitespace callId is not blank
+    // here, exactly as the store's claim treats it as a nameable text value
+    // — a Unicode-aware `trim()` would refuse it and leave such a stored
+    // row undecidable through the wire.
+    expect(
+      decodeRequest({
+        kind: "approvals.resume",
+        executionId: "e1",
+        decision: "approve",
+        callId: " ",
+      }),
+    ).toEqual({ kind: "approvals.resume", executionId: "e1", decision: "approve", callId: " " });
     expect(() => decodeRequest({ kind: "source.revalidate", namespace: 5 })).toThrow();
   });
 
