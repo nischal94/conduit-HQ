@@ -370,6 +370,20 @@ describe("SqliteStore", () => {
       );
     });
 
+    it("INVARIANT §5.5: claimCallId is the id the claim compares — text only; a non-text first key, invalid JSON, or NULL is undefined", async () => {
+      await client.executeMultiple(`
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_text', '', 'paused', '{}', '{"callId":"call_A"}', 0);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_asym', '', 'paused', '{}', '{"callId":123,"callId":"123"}', 0);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_junk', '', 'paused', '{}', 'not json', 0);
+        INSERT INTO executions (id, code, status, seeds, paused_on, started_at) VALUES ('cc_null', '', 'paused', '{}', NULL, 0);
+      `);
+      expect(await store.executions.claimCallId("cc_text")).toBe("call_A");
+      expect(await store.executions.claimCallId("cc_asym")).toBeUndefined();
+      expect(await store.executions.claimCallId("cc_junk")).toBeUndefined();
+      expect(await store.executions.claimCallId("cc_null")).toBeUndefined();
+      expect(await store.executions.claimCallId("cc_missing")).toBeUndefined();
+    });
+
     it("failClaimedResume is a no-op for a row this caller never claimed (the claim lost)", async () => {
       await store.executions.put({
         id: "e5",

@@ -529,6 +529,21 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         });
         return rs.rowsAffected === 1;
       },
+      async claimCallId(id: string): Promise<string | undefined> {
+        // The same extraction the claim's equality arm performs, guarded the
+        // same way (`json_extract` throws on invalid JSON). Text only: a
+        // non-text value is one the claim admitted through a corrupt arm,
+        // and the manager must treat it as such regardless of what
+        // `JSON.parse` made of the same bytes.
+        const rs = await client.execute({
+          sql: `SELECT CASE WHEN json_valid(paused_on) AND json_type(paused_on, '$.callId') = 'text'
+                       THEN json_extract(paused_on, '$.callId') END AS claim_call_id
+                FROM executions WHERE id = ?`,
+          args: [id],
+        });
+        const row = rs.rows[0];
+        return row === undefined ? undefined : maybeText(row, "claim_call_id");
+      },
       async failClaimedResume(
         id: string,
         reason: string,

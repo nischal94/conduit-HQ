@@ -1151,6 +1151,15 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       operatorArg: "call_A",
     },
     {
+      // The claim admits this through the NON-TEXT arm (SQLite reads the
+      // first key, 123); JSON.parse hydrates the last, "123", which would
+      // pass strict equality. The SQL-side identity check catches it.
+      shape: "duplicate callId keys, first non-text and last matching text",
+      pausedOnJson:
+        '{"callId":123,"callId":"123","toolName":"t","input":{},"reason":"r","expiresAt":9000000000000}',
+      operatorArg: "123",
+    },
+    {
       shape: "a JSON number",
       pausedOnJson: JSON.stringify({
         callId: 123,

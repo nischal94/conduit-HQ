@@ -109,6 +109,14 @@ export interface ExecutionRepository {
    */
   claimForResume(id: string, resumeAttemptId: string, callId: string): Promise<boolean>;
   /**
+   * The pending call id AS THE CLAIM SEES IT: `json_extract(paused_on,
+   * '$.callId')` when it is JSON text, else undefined. SQLite's extractor
+   * and `JSON.parse` can disagree on the same bytes (duplicate keys: SQLite
+   * keeps the first, JS the last), so the manager decides on THIS identity
+   * — the one `claimForResume` compared — never only on the hydrated one.
+   */
+  claimCallId(id: string): Promise<string | undefined>;
+  /**
    * Terminalize a row THIS resume claimed but could not finish preparing
    * (design §8/F5, the stranded-running guard). A guarded
    * `UPDATE ... status='failed', ended_at, paused_on=NULL WHERE id=? AND

@@ -1002,7 +1002,9 @@ async function handleRequest(
           // operator can see it and decide it — any call id terminalizes
           // it. The log is where they learn why the column is empty.
           log(
-            `[conduitd] Listing paused execution: stored call id is not text, listed as '-'; deciding it with any call id terminalizes it. Context: {executionId: ${execution.id}}`,
+            row.callId === undefined
+              ? `[conduitd] Listing paused execution: stored pause is corrupt and its call id is un-nameable, listed as '-'; deciding it with any call id terminalizes it. Context: {executionId: ${execution.id}}`
+              : `[conduitd] Listing paused execution: stored pause is corrupt beside a nameable call id, listed with that id; deciding that id terminalizes it. Context: {executionId: ${execution.id}, callId: ${JSON.stringify(row.callId)}}`,
           );
         }
         rows.push(row);

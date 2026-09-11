@@ -786,8 +786,14 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // into the generic catch below and bury the reason. A well-formed
         // pause can only have been claimed with its own callId, so a
         // mismatch is corruption, never a race.
+        // Decide on the identity THE CLAIM COMPARED (the SQL-extracted call
+        // id), not only the hydrated one: SQLite's extractor and JSON.parse
+        // can disagree on the same bytes (duplicate keys — first vs last),
+        // and a claim the corrupt arm admitted must never look well-formed
+        // here just because JSON.parse produced a matching string.
+        const claimCallId = await deps.store.executions.claimCallId(executionId);
         const stored: unknown = execution.pausedOn;
-        if (!isPendingApproval(stored) || stored.callId !== callId) {
+        if (claimCallId !== callId || !isPendingApproval(stored) || stored.callId !== callId) {
           await deps.store.executions.failClaimedResume(
             executionId,
             "resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run",
