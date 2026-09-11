@@ -1,14 +1,15 @@
 # R1 — direct + discovery projections with capability profiles — design
 
-Status: revision 16 — codex loop closed by adjudication at rev 13
-(§12); rev 14 was the read pass; rev 15 folded the PR #57 bot reviews
-(CodeRabbit ×10, Greptile ×5); codex pass #8 on rev 15 found 1 P0 /
-3 P1 in those folds, all folded here: the discard decision moves to
-settle time (`RESULT_BYTES_MAX`, one write), abandoned continuations
-are QUARANTINED against the cap rather than released, the aggregated
-`tools/list` walk carries one absolute deadline, and the IPC-loss
-recovery wording is per projection (keyless direct has no handle).
-Codex pass #9 (confirming) follows on this revision, then the merge. Rev 11 folded the instance-binding threat-model pass
+Status: revision 17 — FINAL for PR #57. Codex loop closed by
+adjudication at rev 13 (§12); rev 14 was the read pass; rev 15 folded
+the PR #57 bot reviews (CodeRabbit ×10, Greptile ×5); codex #8 on rev
+15 found 1 P0 / 3 P1 in those folds → rev 16; codex #9 on rev 16 found
+2 P1 seams of those folds → rev 17 (the deliverable is measured
+redacted, in bytes, before the one settle write; §8.6 lists `conflict`;
+row #39 pins the per-projection IPC-loss wording). Per the rev-16 stop
+line, no further pass: nine passes, the last three each finding only
+seams of the previous fold. Next: merge, then writing-plans (§10, Lane
+A first). Rev 11 folded the instance-binding threat-model pass
 (`/blindspot` eight cards; codex #5, 3 P0 / 1 P1 / 1 P2; two findings
 SHIPPED on main as PR #58 `4c75b05` and PR #59 `cce91ae`, one out of
 scope by decision, §3.1). Rev 12 folded codex #6 (2 P0 / 2 P1 / 1 P2).
@@ -267,11 +268,18 @@ frame oversize only after encoding a response (`connection.ts:538-599`,
 `frames.ts:63-70`), which is after the settle write, and every settle
 write is fenced `status = 'running'` — so a post-settle refinement
 from `delivered` to `discarded` has no path. Instead the manager
-measures `JSON.stringify(result)` when the upstream returns and, if it
+prepares the DELIVERABLE first — the raw result for a synchronous
+completion, the `redactSensitiveFields` output for a resumed one (rev
+17, codex #9: redaction can EXPAND a payload — every object at depth
+64 becomes the twelve-byte string `"[redacted]"`, `redact.ts:22, 85`,
+so a 262 KB raw result can redact to 1.1 MB) — measures it as
+`Buffer.byteLength(JSON.stringify(deliverable), "utf8")` and, if that
 exceeds `RESULT_BYTES_MAX` (256 KiB — a quarter of the IPC frame cap,
 leaving the envelope, `executionId`, and framing far inside 1 MiB),
 settles `completed` with `result_state: 'discarded'` in ONE write and
-hands the daemon a payload that carries no result. The daemon's frame
+hands the daemon a payload that carries no result. What is measured is
+what is sent and what is stored; nothing between the measure and the
+frame can grow. The daemon's frame
 check therefore never fires on a completed direct envelope; if it
 still did (a defect), the shipped `invalid` error would be the answer
 and the row would already be a consistent `delivered`/`retained` —
@@ -1468,7 +1476,11 @@ Same envelope family as `execute`: completed → the upstream result as
 the invoker returned it, on the wire only (a synchronous direct result
 is never persisted; a resumed one is persisted redacted — §4.1 status
 table, D12) as content; paused → the pending shape with `executionId` and the human
-step spelled out; failed → the guest-safe error; outcome-unknown → the
+step spelled out; conflict → `{ status: "conflict", executionId }`
+where the id is the SAME client's execution that already holds the
+`requestKey` (§4.1; foreign rows answer not-found, §5.2) — this is the
+discovery projection's recovery handle after IPC loss (rev 17);
+failed → the guest-safe error; outcome-unknown → the
 projection-specific wording of §7 (rev 16: keyless direct has no
 handle; discovery recovers by `requestKey`). The client polls `check_execution` after a pause; no
 push channel in R1.
@@ -1518,7 +1530,7 @@ then this table is the ledger's staging area.)
 | 28 | `DirectDrive` transitions: dispatch monotonic; `settled` taken exactly once; attempt id fences the settle write (D5) | `manager.test.ts` (Lane A) |
 | 29 | versioned scope snapshot: a write without a version bump is impossible; a snapshot built before a write is never served after it; restart starts unversioned (D7) | `daemon/conduitd.test.ts` (Lane B) |
 | 40 | profile and tool writes exist ONLY under `packages/mcp/src/daemon/` — no CLI or SDK path writes them out of process, so the in-memory scope version cannot be bypassed (D15) | a source-scan test in `packages/mcp/src/daemon/` (Lane B) |
-| 41 | a synchronous direct completion persists no `result` and polls back as `completed, resultAvailable:false` (never `result:null`); a resumed completion persists it redacted per policy `redactFields`; a result over `RESULT_BYTES_MAX` is settled `completed` + `result_state:'discarded'` in ONE write by the manager (both the synchronous and the resumed path), answers `completed` + `resultTooLarge`, and polls back as `completed, resultAvailable:false, resultTooLarge:true`; the daemon's frame check never fires on a completed direct envelope; the read-side guard refuses a completed direct row with no `result_state` or an inconsistent `result`/`result_state` pair (D12; codex #3, rev 9; `'discarded'` rev 15; settle-time decision rev 16) | `manager.test.ts` + `payloads.test.ts` + `sqlite.test.ts` + D5 harness (Lanes A, B) |
+| 41 | a synchronous direct completion persists no `result` and polls back as `completed, resultAvailable:false` (never `result:null`); a resumed completion persists it redacted per policy `redactFields`; a DELIVERABLE over `RESULT_BYTES_MAX` — the raw result for a synchronous completion, the REDACTED result for a resumed one, measured in UTF-8 bytes — is settled `completed` + `result_state:'discarded'` in ONE write by the manager, answers `completed` + `resultTooLarge`, and an expanding redaction tree (objects at depth 64) that fits raw but not redacted is discarded, so neither the resume response nor `check_execution` can ever hit the frame cap; and polls back as `completed, resultAvailable:false, resultTooLarge:true`; the daemon's frame check never fires on a completed direct envelope; the read-side guard refuses a completed direct row with no `result_state` or an inconsistent `result`/`result_state` pair (D12; codex #3, rev 9; `'discarded'` rev 15; settle-time decision rev 16) | `manager.test.ts` + `payloads.test.ts` + `sqlite.test.ts` + D5 harness (Lanes A, B) |
 | 42 | a paused Code Mode row whose namespace is re-provisioned resumes to `ConduitCatalogChanged`, same as a direct row (D13) | D5 harness (Lane A) |
 | 43 | scoped search filters BEFORE ranking and the limit: an allowed tool ranked below ten disallowed ones is still returned, for discovery and in-sandbox search (codex #3, rev 9) | `catalog.test.ts` + `daemon/conduitd.test.ts` (Lanes A, B) |
 | 44 | direct drives are in the daemon's lifecycle accounting: disconnect then `daemon stop` while a direct call runs waits the drain grace and reports abandonment; `executionsInFlight` counts them (codex #3, rev 9) | `daemon/conduitd.test.ts` (Lane B) |
@@ -1537,7 +1549,7 @@ then this table is the ledger's staging area.)
 | 36 | daemon listing cursor is stable across pages; the server's full walk returns every allowed tool exactly once up to the advertisement budget (`ADVERTISE_TOOLS_MAX` / `ADVERTISE_BYTES_MAX`), stops deterministically at the budget with one log line, fails the whole listing when `ADVERTISE_WALK_DEADLINE_MS` expires (never a partial prefix), and a catalog change mid-walk can only drop a name, never bind it to a different tool (budget rev 15; walk deadline rev 16) | `daemon/conduitd.test.ts` (Lane B) + `server.test.ts` (Lane C; a catalog past both budgets; slow pages past the walk deadline) |
 | 37 | a listing carries no schemas when `projections.direct` is false; a listing from an OLDER daemon (no `projections`/`tools`) is read as code-only with no direct tools; the server's page walk terminates and never repeats an entry | `daemon/conduitd.test.ts` + `server.test.ts` (Lanes B, C) |
 | 38 | server name resolution is a pure decode: `decode(encode(q)) === q` for every legal qualified name and an invalid escape (`_e`, trailing `_`) is undecodable; an undecodable or unpermitted name → MCP "unknown tool"; the qualified name goes on the wire and the daemon re-checks `permits` | `server.test.ts` (Lane C) |
-| 39 | `approvals list` renders direct rows with their projection, call id, and tool name, and does not render `reason` (§5.3 display contract); `check_execution` payload shape is unchanged for code rows | `packages/cli/src/approvals.test.ts` + `payloads.test.ts` (Lanes B, C) |
+| 39 | `approvals list` renders direct rows with their projection, call id, and tool name, and does not render `reason` (§5.3 display contract); `check_execution` payload shape is unchanged for code rows; AND the MCP server's IPC-loss wording is per projection — a keyless direct call gets "no lookup handle, re-issue only if safe", a discovery `call` gets "re-issue with the same `requestKey`" — and same-key re-issue returns `conflict` with an execution id the SAME client can poll while a foreign client gets not-found (rev 17, codex #9) | `packages/cli/src/approvals.test.ts` + `payloads.test.ts` + `server.test.ts` (three IPC-loss / conflict cases) (Lanes B, C) |
 
 Three ambiguity invariants (§7): crash-before-persist (sweep test over a
 `running` direct row, Lane A); keyless-upstream documented limit (Lane
@@ -2003,13 +2015,30 @@ regenerated per commit · agent never installs.
   seams in the previous fold and nothing else (LEARNINGS #21); if #9
   returns another fold-seam only, it is folded and the loop stops
   there by the rev-13 adjudication — a tenth pass is not the rule's.
+- 2026-09-11 (17:51 → 18:02) — **codex pass #9 on rev 16: 0 P0 / 2 P1
+  class (c), no new class; folds 2 and 3 confirmed OK** (`gpt-5.6-sol`,
+  `high`; trigger: resource limits + dispatch boundary). **P1** the
+  settle-time measure read the RAW result, but resume redaction can
+  expand it (`redact.ts:22, 85`: depth-64 objects → `"[redacted]"`;
+  262 KB raw → 1.1 MB redacted) → measure the deliverable — raw for
+  sync, redacted for resume — in UTF-8 bytes before the one write
+  (§4.1, row #41). **P1** §8.6 omitted the `conflict` response and row
+  #39 pinned neither the per-projection IPC-loss wording nor conflict
+  id propagation → both added (§8.6, row #39). Confirmed OK: quarantine
+  (fence + one refusal Trace row + expired-budget DELETE suppression,
+  `invoker.ts:154`, `mcp-client.ts:811`); the walk deadline (an error
+  is not an empty list; authority never comes from the list, T2).
+  **Rev 17 folds both and the loop STOPS, per the rev-16 stop line:**
+  passes #7, #8, #9 each found only seams of the immediately previous
+  fold and nothing outside it; the class map (§3.1) is unchanged since
+  rev 11. Merge follows.
 
 ## GSTACK REVIEW REPORT
 
 | Review | Trigger | Why | Runs | Status | Findings |
 |--------|---------|-----|------|--------|----------|
 | CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | — |
-| Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8/9 and the 2026-09-11 threat-model pass #5; three early runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → rev 9; rev 9: 2 P0/3 P1/1 P2 → rev 10; pass #5 (threat model, on rev 10): 3 P0/1 P1/1 P2 → rev 11 + PRs #58/#59 on main; pass #6 (rev 11): 2 P0/2 P1/1 P2 → rev 12; pass #7 (rev 12): 0 new, 1 residual P1 → rev 13; loop closed by adjudication |
+| Codex Review | `/codex review` | Independent 2nd opinion | 0 (direct `codex exec` passes on revs 3/4/8/9 and the 2026-09-11 threat-model pass #5; three early runs lost to the provider limit) | issues_found | rev 3: 4 P0/8 P1/2 P2; rev 4: 1 P0/8 P1/2 P2; rev 8: 0 P0/8 P1/1 P2 → rev 9; rev 9: 2 P0/3 P1/1 P2 → rev 10; pass #5 (threat model, on rev 10): 3 P0/1 P1/1 P2 → rev 11 + PRs #58/#59 on main; pass #6 (rev 11): 2 P0/2 P1/1 P2 → rev 12; pass #7 (rev 12): 0 new, 1 residual P1 → rev 13; loop closed by adjudication; PR-review folds: bots → rev 15, pass #8 (rev 15): 1 P0/3 P1 → rev 16, pass #9 (rev 16): 0/2/0 → rev 17, stopped |
 | Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | issues_folded (codex loop closed at rev 13) | 15 issues, 0 critical gaps |
 | Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | — |
 | DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | — |
