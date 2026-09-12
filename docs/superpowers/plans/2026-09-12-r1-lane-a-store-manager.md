@@ -18,9 +18,11 @@ PRAGMA-then-ALTER ladder. The manager gains a sibling entry point
 decisions seam, TTL expiry, and the settle guards with `start`/`resume`.
 Authority is recomputed per call from a `ScopeResolver` the daemon will
 supply in Lane B; Lane A declares the types, a pure `buildEffectiveScope`,
-and a default-profile resolver. No wire change; two one-way doors (the
-governed-call 404 retry is removed for Code Mode too; every new row stores
-the sentinel in `code`).
+and a default-profile resolver. One ADDITIVE wire change (D-A11 final: the
+`unknown` status on `approvals.resume`, a recorded deviation from §10) and
+three one-way doors (the governed-call 404 retry is removed for Code Mode
+too; every new row stores the sentinel in `code`; a credential echo after a
+200 is terminal-ambiguous).
 
 **Tech Stack:** TypeScript 5.7 (strict, `exactOptionalPropertyTypes`),
 libSQL/SQLite, vitest 3, Biome 2 (double quotes, width 100). Zero new
@@ -88,7 +90,18 @@ Change one here and the affected tasks follow.
   means the default profile: `code` on, `direct`/`discovery` off, allow
   ALL. Lane B makes the daemon pass a resolver on every call. Consequence:
   a direct row resumed without a resolver fails `ConduitScopeRevoked`
-  (fail closed).
+  (fail closed). **Eng review D8 (2026-09-13):** an absent resolver wires NO
+  scope onto the drive — `makeInvoker` gets `scope: undefined` and the host
+  is the unscoped `createCatalogToolHost` — so shipped Code Mode keeps its
+  one `tools.get` per call. The default scope is built ONCE, only at
+  resume step 4. Paying a full `tools.list()` per call belongs with Lane
+  B's D7 versioned snapshot, not before it. **Codex #1 / D11 (2026-09-13):
+  the unscoped path is legal ONLY for the default profile (`clientId ===
+  null`).** A `start` with a non-null `clientId` and no resolver is refused
+  (`ConduitInternalError`, before any row is written); a resume of a row
+  whose `clientId` is non-null with no resolver terminalizes
+  `ConduitScopeRevoked` at step 4 (never the default profile, which is by
+  definition the UNNAMED one). Pinned in Tasks 8 and 9.
 - **D-A4 Post-dispatch classification happens at the invoker's outermost
   catch by READING the per-call dispatch cell, and again by the manager's
   direct arm at settle.** The cell (not an error field) survives error
@@ -111,17 +124,39 @@ Change one here and the affected tasks follow.
 - **D-A9 `executions.create()` is a new store method** (plain INSERT plus
   the `request_keys` row for a named client, one batch); `put()` stays the
   settle upsert and never touches `request_keys`.
-- **D-A10 The `profiles` table and `ProfileRepository` land in Lane A** (pure
-  store code, §4.2) so Lane B touches no store file. No daemon consumer yet.
-- **D-A11 The `status: "unknown"` outcome exists only on the
-  `DirectDriveHandle.outcome` promise.** `resume()` keeps its `ResumeOutcome`
-  type; on the direct resume path the manager awaits the handle's `outcome`
-  and, if it is `unknown`, returns `failed` with error name
-  `ConduitPersistTimeout` and `decisionApplied` as recorded — flagged here
-  as a Lane B wire decision (the payload status vocabulary and the CLI verb
-  rendering must grow the arm before a resume can honestly say "unknown").
-  This is the one place Lane A knowingly under-delivers row #45's wording;
-  the pin for the `startDirect` path is complete.
+- **D-A10 (REVERSED, eng review D1 2026-09-13): the `profiles` table and
+  `ProfileRepository` are Lane B.** Nothing in Lane A reads or writes a
+  profile; the spec's lane list puts profiles with the daemon. Task 4 ships
+  source generation only.
+- **D-A11 (FINAL, founder decision D12 2026-09-13, after codex #4): the
+  `status: "unknown"` outcome exists on BOTH direct paths and travels on the
+  wire.** `startDirect`'s handle and `resume()` both bound the settle write
+  by `SETTLE_WRITE_BUDGET_MS` and resolve `{ status: "unknown", executionId,
+  reason }` on expiry or on a rejected write. `ResumeOutcome` gains the arm.
+  To carry it honestly, Lane A makes one ADDITIVE wire change (a deviation
+  from spec §10's "no wire change", recorded in the PR and in spec §18 at
+  PR time): `EXECUTE_STATUSES` gains `"unknown"` (the client guard derives
+  from it), `ExecutePayload` gains `reason?: "persist-timeout" |
+  "persist-failed"`, and `conduit approvals` treats `unknown` exactly as it
+  treats the IPC outcome-unknown today — exit non-zero, "re-list, do not
+  retry", never a verb (a sibling of the pinned INVARIANTS.md:133 case).
+  One mechanism for one failure; the operator learns "unknown" in 5 s, not
+  after a 100 s transport deadline. Files: `packages/mcp/src/payloads.ts`,
+  `packages/cli/src/commands/approvals.ts`, their tests (Task 10).
+- **D-A12 (eng review D5): shared test fixtures and one conflict mapper.**
+  `packages/sdk/src/test/fixtures.ts` (not a suite; imported by every test
+  file) exports `codeRow`, `directRow`, `pause`, `directCall`.
+  `packages/sdk/src/execution/create-conflict.ts` exports
+  `mapCreateConflict(cause, requestKey, clientId, store)` used by `start`
+  and `startDirect`; it owns the two UNIQUE-failure strings.
+- **D-A13 (eng review D2): the drive budget timer is owned by
+  `createDirectDrive`**, armed at construction, before any store write. A
+  hung `create()` still yields the timeout outcome within budget.
+- **One-way door #3 (eng review D4): a credential echo after a 200 is
+  post-dispatch.** The §9.2 tripwire's refusal now terminalizes the
+  execution `ConduitOutcomeAmbiguous`, no longer a guest-catchable
+  `ConduitUpstreamError`. Truthful (the call ran); named here so the
+  explainer quiz covers it.
 
 ## File structure
 
@@ -142,9 +177,13 @@ Modified files:
   `projection`/`clientId`, `Source.generation`, `NEWER_BUILD_SENTINEL`.
 - `packages/sdk/src/store/store.ts` — `create`, `getByRequestKey(key,
   clientId)`, `settleDirect`, `invalidatePaused`, `sources.getGeneration`,
-  `provisionSource` returns `{ generation }`, `ProfileRepository`.
+  `provisionSource` returns `{ generation }`, `DirectSettle` (incl. `expired`).
 - `packages/sdk/src/store/sqlite.ts` — DDL, ladder, triggers, hydration
-  guards, request keys, profiles.
+  guards, request keys.
+- `packages/sdk/src/test/fixtures.ts` (new, D-A12) — `codeRow`, `directRow`,
+  `pause`, `directCall` test builders.
+- `packages/sdk/src/execution/create-conflict.ts` (new, D-A12) —
+  `mapCreateConflict`.
 - `packages/sdk/src/pipeline/errors.ts` — `ConduitOutcomeAmbiguous` class.
 - `packages/sdk/src/pipeline/mcp-client.ts` — `beforeSend` hook; `callTool`
   without the 404 retry.
@@ -173,7 +212,7 @@ Modified files:
 | 1 | Types + scope module | #8, #9 (unit), validator branches of #50 | types.ts, scope.ts, scope.test.ts, types.test.ts |
 | 2 | Store: execution columns, sentinel/program hydration, kind + result_state guards, `create`, attempt-fenced `settleDirect`, `invalidatePaused`, trace columns | #19, #22 (store half), #41 (store half), request round-trip pin, kind-guard pin, crash-sweep-over-direct-row pin | store.ts, sqlite.ts, sqlite.test.ts |
 | 3 | Store: `request_keys` table + per-client lookups | #25 (store half) | store.ts, sqlite.ts, sqlite.test.ts |
-| 4 | Store: source generation column, ledger table, three triggers, `getGeneration`, `provisionSource` read-back; `profiles` table + repository | #47 | store.ts, sqlite.ts, sqlite.test.ts |
+| 4 | Store: source generation column, ledger table, three triggers, `getGeneration`, `provisionSource` read-back (profiles moved to Lane B, D1) | #47 | store.ts, sqlite.ts, sqlite.test.ts |
 | 5 | Dispatch cell; MCP client `beforeSend` + 404 retry removed for `tools/call`; upstream wiring | #21 (client half), #24 (write-boundary half) | dispatch.ts, mcp-client.ts, upstream.ts, errors.ts, their tests |
 | 6 | Invoker: scope check, attribution, per-call cell, ambiguity classification, deadline gate before credentials | #24 (invoker half), #27 (invoker half), scope-block pin | invoker.ts, invoker.test.ts |
 | 7 | Scoped catalog tool host | #43 (catalog half) | execute.ts, execute.test.ts |
@@ -213,7 +252,7 @@ D-A11 (row #45 resume-path wording).
   - `PendingApproval` (with `namespace`, `sourceGeneration`), `LegacyPendingApproval`, `StoredPendingApproval`
   - `isPendingApproval(value): value is StoredPendingApproval`, `hasProvenance(p): p is PendingApproval`
   - `TraceEvent.projection: Projection`, `TraceEvent.clientId: string | null`
-  - `Source.generation?: number` (populated on read, ignored on write)
+  - `Source.generation: number` (required; populated on read, ignored on write — F11. Mechanical: every `Source` literal in tests and in `packages/mcp/src/daemon/provision.ts:838` gains `generation: 0`)
   - `scope.ts`: `ALL_TOOLS`, `ScopeGrant`, `EffectiveScope`, `ScopeResolver`, `DEFAULT_PROFILE_GRANT`, `namespaceOf`, `buildEffectiveScope`, `defaultScopeResolver`
 
 Note: this task changes types that every existing `Execution` literal and
@@ -231,6 +270,7 @@ import {
   ALL_TOOLS,
   buildEffectiveScope,
   DEFAULT_PROFILE_GRANT,
+  defaultScopeResolver,
   namespaceOf,
 } from "./scope.js";
 import type { Tool } from "./types.js";
@@ -299,6 +339,26 @@ describe("buildEffectiveScope (§5.2)", () => {
     const scope = buildEffectiveScope(DEFAULT_PROFILE_GRANT, live);
     live.push(tool("late.tool"));
     expect(scope.permits("code", "late.tool")).toBe(false);
+  });
+});
+
+describe("defaultScopeResolver (D-A3, D11)", () => {
+  it("reads the store on every call for the default profile (clientId null)", async () => {
+    let listed = 0;
+    const store = { tools: { list: async () => { listed++; return catalog; } } };
+    const resolve = defaultScopeResolver(store);
+    await resolve(null); await resolve(null);
+    expect(listed).toBe(2);
+    expect((await resolve(null)).permits("code", "slack.post")).toBe(true);
+  });
+  it("INVARIANT §5.2 (D11): a NAMED client id gets DENY-ALL from the default resolver, never the default grant, and the store is not read", async () => {
+    let listed = 0;
+    const resolve = defaultScopeResolver({ tools: { list: async () => { listed++; return catalog; } } });
+    const named = await resolve("acme");
+    expect(named.permits("code", "slack.post")).toBe(false);
+    expect(named.projections).toEqual({ code: false, direct: false, discovery: false });
+    expect(named.listing).toEqual([]);
+    expect(listed).toBe(0);
   });
 });
 ```
@@ -381,9 +441,12 @@ export interface Source {
   namespace: string;
   location: string;
   baseUrl?: string;
-  /** §4.1a provenance, allocated by SQLite triggers. Populated on every
-   * read; ignored on write (the database owns it). */
-  generation?: number;
+  /** §4.1a provenance, allocated by SQLite triggers. Present on every
+   * hydrated row; `sources.upsert` and `provisionSource` IGNORE it on write
+   * (the database owns it). Required, per the spec (F11): callers that
+   * construct a Source for a write pass `generation: 0` — the value is
+   * never written. */
+  generation: number;
 }
 ```
 
@@ -419,19 +482,30 @@ export interface DirectCall {
   request: string;
 }
 
+// The valid (kind, projection) pairs are exactly three (§9.2): ("code","code"),
+// ("direct","direct"), ("direct","discovery"). The pair is enforced in the TYPE
+// (below), in fresh DDL (a CHECK), and read-side in hydration (codex pass 2, #5:
+// independent guards would let {kind:"direct", projection:"code"} be authorized
+// under the Code flag and dispatched through the direct arm).
 export type Execution =
-  | (ExecutionBase & {
+  | (Omit<ExecutionBase, "projection"> & {
       kind: "code";
+      projection: "code";
       code: string;
       /** Recorded non-determinism, replayed verbatim on resume (spec §5.5). */
       seeds: { now: number; random: number };
     })
-  | (ExecutionBase & {
+  | (Omit<ExecutionBase, "projection"> & {
       kind: "direct";
+      projection: "direct" | "discovery";
       call: DirectCall;
       /** Set iff status is `completed` (§4.1 status table, rev 16). */
       resultState?: ResultState;
     });
+
+export function isValidProjectionForKind(kind: ExecutionKind, projection: Projection): boolean {
+  return kind === "code" ? projection === "code" : projection !== "code";
+}
 
 /** A call waiting on a human (spec §10.2), as written by R1: provenance included (§4.1). */
 export interface PendingApproval {
@@ -552,10 +626,25 @@ export function buildEffectiveScope(grant: ScopeGrant, tools: readonly Tool[]): 
   };
 }
 
-/** The default profile, read fresh from the store on every call (D-A3). */
-export function defaultScopeResolver(store: Pick<ConduitStore, "tools">): ScopeResolver {
-  return async () => buildEffectiveScope(DEFAULT_PROFILE_GRANT, await store.tools.list());
+/** A scope that permits nothing and lists nothing (fail closed). */
+const DENY_ALL: EffectiveScope = { projections: { code: false, direct: false, discovery: false }, permits: () => false, listing: [] };
+
+/**
+ * The default profile, read fresh from the store on every call (D-A3). The
+ * default profile is the UNNAMED one: for any non-null clientId this resolver
+ * answers DENY_ALL (codex pass 2, #1 — D11 must hold inside the function, not
+ * only at its call sites). Narrow parameter so a `{ tools: { list } }` stub
+ * satisfies it (F10a).
+ */
+export function defaultScopeResolver(store: { tools: Pick<ToolRepository, "list"> }): ScopeResolver {
+  return async (clientId) =>
+    clientId === null ? buildEffectiveScope(DEFAULT_PROFILE_GRANT, await store.tools.list()) : DENY_ALL;
 }
+```
+
+(`import type { ToolRepository } from "./store/store.js";` replaces the `ConduitStore` import.)
+
+```ts
 ```
 
 - [ ] **Step 6: Export from `index.ts`**
@@ -600,14 +689,16 @@ pre-commit hook typechecks the whole package.
   - `ExecutionRepository.create(execution: Execution, opts?: { attempt?: string }): Promise<void>` — plain INSERT; throws on duplicate id or duplicate request key.
   - `ExecutionRepository.put(execution: Execution): Promise<void>` — settle upsert, unchanged contract, never touches `request_keys`, never touches `resume_attempt`.
   - `ExecutionRepository.settleDirect(id: string, attempt: string, settle: DirectSettle): Promise<boolean>` — fenced `WHERE status='running' AND resume_attempt=?`; true iff one row changed.
-  - `type DirectSettle = { status: "completed"; resultState: "delivered" | "discarded" } | { status: "completed"; resultState: "retained"; result: unknown } | { status: "failed"; error: ExecutionError } | { status: "paused"; pausedOn: PendingApproval }`
+  - `type DirectSettle = { status: "completed"; resultState: "delivered" | "discarded" } | { status: "completed"; resultState: "retained"; result: unknown } | { status: "failed"; error: ExecutionError } | { status: "paused"; pausedOn: PendingApproval } | { status: "expired" }` (the `expired` arm: `status='expired', ended_at=now, paused_on=NULL` — used by the direct resume TTL branch, codex pass 2 #3)
   - `ExecutionRepository.invalidatePaused(namespace: string): Promise<number>`
   - `ExecutionRepository.getByRequestKey(key: string, clientId: string | null)` — signature widened here; the named-client lookup body lands in Task 3 (this task: `clientId !== null` → return `undefined`).
+  - `ExecutionRepository.kindOf(id: string): Promise<ExecutionKind | undefined>` — `SELECT kind FROM executions WHERE id = ?`, no hydration; `undefined` for a missing row or an unrecognized value. Lets `resume` route a corrupt direct row's terminalization through the bounded fenced settle before hydration can succeed (codex pass 3, #2). Test: a row whose `seeds` is not JSON still answers `kindOf`.
 
-- [ ] **Step 1: Write the failing store tests** (append inside `describe("executions")` in `sqlite.test.ts`; add a `codeRow` helper at file top)
+- [ ] **Step 1: Write the failing store tests** (append inside `describe("executions")` in `sqlite.test.ts`). The fixture builders live in `packages/sdk/src/test/fixtures.ts` (D-A12, F10d) — create that file now with the two builders below and `import { codeRow, directRow } from "../test/fixtures.js"` in every test file that needs them:
 
 ```ts
-function codeRow(overrides: Partial<Extract<Execution, { kind: "code" }>> & { id: string }): Execution {
+// packages/sdk/src/test/fixtures.ts — test-only builders; not exported from index.ts (codex #14: `export` on each)
+export function codeRow(overrides: Partial<Extract<Execution, { kind: "code" }>> & { id: string }): Execution {
   return {
     kind: "code",
     code: "return 1",
@@ -619,7 +710,7 @@ function codeRow(overrides: Partial<Extract<Execution, { kind: "code" }>> & { id
     ...overrides,
   };
 }
-function directRow(overrides: Partial<Extract<Execution, { kind: "direct" }>> & { id: string }): Execution {
+export function directRow(overrides: Partial<Extract<Execution, { kind: "direct" }>> & { id: string }): Execution {
   return {
     kind: "direct",
     call: { toolName: "github.issues.list", namespace: "github", request: "{}" },
@@ -642,11 +733,20 @@ it("INVARIANT §4.1 (#19): every new row stores the sentinel in `code` and the p
   expect(back?.kind === "code" && back.code).toBe("return 42");
 });
 
-it("INVARIANT §4.1 (#19): an OLDER hydrator (reads `code` only) sees the sentinel for both kinds", async () => {
+it("INVARIANT §4.1 (#19): an OLDER build (reads `code` only) gets a program that THROWS — verbatim literal, executed, no tool dispatch", async () => {
   await store.executions.create(codeRow({ id: "e_c" }));
   await store.executions.create(directRow({ id: "e_d" }));
   const legacyView = await client.execute("SELECT id, code FROM executions ORDER BY id");
-  expect(legacyView.rows.map((r) => r.code)).toEqual([NEWER_BUILD_SENTINEL, NEWER_BUILD_SENTINEL]);
+  // codex #11: the literal, not the constant — a non-throwing sentinel would pass a constant comparison.
+  const LITERAL = 'throw new Error("conduit: row written by a newer build")';
+  expect(legacyView.rows.map((r) => r.code)).toEqual([LITERAL, LITERAL]);
+  // Simulate the pre-R1 drive: the sandbox runs `code` with a real tool host that records calls.
+  const calls: string[] = [];
+  const host = { search: async () => [], describe: async () => undefined, call: async (path: string) => { calls.push(path); return {}; } };
+  const result = await new QuickJSSandbox().execute({ code: String(legacyView.rows[0]?.code), tools: host });
+  expect(result.status).toBe("failed");
+  expect(result.status === "failed" && result.error.message).toContain("newer build");
+  expect(calls).toEqual([]);
   const direct = await client.execute({ sql: "SELECT program, seeds FROM executions WHERE id = ?", args: ["e_d"] });
   expect(direct.rows[0]?.program).toBeNull();
   expect(direct.rows[0]?.seeds).toBe("{}");
@@ -662,6 +762,14 @@ it("a legacy row (program NULL, kind defaulted) hydrates its program from `code`
   expect(row?.kind === "code" && row.code).toBe("return 'old'");
   expect(row?.clientId).toBeNull();
   expect(row?.projection).toBe("code");
+});
+
+it("INVARIANT §9.2 (codex pass 2 #5): only the three valid (kind, projection) pairs hydrate; a mismatched pair is refused on read and by the fresh CHECK", async () => {
+  await client.execute("INSERT INTO executions (id, code, status, seeds, started_at, kind, projection) VALUES ('legacyish', 'x', 'running', '{}', 0, 'code', 'code')");
+  await expect(client.execute("INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call) VALUES ('bad', 'x', 'running', '{}', 0, 'direct', 'code', '{\"toolName\":\"a.b\",\"namespace\":\"a\",\"request\":\"{}\"}')")).rejects.toThrow(/CHECK/);
+  await expect(client.execute("INSERT INTO executions (id, code, status, seeds, started_at, kind, projection) VALUES ('bad2', 'x', 'running', '{}', 0, 'code', 'discovery')")).rejects.toThrow(/CHECK/);
+  // legacy table without the CHECK: build one via the stored-vocabulary fixture pattern (sqlite.test.ts:913) and assert
+  // `get` rejects with /cannot carry projection/ for the same two rows.
 });
 
 it("INVARIANT §4.1: the read-side kind guard refuses a row whose kind and direct_call disagree", async () => {
@@ -737,12 +845,14 @@ it("INVARIANT §4.1 (D3 sweep): invalidatePaused flips paused rows of BOTH kinds
   expect((await store.executions.get("p_running"))?.status).toBe("running");
 });
 
-it("§7 crash sweep: a running DIRECT row is listed by id and terminalized without hydration", async () => {
+it("§7 crash sweep: a running DIRECT row is listed by id (store half)", async () => {
   await store.executions.create(directRow({ id: "d_run" }));
   expect(await store.executions.listRunningIds()).toContain("d_run");
-  await store.executions.failClaimedResume("d_run", "daemon died", "ConduitOutcomeAmbiguous");
-  expect((await store.executions.get("d_run"))?.error?.name).toBe("ConduitOutcomeAmbiguous");
 });
+// codex #10: the REAL sweep is pinned in packages/mcp/src/daemon/sweep.test.ts (Lane A adds one case there —
+// the SDK cannot import the daemon): seed a running direct row + a paused direct row, run
+// `sweepOrphanedExecutions(store)`, assert the running row is `failed` / `ConduitOutcomeAmbiguous`
+// with `result` undefined and the paused row untouched.
 
 it("§4.3 (#27 store half): trace rows carry projection and client_id; legacy rows default to code / null", async () => {
   await store.trace.append({ callId: "t1", executionId: "e", toolName: "a.b", connectionPrefix: "p", input: {}, policyVerdict: "allow", at: 1, projection: "discovery", clientId: "acme" });
@@ -750,6 +860,65 @@ it("§4.3 (#27 store half): trace rows carry projection and client_id; legacy ro
   const [legacy, r1] = await store.trace.listByExecution("e");
   expect([legacy?.projection, legacy?.clientId]).toEqual(["code", null]);
   expect([r1?.projection, r1?.clientId]).toEqual(["discovery", "acme"]);
+});
+
+it("settleDirect on a CODE row is a no-op (kind fence), even with the right attempt", async () => {
+  await store.executions.create(codeRow({ id: "c_f" }), { attempt: "a" });
+  expect(await store.executions.settleDirect("c_f", "a", { status: "failed", error: { name: "X", message: "m" } })).toBe(false);
+  expect((await store.executions.get("c_f"))?.status).toBe("running");
+});
+
+it("put never changes resume_attempt", async () => {
+  await store.executions.create(codeRow({ id: "p_k" }), { attempt: "att" });
+  await store.executions.put({ ...codeRow({ id: "p_k" }), status: "completed", result: 1 });
+  const raw = await client.execute({ sql: "SELECT resume_attempt FROM executions WHERE id = ?", args: ["p_k"] });
+  expect(raw.rows[0]?.resume_attempt).toBe("att");
+});
+// (The "put never writes request_keys" half moves to Task 3, which creates the table — codex pass 2 #8.)
+
+it("the read-side guard refuses a malformed direct_call (not JSON, not an object, missing field)", async () => {
+  const insert = (id: string, directCall: string) => client.execute({
+    sql: "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call) VALUES (?, 'x', 'running', '{}', 0, 'direct', 'direct', ?)",
+    args: [id, directCall],
+  });
+  await insert("m1", "{not json");
+  await expect(store.executions.get("m1")).rejects.toThrow(/direct_call is not valid JSON/);
+  await insert("m2", "[]");
+  await expect(store.executions.get("m2")).rejects.toThrow(/direct_call is malformed/);
+  await insert("m3", '{"toolName":"a.b","namespace":"a"}');
+  await expect(store.executions.get("m3")).rejects.toThrow(/direct_call is malformed/);
+});
+
+it("invalidatePaused skips a LEGACY pause (no namespace) and an invalid-JSON pause; both stay paused", async () => {
+  await store.executions.create(codeRow({ id: "lp", status: "paused", pausedOn: { callId: "c", toolName: "github.t", input: {}, reason: "r", expiresAt: 9e12 } }));
+  await client.execute("INSERT INTO executions (id, code, status, seeds, started_at, paused_on) VALUES ('bad', 'x', 'paused', '{}', 0, '{oops')");
+  expect(await store.executions.invalidatePaused("github")).toBe(0);
+  expect((await store.executions.get("lp"))?.status).toBe("paused");
+  expect((await client.execute("SELECT status FROM executions WHERE id = 'bad'")).rows[0]?.status).toBe("paused");
+});
+
+it("M5: two simultaneous opens of a legacy db with the R1 columns pending both succeed", async () => {
+  const { url } = await legacyDb(); // the file-db fixture at sqlite.test.ts:458 — pre-R1 executions shape
+  const secretBox = await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes());
+  const [a, b] = await Promise.all([
+    openSqliteStore({ client: createClient({ url }), secretBox }),
+    openSqliteStore({ client: createClient({ url }), secretBox }),
+  ]);
+  expect((await a.executions.get("exec_old"))?.kind).toBe("code");
+  expect((await b.executions.get("exec_old"))?.projection).toBe("code");
+  // codex #12: assert EVERY R1 retrofit landed exactly once, and all three triggers exist.
+  const probe = createClient({ url });
+  const cols = (await probe.execute("PRAGMA table_info(executions)")).rows.map((r) => String(r.name));
+  for (const c of ["kind", "projection", "direct_call", "client_id", "program", "result_state"]) expect(cols.filter((n) => n === c)).toHaveLength(1);
+  const trace = (await probe.execute("PRAGMA table_info(trace_events)")).rows.map((r) => String(r.name));
+  expect(trace).toEqual(expect.arrayContaining(["projection", "client_id"]));
+  const src = (await probe.execute("PRAGMA table_info(sources)")).rows.map((r) => String(r.name));
+  expect(src).toContain("generation");
+  const triggers = (await probe.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")).rows.map((r) => r.name);
+  expect(triggers).toEqual(["sources_gen_on_insert", "sources_gen_on_tools", "sources_gen_on_update"]);
+  // Known limit (codex #12): Promise.all does not force both openers into the PRAGMA→ALTER
+  // window; this is the same shape the shipped M5 tests use (sqlite.test.ts:605). The
+  // tolerateSchemaRace unit itself is pinned by those tests.
 });
 
 it("fresh DDL CHECKs refuse an unknown kind, projection, result_state, and trace projection", async () => {
@@ -824,10 +993,11 @@ In `SCHEMA`, the `executions` CREATE gains, after `request_key TEXT`:
     direct_call TEXT,
     client_id TEXT,
     program TEXT,
-    result_state TEXT CHECK (result_state IN ('delivered', 'retained', 'discarded'))
+    result_state TEXT CHECK (result_state IN ('delivered', 'retained', 'discarded')),
+    CHECK ((kind = 'code' AND projection = 'code') OR (kind = 'direct' AND projection IN ('direct', 'discovery')))
 ```
 
-`trace_events` CREATE gains, after `at INTEGER NOT NULL`:
+(The pair CHECK is a table constraint on the fresh DDL; legacy tables get the read-side guard below — codex pass 2, #5.) `trace_events` CREATE gains, after `at INTEGER NOT NULL`:
 
 ```sql
     projection TEXT NOT NULL DEFAULT 'code' CHECK (projection IN ('code', 'direct', 'discovery')),
@@ -978,6 +1148,7 @@ Replace the body of `hydrateExecutionRow` after the status check:
   if (kind !== "code" && kind !== "direct") throw executionReadError(`unrecognized kind ${JSON.stringify(kind)}`);
   const projection = text(row, "projection");
   if (!isOneOf(projection, PROJECTIONS)) throw executionReadError(`unrecognized projection ${JSON.stringify(projection)}`);
+  if (!isValidProjectionForKind(kind, projection)) throw executionReadError(`kind '${kind}' cannot carry projection '${projection}'`);
   const directCall = maybeText(row, "direct_call");
   if (kind === "direct" && directCall === undefined) throw executionReadError("kind = 'direct' requires direct_call");
   if (kind === "code" && directCall !== undefined) throw executionReadError("kind = 'code' forbids direct_call");
@@ -1024,7 +1195,7 @@ Expected: the new tests PASS; existing tests FAIL only where fixtures lack the n
 
 - [ ] **Step 8: Mechanical fixture update**
 
-Enumerate: `grep -rn "status: \"paused\"\|status: \"running\"\|status: \"completed\"\|status: \"failed\"\|status: \"expired\"" packages/sdk/src packages/mcp/src packages/cli/src --include=*.test.ts -l`. In each file, add `kind: "code", clientId: null, projection: "code"` to every `Execution` literal (or route it through a `codeRow` helper as above), and `projection: "code", clientId: null` to every `TraceEvent` literal. Update `executions.getByRequestKey(key)` calls to `getByRequestKey(key, null)`.
+Enumerate: `grep -rn "status: \"paused\"\|status: \"running\"\|status: \"completed\"\|status: \"failed\"\|status: \"expired\"" packages/sdk/src packages/mcp/src packages/cli/src --include=*.test.ts -l`. In each file, add `kind: "code", clientId: null, projection: "code"` to every `Execution` literal (or route it through a `codeRow` helper as above), and `projection: "code", clientId: null` to every `TraceEvent` literal. Update `executions.getByRequestKey(key)` calls to `getByRequestKey(key, null)`. **`Source` literals (F11, codex pass 3 #4):** `grep -rn "sources.upsert(\|source: {" packages --include=*.ts` and add `generation: 0` to every write-side `Source` literal — tests, `manager-harness.ts`, the plan's own snippets in Tasks 6/9/10/11, and `packages/mcp/src/daemon/provision.ts:838`. Verify with `pnpm typecheck` at the root, not per package.
 
 - [ ] **Step 9: Typecheck and full SDK suite**
 
@@ -1087,6 +1258,15 @@ it("INVARIANT §4.1 (#25): a duplicate named key fails the create atomically —
   await store.executions.create(codeRow({ id: "n5", clientId: "beta", requestKey: "dup" })); // another client: fine
 });
 
+it("put never writes request_keys (settle upserts leave the key table alone)", async () => {
+  await store.executions.create(codeRow({ id: "p_k2", clientId: "acme", requestKey: "k2" }));
+  await store.executions.put({ ...codeRow({ id: "p_k2", clientId: "acme", requestKey: "k2" }), status: "completed", result: 1 });
+  const keys = await client.execute("SELECT COUNT(*) AS n FROM request_keys WHERE key = 'k2'");
+  expect(Number(keys.rows[0]?.n)).toBe(1);
+  const raw = await client.execute({ sql: "SELECT request_key FROM executions WHERE id = ?", args: ["p_k2"] });
+  expect(raw.rows[0]?.request_key).toBeNull();
+});
+
 it("listPaused hydrates a named row's key through the join", async () => {
   await store.executions.create(codeRow({ id: "np", clientId: "acme", requestKey: "pk", status: "paused",
     pausedOn: { callId: "c", toolName: "a.b", input: {}, reason: "r", expiresAt: 9e12 } }));
@@ -1110,6 +1290,20 @@ CREATE TABLE IF NOT EXISTS request_keys (
   execution_id TEXT NOT NULL,
   PRIMARY KEY (client_id, key)
 )
+```
+```sql
+CREATE INDEX IF NOT EXISTS request_keys_execution ON request_keys (execution_id)
+```
+
+(Eng review D9: every execution read LEFT JOINs on `execution_id`; without
+the index that join is a scan of an append-only table.) Add to Step 1:
+
+```ts
+it("the execution read joins request_keys through an index, not a scan (eng review D9)", async () => {
+  const plan = await client.execute("EXPLAIN QUERY PLAN SELECT e.*, rk.key AS named_request_key FROM executions e LEFT JOIN request_keys rk ON rk.execution_id = e.id WHERE e.id = 'x'");
+  const text = plan.rows.map((r) => String(r.detail)).join("\n");
+  expect(text).toMatch(/USING (COVERING )?INDEX request_keys_execution/);
+});
 ```
 
 `create`: when `named`, the batch is `[insert, { sql: "INSERT INTO request_keys (client_id, key, execution_id) VALUES (?, ?, ?)", args: [execution.clientId, execution.requestKey, execution.id] }]`. libSQL rolls the batch back on the PK failure and surfaces the SQLite message verbatim.
@@ -1140,10 +1334,10 @@ git commit -m "feat(sdk): client-namespaced request keys via request_keys table"
 
 ---
 
-### Task 4: Store — source generation (§4.1a, row #47) and profiles (§4.2)
+### Task 4: Store — source generation (§4.1a, row #47)
 
 **Files:**
-- Modify: `packages/sdk/src/store/store.ts` (`SourceRepository.getGeneration`, `provisionSource` return, `ProfileRepository`, `ConduitStore.profiles`)
+- Modify: `packages/sdk/src/store/store.ts` (`SourceRepository.getGeneration`, `provisionSource` return)
 - Modify: `packages/sdk/src/store/sqlite.ts`
 - Modify: `packages/sdk/src/store/sqlite.test.ts`
 - Modify: `packages/sdk/src/types.ts` (`Profile`)
@@ -1152,10 +1346,8 @@ git commit -m "feat(sdk): client-namespaced request keys via request_keys table"
 - Produces:
   - `SourceRepository.getGeneration(namespace: string): Promise<number | undefined>` — `undefined` when no source row.
   - `ConduitStore.provisionSource(...)`: `Promise<{ generation: number }>`.
-  - `Source.generation` populated by `rowToSource`.
-  - `interface Profile { clientId: string; projections: {code;direct;discovery}; allow: string[]; updatedAt: number }`
-  - `ProfileRepository { get(clientId); list(); put(profile); remove(clientId) }`; `put` throws on a `clientId` outside `/^[a-z0-9][a-z0-9_-]{0,63}$/`.
-  - `CLIENT_ID_GRAMMAR` regex exported from `types.ts`.
+  - `Source.generation` populated by `rowToSource` (required on the type since Task 1 — F11; `sources.upsert` and `provisionSource` ignore it on write, so the `provision()` helper's source literal carries `generation: 0`).
+  - (Profiles: Lane B — D1. No profile types or repository in Lane A; codex pass 2 #8.)
 
 - [ ] **Step 1: Write the failing generation tests** (new `describe("source generation (§4.1a)")`)
 
@@ -1165,7 +1357,7 @@ const ledgerCount = async () => Number((await client.execute("SELECT COUNT(*) AS
 
 async function provision(namespace: string, toolNames: string[], location = "https://x.example/mcp") {
   return store.provisionSource({
-    source: { id: `src_${namespace}`, type: "mcp", namespace, location },
+    source: { id: `src_${namespace}`, type: "mcp", namespace, location, generation: 0 },
     integration: { id: `int_${namespace}`, sourceId: `src_${namespace}`, namespace },
     connection: { id: `conn_${namespace}`, integrationId: `int_${namespace}`, prefix: `${namespace}.acme.prod` },
     tools: toolNames.map((n) => tool({ name: `${namespace}.${n}`, namespace })),
@@ -1183,7 +1375,7 @@ it("INVARIANT §4.1a (#47): a provision with N tools writes exactly N+1 ledger r
 });
 
 it("INVARIANT §4.1a (#47): every write path bumps — standalone INSERT (sources.upsert), zero-tool revalidate, retarget", async () => {
-  await store.sources.upsert({ id: "s1", type: "mcp", namespace: "solo", location: "https://a" });
+  await store.sources.upsert({ id: "src_solo", type: "mcp", namespace: "solo", location: "https://a" }); // same id as provision() uses: sources.namespace is UNIQUE (F8)
   const g0 = await gen("solo");
   expect(g0).toBeGreaterThan(0); // INSERT trigger: never the column default
   await provision("solo", []);            // zero tools: the source-row trigger bumps alone
@@ -1250,65 +1442,16 @@ it("the update trigger does not recurse: one allocation per statement with recur
 
 (Tighten the last test: provision `gh` once in a `beforeEach`, then assert exactly `1` per bare UPDATE.)
 
-- [ ] **Step 2: Write the failing profile tests** (new `describe("profiles (§4.2)")`)
-
-```ts
-it("round-trips a profile and lists deterministically by clientId", async () => {
-  const p = { clientId: "acme", projections: { code: true, direct: true, discovery: false }, allow: ["github", "slack.post"], updatedAt: 5 };
-  await store.profiles.put(p);
-  await store.profiles.put({ ...p, clientId: "abc", allow: [] });
-  expect(await store.profiles.get("acme")).toEqual(p);
-  expect((await store.profiles.list()).map((x) => x.clientId)).toEqual(["abc", "acme"]);
-  await store.profiles.remove("acme");
-  expect(await store.profiles.get("acme")).toBeUndefined();
-});
-
-it("put is a whole-row replace", async () => {
-  await store.profiles.put({ clientId: "acme", projections: { code: true, direct: false, discovery: false }, allow: ["a"], updatedAt: 1 });
-  await store.profiles.put({ clientId: "acme", projections: { code: false, direct: true, discovery: true }, allow: [], updatedAt: 2 });
-  expect(await store.profiles.get("acme")).toMatchObject({ allow: [], updatedAt: 2, projections: { code: false, direct: true, discovery: true } });
-});
-
-it.each(["", "Acme", "-lead", "a".repeat(65), "has space", "dot.name"])("refuses clientId %j (grammar)", async (bad) => {
-  await expect(store.profiles.put({ clientId: bad, projections: { code: true, direct: false, discovery: false }, allow: [], updatedAt: 0 })).rejects.toThrow(/clientId/);
-});
-
-it("a corrupt stored projections/allow blob fails the read loudly", async () => {
-  await client.execute("INSERT INTO profiles (client_id, projections, allow, updated_at) VALUES ('bad', '{\"code\":1}', '[]', 0)");
-  await expect(store.profiles.get("bad")).rejects.toThrow(/projections/);
-});
-```
+- [ ] **Step 2: (removed — profiles are Lane B, eng review D1)**
 
 - [ ] **Step 3: Run to verify failure**
 
-Run: `./packages/sdk/node_modules/.bin/vitest run --root packages/sdk src/store/sqlite.test.ts -t "§4.1a|profiles"`
-Expected: FAIL — `getGeneration`/`profiles` undefined; no `source_generations` table.
+Run: `./packages/sdk/node_modules/.bin/vitest run --root packages/sdk src/store/sqlite.test.ts -t "§4.1a"`
+Expected: FAIL — `getGeneration` undefined; no `source_generations` table.
 
 - [ ] **Step 4: Types**
 
-`types.ts`:
-
-```ts
-export const CLIENT_ID_GRAMMAR = /^[a-z0-9][a-z0-9_-]{0,63}$/;
-export interface Profile {
-  clientId: string;
-  projections: { code: boolean; direct: boolean; discovery: boolean };
-  allow: string[];
-  updatedAt: number;
-}
-```
-
-`store.ts`: `SourceRepository.getGeneration`, `ConduitStore.profiles: ProfileRepository`, `provisionSource(...): Promise<{ generation: number }>`, and:
-
-```ts
-export interface ProfileRepository {
-  get(clientId: string): Promise<Profile | undefined>;
-  list(): Promise<Profile[]>;
-  /** Whole-row replace. Throws on a clientId outside CLIENT_ID_GRAMMAR. */
-  put(profile: Profile): Promise<void>;
-  remove(clientId: string): Promise<void>;
-}
-```
+`store.ts`: `SourceRepository.getGeneration(namespace: string): Promise<number | undefined>` and `provisionSource(...): Promise<{ generation: number }>`. No profile types in Lane A.
 
 - [ ] **Step 5: `sqlite.ts` DDL, ladder, triggers**
 
@@ -1321,15 +1464,6 @@ CREATE TABLE IF NOT EXISTS source_generations (
   at INTEGER NOT NULL
 )
 ```
-```sql
-CREATE TABLE IF NOT EXISTS profiles (
-  client_id TEXT PRIMARY KEY,
-  projections TEXT NOT NULL,
-  allow TEXT NOT NULL,
-  updated_at INTEGER NOT NULL
-)
-```
-
 Ladder, after the other retrofits and BEFORE the canary:
 
 ```ts
@@ -1354,7 +1488,6 @@ with, at module scope, the three trigger statements copied VERBATIM from spec §
 - `rowToSource`: `generation: integer(row, "generation")` (present after the ladder on every db).
 - `sources.getGeneration`: `SELECT generation FROM sources WHERE namespace = ?` → `maybeInteger`.
 - `provisionSource`: after `client.batch(statements, "write")`, `const rs = await client.execute({ sql: "SELECT generation FROM sources WHERE id = ?", args: [source.id] }); return { generation: integer(rs.rows[0] as Row, "generation") };` — no explicit ledger insert (§4.1a rev 11).
-- `profiles` repository: `put` validates `CLIENT_ID_GRAMMAR.test(profile.clientId)` and that `allow` is `string[]` and each projection flag is boolean, then `INSERT ... ON CONFLICT(client_id) DO UPDATE SET projections=excluded.projections, allow=excluded.allow, updated_at=excluded.updated_at`; `rowToProfile` parses both JSON blobs with `parseJson` and rebuilds field-by-field, throwing `[SqliteStore] Failed to read profile: projections is malformed. Context: { clientId }` on any non-boolean flag or non-string allow entry.
 
 - [ ] **Step 7: Run the whole SDK suite and root typecheck**
 
@@ -1365,7 +1498,7 @@ Expected: PASS; `packages/mcp` compiles (its `provisionSource` call ignores the 
 
 ```bash
 git add packages/sdk/src
-git commit -m "feat(sdk): source generation ledger with writer-independent triggers; profiles table"
+git commit -m "feat(sdk): source generation ledger with writer-independent triggers"
 ```
 
 ---
@@ -1444,7 +1577,7 @@ it("INVARIANT §7 (#21): a governed tools/call is dispatched at most once — a 
   expect(initializeCount).toBe(1);
 });
 
-it("INVARIANT §5.5 (#24): beforeSend fires exactly once, before the tools/call body is written, and never for handshake posts", async () => {
+it("INVARIANT §5.5 (#24): beforeSend fires exactly once per tools/call and never for handshake posts (F5: the 'before the write' half is pinned only by the connection-loss test below)", async () => {
   const order: string[] = [];
   const url = await serve((req, res) => {
     readBody(req).then(({ parsed }) => {
@@ -1721,11 +1854,30 @@ describe("§7 post-dispatch classification", () => {
     const invoke = createToolInvoker(deps(initOnly), { executionId: "exec_c", projection: "code", clientId: null });
     await expect(invoke("github.list_issues", {})).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
   });
-  it("a caller-supplied cell (direct drive) is the one advanced", async () => {
+  it("REGRESSION (one-way door #3, eng review D4): a credential echo after a 200 is post-dispatch — ConduitOutcomeAmbiguous, result never delivered", async () => {
+    // The real caller: initialize + tools/call succeed, the 200 body echoes the bearer.
+    const echoing = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    // (stand up a loopback server as in upstream.test.ts whose tools/call result is { echoed: SECRET })
+    const invoke = createToolInvoker(deps(echoing), { executionId: "exec_echo", projection: "code", clientId: null });
+    await expect(invoke("github.list_issues", {})).rejects.toBeInstanceOf(ConduitOutcomeAmbiguous);
+    const rows = await store.trace.listByExecution("exec_echo");
+    expect(JSON.stringify(rows)).not.toContain("ghp_invoker_secret");
+  });
+
+  it("a caller-supplied cell (direct drive) is the one the upstream caller advances", async () => {
     const cell = createDispatchCell();
-    const invoke = createToolInvoker(deps(recordingUpstream().caller), { executionId: "exec_d", projection: "direct", clientId: null, dispatch: cell });
+    const advancing: UpstreamCaller = { async call(request) { request.dispatch?.advance("initializing"); request.dispatch?.advance("dispatched"); return { result: {}, status: 200, latencyMs: 1 }; } };
+    const invoke = createToolInvoker(deps(advancing), { executionId: "exec_d", projection: "direct", clientId: null, dispatch: cell });
     await invoke("github.list_issues", {});
-    expect(cell.state).toBe("none"); // the recording caller never advances; the cell was handed over intact
+    expect(cell.state).toBe("dispatched"); // F6: would read "none" if the invoker minted its own cell
+  });
+  it("INVARIANT §5.3 (F2): the budget is re-checked AFTER the source read — a stall there never dispatches once the budget is gone", async () => {
+    let remaining = 100;
+    const slowSources = { ...store, sources: { ...store.sources, getByNamespace: async (ns: string) => { remaining = 0; return store.sources.getByNamespace(ns); } } } as ConduitStore;
+    const { caller, requests } = recordingUpstream();
+    const invoke = createToolInvoker(deps(caller, { store: slowSources }), { executionId: "exec_f2", projection: "direct", clientId: null, deadline: () => remaining });
+    await expect(invoke("github.list_issues", {})).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream, message: expect.stringContaining("budget is exhausted") });
+    expect(requests).toHaveLength(0);
   });
   it("INVARIANT §5.3 quarantine gate: an exhausted deadline refuses BEFORE credentials are resolved", async () => {
     const resolve = vi.fn();
@@ -1796,7 +1948,21 @@ Expected: FAIL (type errors on the new options; scope ignored; ambiguity not rai
 and the unknown-tool branch's allow-reason becomes
 `outOfScope ? `Tool "${path}" is outside this client's scope.` : `Unknown tool "${path}": not in the catalog, so it is blocked.``.
 
-Move the `remaining <= 0` refusal to run right after connection resolution (step 3) and BEFORE `deps.credentials.resolve` (step 4); keep its trace append and message.
+Reorder steps 3–5 (codex #7, F2): connection resolution → **source read** (`sources.getByNamespace`, the one unbounded read) → **deadline check** (`remaining <= 0` → the same refusal trace and budget-exhausted `upstreamError`) → **credentials** → `upstream.call`. Credentials are resolved only after every unbounded read has returned and the budget has been re-read, so a continuation stuck on a store read never holds live credential material and never dispatches after the row was settled. `timeoutMs` is computed from that post-read deadline. Pass the drive deadline onto the request too — `deadline: options.deadline` on `UpstreamRequest` — for the pre-write gate below (codex #2).
+
+**Pre-write gate inside `beforeSend` (codex #2, P0):** the check above still precedes egress pre-flight and the session handshake, both of which await. The LAST check runs inside the hook, immediately before `req.end`:
+
+```ts
+// upstream.ts, the callTool hooks argument:
+{ beforeSend: () => {
+    if (request.deadline !== undefined && request.deadline() <= 0) {
+      throw new McpClientError("timeout", "drive budget elapsed before the governed call was written");
+    }
+    request.dispatch?.advance("dispatched");
+} }
+```
+
+`openPost` lets a `beforeSend` throw reject the POST promise before `req.end` (wrap the call: `try { beforeSend?.(); } catch (e) { req.destroy(); reject(e); return; }`). The cell is NOT advanced on that path, so the failure classifies pre-dispatch. `UpstreamRequest.deadline?: () => number` is a new optional field. Tests: `upstream.test.ts` — a `deadline` that returns 0 after `initialize` was served → `tools/call` never arrives at the server, cell reads `initializing`, error is the timeout upstream error; `mcp-client.test.ts` — a throwing `beforeSend` rejects with that error and the server records no `tools/call`.
 
 Pass `dispatch` on the `UpstreamRequest`: `...(dispatch !== undefined ? { dispatch } : {})` — always defined here, so simply `dispatch`.
 
@@ -1861,6 +2027,11 @@ describe("createScopedCatalogToolHost (§5.2, #43)", () => {
     const host = createScopedCatalogToolHost(catalog, invoke, wide, "code");
     expect(await host.search({ query: "deploy", limit: 3 })).toHaveLength(3);
   });
+  it("call passes through to the invoker untouched — scope is the invoker's job at call time", async () => {
+    const host = createScopedCatalogToolHost(catalog, invoke, scope, "code");
+    await host.call("ops.deploy_1", { x: 1 });
+    expect(invoke).toHaveBeenCalledWith("ops.deploy_1", { x: 1 });
+  });
 });
 ```
 
@@ -1882,22 +2053,29 @@ export function createScopedCatalogToolHost(
   invoke: ToolInvoker,
   scope: () => Promise<EffectiveScope>,
   projection: Projection,
+  log: (message: string) => void = (m) => console.error(m),
 ): ToolHost {
   const DEFAULT_LIMIT = 10;
+  // codex #8: a resolver failure is a host fault. It must cross into the guest
+  // as the opaque infra error (correlation id in the host log), never as the
+  // store's raw message — the same boundary the invoker applies.
+  const resolve = () => scope().catch((cause) => { throw infraError(cause, log); });
   return {
     search: async (options) => {
-      const snapshot = await scope();
+      const snapshot = await resolve();
       const ranked = catalog.search({ query: options.query, limit: Number.MAX_SAFE_INTEGER });
       return ranked
         .filter((hit) => snapshot.permits(projection, hit.path))
         .slice(0, options.limit ?? DEFAULT_LIMIT);
     },
     describe: async (path, options) =>
-      (await scope()).permits(projection, path) ? catalog.describe(path, options) : undefined,
+      (await resolve()).permits(projection, path) ? catalog.describe(path, options) : undefined,
     call: (path, input) => invoke(path, input),
   };
 }
 ```
+
+(`import { infraError } from "./pipeline/errors.js"`.) Add to the tests: a `scope` that rejects with `new Error("[SqliteStore] disk full at /Users/x/.conduit/conduit.db")` → `host.search(...)` rejects with `name: "ConduitInternalError"` and a message that does NOT contain "SqliteStore" or "/Users"; the `log` spy received the raw detail.
 
 Export it from `index.ts` beside `createCatalogToolHost`.
 
@@ -1934,7 +2112,8 @@ describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
     active = await makeHarness();
     const m = createExecutionManager(active.deps);
     const a = await m.start("return 1");
-    const b = await m.start("return 1", { clientId: "acme" });
+    const permitAllCode: ScopeResolver = async () => buildEffectiveScope({ projections: { code: true, direct: false, discovery: false }, allow: ALL_TOOLS }, await active!.store.tools.list());
+    const b = await m.start("return 1", { clientId: "acme", scope: permitAllCode }); // D11: named ⇒ resolver required
     expect(await m.get(a.executionId)).toMatchObject({ kind: "code", clientId: null, projection: "code" });
     expect(await m.get(b.executionId)).toMatchObject({ kind: "code", clientId: "acme", projection: "code" });
   });
@@ -1943,10 +2122,11 @@ describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
     active = await makeHarness();
     const m = createExecutionManager(active.deps);
     const { executionId } = await m.start("return 7");
-    const raw = await (active.store as unknown as { client?: never }) // use the harness's libsql client instead
-    void raw;
+    const raw = await active.client.execute({ sql: "SELECT code, program FROM executions WHERE id = ?", args: [executionId] });
+    expect(raw.rows[0]?.code).toBe(NEWER_BUILD_SENTINEL);
+    expect(raw.rows[0]?.program).toBe("return 7");
   });
-  // (Write the sentinel assertion with the harness's raw client: SELECT code, program FROM executions WHERE id = ?; expect sentinel / "return 7".)
+  // Harness change: `makeHarness` keeps the first libsql client it opens and exposes it as `Harness.client`.
 
   it("INVARIANT §4.1: a pause captures namespace and sourceGeneration equal to the store's current generation", async () => {
     active = await makeHarness();
@@ -1983,28 +2163,37 @@ describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
   });
 
   it("INVARIANT §5.2 (#16): turning the code flag off mid-drive bites on the running program's NEXT call", async () => {
-    active = await makeHarness();
     let codeOn = true;
+    // `onCall` runs on the fixture server BEFORE it answers a tools/call, so the
+    // flip lands between the first call's dispatch and the second call's scope check.
+    active = await makeHarness({ onCall: () => { codeOn = false; } });
     const scope: ScopeResolver = async () => buildEffectiveScope({ projections: { code: codeOn, direct: false, discovery: false }, allow: ALL_TOOLS }, await active!.store.tools.list());
     const m = createExecutionManager(active.deps);
     const out = await m.start(`
       await tools.github.list_issues({});
-      await tools.github.list_issues({}); // second call is the one that lands after the flag flips
+      await tools.github.list_issues({}); // lands after the flag flipped
       return "reached";
     `, { scope });
-    // arrange the flip: the recording server flips the flag on the FIRST tools/call
-    // (add an `onCall` hook to startMcpServer that runs before it responds; set codeOn = false there)
     expect(out).toMatchObject({ status: "failed", error: { name: "ConduitPolicyBlocked" } });
     expect(active.calls).toHaveLength(1);
+  });
+
+  it("D11 (codex #1): start with a NAMED client and no resolver is refused before any row is written", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    await expect(m.start("return 1", { clientId: "acme" })).rejects.toThrow(/named client requires a scope resolver/);
+    expect(await active.store.executions.listRunningIds()).toEqual([]);
   });
 
   it("INVARIANT §4.1 (#25, manager half): a named client's requestKey conflicts within that client and returns the SAME client's id; another client with the same key runs", async () => {
     active = await makeHarness();
     const m = createExecutionManager(active.deps);
-    const first = await m.start("return 1", { clientId: "acme", requestKey: "k" });
-    const again = await m.start("return 2", { clientId: "acme", requestKey: "k" });
+    // D11: every named start passes a resolver (a named client without one is refused).
+    const permitAllCode: ScopeResolver = async () => buildEffectiveScope({ projections: { code: true, direct: false, discovery: false }, allow: ALL_TOOLS }, await active!.store.tools.list());
+    const first = await m.start("return 1", { clientId: "acme", requestKey: "k", scope: permitAllCode });
+    const again = await m.start("return 2", { clientId: "acme", requestKey: "k", scope: permitAllCode });
     expect(again).toEqual({ status: "conflict", executionId: first.executionId });
-    const other = await m.start("return 3", { clientId: "beta", requestKey: "k" });
+    const other = await m.start("return 3", { clientId: "beta", requestKey: "k", scope: permitAllCode });
     expect(other.status).toBe("completed");
     const dflt = await m.start("return 4", { requestKey: "k" });
     expect(dflt.status).toBe("completed");
@@ -2021,7 +2210,7 @@ describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
 });
 ```
 
-Harness additions: `startMcpServer(options?: { onCall?: (call: UpstreamCall) => void; respondToCall?: (res: ServerResponse, payload) => void })`; `makeHarness` accepts and forwards them.
+Harness additions (this task, so Tasks 9–11 can use them — F13): extract `startMcpServer`, `makeHarness`, `pendingCallOf`, `SECRET`, `PREFIX`, `mcpToolsList`, `Harness` into `packages/sdk/src/execution/manager-harness.ts` (a `*.ts`, not a suite); `startMcpServer(options?: { onCall?: (call: UpstreamCall) => void; respondToCall?: (res: ServerResponse, payload) => void; echoCredential?: boolean })` where `echoCredential` makes the tools/call 200 result `{ ok: true, nested: { token: req.headers.authorization } }`; `makeHarness` forwards them and exposes `Harness.client` (the first libsql client) and `Harness.reprovision()` (the `provisionSource` call with the same rows as setup, `generation: 0` on the source literal).
 
 - [ ] **Step 2: Run to verify failure**
 
@@ -2055,11 +2244,58 @@ Expected: FAIL.
 In `createExecutionManager`:
 
 ```ts
-  /** Bind a resolver to one client id; absent resolver → default profile (D-A3). */
-  function bindScope(scope: ScopeResolver | undefined, clientId: string | null): () => Promise<EffectiveScope> {
-    const resolver = scope ?? defaultScopeResolver(deps.store);
-    return () => resolver(clientId);
+  /**
+   * Bind a resolver to one client id. ABSENT stays absent (eng review D8):
+   * the drive then runs today's unscoped path — no per-call tools.list().
+   * The default profile is materialized only where a check is mandatory
+   * (resume step 4) via `defaultScopeResolver(deps.store)`.
+   */
+  function bindScope(scope: ScopeResolver | undefined, clientId: string | null): (() => Promise<EffectiveScope>) | undefined {
+    return scope === undefined ? undefined : () => scope(clientId);
   }
+```
+
+`start` passes `...(scope !== undefined ? { scope } : {})` to `makeInvoker` and
+`scope !== undefined ? { scope, projection: "code" } : undefined` to `drive`
+(hence to `makeToolHost`). The conflict path uses the shared mapper (D-A12):
+
+```ts
+// packages/sdk/src/execution/create-conflict.ts
+import type { ConduitStore } from "../store/store.js";
+import type { ExecutionOutcome } from "./manager.js";
+
+const UNIQUE_MARKERS = [
+  "UNIQUE constraint failed: executions.request_key",
+  "UNIQUE constraint failed: request_keys.client_id, request_keys.key",
+] as const;
+
+/**
+ * Maps a failed `executions.create` to a `conflict` outcome when the cause is
+ * the request-key uniqueness rule (M1): default profile → the legacy column's
+ * unique index; named client → the request_keys primary key. Returns undefined
+ * for any other cause so the caller rethrows it.
+ */
+export async function mapCreateConflict(
+  cause: unknown,
+  requestKey: string | undefined,
+  clientId: string | null,
+  store: Pick<ConduitStore, "executions">,
+): Promise<ExecutionOutcome | undefined> {
+  if (requestKey === undefined) return undefined;
+  const text = String(cause);
+  if (!UNIQUE_MARKERS.some((m) => text.includes(m))) return undefined;
+  const existing = await store.executions.getByRequestKey(requestKey, clientId);
+  return existing === undefined ? undefined : { status: "conflict", executionId: existing.id };
+}
+```
+
+`start`:
+```ts
+      } catch (cause) {
+        const conflict = await mapCreateConflict(cause, opts?.requestKey, clientId, deps.store);
+        if (conflict !== undefined) return conflict;
+        throw cause;
+      }
 ```
 
 `CapturedDriveState` gains `catalogChanged?: ExecutionError`. `journal()`'s `onApprovalPause` type becomes `() => Promise<PendingApproval>`; in the `isRequireApproval` branch:
@@ -2072,7 +2308,13 @@ In `createExecutionManager`:
               captured.catalogChanged = { name: "ConduitCatalogChanged", message: cause.message };
               throw new ConduitApprovalPause(true);
             }
-            throw cause;
+            // codex #8: any other provenance failure (a store read threw) is a host
+            // fault. Terminal, guest-uncatchable, OPAQUE — the cause goes to the host
+            // log, never into a guest-visible or persisted message.
+            const correlationId = crypto.randomUUID();
+            console.error(`[ExecutionManager] Provenance read failed at pause ${correlationId}: ${String(cause)}`);
+            captured.ambiguous = { name: "ConduitInternalError", message: `[ExecutionManager] Approval pause could not be recorded. Reference: ${correlationId}` };
+            throw new ConduitApprovalPause(true);
           }
           throw new ConduitApprovalPause();
 ```
@@ -2106,13 +2348,17 @@ Add, beside `isReplayDivergence`: `function isOutcomeAmbiguous(error: unknown): 
     }
 ```
 
-(`CatalogChangedAtPause` is module-scope, not inside the wrapper.) In `drive()`, after the divergence/ambiguous checks: `if (captured.catalogChanged !== undefined) return finish(execution, { status: "failed", error: captured.catalogChanged });`.
+(`CatalogChangedAtPause` is module-scope, not inside the wrapper.) In `drive()`, after the divergence/ambiguous checks: `if (captured.catalogChanged !== undefined) return finish(execution, { status: "failed", error: captured.catalogChanged });`. `neverPauses` becomes an async thrower to match the new `onApprovalPause` type (F10b): `function neverPauses(op: string): () => Promise<PendingApproval> { return async () => { throw new Error(...) }; }`.
 
 `start`:
 
 ```ts
     async start(code, opts) {
       const clientId = opts?.clientId ?? null;
+      if (clientId !== null && opts?.scope === undefined) {
+        // D11 / codex #1: a NAMED client without a resolver has no authority to run under.
+        throw new Error(`[ExecutionManager] start refused: a named client requires a scope resolver. Context: { clientId: ${JSON.stringify(clientId)} }`);
+      }
       const scope = bindScope(opts?.scope, clientId);
       const execution: Execution = {
         id: `exec_${newId()}`, kind: "code", code, status: "running", seeds: generateSeeds(), startedAt: now(),
@@ -2131,9 +2377,9 @@ Add, beside `isReplayDivergence`: `function isOutcomeAmbiguous(error: unknown): 
         }
         throw cause;
       }
-      // ... unchanged session/invoker window, with:
-      invoke = deps.makeInvoker({ executionId: execution.id, deadline: deadlineFor(opts?.limits), upstreamSession, projection: "code", clientId, scope });
-      return await drive(execution, invoke, [], undefined, opts?.limits, { scope, projection: "code" });
+      // ... unchanged session/invoker window, with (F9 — matches the prose above; exactOptionalPropertyTypes forbids `scope: undefined`):
+      invoke = deps.makeInvoker({ executionId: execution.id, deadline: deadlineFor(opts?.limits), upstreamSession, projection: "code", clientId, ...(scope !== undefined ? { scope } : {}) });
+      return await drive(execution, invoke, [], undefined, opts?.limits, scope !== undefined ? { scope, projection: "code" } : undefined);
 ```
 
 `drive(execution, invoke, prefix, secret, limits, scoped?)` passes `scoped` to `deps.makeToolHost(invoke, scoped)`. `drive` must narrow: `execution.kind === "code"` (it is the only caller until Task 10); pass `execution.code`/`execution.seeds` from the narrowed value.
@@ -2159,7 +2405,7 @@ git commit -m "feat(sdk): start carries client attribution, provenance-stamped p
 
 **Interfaces:**
 - Consumes: Tasks 1–8.
-- Produces: `ExecutionManager.resume(executionId, decision, callId, scope?: ScopeResolver): Promise<ResumeOutcome>`. New terminal error names on the resume path: `ConduitCatalogChanged` (`decisionApplied: false`, no `corruptPause`), `ConduitScopeRevoked` (`decisionApplied: false`), and `ConduitInternalError` + `corruptPause: true` for every disposition-table row marked "terminalize corrupt". A direct row reaching step 5 is handed to Task 10's arm; until Task 10 lands, `resume` on a direct row terminalizes `failed` `ConduitInternalError` "direct resume not yet implemented" so the guard tests can run against direct rows.
+- Produces: `ExecutionManager.resume(executionId, decision, callId, scope?: ScopeResolver, lifecycle?: (handle: { retention: Promise<"released" | "abandoned">; finished: Promise<void> }) => void): Promise<ResumeOutcome>` — `lifecycle` is called synchronously for a DIRECT row only, before the drive starts (codex pass 2, #4), so the daemon can hold the admission slot exactly as for `startDirect`; code rows never call it. New terminal error names on the resume path: `ConduitCatalogChanged` (`decisionApplied: false`, no `corruptPause`), `ConduitScopeRevoked` (`decisionApplied: false`), and `ConduitInternalError` + `corruptPause: true` for every disposition-table row marked "terminalize corrupt". A direct row reaching step 5 is handed to Task 10's arm; until Task 10 lands, `resume` on a direct row terminalizes `failed` `ConduitInternalError` "direct resume not yet implemented" so the guard tests can run against direct rows.
 
 - [ ] **Step 1: Write the failing tests** — one per §5.4 disposition row, plus the D3 and scope pins. Use `makeBareStore()` + `makeStubDeps()` for hand-built rows (the guard fires BEFORE any drive) and the real harness for the D3/scope end-to-end cases.
 
@@ -2190,6 +2436,10 @@ describe("§5.4 step 2 — post-claim read-side guard (row #50), one test per di
     await store.tools.replaceNamespace("github", [tool({ name: "github.list_issues", namespace: "github" })]);
     manager = createExecutionManager(makeStubDeps(store, throwingSandbox()));
   });
+  /** F10c: a Sandbox whose execute throws — the guard under test fires BEFORE any drive. */
+  function throwingSandbox(): Sandbox {
+    return { execute: () => Promise.reject(new Error("[test] sandbox must not run: the resume guard terminalizes first")) };
+  }
   const currentGen = async () => (await store.sources.getGeneration("github")) as number;
 
   async function resumeRaw(id: string, rawPausedOn: string, callId = "c1") {
@@ -2274,6 +2524,14 @@ describe("§5.4 step 2 — post-claim read-side guard (row #50), one test per di
     await store.executions.create(directRow({ id: "d", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }));
     expect(await manager.resume("d", { kind: "approve" }, "c1")).toMatchObject({ error: { name: "ConduitScopeRevoked" } }); // D-A3: no resolver = default profile, direct off
   });
+
+  it("D11 (codex #1): a NAMED row resumed with no resolver fails closed — never the default profile, never an unscoped drive", async () => {
+    const gen = await currentGen();
+    await store.executions.create(codeRow({ id: "named", clientId: "acme", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }));
+    const spy = vi.spyOn(store.tools, "list");
+    expect(await manager.resume("named", { kind: "approve" }, "c1")).toMatchObject({ status: "failed", decisionApplied: false, error: { name: "ConduitScopeRevoked" } });
+    expect(spy).not.toHaveBeenCalled(); // the default profile was not even consulted
+  });
 });
 
 describe("§5.4 resume under scope — real stack", () => {
@@ -2293,7 +2551,7 @@ describe("§5.4 resume under scope — real stack", () => {
     const m = createExecutionManager(active.deps);
     const paused = await m.start('await tools.github.create_issue({ title: "x" }); return 1;');
     const callId = await pendingCallOf(m, paused.executionId);
-    await active.store.provisionSource({ /* same source/integration/connection as makeHarness, tools: normalizeMcp(...) */ } as never);
+    await active.reprovision(); // F13: the harness helper (defined in Task 8's harness change) — triggers bump the generation
     expect(await active.store.executions.get(paused.executionId)).toMatchObject({ status: "paused" }); // no sweep in the SDK; the daemon runs it (Lane B)
     const out = await m.resume(paused.executionId, { kind: "approve" }, callId);
     expect(out).toMatchObject({ status: "failed", decisionApplied: false, error: { name: "ConduitCatalogChanged" } });
@@ -2310,9 +2568,37 @@ describe("§5.4 resume under scope — real stack", () => {
       const terminalize = async (
         reason: string, errorName: string, flag: { corruptPause?: true } = {},
       ): Promise<ResumeOutcome> => {
-        await deps.store.executions.failClaimedResume(executionId, reason, errorName);
-        return { status: "failed", executionId, error: { name: errorName, message: `[ExecutionManager] ${reason}. Context: { executionId: ${executionId} }` }, decisionApplied: false, ...flag };
+        const error = { name: errorName, message: `[ExecutionManager] ${reason}. Context: { executionId: ${executionId} }` };
+        if (execution?.kind === "direct") {
+          // codex pass 2, #3: every post-claim DIRECT terminal write is bounded and
+          // attempt-fenced (D-A11 final), including the TTL expiry write below. Code
+          // rows keep the shipped failClaimedResume path unchanged.
+          const written = await settleDirectBounded(executionId, resumeAttemptId, { status: "failed", error });
+          if (written !== "written") return { status: "unknown", executionId, reason: written, decisionApplied: false };
+        } else {
+          await deps.store.executions.failClaimedResume(executionId, reason, errorName);
+        }
+        return { status: "failed", executionId, error, decisionApplied: false, ...flag };
       };
+```
+
+with, in `createExecutionManager`:
+
+```ts
+  /** Race one fenced direct settle against SETTLE_WRITE_BUDGET_MS. Never throws. */
+  async function settleDirectBounded(id: string, attempt: string, settle: DirectSettle): Promise<"written" | "persist-failed" | "persist-timeout"> {
+    const write = deps.store.executions.settleDirect(id, attempt, settle).then((ok) => (ok ? "written" : "persist-failed"), () => "persist-failed");
+    let t: NodeJS.Timeout | undefined;
+    const timer = new Promise<"persist-timeout">((r) => { t = setTimeout(() => r("persist-timeout"), budgets.settleWriteBudgetMs); });
+    const winner = await Promise.race([write, timer]);
+    clearTimeout(t);
+    return winner;
+  }
+```
+
+The TTL-expiry branch (`now() > pausedOn.expiresAt`) for a direct row uses the same helper with `{ status: "expired" }` — add that arm to `DirectSettle` in Task 2 (`| { status: "expired" }`, writes `status='expired', ended_at, paused_on=NULL`) — and returns `unknown` on a non-`written` result. Note: the corrupt-pause branches that run BEFORE `execution` is hydrated (`execution === undefined`) cannot know the kind and keep `failClaimedResume`.
+
+```ts
       const CORRUPT = { corruptPause: true as const };
 ```
 
@@ -2347,14 +2633,27 @@ then, in order (§5.4 step 2):
       if (currentGeneration === undefined || currentGeneration !== pausedOn.sourceGeneration) {
         return terminalize("catalog changed — re-approve", "ConduitCatalogChanged");
       }
-      // step 4: revalidate flag AND grant under the ROW's client and projection
-      const scope = bindScope(scopeResolver, execution.clientId);
+      // step 4: revalidate flag AND grant under the ROW's client and projection.
+      // No resolver: the default profile applies ONLY to a default-profile row
+      // (clientId null — D8); a NAMED row without a resolver has no authority to
+      // resume under and fails closed (D11 / codex #1). Once per resume, never per call.
+      if (scopeResolver === undefined && execution.clientId !== null) {
+        return terminalize("no scope resolver for a named client's row — cannot revalidate its grant", "ConduitScopeRevoked");
+      }
+      const scope = bindScope(scopeResolver, execution.clientId) ??
+        (() => defaultScopeResolver(deps.store)(null));
       if (!(await scope()).permits(execution.projection, pausedOn.toolName)) {
         return terminalize("the client's scope no longer permits this call — re-approve is not possible", "ConduitScopeRevoked");
       }
 ```
 
-`resume(executionId, decision, callId, scopeResolver?)` — thread `scope` into `makeInvoker({ ..., projection: execution.projection, clientId: execution.clientId, scope })` and `drive(running, invoke, prefix, undefined, undefined, { scope, projection: "code" })` for code rows. For `execution.kind === "direct"`: `return terminalize("direct resume not yet implemented", "ConduitInternalError")` — replaced in Task 10.
+**Prep-window catch is opaque (codex pass 3, #1):** the shipped catch at the bottom of `resume` persists `resume preparation failed: ${String(cause)}`. The new guard reads (`tools.get`, `getGeneration`, `scope()`) now flow through it, and a store rejection carries host-only detail (a database path) into a row `check_execution` returns to the agent. Replace the catch body with: `const ref = crypto.randomUUID(); console.error(`[ExecutionManager] resume preparation failed ${ref}: ${String(cause)}`); await deps.store.executions.failClaimedResume(executionId, `resume preparation failed. Reference: ${ref}`).catch(() => {}); throw cause;`. This changes the wording of the shipped I-3 accepted exception (INVARIANTS.md §5.5 row: "with the parse error as its stored reason"); Task 11 rewords that clause to "with an opaque reference as its stored reason; the cause is in the daemon log". For DIRECT rows, the same catch uses the bounded fenced helper (`settleDirectBounded(executionId, resumeAttemptId, { status: "failed", error })`) — see the next paragraph.
+
+**Direct rows: every post-claim terminalization is bounded and fenced, including the branches that run BEFORE hydration succeeds (codex pass 3, #2):** the `execution === undefined` / `pausedOn === undefined` branch and the `isPendingApproval` failure branch cannot read `execution.kind`, so Task 2 adds `ExecutionRepository.kindOf(id): Promise<ExecutionKind | undefined>` (`SELECT kind FROM executions WHERE id = ?`, no hydration, never throws on a corrupt sibling column). `resume` reads `kindOf` once right after the claim wins; when it is `"direct"`, every terminalization in the prep window routes through `settleDirectBounded`, and a non-`written` result returns `{ status: "unknown", executionId, reason, decisionApplied: false }`. Code rows keep `failClaimedResume`.
+
+**The direct drive is created right after the claim, before any guard read (codex pass 3, #3):** when `kindOf` says `"direct"`, `resume` builds the `DirectDrive` (its timer starts) and calls `lifecycle?.()` at that point; every later await in the guard (`get`, `claimCallId`, `tools.get`, `getGeneration`, `scope()`, `policies.get`) is followed by `if (drive.deadline() <= 0)` → bounded terminalize `ConduitExecutionInterrupted`. Task 10's arm then REUSES that drive instead of constructing one. A stalled guard read can no longer outlive the client deadline and then open a fresh 60 s window.
+
+`resume(executionId, decision, callId, scopeResolver?, lifecycle?)` — for code rows thread the BOUND resolver only when one was given: `const driveScope = bindScope(scopeResolver, execution.clientId);` then `makeInvoker({ ..., projection: execution.projection, clientId: execution.clientId, ...(driveScope !== undefined ? { scope: driveScope } : {}) })` and `drive(running, invoke, prefix, undefined, undefined, driveScope !== undefined ? { scope: driveScope, projection: "code" } : undefined)`. (Step 4 above used the default profile once; the drive itself stays unscoped when no resolver exists — D8.) For `execution.kind === "direct"`: `return terminalize("direct resume not yet implemented", "ConduitInternalError")` — replaced in Task 10.
 
 Also: the existing corrupt-state message for the `isPendingApproval` failure stays; the existing "no pending approval" branch stays.
 
@@ -2385,9 +2684,11 @@ git commit -m "feat(sdk): post-claim read-side guard, generation check, scope re
 // direct.ts
 export interface DirectBudgets { driveBudgetMs: number; settleWriteBudgetMs: number; slotRetentionMs: number; resultBytesMax: number }
 export const DIRECT_DEFAULTS: DirectBudgets = { driveBudgetMs: 60_000, settleWriteBudgetMs: 5_000, slotRetentionMs: 30_000, resultBytesMax: 262_144 };
+export type UnknownOutcome = { status: "unknown"; executionId: string; reason: "persist-timeout" | "persist-failed" };
 export type DirectOutcome =
   | ExecutionOutcome                                         // completed arm may carry `resultTooLarge: true`
-  | { status: "unknown"; executionId: string; reason: "persist-timeout" };
+  | UnknownOutcome;                                          // codex #5: a REJECTED write is "persist-failed", never the intended outcome
+// manager.ts: `ResumeOutcome = (ExecutionOutcome | UnknownOutcome) & { decisionApplied: boolean; corruptPause?: true }` (D-A11 final)
 export interface DirectDriveHandle {
   executionId: string;
   /** Client-visible. Resolves within driveBudgetMs + settleWriteBudgetMs. Never rejects. */
@@ -2405,9 +2706,22 @@ export interface DirectDrive {
   settle(): boolean;
   readonly settled: boolean;
 }
-export function createDirectDrive(args: { executionId: string; attempt: string; now: () => number; budgetMs: number }): DirectDrive;
+export function createDirectDrive(args: { executionId: string; attempt: string; now: () => number; budgetMs: number; onExpire?: () => void }): DirectDrive & {
+  dispose(): void;
+  /** Reassignable: the resume path creates the drive before the run exists (codex pass 3, #3). */
+  onExpire: (() => void) | undefined;
+  /** Deferred lifecycle wiring for the resume path: `lifecycle` receives promises built from these before the run exists. */
+  resolveFinished(p: Promise<void>): void;
+  resolveSettledAt(p: Promise<void>): void;
+  readonly finished: Promise<void>;
+  readonly settledAt: Promise<void>;
+};
+// (codex #14 / pass 3 #3: this is the authoritative signature; the Step 3 snippet matches it — the timer's
+// callback reads `this.onExpire` at fire time, so a drive created before its run can still settle it.)
 // manager.ts
-startDirect(toolName: string, input: unknown, opts: { clientId: string | null; projection: "direct" | "discovery"; requestKey?: string; scope?: ScopeResolver }): DirectDriveHandle;
+startDirect(toolName: string, input: unknown, opts: { clientId: string | null; projection: "direct" | "discovery"; requestKey?: string; scope: ScopeResolver }): DirectDriveHandle;
+// `scope` is REQUIRED here (spec §5.4; outside voice F1): a direct call whose projection flag is never
+// evaluated would be a public SDK bypass. D-A3's optional scope applies to start/resume only.
 // ExecutionOutcome completed arm gains `resultTooLarge?: true`
 // ExecutionManagerDeps gains `direct?: Partial<DirectBudgets>`
 ```
@@ -2471,19 +2785,133 @@ it("INVARIANT §4.1 (#41): a deliverable over RESULT_BYTES_MAX is settled `disca
   expect(out).toMatchObject({ status: "completed", resultTooLarge: true });
   expect((out as { value?: unknown }).value).toBeUndefined();
   expect(await m.get(out.executionId)).toMatchObject({ status: "completed", resultState: "discarded" });
-  // expanding redaction: build a fixture whose result is a 250 KB tree of 20,000 empty objects nested 65 deep
-  // → raw 250 KB fits; redacted, every depth-64 object becomes the 12-byte "[redacted]" → > 256 KiB → resumed path settles discarded
-  // (assert resultState "discarded", result undefined, outcome resultTooLarge:true, decisionApplied:true)
 });
 
-it("INVARIANT §5.3 (#22/#28): exactly-once settlement — the timer wins, a delayed SUCCESS never overwrites `failed`, the late continuation is discarded", async () => {
-  active = await makeHarness({ respondToCall: (res, payload) => setTimeout(() => { res.writeHead(200, { "content-type": "application/json" }); res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: { late: true } })); }, 900) });
+it("INVARIANT §4.1 (#41, codex #9): an expanding redaction — fits raw, exceeds the cap redacted — is discarded on the RESUMED path", async () => {
+  // 25,000 leaves, each an empty object at depth 65 under a 64-deep spine. Raw: each leaf
+  // is `{}` (2 bytes) plus array commas → ~75 KB, well under 256 KiB. Redacted: every
+  // object at depth >= 64 becomes the 12-byte string "[redacted]" → ~300 KB → over the cap.
+  const spine = (depth: number, leaves: unknown): unknown => (depth === 0 ? leaves : { d: spine(depth - 1, leaves) });
+  const bigResult = spine(64, Array.from({ length: 25_000 }, () => ({})));
+  expect(deliverableBytes(bigResult)).toBeLessThan(262_144);
+  expect(deliverableBytes(redactSensitiveFields(bigResult, []))).toBeGreaterThan(262_144);
+  active = await makeHarness({ respondToCall: (res, payload) => {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: bigResult }));
+  } });
   const m = createExecutionManager({ ...active.deps, direct: fast });
+  const paused = await m.startDirect("github.create_issue", { title: "t" }, { clientId: null, projection: "direct", scope: permitDirect }).outcome;
+  const out = await m.resume(paused.executionId, { kind: "approve" }, await pendingCallOf(m, paused.executionId), permitDirect);
+  expect(out).toMatchObject({ status: "completed", resultTooLarge: true, decisionApplied: true });
+  const row = await m.get(paused.executionId);
+  expect(row).toMatchObject({ resultState: "discarded" });
+  expect(row?.result).toBeUndefined();
+});
+
+it("deliverableBytes measures UTF-8, not string length; undefined measures as null", () => {
+  expect(deliverableBytes("ÿ")).toBe(4);            // '"ÿ"' → quote + 2-byte char + quote
+  expect(deliverableBytes(undefined)).toBe(4);      // "null"
+  expect(deliverableBytes({ a: "€" })).toBe(11);    // {"a":"€"} is 9 chars; € is 3 bytes → 11 (codex #15)
+});
+
+it("D-A13 (eng review D2): the budget timer is armed before create() — a hung first write still yields the timeout outcome within budget", async () => {
+  active = await makeHarness();
+  const never = new Promise<never>(() => {});
+  const stuck = { ...active.store, executions: { ...active.store.executions, create: () => never } } as ConduitStore;
+  const m = createExecutionManager({ ...active.deps, store: stuck, direct: fast });
+  const t0 = Date.now();
+  const out = await m.startDirect("github.list_issues", {}, { clientId: null, projection: "direct", scope: permitDirect }).outcome;
+  expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 200);
+  expect(out).toMatchObject({ status: "failed", error: { name: "ConduitExecutionInterrupted" } });
+  expect(active.calls).toHaveLength(0);
+});
+
+it("INVARIANT §5.3 (#22/#28): exactly-once settlement — the timer wins, a delayed SUCCESS from the continuation never overwrites `failed`", async () => {
+  // F4: the upstream clamp would fail the continuation itself, so stub the INVOKER to
+  // succeed 500 ms after the 400 ms budget; only the manager's latch + fence can keep
+  // the row `failed`. A late invoker success advances no cell, so the timer's
+  // classification is pre-dispatch (ConduitExecutionInterrupted).
+  active = await makeHarness();
+  const settleCalls: boolean[] = [];
+  const spyStore = { ...active.store, executions: { ...active.store.executions,
+    settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => { const r = await active!.store.executions.settleDirect(...a); settleCalls.push(r); return r; } } } as ConduitStore;
+  const m = createExecutionManager({ ...active.deps, store: spyStore, direct: fast,
+    makeInvoker: () => () => new Promise((resolve) => setTimeout(() => resolve({ late: true }), 900)) });
   const handle = m.startDirect("github.list_issues", {}, { clientId: null, projection: "direct", scope: permitDirect });
   const out = await handle.outcome;
-  expect(out).toMatchObject({ status: "failed", error: { name: "ConduitOutcomeAmbiguous" } }); // the body was written before the stall
+  expect(out).toMatchObject({ status: "failed", error: { name: "ConduitExecutionInterrupted" } });
   await handle.finished;
+  expect(settleCalls).toEqual([true]); // exactly one write changed the row; the late success never reached settleDirect
+  expect(await m.get(out.executionId)).toMatchObject({ status: "failed", error: { name: "ConduitExecutionInterrupted" } });
+});
+
+it("INVARIANT §7 (#22, codex #9): the timer fires with the cell already DISPATCHED — settled ConduitOutcomeAmbiguous, and a late continuation changes nothing", async () => {
+  active = await makeHarness();
+  const settleCalls: boolean[] = [];
+  const spyStore = { ...active.store, executions: { ...active.store.executions,
+    settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => { const r = await active!.store.executions.settleDirect(...a); settleCalls.push(r); return r; } } } as ConduitStore;
+  // The invoker stub advances the SUPPLIED cell (the drive's) to dispatched, then hangs past the budget.
+  const m = createExecutionManager({ ...active.deps, store: spyStore, direct: fast,
+    makeInvoker: ({ dispatch }) => () => { dispatch?.advance("initializing"); dispatch?.advance("dispatched"); return new Promise((resolve) => setTimeout(() => resolve({ late: true }), 900)); } });
+  const handle = m.startDirect("github.list_issues", {}, { clientId: null, projection: "direct", scope: permitDirect });
+  const out = await handle.outcome;
+  expect(out).toMatchObject({ status: "failed", error: { name: "ConduitOutcomeAmbiguous" } });
+  await handle.finished;
+  expect(settleCalls).toEqual([true]);
   expect(await m.get(out.executionId)).toMatchObject({ status: "failed", error: { name: "ConduitOutcomeAmbiguous" } });
+});
+
+it("INVARIANT §5.3 (codex #5): a REJECTED settle write publishes unknown/persist-failed, never the intended outcome", async () => {
+  active = await makeHarness();
+  const failing = { ...active.store, executions: { ...active.store.executions, settleDirect: async () => { throw new Error("SQLITE_IOERR"); } } } as ConduitStore;
+  const m = createExecutionManager({ ...active.deps, store: failing, direct: fast });
+  const out = await m.startDirect("github.list_issues", {}, { clientId: null, projection: "direct", scope: permitDirect }).outcome;
+  expect(out).toEqual({ status: "unknown", executionId: expect.any(String), reason: "persist-failed" });
+});
+
+it("D-A11 final (D12): on RESUME a stalled settle write yields unknown/persist-timeout within budget, with decisionApplied", async () => {
+  active = await makeHarness();
+  let release!: () => void;
+  const gate = new Promise<void>((r) => { release = r; });
+  const slowSettle = { ...active.store, executions: { ...active.store.executions,
+    settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => { await gate; return active!.store.executions.settleDirect(...a); } } } as ConduitStore;
+  const m = createExecutionManager({ ...active.deps, direct: fast });
+  const paused = await m.startDirect("github.create_issue", { title: "t" }, { clientId: null, projection: "direct", scope: permitDirect }).outcome;
+  const slowM = createExecutionManager({ ...active.deps, store: slowSettle, direct: fast });
+  const t0 = Date.now();
+  const out = await slowM.resume(paused.executionId, { kind: "approve" }, await pendingCallOf(m, paused.executionId), permitDirect);
+  expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 300);
+  expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout", decisionApplied: true });
+  release();
+  await new Promise((r) => setTimeout(r, 50));
+  expect(await m.get(paused.executionId)).toMatchObject({ status: "completed", resultState: "retained" });
+});
+
+it("INVARIANT §5.3 (F2): a source read that outlives the budget never dispatches — the row settles pre-dispatch and the upstream sees nothing", async () => {
+  active = await makeHarness();
+  const slow = { ...active.store, sources: { ...active.store.sources, getByNamespace: (ns: string) => new Promise((r) => setTimeout(() => r(active!.store.sources.getByNamespace(ns)), 900)) } } as ConduitStore;
+  const m = createExecutionManager({ ...active.deps, store: slow, direct: fast });
+  const handle = m.startDirect("github.list_issues", {}, { clientId: null, projection: "direct", scope: permitDirect });
+  const out = await handle.outcome;
+  expect(out).toMatchObject({ status: "failed", error: { name: "ConduitExecutionInterrupted" } });
+  await handle.finished;
+  expect(active.calls).toHaveLength(0);
+});
+
+it("F3: the timer fires while create() is in flight, create() then succeeds — the row is settled failed, never left running, and the pipeline never runs", async () => {
+  active = await makeHarness();
+  let releaseCreate!: () => void;
+  const gate = new Promise<void>((r) => { releaseCreate = r; });
+  const slowCreate = { ...active.store, executions: { ...active.store.executions,
+    create: async (...a: Parameters<ConduitStore["executions"]["create"]>) => { await gate; return active!.store.executions.create(...a); } } } as ConduitStore;
+  const m = createExecutionManager({ ...active.deps, store: slowCreate, direct: fast });
+  const handle = m.startDirect("github.list_issues", {}, { clientId: null, projection: "direct", scope: permitDirect });
+  const out = await handle.outcome;
+  expect(out.status).toBe("failed");
+  releaseCreate();
+  await handle.finished;
+  expect(await m.get(out.executionId)).toMatchObject({ status: "failed", error: { name: "ConduitExecutionInterrupted" } });
+  expect(active.calls).toHaveLength(0);
 });
 
 it("INVARIANT §5.3 (#22): a delayed REFUSAL after timeout leaves the row failed under the timeout's own classification (pre-dispatch)", async () => {
@@ -2564,21 +2992,41 @@ import type { ExecutionOutcome } from "./manager.js";
 
 export interface DirectBudgets { /* as in Interfaces */ }
 export const DIRECT_DEFAULTS: DirectBudgets = { driveBudgetMs: 60_000, settleWriteBudgetMs: 5_000, slotRetentionMs: 30_000, resultBytesMax: 262_144 };
-export type DirectOutcome = ExecutionOutcome | { status: "unknown"; executionId: string; reason: "persist-timeout" };
+export type UnknownOutcome = { status: "unknown"; executionId: string; reason: "persist-timeout" | "persist-failed" };
+export type DirectOutcome = ExecutionOutcome | UnknownOutcome; // matches the Interfaces block (codex pass 2, #7)
 export interface DirectDriveHandle { /* as in Interfaces */ }
 export interface DirectDrive { /* as in Interfaces */ }
 
-export function createDirectDrive(args: { executionId: string; attempt: string; now: () => number; budgetMs: number }): DirectDrive {
+/**
+ * D-A13: the drive OWNS its budget timer, armed at construction — before any
+ * store write — so a hung `create()` cannot postpone the timeout. `onExpire`
+ * runs at most once, only if the latch is still free; `dispose()` clears the
+ * timer (call it in the continuation's `finally`).
+ */
+export function createDirectDrive(args: {
+  executionId: string; attempt: string; now: () => number; budgetMs: number;
+  onExpire?: () => void;
+}) {
   const end = args.now() + args.budgetMs;
   let settled = false;
-  return {
+  let resolveFinished!: (p: Promise<void>) => void;
+  let resolveSettledAt!: (p: Promise<void>) => void;
+  const finished = new Promise<void>((r) => { resolveFinished = (p) => p.then(r, r); });
+  const settledAt = new Promise<void>((r) => { resolveSettledAt = (p) => p.then(r, r); });
+  const drive = {
     executionId: args.executionId,
     attempt: args.attempt,
     dispatch: createDispatchCell(),
+    onExpire: args.onExpire,
     deadline: () => end - args.now(),
     settle() { if (settled) return false; settled = true; return true; },
     get settled() { return settled; },
+    dispose() { clearTimeout(timer); },
+    resolveFinished, resolveSettledAt, finished, settledAt,
   };
+  // Reads `drive.onExpire` at FIRE time: the resume path assigns it after construction.
+  const timer = setTimeout(() => { if (!settled) drive.onExpire?.(); }, args.budgetMs);
+  return drive;
 }
 
 /** UTF-8 size of what will be sent AND stored (§4.1 rev 17). */
@@ -2603,15 +3051,44 @@ Shared core used by BOTH `startDirect` and the direct resume arm:
     redactFields?: readonly string[];
     resolveOutcome: (o: DirectOutcome) => void;
     tracked: Promise<unknown>[]; // settle writes still in flight
+    /** True once create() (startDirect) or the claim (resume) has put the row in place. */
+    persisted: boolean;
   }
 
-  /** Bounded settle: resolve the outcome at most settleWriteBudgetMs after the write starts. */
+  /**
+   * Bounded settle (both direct paths — D-A11 final): the intended outcome is
+   * published ONLY when the fenced write returned true (codex #5). false = the
+   * fence lost (the other side already settled; publish nothing, the winner
+   * did). A rejected write = "persist-failed"; a write still pending after
+   * SETTLE_WRITE_BUDGET_MS = "persist-timeout". Both mean "the effect may have
+   * landed and the row may not yet say so" — never a claimed terminal.
+   */
   async function settleBounded(run: DirectRun, settle: DirectSettle, outcome: DirectOutcome): Promise<void> {
-    const write = deps.store.executions.settleDirect(run.execution.id, run.drive.attempt, settle).catch(() => false);
+    if (!run.persisted) {
+      // codex pass 2, #2: no row exists yet (the timer beat create()). There is
+      // nothing to write and nothing that could have dispatched; publish the
+      // pre-dispatch outcome directly. If create() lands later, startDirect's
+      // post-create branch re-issues this settle against the row (F3).
+      run.resolveOutcome(outcome);
+      return;
+    }
+    const write: Promise<"written" | "fenced" | "failed"> = deps.store.executions
+      .settleDirect(run.execution.id, run.drive.attempt, settle)
+      .then((changed) => (changed ? "written" : "fenced"), () => "failed");
     run.tracked.push(write);
-    const timer = new Promise<"timeout">((r) => setTimeout(() => r("timeout"), budgets.settleWriteBudgetMs));
-    const winner = await Promise.race([write.then(() => "written" as const), timer]);
-    run.resolveOutcome(winner === "written" ? outcome : { status: "unknown", executionId: run.execution.id, reason: "persist-timeout" });
+    let timerHandle: NodeJS.Timeout | undefined;
+    const timer = new Promise<"timeout">((r) => { timerHandle = setTimeout(() => r("timeout"), budgets.settleWriteBudgetMs); });
+    const winner = await Promise.race([write, timer]);
+    clearTimeout(timerHandle);
+    switch (winner) {
+      case "written": run.resolveOutcome(outcome); return;
+      // "fenced" on a persisted row: the latch guarantees ONE settleBounded caller per
+      // drive, so a 0-row result means the row is not `running` under this attempt —
+      // an inconsistency, reported honestly as unknown, never as the intended outcome.
+      case "fenced":
+      case "failed": run.resolveOutcome({ status: "unknown", executionId: run.execution.id, reason: "persist-failed" }); return;
+      case "timeout": run.resolveOutcome({ status: "unknown", executionId: run.execution.id, reason: "persist-timeout" }); return;
+    }
   }
 
   function classifyDirectFailure(run: DirectRun, cause: unknown): ExecutionError {
@@ -2621,23 +3098,29 @@ Shared core used by BOTH `startDirect` and the direct resume arm:
     return toSandboxError(cause);
   }
 
-  /** The one continuation. Never throws. */
+  /** The timer's settle handler (D-A13): installed via createDirectDrive's onExpire. */
+  function expireDirect(run: DirectRun): void {
+    const { execution, drive } = run;
+    if (!drive.settle()) return;
+    const error: ExecutionError = drive.dispatch.state === "dispatched"
+      ? classifyDirectFailure(run, new Error("budget elapsed after dispatch"))
+      : { name: "ConduitExecutionInterrupted", message: `[ExecutionManager] Direct drive budget elapsed before dispatch (${budgets.driveBudgetMs}ms). Context: { executionId: ${execution.id} }` };
+    void settleBounded(run, { status: "failed", error }, { status: "failed", executionId: execution.id, error });
+  }
+
+  /** The one continuation. Never throws. The timer already runs (armed in createDirectDrive). */
   async function runDirect(run: DirectRun): Promise<void> {
     const { execution, drive } = run;
-    const timer = setTimeout(() => {
-      if (!drive.settle()) return;
-      const error: ExecutionError = drive.dispatch.state === "dispatched"
-        ? classifyDirectFailure(run, new Error("budget elapsed after dispatch"))
-        : { name: "ConduitExecutionInterrupted", message: `[ExecutionManager] Direct drive budget elapsed before dispatch (${budgets.driveBudgetMs}ms). Context: { executionId: ${execution.id} }` };
-      void settleBounded(run, { status: "failed", error }, { status: "failed", executionId: execution.id, error });
-    }, budgets.driveBudgetMs);
     let upstreamSession: UpstreamSessionScope | undefined;
     try {
       upstreamSession = makeUpstreamSession();
       const invoke = deps.makeInvoker({ executionId: execution.id, deadline: drive.deadline, upstreamSession, projection: execution.projection, clientId: execution.clientId, scope: run.scope, dispatch: drive.dispatch, ...(run.decisions !== undefined ? { decisions: run.decisions } : {}) });
       const value = await invoke(execution.call.toolName, JSON.parse(execution.call.request));
-      if (!drive.settle()) return; // timer won; discard
+      // codex #6: every unbounded read that the settle needs happens BEFORE the latch is
+      // taken, so the timer can still win while they run. Here the deliverable is pure
+      // computation; the pause path below reads the generation before its settle().
       const deliverable = run.redactFields === undefined ? value : redactSensitiveFields(value, run.redactFields);
+      if (!drive.settle()) return; // timer won; discard
       if (deliverableBytes(deliverable) > budgets.resultBytesMax) {
         await settleBounded(run, { status: "completed", resultState: "discarded" }, { status: "completed", executionId: execution.id, value: undefined, resultTooLarge: true });
       } else if (run.redactFields === undefined) {
@@ -2646,11 +3129,25 @@ Shared core used by BOTH `startDirect` and the direct resume arm:
         await settleBounded(run, { status: "completed", resultState: "retained", result: deliverable }, { status: "completed", executionId: execution.id, value: deliverable });
       }
     } catch (cause) {
-      if (!drive.settle()) return;
       if (cause instanceof Error && cause.name === GUEST_ERROR_NAMES.policyDenied && run.decisions === undefined) {
-        // §5.4 startDirect step 5: pause, provenance read immediately before the write
+        // §5.4 startDirect step 5: pause. The generation read is UNBOUNDED, so it runs
+        // BEFORE the latch (codex #6) — the timer can still settle the row while it
+        // stalls — and immediately before the write, as the spec requires.
         const namespace = execution.call.namespace;
-        const generation = await deps.store.sources.getGeneration(namespace);
+        let generation: number | undefined;
+        try {
+          generation = await deps.store.sources.getGeneration(namespace);
+        } catch (readCause) {
+          // codex pass 2, #6: a REJECTED read is a store fault, not a catalog change.
+          // Opaque to the client; the cause goes to the host log only.
+          if (!drive.settle()) return;
+          const ref = crypto.randomUUID();
+          console.error(`[ExecutionManager] Provenance read failed at direct pause ${ref}: ${String(readCause)}`);
+          const error = { name: "ConduitInternalError", message: `[ExecutionManager] Approval pause could not be recorded. Reference: ${ref}` };
+          await settleBounded(run, { status: "failed", error }, { status: "failed", executionId: execution.id, error });
+          return;
+        }
+        if (!drive.settle()) return;
         if (generation === undefined) {
           const error = { name: "ConduitCatalogChanged", message: `[ExecutionManager] Approval pause refused: no source for namespace. Context: { executionId: ${execution.id} }` };
           await settleBounded(run, { status: "failed", error }, { status: "failed", executionId: execution.id, error });
@@ -2660,14 +3157,46 @@ Shared core used by BOTH `startDirect` and the direct resume arm:
         await settleBounded(run, { status: "paused", pausedOn: pending }, { status: "paused", executionId: execution.id, pending });
         return;
       }
+      if (!drive.settle()) return;
       const error = classifyDirectFailure(run, cause);
       await settleBounded(run, { status: "failed", error }, { status: "failed", executionId: execution.id, error });
     } finally {
-      clearTimeout(timer);
+      run.drive.dispose();
       await upstreamSession?.dispose().catch(() => {});
       await Promise.allSettled(run.tracked);
     }
   }
+```
+
+`DirectRun.drive` is typed `DirectDrive & { dispose(): void }` (the
+interface block in Interfaces above uses the same type — F10e). Because the
+timer is armed before `create()`, `expireDirect` may fire while the row does
+not exist yet; `settleDirect` then affects 0 rows and `settleBounded` still
+resolves the outcome `failed`. If `create()` later SUCCEEDS, the code above
+re-issues the fenced timeout settle and skips the pipeline (F3). **Accepted
+limit (F12, P2):** if `create()` later REJECTS with the request-key UNIQUE
+failure, the client already received `failed: ConduitExecutionInterrupted`
+rather than `conflict`; nothing was persisted for this id, no dispatch
+happened, and the next re-issue with the same key answers `conflict`. A
+`create()` slower than `DIRECT_DRIVE_BUDGET_MS` (60 s) is a store fault the
+timeout correctly surfaces. Recorded in the PR's Deviations.
+
+Prep-window throws (F14): `makeUpstreamSession()` and `deps.makeInvoker()`
+inside `runDirect` are wrapped so the STORED error carries the cause and the
+CLIENT-VISIBLE outcome does not, exactly as `start()` does today:
+
+```ts
+      let invoke: ToolInvoker;
+      try {
+        upstreamSession = makeUpstreamSession();
+        invoke = deps.makeInvoker({ /* as above */ });
+      } catch (cause) {
+        if (!drive.settle()) return;
+        const stored: ExecutionError = { name: "ConduitInternalError", message: `[ExecutionManager] Direct drive preparation failed. Context: { executionId: ${execution.id}, cause: ${String(cause)} }` };
+        const visible: ExecutionError = { name: "ConduitInternalError", message: `[ExecutionManager] Direct drive preparation failed. Context: { executionId: ${execution.id} }` };
+        await settleBounded(run, { status: "failed", error: stored }, { status: "failed", executionId: execution.id, error: visible });
+        return;
+      }
 ```
 
 `startDirect`:
@@ -2676,27 +3205,55 @@ Shared core used by BOTH `startDirect` and the direct resume arm:
     startDirect(toolName, input, opts) {
       const executionId = `exec_${newId()}`;
       const attempt = newId();
-      const drive = createDirectDrive({ executionId, attempt, now, budgetMs: budgets.driveBudgetMs }); // timer starts here, before any async prep
       let resolveOutcome!: (o: DirectOutcome) => void;
       const outcome = new Promise<DirectOutcome>((r) => { resolveOutcome = r; });
       let markSettled!: () => void;
       const settledAt = new Promise<void>((r) => { markSettled = r; });
+      const request = JSON.stringify(input);
+      const execution: Extract<Execution, { kind: "direct" }> = {
+        id: executionId, kind: "direct", status: "running", startedAt: now(), clientId: opts.clientId, projection: opts.projection,
+        call: { toolName, namespace: namespaceOf(toolName) ?? "", request: request ?? "null" },
+        ...(opts.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
+      };
+      // D-A13: the run object exists before the timer so expireDirect can settle it;
+      // the drive arms its timer at construction — before create() — so a hung
+      // first write still yields the timeout outcome within budget.
+      const run: DirectRun = {
+        execution, drive: undefined as never, // assigned on the next line
+        scope: () => opts.scope(opts.clientId), // required resolver (F1)
+        resolveOutcome: (o) => { resolveOutcome(o); markSettled(); }, tracked: [], persisted: false,
+      };
+      run.drive = createDirectDrive({ executionId, attempt, now, budgetMs: budgets.driveBudgetMs, onExpire: () => expireDirect(run) });
       const finished = (async () => {
-        const request = JSON.stringify(input);
         if (request === undefined) { // decoder guarantees a JSON value; defend the public SDK entrypoint
-          const error = { name: "ConduitInternalError", message: "[ExecutionManager] startDirect refused: input is not a JSON value." };
-          resolveOutcome({ status: "failed", executionId, error }); return;
+          if (run.drive.settle()) {
+            run.resolveOutcome({ status: "failed", executionId, error: { name: "ConduitInternalError", message: "[ExecutionManager] startDirect refused: input is not a JSON value." } });
+          }
+          return;
         }
-        const execution: Extract<Execution, { kind: "direct" }> = {
-          id: executionId, kind: "direct", status: "running", startedAt: now(), clientId: opts.clientId, projection: opts.projection,
-          call: { toolName, namespace: namespaceOf(toolName) ?? "", request },
-          ...(opts.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
-        };
-        try { await deps.store.executions.create(execution, { attempt }); }
-        catch (cause) { /* same conflict mapping as start(); resolveOutcome({status:"conflict",...}) or failed */ return; }
-        const run: DirectRun = { execution, drive, scope: bindScope(opts.scope, opts.clientId), resolveOutcome: (o) => { resolveOutcome(o); markSettled(); }, tracked: [] };
+        try {
+          await deps.store.executions.create(execution, { attempt });
+          run.persisted = true;
+        } catch (cause) {
+          // codex #6: the conflict lookup is an unbounded read — do it BEFORE taking the
+          // latch so the timer can still answer if it stalls; then publish only if we won.
+          const conflict = await mapCreateConflict(cause, opts.requestKey, opts.clientId, deps.store).catch(() => undefined);
+          if (!run.drive.settle()) return; // the timer already answered (accepted limit, see F12 note below)
+          run.resolveOutcome(conflict ?? { status: "failed", executionId, error: { name: "ConduitInternalError", message: `[ExecutionManager] startDirect could not persist the row. Context: { executionId: ${executionId} }` } });
+          return;
+        }
+        if (run.drive.settled) {
+          // F3: the timer fired while create() was in flight and its fenced settle hit 0
+          // rows. The row now exists `running`; re-issue the SAME timeout settle (fenced
+          // on this attempt) so it cannot linger for the crash sweep to relabel, and never
+          // run the pipeline on a drive that already answered.
+          const error: ExecutionError = { name: "ConduitExecutionInterrupted", message: `[ExecutionManager] Direct drive budget elapsed before dispatch (${budgets.driveBudgetMs}ms). Context: { executionId: ${executionId} }` };
+          run.tracked.push(deps.store.executions.settleDirect(executionId, attempt, { status: "failed", error }).catch(() => false));
+          await Promise.allSettled(run.tracked);
+          return;
+        }
         await runDirect(run);
-      })().catch(() => {});
+      })().catch(() => {}).finally(() => run.drive.dispose());
       const retention = Promise.race([
         finished.then(() => "released" as const),
         settledAt.then(() => new Promise<"abandoned">((r) => setTimeout(() => r("abandoned"), budgets.slotRetentionMs))),
@@ -2714,33 +3271,84 @@ Direct resume arm — replaces Task 9's placeholder, after step 4:
           const decisions = makeDecisions();
           decisions.stage(executionId, { op: "call", toolName: execution.call.toolName, request: execution.call.request }, decision);
           const policyRow = await deps.store.policies.get(execution.call.toolName);
-          const drive = createDirectDrive({ executionId, attempt: resumeAttemptId, now, budgetMs: budgets.driveBudgetMs });
           let resolveOutcome!: (o: DirectOutcome) => void;
           const outcome = new Promise<DirectOutcome>((r) => { resolveOutcome = r; });
           const running = { ...execution, status: "running" as const }; delete running.pausedOn;
-          void runDirect({ execution: running, drive, scope, decisions, redactFields: policyRow?.redactFields ?? [], resolveOutcome, tracked: [] });
-          const settled = await outcome;
+          let markSettled!: () => void;
+          const settledAt = new Promise<void>((r) => { markSettled = r; });
+          const run: DirectRun = {
+            execution: running, drive: undefined as never, scope, decisions,
+            redactFields: policyRow?.redactFields ?? [],
+            resolveOutcome: (o) => { resolveOutcome(o); markSettled(); }, tracked: [],
+            persisted: true, // the claim put the row `running` under resumeAttemptId
+          };
+          // codex pass 3, #3: the drive (and its timer) was created right after the claim
+          // identified a direct row (Task 9); reuse it. `lifecycle` was already invoked
+          // there, with `retention`/`finished` wired to this run's promises via the
+          // deferred pair the drive carries (`drive.attachRun(run)` sets them).
+          run.drive = directDrive;
+          directDrive.onExpire = () => expireDirect(run);
+          const finished = runDirect(run).catch(() => {}).finally(() => run.drive.dispose());
+          directDrive.resolveFinished(finished);
+          directDrive.resolveSettledAt(settledAt);
+          const settled = await outcome; // D-A11 final: may be `unknown` (persist-timeout / persist-failed)
           const decisionApplied = decisions.consumed(executionId);
-          if (settled.status === "unknown") {
-            // D-A11: the wire has no "unknown" arm yet (Lane B). Honest failure name; the write stays tracked.
-            return { status: "failed", executionId, error: { name: "ConduitPersistTimeout", message: `[ExecutionManager] Settle write did not complete within budget; the row may still update. Context: { executionId: ${executionId} }` }, decisionApplied };
-          }
           return { ...settled, decisionApplied };
         }
 ```
 
 (`bindScope` for resume was computed in Task 9 step 4 as `scope`.) `budgets = { ...DIRECT_DEFAULTS, ...deps.direct }` at manager construction.
 
-- [ ] **Step 5: Exports** — `index.ts`: `DirectBudgets`, `DirectDriveHandle`, `DirectOutcome`, `DirectDrive` types; `DIRECT_DEFAULTS`, `createDirectDrive`, `deliverableBytes`.
+- [ ] **Step 5: Exports and the drive unit test (F15)** — `index.ts`: `DirectBudgets`, `DirectDriveHandle`, `DirectOutcome`, `DirectDrive` types; `DIRECT_DEFAULTS`, `createDirectDrive`, `deliverableBytes`. Create `packages/sdk/src/execution/direct.test.ts`:
 
-- [ ] **Step 6: Run the manager suite (unsandboxed), SDK suite, root typecheck** — PASS. `payloads.ts`'s `outcomeToPayload` still compiles: the completed arm's extra optional field is ignored by the projection (Lane B adds `resultTooLarge` to the wire).
+```ts
+import { describe, expect, it, vi } from "vitest";
+import { createDirectDrive } from "./direct.js";
+
+describe("DirectDrive (row #28)", () => {
+  it("settle() is taken exactly once", () => {
+    const drive = createDirectDrive({ executionId: "e", attempt: "a", now: Date.now, budgetMs: 10_000, onExpire: () => {} });
+    expect(drive.settled).toBe(false);
+    expect(drive.settle()).toBe(true);
+    expect(drive.settle()).toBe(false);
+    expect(drive.settled).toBe(true);
+    drive.dispose();
+  });
+  it("onExpire fires once at the budget and never after settle()", async () => {
+    vi.useFakeTimers();
+    const onExpire = vi.fn();
+    const drive = createDirectDrive({ executionId: "e", attempt: "a", now: Date.now, budgetMs: 50, onExpire });
+    vi.advanceTimersByTime(49); expect(onExpire).not.toHaveBeenCalled();
+    vi.advanceTimersByTime(1); expect(onExpire).toHaveBeenCalledTimes(1);
+    const settledFirst = createDirectDrive({ executionId: "f", attempt: "a", now: Date.now, budgetMs: 50, onExpire });
+    settledFirst.settle();
+    vi.advanceTimersByTime(100); expect(onExpire).toHaveBeenCalledTimes(1);
+    vi.useRealTimers();
+  });
+  it("dispose() cancels the timer; deadline() counts down from construction", () => {
+    vi.useFakeTimers();
+    const onExpire = vi.fn();
+    const drive = createDirectDrive({ executionId: "e", attempt: "a", now: Date.now, budgetMs: 50, onExpire });
+    vi.advanceTimersByTime(20); expect(drive.deadline()).toBe(30);
+    drive.dispose();
+    vi.advanceTimersByTime(100); expect(onExpire).not.toHaveBeenCalled();
+    vi.useRealTimers();
+  });
+});
+```
+
+- [ ] **Step 5b: The `unknown` wire arm (D-A11 final, D12)** — `packages/mcp/src/payloads.ts`: `EXECUTE_STATUSES = [..., "unknown"] as const`; `ExecutePayload.reason?: "persist-timeout" | "persist-failed"`; `outcomeToPayload` gains `case "unknown": return { status: "unknown", executionId, reason: outcome.reason, message: UNKNOWN_MESSAGE }` where `UNKNOWN_MESSAGE = "the call may have completed; the record is not yet durable — re-list before deciding again, do not retry"`. `packages/cli/src/commands/approvals.ts`: in the verb-reporting branch, `if (outcome.status === "unknown")` → print the message, exit non-zero, never print `approved`/`denied` (copy the existing IPC outcome-unknown branch). Tests: `payloads.test.ts` F6 case for the `unknown` arm (predicate accepts it; `reason` round-trips); `approvals.test.ts` "INVARIANT §17 / §5: an `unknown` resume outcome is NEVER reported as a landed verb, and exits non-zero" beside the IPC sibling. `connection.ts` needs no change (it projects whatever `resume` returns).
+
+- [ ] **Step 6: Run the manager suite (unsandboxed), SDK suite, root typecheck** — PASS across sdk, mcp, cli.
 
 - [ ] **Step 7: Commit**
 
 ```bash
-git add packages/sdk/src
-git commit -m "feat(sdk): direct execution arm — startDirect, direct resume, result states, exactly-once settle"
+git add packages/sdk/src packages/mcp/src/payloads.ts packages/mcp/src/payloads.test.ts packages/cli/src/commands/approvals.ts packages/cli/src/approvals.test.ts
+git commit -m "feat: direct execution arm — startDirect, direct resume, result states, unknown outcome on the wire"
 ```
+
+(codex pass 3, #5: the `unknown` wire arm and its tests land in THIS commit, or the invariant and its pin are split across commits.)
 
 ---
 
@@ -2783,11 +3391,14 @@ describe.each(PAIRS)("D5 harness — kind=$kind projection=$projection", (pair) 
   let active: Harness | undefined;
   afterEach(async () => { await active?.cleanup(); active = undefined; });
 
-  it("INVARIANT §9.2 (#2): the credential never appears in the result, the Trace, or the replay journal", async () => {
-    active = await makeHarness();
+  it("INVARIANT §9.2 (#2): an upstream that echoes the credential in a 200 body is refused on every projection — nothing stored, traced, journaled, or returned carries it", async () => {
+    // F7: the plain fixture never returns the secret, so a not.toContain would be vacuous.
+    // `echoCredential` makes the tools/call 200 embed req.headers.authorization at result.nested.token.
+    active = await makeHarness({ echoCredential: true });
     const m = createExecutionManager(active.deps);
     const out = await performOnce(m, active, pair, "github.list_issues", { owner: "o" }, { clientId: "acme" });
-    expect(out.status).toBe("completed");
+    expect(active.calls).toHaveLength(1); // the secret was genuinely in play
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitOutcomeAmbiguous" } }); // one-way door #3
     const everything = JSON.stringify([out, await active.store.trace.listByExecution(out.executionId), await active.store.replayJournal.listByExecution(out.executionId), await m.get(out.executionId)]);
     expect(everything).not.toContain("ghp_manager_secret");
   });
@@ -2826,7 +3437,21 @@ describe.each(PAIRS)("D5 harness — kind=$kind projection=$projection", (pair) 
 
 Note the discovery pair passes `requestKey` on the `startDirect` call and the direct pair passes none for the conflict test — adjust: for `projection: "direct"` the #11 case asserts instead that `startDirect` is called WITHOUT a key (A4) and two identical calls both complete (two executions). Write that as a branch inside the test on `pair.projection === "direct"`.
 
-- [ ] **Step 2: Extract the harness** — move `startMcpServer`, `makeHarness`, `pendingCallOf`, `SECRET`, `PREFIX`, `mcpToolsList`, `Harness` from `manager.test.ts` into `manager-harness.ts` (same directory, `*.ts` not `*.test.ts`, so vitest does not run it as a suite; import it from `manager.test.ts`). Add `Harness.reprovision(): Promise<void>`.
+- [ ] **Step 2: Harness** — already extracted in Task 8 (F13). Confirm `manager-harness.ts` exports `Harness.client` and `Harness.reprovision`:
+
+```ts
+    /** Re-provision the github namespace with the same rows: the §4.1a triggers bump its generation. */
+    reprovision: async () => {
+      await store.provisionSource({
+        source: { id: "src_gh", type: "mcp", namespace: "github", location },
+        integration: { id: "int_gh", sourceId: "src_gh", namespace: "github" },
+        connection: { id: "conn_gh", integrationId: "int_gh", prefix: PREFIX, credentialRef: "cred_gh" },
+        tools: normalizeMcp({ namespace: "github", tools: mcpToolsList }),
+      });
+    },
+```
+
+(Test-only fixtures `codeRow`, `directRow`, `pause`, `directCall` live in `packages/sdk/src/test/fixtures.ts` per D-A12; every test file imports them from there.)
 
 - [ ] **Step 3: Run the harness and the manager suite** (unsandboxed) — PASS, 12 harness cases.
 
@@ -2844,7 +3469,8 @@ Add ONE row for G1 and G2 each:
 - `| §5.5 — claimForResume is an exactly-one-winner CAS | packages/sdk/src/store/sqlite.test.ts ("INVARIANT §5.5: claimForResume is an exactly-one-winner CAS …") | ✅ pinned |`
 
 Add a new section header `### R1 (spec 2026-09-05, §9.1)` and one row per §9.1 row #1–#50 (excluding #46 and #49, already present), copying the claim column VERBATIM from the spec's table and the test column as the spec names it. Status:
-- ✅ for rows pinned in this PR: #1, #2 (harness), #3, #8, #9, #10, #11, #14 (manager + store halves; the `daemon/provision.test.ts` sweep-placement half stays ⏳ and is noted in the row), #15, #16 (manager half; daemon half ⏳ noted), #17, #18 (manager half; daemon half ⏳ noted), #19, #21 (client + manager; the Lane C description statement noted ⏳), #22, #24, #25, #27, #28, #41 (manager + store; `payloads.test.ts` half ⏳ noted), #42, #43 (execute.test.ts — note the D-A6 file deviation), #45, #47, #50.
+- ✅ for rows pinned in full by this PR: #1, #2 (harness), #3, #8, #9, #10, #11, #15, #17, #19, #22, #24, #25, #27, #28, #42, #45, #47, #50.
+- **Composite rows are SPLIT into sub-rows (codex #13), never marked ✅ while a half is pending:** #14a manager+store (generation check, remove/re-add) ✅ / #14b daemon sweep placement ⏳; #16a manager (running program + paused resume) ✅ / #16b daemon real-process ⏳; #18a manager (per-client conflict) ✅ / #18b daemon `execution.get` authority ⏳; #21a client + manager (no 404 retry, both kinds) ✅ / #21b Lane C description statement ⏳; #41a manager+store (result states, discard, guard) ✅ / #41b `payloads.test.ts` projection ⏳; #43a scoped host filter-before-rank (`execute.test.ts`, D-A6) ✅ / #43b daemon search ⏳.
 - ⏳ for every Lane B/C row: #4, #5, #6, #7, #12, #13, #20, #23, #26, #29, #30–#40, #44, #48.
 
 Add the two data-model pins (§9.1 tail): request round-trip (`sqlite.test.ts`) and the kind guard (`sqlite.test.ts`), both ✅. Add the three ambiguity invariants (§7): crash-before-persist over a direct row (`sqlite.test.ts`, ✅), keyless no-retry (`mcp-client.test.ts`, ✅; Lane C description ⏳), timeout-unknown pre/post dispatch (`manager.test.ts`, ✅).
@@ -2872,6 +3498,27 @@ PR body must carry: the two one-way doors (404 retry removed for Code Mode; sent
 
 ## Self-review (run after all tasks are written)
 
-1. **Spec coverage.** Every §10 Lane A item maps to a task: §4 columns (T2–T4), §5.4 (T8–T10), §5.5 dispatch cell (T5–T6), `EffectiveScope`/`ScopeResolver` types (T1), request keys (T3), D5 harness (T11), ambiguity invariants manager side (T5, T6, T10), rows #1–#3/#9/#15/#16/#17/#18/#19/#21/#25/#41/#42/#47/#50 (per task map), G1–G3 (T11). Gaps knowingly left: row #45's "unknown" wording on the RESUME wire (D-A11, Lane B); row #14's sweep-placement half and row #43's `catalog.test.ts` naming (D-A6) — all recorded as deviations.
-2. **Placeholder scan.** Two test bodies in Task 8 and one in Task 10 carry a `// (…)` instruction instead of full code (the raw-client sentinel assertion, the flag-flip hook, the expanding-redaction fixture, the `reprovision` helper). The executor writes them from the instruction; each names the exact assertion. Everything else is complete.
+1. **Spec coverage.** Every §10 Lane A item maps to a task: §4 columns (T2–T4), §5.4 (T8–T10), §5.5 dispatch cell (T5–T6), `EffectiveScope`/`ScopeResolver` types (T1), request keys (T3), D5 harness (T11), ambiguity invariants manager side (T5, T6, T10), rows #1–#3/#9/#15/#16/#17/#18/#19/#21/#25/#41/#42/#47/#50 (per task map), G1–G3 (T11). Deviations knowingly recorded: D-A11 final adds the `unknown` status to the `approvals.resume` wire (spec §10 said "no wire change" for Lane A; founder decision D12); row #14's sweep-placement half is Lane B (#14b ⏳); row #43's test lives in `execute.test.ts` (D-A6); F12's conflict-vs-timeout race on a >60 s `create()` is an accepted limit.
+2. **Placeholder scan.** After the 2026-09-13 eng review (D6) and the outside-voice fold (F1–F15) every test body is code except one instruction: the credential-echo regression test in Task 6 says "stand up a loopback server as in upstream.test.ts" — the fixture at `upstream.test.ts:436` is the model; copy it. The D5 row #2 case uses the harness's `echoCredential` mode instead.
+
+7. **Codex pass #3, confirming (2026-09-13 ~03:45, `gpt-5.6-sol` `high`; 3 P1 / 2 P2, NOT CONVERGED — every finding a seam of the pass-2 fold, no new class):** #1 the prep-window catch persists an opaque reference, cause to the daemon log (ledger clause reworded); #2 `kindOf` lets pre-hydration terminalizations of a direct row use the bounded fenced settle; #3 the direct drive and `lifecycle` are created right after the claim, every guard read gated on its deadline; #4 `generation: 0` on every write-side Source literal, root typecheck; #5 the wire-arm files stage in Task 10's commit. All folded. **Loop STOPPED by adjudication (adversarial-convergence rule; precedent: the spec's rev-16 stop line):** passes #1 → #2 → #3 each found only seams of the immediately previous fold; the class map has not changed since the Fable pass. A fourth pass is the founder's call, not the rule's.
+6. **Codex pass #2, confirming (2026-09-13 ~03:20, `gpt-5.6-sol` `high`; 5 P1 / 3 P2, NOT CONVERGED; four defective folds, one new, three text/sequencing):** #1 `defaultScopeResolver` denies all for a non-null client id (D11 inside the function); #2 pre-persist timer path resolves the outcome directly instead of hanging (`run.persisted`); #3 direct-resume terminal writes (guard failures, TTL expiry) go through the bounded fenced helper, `DirectSettle` gains `expired`; #4 `resume` takes a `lifecycle` callback exposing `retention`/`finished` for the daemon's slot; #5 the three valid `(kind, projection)` pairs enforced in type, DDL CHECK, and hydration; #6 a rejected `getGeneration` at pause is an opaque internal error, not `ConduitCatalogChanged`; #7 `UnknownOutcome` declared once with both reasons, header and self-review reconciled; #8 Task 1 import, the `request_keys` test moved to Task 3, Task 4 profile residue removed, `generation: 0` on source literals. All folded; codex pass #3 (confirming) follows.
+5. **Codex pass #1 on the folded plan (2026-09-13 02:52, `gpt-5.6-sol` `high`; triggers: authorization boundary, persistence invariant, concurrency latch, >8 files; 2 P0 / 9 P1 / 4 P2, NOT CONVERGED):** #1 named row without resolver → D11 refinement of D8 (fail closed); #2 deadline check inside `beforeSend` (P0, second dispatch window); #3 resume races the outcome; #4 bounded resume settle + `unknown` wire arm → founder decision D12 (Option A; Lane A deviation from §10 "no wire change"); #5 `settleBounded` publishes only on `true`; #6 latch after unbounded reads; #7 source read before credentials; #8 opaque resolver/provenance failures; #9 timer-with-dispatched-cell test; #10 real sweep test in `sweep.test.ts`; #11 sentinel literal executed in the sandbox; #12 M5 assertion widened; #13 composite ledger rows split; #14 interface blocks reconciled; #15 11 bytes. All folded; one confirming pass follows per the convergence rule.
+4. **Outside voice (Fable subagent, 2026-09-13, 15 findings, NOT CONVERGED → all folded):** F1 required scope on `startDirect`; F2 second deadline check after the source read + tests (Task 6, Task 10); F3 timer-then-create zombie row closed + test; F4 latch test replaced with an invoker stub; F5 beforeSend ordering claim narrowed; F6 caller-cell test made falsifiable; F7 D5 row #2 uses an echoing fixture; F8 `src_solo` id; F9 `start` snippet matches prose; F10a–e types/names aligned; F11 `Source.generation` required; F12 accepted limit recorded (conflict vs timeout race on a >60 s `create()`); F13 harness extraction moved to Task 8; F14 prep-window throws wrapped; F15 `direct.test.ts`. A codex confirming pass is queued (usage limit until 02:52).
 3. **Type consistency.** Names used across tasks: `create`/`put`/`settleDirect`/`invalidatePaused`/`getByRequestKey(key, clientId)`/`getGeneration` (T2–T4 → T8–T10); `bindScope`, `defaultScopeResolver`, `namespaceOf`, `buildEffectiveScope`, `ALL_TOOLS` (T1 → T6–T10); `createDispatchCell`, `DispatchCell`, `OUTCOME_AMBIGUOUS_ERROR_NAME`, `ConduitOutcomeAmbiguous` (T5 → T6, T8, T10); `makeInvoker` args and `makeToolHost(invoke, scoped?)` (T8 → T9, T10, runtime.ts); `DirectSettle` (T2 → T10); `hasProvenance` (T1 → T9). Checked consistent.
+
+## GSTACK REVIEW REPORT
+
+| Review | Trigger | Why | Runs | Status | Findings |
+|--------|---------|-----|------|--------|----------|
+| CEO Review | `/plan-ceo-review` | Scope & strategy | 0 | — | scope fixed by spec §10 + §18 (2026-09-11); not run by decision |
+| Codex Review | `/codex review` | Independent 2nd opinion | 3 (raw `codex exec`, `gpt-5.6-sol` `high`, per codex-one-path) | issues_found → stopped by adjudication | pass 1: 2 P0 / 9 P1 / 4 P2; pass 2: 5 P1 / 3 P2 (4 defective folds, 1 new); pass 3: 3 P1 / 2 P2 (seams only, no new class) — all folded |
+| Eng Review | `/plan-eng-review` | Architecture & tests (required) | 1 | clean (SCOPE_REDUCED) | 9 decisions D1–D9 folded (scope: profiles → Lane B; arch ×3; quality ×2; tests: 9 gaps; perf ×2), 0 critical gaps |
+| Design Review | `/plan-design-review` | UI/UX gaps | 0 | — | no UI |
+| DX Review | `/plan-devex-review` | Developer experience gaps | 0 | — | one daemon-facing interface, covered by eng review |
+
+- **CODEX:** three passes on the folded plan, 13 + 8 + 5 findings folded; two founder decisions taken on cross-model tensions (D11 refines D8 — named client without resolver fails closed; D12 accepts codex — settle write bounded on both direct paths, `unknown` on the wire as a recorded §10 deviation). Loop stopped after three consecutive seam-only passes (adversarial-convergence rule; the spec's own rev-16 precedent). A fourth pass is the founder's call.
+- **CROSS-MODEL:** Fable fresh-context subagent (interim outside voice while codex waited on the usage limit) found 15 findings the eng review missed; codex pass 1 independently confirmed the timer-before-create and required-scope classes and added the beforeSend deadline gate. Overlap: high on the direct-drive latch/timer/fence seams; codex alone found the kind/projection pair guard and the settleBounded false-positive.
+- **VERDICT:** ENG CLEARED — ready to implement (subagent-driven per task, `feat/r1-lane-a` from `origin/main`); Tier 2 gauntlet + explainer quiz at PR time per CLAUDE.md.
+
+NO UNRESOLVED DECISIONS
