@@ -1375,7 +1375,7 @@ it("INVARIANT §4.1a (#47): a provision with N tools writes exactly N+1 ledger r
 });
 
 it("INVARIANT §4.1a (#47): every write path bumps — standalone INSERT (sources.upsert), zero-tool revalidate, retarget", async () => {
-  await store.sources.upsert({ id: "src_solo", type: "mcp", namespace: "solo", location: "https://a" }); // same id as provision() uses: sources.namespace is UNIQUE (F8)
+  await store.sources.upsert({ id: "src_solo", type: "mcp", namespace: "solo", location: "https://a", generation: 0 }); // same id as provision() uses: sources.namespace is UNIQUE (F8)
   const g0 = await gen("solo");
   expect(g0).toBeGreaterThan(0); // INSERT trigger: never the column default
   await provision("solo", []);            // zero tools: the source-row trigger bumps alone
@@ -2075,7 +2075,7 @@ export function createScopedCatalogToolHost(
 }
 ```
 
-(`import { infraError } from "./pipeline/errors.js"`.) Add to the tests: a `scope` that rejects with `new Error("[SqliteStore] disk full at /Users/x/.conduit/conduit.db")` → `host.search(...)` rejects with `name: "ConduitInternalError"` and a message that does NOT contain "SqliteStore" or "/Users"; the `log` spy received the raw detail.
+(`import { infraError } from "./pipeline/errors.js"`.) Add to the tests: a `scope` that rejects with `new Error("[SqliteStore] disk full at ~/.conduit/conduit.db")` → `host.search(...)` rejects with `name: "ConduitInternalError"` and a message that does NOT contain "SqliteStore" or ".conduit"; the `log` spy received the raw detail.
 
 Export it from `index.ts` beside `createCatalogToolHost`.
 
@@ -2368,13 +2368,9 @@ Add, beside `isReplayDivergence`: `function isOutcomeAmbiguous(error: unknown): 
       try {
         await deps.store.executions.create(execution);
       } catch (cause) {
-        const text = String(cause);
-        if (opts?.requestKey !== undefined &&
-            (text.includes("UNIQUE constraint failed: executions.request_key") ||
-             text.includes("UNIQUE constraint failed: request_keys.client_id, request_keys.key"))) {
-          const existing = await deps.store.executions.getByRequestKey(opts.requestKey, clientId);
-          if (existing !== undefined) return { status: "conflict", executionId: existing.id };
-        }
+        // D-A12: the ONE conflict mapper, shared with startDirect (Greptile: no inline copy here).
+        const conflict = await mapCreateConflict(cause, opts?.requestKey, clientId, deps.store);
+        if (conflict !== undefined) return conflict;
         throw cause;
       }
       // ... unchanged session/invoker window, with (F9 — matches the prose above; exactOptionalPropertyTypes forbids `scope: undefined`):
@@ -2432,7 +2428,7 @@ describe("§5.4 step 2 — post-claim read-side guard (row #50), one test per di
   let store: ConduitStore; let client: ReturnType<typeof createClient>; let manager: ExecutionManager;
   beforeEach(async () => {
     ({ store, client } = await makeBareStoreWithClient());
-    await store.sources.upsert({ id: "src_gh", type: "mcp", namespace: "github", location: "https://gh" });
+    await store.sources.upsert({ id: "src_gh", type: "mcp", namespace: "github", location: "https://gh", generation: 0 });
     await store.tools.replaceNamespace("github", [tool({ name: "github.list_issues", namespace: "github" })]);
     manager = createExecutionManager(makeStubDeps(store, throwingSandbox()));
   });
@@ -2512,7 +2508,7 @@ describe("§5.4 step 2 — post-claim read-side guard (row #50), one test per di
     const gen = await currentGen();
     await store.executions.create(codeRow({ id: "c", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }));
     await store.sources.remove("src_gh");
-    await store.sources.upsert({ id: "src_gh", type: "mcp", namespace: "github", location: "https://gh" });
+    await store.sources.upsert({ id: "src_gh", type: "mcp", namespace: "github", location: "https://gh", generation: 0 });
     expect(await manager.resume("c", { kind: "approve" }, "c1", permitAll)).toMatchObject({ error: { name: "ConduitCatalogChanged" } });
   });
 
@@ -2651,7 +2647,20 @@ then, in order (§5.4 step 2):
 
 **Direct rows: every post-claim terminalization is bounded and fenced, including the branches that run BEFORE hydration succeeds (codex pass 3, #2):** the `execution === undefined` / `pausedOn === undefined` branch and the `isPendingApproval` failure branch cannot read `execution.kind`, so Task 2 adds `ExecutionRepository.kindOf(id): Promise<ExecutionKind | undefined>` (`SELECT kind FROM executions WHERE id = ?`, no hydration, never throws on a corrupt sibling column). `resume` reads `kindOf` once right after the claim wins; when it is `"direct"`, every terminalization in the prep window routes through `settleDirectBounded`, and a non-`written` result returns `{ status: "unknown", executionId, reason, decisionApplied: false }`. Code rows keep `failClaimedResume`.
 
-**The direct drive is created right after the claim, before any guard read (codex pass 3, #3):** when `kindOf` says `"direct"`, `resume` builds the `DirectDrive` (its timer starts) and calls `lifecycle?.()` at that point; every later await in the guard (`get`, `claimCallId`, `tools.get`, `getGeneration`, `scope()`, `policies.get`) is followed by `if (drive.deadline() <= 0)` → bounded terminalize `ConduitExecutionInterrupted`. Task 10's arm then REUSES that drive instead of constructing one. A stalled guard read can no longer outlive the client deadline and then open a fresh 60 s window.
+**The direct drive is created right after the claim, before any guard read (codex pass 3, #3):** when `kindOf` says `"direct"`, `resume` builds the `DirectDrive` (its timer starts) and calls `lifecycle?.({ retention, finished })` at that point, where both promises are built from the drive's deferred pair; every later await in the guard (`get`, `claimCallId`, `tools.get`, `getGeneration`, `scope()`, `policies.get`) is followed by `if (drive.deadline() <= 0)` → bounded terminalize `ConduitExecutionInterrupted`. Task 10's arm then REUSES that drive instead of constructing one. A stalled guard read can no longer outlive the client deadline and then open a fresh 60 s window.
+
+**Every early exit completes the lifecycle (Greptile on PR #61, P1):** once `lifecycle` has been published, a direct resume that terminalizes in the guard — corrupt pause, `ConduitCatalogChanged`, `ConduitScopeRevoked`, TTL expiry, guard-read timeout, or the prep-window catch — must resolve the same two promises, or Lane B holds the admission slot forever. `terminalize` and the expiry branch therefore end with `directDrive.finishEarly()` for direct rows, where:
+
+```ts
+    /** Completes retention + finished when no run will ever attach (guard exits). */
+    finishEarly() {
+      this.resolveSettledAt(Promise.resolve());
+      this.resolveFinished(Promise.resolve());
+      this.dispose();
+    },
+```
+
+is added to the object `createDirectDrive` returns (both deferred resolvers are idempotent: a second `resolve*` call is a no-op because the underlying promise is already settled). Pinned in Task 10's tests: a direct resume that fails the generation check with a `lifecycle` callback installed → `retention` resolves `"released"` and `finished` resolves, both within the settle budget.
 
 `resume(executionId, decision, callId, scopeResolver?, lifecycle?)` — for code rows thread the BOUND resolver only when one was given: `const driveScope = bindScope(scopeResolver, execution.clientId);` then `makeInvoker({ ..., projection: execution.projection, clientId: execution.clientId, ...(driveScope !== undefined ? { scope: driveScope } : {}) })` and `drive(running, invoke, prefix, undefined, undefined, driveScope !== undefined ? { scope: driveScope, projection: "code" } : undefined)`. (Step 4 above used the default profile once; the drive itself stays unscoped when no resolver exists — D8.) For `execution.kind === "direct"`: `return terminalize("direct resume not yet implemented", "ConduitInternalError")` — replaced in Task 10.
 
@@ -2713,6 +2722,8 @@ export function createDirectDrive(args: { executionId: string; attempt: string; 
   /** Deferred lifecycle wiring for the resume path: `lifecycle` receives promises built from these before the run exists. */
   resolveFinished(p: Promise<void>): void;
   resolveSettledAt(p: Promise<void>): void;
+  /** Guard exits: settle both lifecycle promises and cancel the timer (Greptile P1). */
+  finishEarly(): void;
   readonly finished: Promise<void>;
   readonly settledAt: Promise<void>;
 };
@@ -3023,6 +3034,7 @@ export function createDirectDrive(args: {
     get settled() { return settled; },
     dispose() { clearTimeout(timer); },
     resolveFinished, resolveSettledAt, finished, settledAt,
+    finishEarly() { resolveSettledAt(Promise.resolve()); resolveFinished(Promise.resolve()); clearTimeout(timer); },
   };
   // Reads `drive.onExpire` at FIRE time: the resume path assigns it after construction.
   const timer = setTimeout(() => { if (!settled) drive.onExpire?.(); }, args.budgetMs);
@@ -3443,7 +3455,7 @@ Note the discovery pair passes `requestKey` on the `startDirect` call and the di
     /** Re-provision the github namespace with the same rows: the §4.1a triggers bump its generation. */
     reprovision: async () => {
       await store.provisionSource({
-        source: { id: "src_gh", type: "mcp", namespace: "github", location },
+        source: { id: "src_gh", type: "mcp", namespace: "github", location, generation: 0 },
         integration: { id: "int_gh", sourceId: "src_gh", namespace: "github" },
         connection: { id: "conn_gh", integrationId: "int_gh", prefix: PREFIX, credentialRef: "cred_gh" },
         tools: normalizeMcp({ namespace: "github", tools: mcpToolsList }),
