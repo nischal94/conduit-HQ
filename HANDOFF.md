@@ -31,7 +31,94 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-11 ~18:20 (**PR #57 MERGED `0cba1da` — R1 design spec at rev 17 is on main**, founder-named merge; branches = main only; PR #59 MERGED `cce91ae` · NEXT: `superpowers:writing-plans` from spec §10, Lane A first)
+## Current handoff — updated 2026-09-13 ~04:45 (**Lane A plan WRITTEN and REVIEWED — PR #61 OPEN (docs-only)**; main unchanged since `f6fec9f`; NEXT: merge #61 on the founder's word, then execute the plan on `feat/r1-lane-a`)
+
+**State.** The R1 Lane A implementation plan lives at
+`docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md` on branch
+`docs/r1-lane-a-plan` (PR #61, docs-only, 3 commits, CI pending at
+handoff time). Eleven tasks with TDD steps; decisions D-A1–D-A13 in the
+header; task map keyed to spec §9.1 rows; a `## GSTACK REVIEW REPORT`
+closes the file. Review record: `/plan-eng-review` (9 founder decisions
+D1–D9), a fresh-context Fable subagent as interim outside voice (15
+findings), and three raw `codex exec` passes (`gpt-5.6-sol` `high`;
+15 + 8 + 5 findings). Everything folded. The loop stopped by
+adjudication after three consecutive seam-only passes (LEARNINGS #26
+shape). Three founder decisions changed the plan against the spec's
+letter and are recorded in it: **D1** profiles table → Lane B; **D11** a
+named client without a resolver fails closed (default profile = null
+client only, enforced inside `defaultScopeResolver`); **D12** the settle
+write is bounded on BOTH direct paths and `unknown` becomes a wire
+status on `approvals.resume` — an additive deviation from spec §10's
+"no wire change" for Lane A, to be entered in spec §18 when the Lane A
+PR opens (do not edit the spec for it before then).
+
+**Also this session:** no code changed. Memory file
+`feedback-write-early-chunk-plans` was written after a process failure
+(the plan was composed silently for an hour with nothing on disk; see
+LEARNINGS #27). gstack `proactive` set to `false`; verify in a fresh
+session with `gstack-config get proactive`.
+
+### NEXT
+
+1. **Merge PR #61 on the founder's word** (docs-only: no explainer quiz
+   required; CI green + read the CodeRabbit/Greptile review first, fold
+   anything real — they found a real class on #57). Then delete the
+   branch local + remote.
+2. **Execute the plan** — `superpowers:subagent-driven-development`
+   (recommended in the plan) on `feat/r1-lane-a` from `origin/main`, one
+   task per subagent, review between tasks. Tasks 1→4 sequential (store),
+   5/6/7 parallel-capable after 1, 8→10 sequential, 11 last. Every task's
+   commit includes its tests; ledger rows flip per commit. `resume` for a
+   named client now REQUIRES a resolver — `connection.ts` needs no change
+   because production rows have `clientId null` until Lane B.
+3. **Lane A PR** is load-bearing: Tier 2 gauntlet + `/explain-diff` +
+   quiz covering the THREE one-way doors (404 retry removed for Code
+   Mode; sentinel in `code`; credential echo after a 200 is
+   terminal-ambiguous) and the D12 wire deviation. Record the §18 entry
+   in the same PR.
+4. **Unchanged after that:** R3a preview packaging (§18 2026-09-11),
+   then the three-week alpha window and the profiles decision.
+
+**Session quirks worth inheriting (2026-09-13):** codex died once on the
+usage limit at pass start; a `nohup sh -c "sleep N; codex exec …"` queue
+to the stated retry minute worked first try, and a Fable fresh-context
+subagent is a usable interim outside voice meanwhile (it found 15 real
+findings) · the shell's `grep` is aliased and returns nothing on plan
+files — use `/usr/bin/grep` · every fold of adversarial findings
+introduced 4–5 defects of its own (a hang, an unbounded write, a resolver
+ignoring its argument): budget a confirming pass per fold · the
+commit-msg hook rejects the harness's AI co-author trailer — commit
+without it · the harness blocks foreground `sleep` chains; wait on a
+process with `run_in_background` + an `until pgrep …` loop.
+
+**DEFERRED (live list, updated 2026-09-13):** carry the 2026-09-11 lists,
+plus: spec §18 entry for the D12 wire deviation (with the Lane A PR) ·
+Lane B must add the profiles table/repository (moved out of Lane A) and
+consume `resume`'s `lifecycle` handle for direct admission · the
+INVARIANTS §5.5 I-3 clause changes wording ("opaque reference", not "the
+parse error") in Lane A Task 11 · three merged-PR remote branches still
+exist on origin (`docs/r1-design-spec`, `docs/s18-r1-sequencing`,
+`fix/cas-malformed-callid`) — verified stale, deletion is a
+confirmation-tier push; ask.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #61 is
+> the OPEN docs-only PR carrying the reviewed Lane A plan at
+> `docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md`). **Do
+> NOT re-review the plan; the loop is closed.** NEXT: merge #61 on the
+> founder's word, then `superpowers:subagent-driven-development` on
+> `feat/r1-lane-a` from `origin/main`, Task 1 first; a task list up front
+> and one commit per task. Carry the DEFERRED list.
+
+---
+
+**Superseded (2026-09-11 18:20) — kept for the record:**
+
+### Previous handoff — 2026-09-11 ~18:20 (**PR #57 MERGED `0cba1da` — R1 design spec at rev 17 is on main**, founder-named merge; branches = main only; PR #59 MERGED `cce91ae` · NEXT: `superpowers:writing-plans` from spec §10, Lane A first)
 
 **Merge record (18:15):** founder said "merge #57" at ~17:25. Marking
 the PR ready triggered CodeRabbit (10 findings) and Greptile (5);

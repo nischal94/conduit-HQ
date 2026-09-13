@@ -2635,3 +2635,37 @@ fold, trace the fix to the read site, the measured value, the unit
 that would have caught all four seams before the pass did. And write
 the stop line BEFORE the next pass runs, so stopping is a decision
 already made, not a judgment under pressure.**
+
+### 27. A plan composed in reasoning is not a plan — write the header first, then one task per write
+
+Planning Lane A, the agent read the 141 KB spec and six source files,
+then composed an eleven-task plan in its head for roughly an hour with
+nothing on disk. Seven "what is happening?" prompts each got a status
+paragraph. The header-only write the founder finally forced took two
+minutes; the eleven tasks followed as eleven further writes, each a
+point where the founder could have stopped or redirected. The harness
+already required brief progress updates and CLAUDE.md a task list for
+five-plus steps; both were skipped, so this was a compliance failure
+and lives in project memory, not a new rule. **Lesson: a document over
+~300 lines lands header-first; a status question gets a file path or an
+immediate write, never a second paragraph; the harness task list goes
+up before the first read so progress is visible without narration.**
+
+### 28. Every fold has its own seams, and a fresh model finds them faster than a re-read
+
+The eng review's nine decisions were folded; a Fable fresh-context
+subagent then found fifteen defects in the folded plan (a public
+entrypoint that skipped the flag check, a dispatch window after the
+timer, a test that passed without the latch). Those were folded; codex
+pass 1 found fifteen more, four of them in the new folds (a timer armed
+after the write it was meant to bound; a resolver that ignored its
+client id). Codex pass 2 found four defective folds and one new class
+(kind/projection pairs guarded independently). Pass 3 found three
+seams, no new class — the LEARNINGS #26 stop shape, and the loop
+stopped there. Two cross-model tensions went to the founder: one
+refined a decision (D11), one reversed the agent's own recommendation
+after a written trade-off analysis (D12). **Lesson: budget one
+confirming pass per fold, not per finding set; a fold's seams are in
+the read site, the unit, and the lifetime of what it bounds (#26), plus
+one more this time — the function boundary: a guard applied at a call
+site is not a guard until the callee enforces it.**
