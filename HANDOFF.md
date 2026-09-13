@@ -79,7 +79,13 @@ session with `gstack-config get proactive`.
    5/6/7 parallel-capable after 1, 8→10 sequential, 11 last. Every task's
    commit includes its tests; ledger rows flip per commit. `resume` for a
    named client now REQUIRES a resolver — `connection.ts` needs no change
-   because production rows have `clientId null` until Lane B.
+   because production rows have `clientId null` until Lane B. Two
+   implementer notes from the 2026-09-13 read-only pass (not plan edits):
+   Task 10's exactly-once tests use `vi.useFakeTimers()`, never 400 ms
+   real budgets — the QuickJS suite already stretches to 110 s under CI
+   load; and draw the latch state machine (guard-phase expiry, run
+   expiry, continuation, one shared latch) as a code comment BEFORE
+   writing `runDirect`.
 3. **Lane A PR** is load-bearing: Tier 2 gauntlet + `/explain-diff` +
    quiz covering the THREE one-way doors (404 retry removed for Code
    Mode; sentinel in `code`; credential echo after a 200 is
