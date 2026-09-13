@@ -31,12 +31,24 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-13 ~04:45 (**Lane A plan WRITTEN and REVIEWED — PR #61 OPEN (docs-only)**; main unchanged since `f6fec9f`; NEXT: merge #61 on the founder's word, then execute the plan on `feat/r1-lane-a`)
+## Current handoff — updated 2026-09-13 ~12:10 (**Lane A plan WRITTEN, REVIEWED, and MERGED — PR #61 `1022b2e`**, founder-named merge; branches = main only; NEXT: execute the plan on `feat/r1-lane-a`)
 
-**State.** The R1 Lane A implementation plan lives at
-`docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md` on branch
-`docs/r1-lane-a-plan` (PR #61, docs-only, 3 commits, CI pending at
-handoff time). Eleven tasks with TDD steps; decisions D-A1–D-A13 in the
+**Merge record (12:05):** founder said "do it" to the two named open
+items. Greptile reviewed #61 in three rounds (round 1: a P1 lifecycle
+leak on guard exits + three P2s; round 2: a P1 guard-phase timer with no
+handler + a "plans must be HTML" P2 answered as false positive by repo
+convention, reply on the thread); both P1s folded (`finishEarly()`, guard
+phase raced against expiry). One CI flake on a docs-only commit
+(`client.test.ts` rotation-in-progress, the known class) → one rerun,
+green. `gh pr update-branch` was needed once more (the HANDOFF docs push
+had moved main). Squash `1022b2e`; tree identical to the branch tip;
+branch deleted. The three stale merged-PR remote branches named in the
+previous DEFERRED list were already gone on origin; `git fetch --prune`
+cleared the local tracking refs.
+
+**State.** The R1 Lane A implementation plan is on main at
+`docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md`
+(PR #61 MERGED `1022b2e`). Eleven tasks with TDD steps; decisions D-A1–D-A13 in the
 header; task map keyed to spec §9.1 rows; a `## GSTACK REVIEW REPORT`
 closes the file. Review record: `/plan-eng-review` (9 founder decisions
 D1–D9), a fresh-context Fable subagent as interim outside voice (15
@@ -60,10 +72,7 @@ session with `gstack-config get proactive`.
 
 ### NEXT
 
-1. **Merge PR #61 on the founder's word** (docs-only: no explainer quiz
-   required; CI green + read the CodeRabbit/Greptile review first, fold
-   anything real — they found a real class on #57). Then delete the
-   branch local + remote.
+1. ~~Merge PR #61~~ — DONE (`1022b2e`, see the merge record above).
 2. **Execute the plan** — `superpowers:subagent-driven-development`
    (recommended in the plan) on `feat/r1-lane-a` from `origin/main`, one
    task per subagent, review between tasks. Tasks 1→4 sequential (store),
@@ -96,10 +105,9 @@ plus: spec §18 entry for the D12 wire deviation (with the Lane A PR) ·
 Lane B must add the profiles table/repository (moved out of Lane A) and
 consume `resume`'s `lifecycle` handle for direct admission · the
 INVARIANTS §5.5 I-3 clause changes wording ("opaque reference", not "the
-parse error") in Lane A Task 11 · three merged-PR remote branches still
-exist on origin (`docs/r1-design-spec`, `docs/s18-r1-sequencing`,
-`fix/cas-malformed-callid`) — verified stale, deletion is a
-confirmation-tier push; ask.
+parse error") in Lane A Task 11 · (the three stale remote branches noted
+earlier were already deleted on origin; local tracking refs pruned
+2026-09-13).
 
 **SHELVED (unchanged):** the project-jail plan.
 
@@ -107,10 +115,10 @@ confirmation-tier push; ask.
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
 > follow its protocol (incl. `gh pr list --state all --limit 5` — #61 is
-> the OPEN docs-only PR carrying the reviewed Lane A plan at
-> `docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md`). **Do
-> NOT re-review the plan; the loop is closed.** NEXT: merge #61 on the
-> founder's word, then `superpowers:subagent-driven-development` on
+> MERGED `1022b2e`; the reviewed Lane A plan is on main at
+> `docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md`;
+> branches = main only). **Do NOT re-review the plan; the loop is
+> closed.** NEXT: `superpowers:subagent-driven-development` on
 > `feat/r1-lane-a` from `origin/main`, Task 1 first; a task list up front
 > and one commit per task. Carry the DEFERRED list.
 
