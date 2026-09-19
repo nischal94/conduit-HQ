@@ -128,6 +128,19 @@ const SCHEMA = [
     outcome TEXT NOT NULL,
     PRIMARY KEY (execution_id, ordinal)
   )`,
+  // §4.1: a named client's request key lives here, never in
+  // executions.request_key — the PK namespaces the key by client, so two
+  // clients may reuse one key string and a default-profile (NULL client)
+  // key can never collide with a named one. The index on execution_id
+  // serves the LEFT JOIN every execution read performs (eng review D9);
+  // without it that join scans this append-only table.
+  `CREATE TABLE IF NOT EXISTS request_keys (
+    client_id TEXT NOT NULL,
+    key TEXT NOT NULL,
+    execution_id TEXT NOT NULL,
+    PRIMARY KEY (client_id, key)
+  )`,
+  `CREATE INDEX IF NOT EXISTS request_keys_execution ON request_keys (execution_id)`,
   `CREATE TABLE IF NOT EXISTS secrets (
     ref TEXT PRIMARY KEY,
     sealed TEXT NOT NULL,
@@ -152,6 +165,15 @@ async function tolerateSchemaRace(run: () => Promise<unknown>): Promise<void> {
     }
   }
 }
+
+/**
+ * The one execution read shape (§4.1): every hydrating read LEFT JOINs
+ * `request_keys` so a named row's key arrives as `named_request_key`, which
+ * `hydrateExecutionRow` folds into `requestKey`. `e.*` first — the join
+ * column must not shadow a real column.
+ */
+const EXECUTION_SELECT = `SELECT e.*, rk.key AS named_request_key
+  FROM executions e LEFT JOIN request_keys rk ON rk.execution_id = e.id`;
 
 export async function openSqliteStore(options: SqliteStoreOptions): Promise<ConduitStore> {
   const { client, secretBox } = options;
@@ -481,7 +503,11 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
     executions: {
       async create(execution: Execution, opts?: { attempt?: string }): Promise<void> {
         const c = executionWriteColumns(execution);
-        const named = execution.clientId !== null && execution.requestKey !== undefined;
+        const namedKey =
+          execution.clientId !== null && execution.requestKey !== undefined
+            ? { clientId: execution.clientId, key: execution.requestKey }
+            : undefined;
+        const named = namedKey !== undefined;
         const insert = {
           sql: `INSERT INTO executions
                   (id, code, status, seeds, paused_on, started_at, ended_at, result, error, request_key,
@@ -511,8 +537,19 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           await client.execute(insert);
           return;
         }
-        // Task 3 adds the request_keys statement to this batch.
-        await client.batch([insert], "write");
+        // ONE batch, so a duplicate key rolls the execution row back with
+        // it: libSQL surfaces the SQLite message verbatim, and the manager
+        // matches that text to raise the client-visible conflict.
+        await client.batch(
+          [
+            insert,
+            {
+              sql: "INSERT INTO request_keys (client_id, key, execution_id) VALUES (?, ?, ?)",
+              args: [namedKey.clientId, namedKey.key, execution.id],
+            },
+          ],
+          "write",
+        );
       },
       async put(execution: Execution): Promise<void> {
         const c = executionWriteColumns(execution);
@@ -552,7 +589,7 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       },
       async get(id: string): Promise<Execution | undefined> {
         const rs = await client.execute({
-          sql: "SELECT * FROM executions WHERE id = ?",
+          sql: `${EXECUTION_SELECT} WHERE e.id = ?`,
           args: [id],
         });
         const row = rs.rows[0];
@@ -573,14 +610,19 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         return kind !== undefined && isOneOf(kind, EXECUTION_KINDS) ? kind : undefined;
       },
       async getByRequestKey(key: string, clientId: string | null): Promise<Execution | undefined> {
-        if (clientId !== null) {
-          // The named-client lookup reads `request_keys`, which Task 3 creates.
-          return undefined;
-        }
-        const rs = await client.execute({
-          sql: "SELECT * FROM executions WHERE request_key = ?",
-          args: [key],
-        });
+        // Two disjoint key spaces (§4.1): a named client's key is only ever
+        // in `request_keys`, the default profile's only ever in the legacy
+        // column. Neither lookup can reach the other's rows, so a key that
+        // collides across the two — including one holding U+0000 — stays
+        // two distinct executions.
+        const rs = await client.execute(
+          clientId === null
+            ? { sql: `${EXECUTION_SELECT} WHERE e.request_key = ?`, args: [key] }
+            : {
+                sql: `${EXECUTION_SELECT} WHERE rk.client_id = ? AND rk.key = ?`,
+                args: [clientId, key],
+              },
+        );
         const row = rs.rows[0];
         return row === undefined ? undefined : hydrateExecutionRow(row, text(row, "id"));
       },
@@ -729,8 +771,10 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         // and the manager's post-claim strict check then terminalizes the
         // row as corrupt. Guarded: `json_extract` throws on invalid JSON.
         const rs = await client.execute(
-          `SELECT *, CASE WHEN json_valid(paused_on) THEN json_extract(paused_on, '$.callId') END AS claim_call_id
-           FROM executions WHERE status = 'paused' ORDER BY started_at ASC, id ASC`,
+          `SELECT e.*, CASE WHEN json_valid(e.paused_on) THEN json_extract(e.paused_on, '$.callId') END AS claim_call_id,
+                  rk.key AS named_request_key
+           FROM executions e LEFT JOIN request_keys rk ON rk.execution_id = e.id
+           WHERE e.status = 'paused' ORDER BY e.started_at ASC, e.id ASC`,
         );
         // One row whose JSON will not parse must not hide the whole queue:
         // the resume claim admits such a pause so an operator can

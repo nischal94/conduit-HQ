@@ -812,6 +812,85 @@ describe("SqliteStore", () => {
         ),
       ).rejects.toThrow(/check/i);
     });
+
+    it("INVARIANT §4.1 (#25): a named client's key lives in request_keys; the legacy column stays NULL; lookup is per client", async () => {
+      await store.executions.create(codeRow({ id: "n1", clientId: "acme", requestKey: "k" }));
+      const raw = await client.execute({
+        sql: "SELECT request_key FROM executions WHERE id = ?",
+        args: ["n1"],
+      });
+      expect(raw.rows[0]?.request_key).toBeNull();
+      const rk = await client.execute({
+        sql: "SELECT execution_id FROM request_keys WHERE client_id = ? AND key = ?",
+        args: ["acme", "k"],
+      });
+      expect(rk.rows[0]?.execution_id).toBe("n1");
+      expect((await store.executions.getByRequestKey("k", "acme"))?.id).toBe("n1");
+      expect(await store.executions.getByRequestKey("k", null)).toBeUndefined();
+      expect(await store.executions.getByRequestKey("k", "other")).toBeUndefined();
+      expect((await store.executions.get("n1"))?.requestKey).toBe("k"); // hydrated through the join
+    });
+
+    it("INVARIANT §4.1 (#25): a named key never collides with a default-profile key, including a legacy key containing U+0000", async () => {
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, started_at, request_key) VALUES ('legacy', 'x', 'completed', '{}', 0, ?)",
+        args: ["acme k"],
+      });
+      await store.executions.create(codeRow({ id: "d1", requestKey: "k" })); // default profile, raw column
+      await store.executions.create(codeRow({ id: "n2", clientId: "acme", requestKey: "k" })); // named, table
+      expect((await store.executions.getByRequestKey("k", null))?.id).toBe("d1");
+      expect((await store.executions.getByRequestKey("k", "acme"))?.id).toBe("n2");
+      expect((await store.executions.getByRequestKey("acme k", null))?.id).toBe("legacy");
+      expect(await store.executions.getByRequestKey("acme k", "acme")).toBeUndefined(); // unreachable from a named client
+    });
+
+    it("INVARIANT §4.1 (#25): a duplicate named key fails the create atomically — no execution row, no key row", async () => {
+      await store.executions.create(codeRow({ id: "n3", clientId: "acme", requestKey: "dup" }));
+      await expect(
+        store.executions.create(codeRow({ id: "n4", clientId: "acme", requestKey: "dup" })),
+      ).rejects.toThrow("UNIQUE constraint failed: request_keys.client_id, request_keys.key");
+      expect(await store.executions.get("n4")).toBeUndefined();
+      await store.executions.create(codeRow({ id: "n5", clientId: "beta", requestKey: "dup" })); // another client: fine
+    });
+
+    it("put never writes request_keys (settle upserts leave the key table alone)", async () => {
+      await store.executions.create(codeRow({ id: "p_k2", clientId: "acme", requestKey: "k2" }));
+      await store.executions.put({
+        ...codeRow({ id: "p_k2", clientId: "acme", requestKey: "k2" }),
+        status: "completed",
+        result: 1,
+      });
+      const keys = await client.execute("SELECT COUNT(*) AS n FROM request_keys WHERE key = 'k2'");
+      expect(Number(keys.rows[0]?.n)).toBe(1);
+      const raw = await client.execute({
+        sql: "SELECT request_key FROM executions WHERE id = ?",
+        args: ["p_k2"],
+      });
+      expect(raw.rows[0]?.request_key).toBeNull();
+    });
+
+    it("listPaused hydrates a named row's key through the join", async () => {
+      await store.executions.create(
+        codeRow({
+          id: "np",
+          clientId: "acme",
+          requestKey: "pk",
+          status: "paused",
+          pausedOn: { callId: "c", toolName: "a.b", input: {}, reason: "r", expiresAt: 9e12 },
+        }),
+      );
+      expect((await store.executions.listPaused()).find((e) => e.id === "np")?.requestKey).toBe(
+        "pk",
+      );
+    });
+
+    it("the execution read joins request_keys through an index, not a scan (eng review D9)", async () => {
+      const plan = await client.execute(
+        "EXPLAIN QUERY PLAN SELECT e.*, rk.key AS named_request_key FROM executions e LEFT JOIN request_keys rk ON rk.execution_id = e.id WHERE e.id = 'x'",
+      );
+      const text = plan.rows.map((r) => String(r.detail)).join("\n");
+      expect(text).toMatch(/USING (COVERING )?INDEX request_keys_execution/);
+    });
   });
 
   describe("execution outcome persistence (mcp design M4)", () => {
