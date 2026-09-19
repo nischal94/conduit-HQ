@@ -882,8 +882,33 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   //
   // GUARD-PHASE EXPIRY (resume): the drive is constructed right after the
   // claim identifies a direct row, so its timer covers the §5.4 read-side
-  // guard too. A guard exit that terminalizes the row calls `finishEarly()`,
-  // which settles both lifecycle promises and cancels the timer.
+  // guard too — its `onExpire` is wired AT CONSTRUCTION, and every guard read
+  // races it. The SAME one latch decides here:
+  //
+  //        budget elapses during the guard        a guard read resolves
+  //                    │                                    │
+  //                    ▼                                    ▼
+  //          onExpire: drive.settle() ◄───── the one latch ─────► terminalizeDirect:
+  //                    │                                         drive.settle()
+  //         ┌──────────┴──────────┐                     ┌──────────┴──────────┐
+  //     true (WINNER)        false (LOSER)          true (WINNER)      false (LOSER)
+  //     finishEarly()        return, write          finishEarly()      EXPIRY HOLDS IT:
+  //     bounded fenced       nothing                bounded fenced     await guardExpiry
+  //     settle; publish                             settle; publish    and return ITS
+  //     via guardExpiry                             its own outcome    outcome — never a
+  //                                                                    second write
+  //
+  // A late guard result deferring to `guardExpiry` is what keeps the loser
+  // from issuing a SECOND `settleDirect` on the same (id, attempt) and then
+  // reading its own `fenced` (0 rows) as `unknown/persist-failed` — a false
+  // non-answer for a write that actually SUCCEEDED. The SQL fence protects
+  // the record; only the latch protects the published outcome.
+  //
+  // `terminalizeDirect` is the ONE place this rule lives: every guard
+  // terminalization and the prep-window catch call it, and it owns
+  // `finishEarly()` so no caller can settle the row and forget to stop the
+  // drive. The expiry handler calls `finishEarly()` itself for the same
+  // reason, so that exit looks like every other exit.
   //
   // CLASSIFICATION at expiry is decided by the DISPATCH CELL (D-A4), never by
   // elapsed time: cell `dispatched` → ConduitOutcomeAmbiguous ("the upstream
@@ -1477,6 +1502,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               onExpire: () => {
                 // The latch: if the guard already decided, it owns the settle.
                 if (!directDrive?.settle()) return;
+                // Resolve the drive's lifecycle promises and clear its timer
+                // on THIS path too, so the expiry exit looks like every other
+                // exit rather than leaving `finished`/`settledAt` pending and
+                // the drive undisposed.
+                directDrive.finishEarly();
                 const error: ExecutionError = {
                   name: "ConduitExecutionInterrupted",
                   message: `[ExecutionManager] Direct resume budget elapsed during the read-side guard (${budgets.driveBudgetMs}ms); the pending call did not run. Context: { executionId: ${executionId} }`,
@@ -1517,6 +1547,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       }
 
       /**
+       * The UNLATCHED write. Only two callers may use it: the expiry handler
+       * (which has already taken the latch) and `terminalizeDirect` below
+       * (which takes it on the caller's behalf). Everything else goes through
+       * `terminalizeDirect`.
+       *
        * Task 9 handover: the direct row's guard terminalizations must NOT use
        * the unbounded, unfenced `failClaimedResume`. This writes the same
        * terminal state through the ONE bounded fenced settle, and reports
@@ -1546,6 +1581,39 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         };
       }
 
+      /**
+       * THE latch rule for the resume path, in ONE place: **take the latch, or
+       * defer to whoever holds it.**
+       *
+       * Arming `onExpire` (fix round 1) made a previously-dead race live. The
+       * budget can elapse just before a slow-but-returning guard read
+       * resolves: the timer callback has then already taken the latch and
+       * started its write, and a guard terminalization that wrote anyway
+       * would issue a SECOND `settleDirect` for the same
+       * `(executionId, resumeAttemptId)`. The SQL fence keeps the RECORD
+       * correct — the loser matches 0 rows — but the loser would read that as
+       * `fenced` and publish `unknown/persist-failed` even though the
+       * expiry's write SUCCEEDED. That is exactly the false `persist-failed`
+       * the `unknown` contract exists to avoid.
+       *
+       * So: every guard terminalization and the prep-window catch call this.
+       * It also owns `finishEarly()`, so no caller can settle the row and
+       * forget to stop the drive.
+       */
+      async function terminalizeDirect(
+        drive: OwnedDirectDrive,
+        settle: DirectSettle,
+        error: ExecutionError,
+      ): Promise<ResumeOutcome> {
+        if (!drive.settle()) {
+          // The expiry handler holds the latch and is writing (or has
+          // written). Publish ITS outcome; never write a second time.
+          return guardExpiry;
+        }
+        drive.finishEarly();
+        return settleDirectBounded(settle, error);
+      }
+
       // The claim just flipped the row to `running`. EVERYTHING from here until
       // `drive` takes over is a fragile preparation window (design §8/F5): a
       // throw in `get` (which can surface CORRUPT stored JSON — bad seeds or
@@ -1572,8 +1640,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           };
           const reason = "resumed execution has no pending approval (corrupt state)";
           if (directDrive !== undefined) {
-            directDrive.finishEarly();
-            const settled = await settleDirectBounded({ status: "failed", error }, error);
+            const settled = await terminalizeDirect(
+              directDrive,
+              { status: "failed", error },
+              error,
+            );
             return { ...settled, corruptPause: true };
           }
           await deps.store.executions.failClaimedResume(executionId, reason);
@@ -1611,8 +1682,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             message: `[ExecutionManager] Resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run. Context: { executionId: ${executionId} }`,
           };
           if (directDrive !== undefined) {
-            directDrive.finishEarly();
-            const settled = await settleDirectBounded({ status: "failed", error }, error);
+            const settled = await terminalizeDirect(
+              directDrive,
+              { status: "failed", error },
+              error,
+            );
             return { ...settled, corruptPause: true };
           }
           await deps.store.executions.failClaimedResume(executionId, reason);
@@ -1631,7 +1705,9 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         if (now() > pausedOn.expiresAt) {
           if (directDrive !== undefined) {
             // §5.3: a direct row's terminal write is the fenced `settleDirect`
-            // — the `expired` arm — never an unfenced `put`.
+            // — the `expired` arm — never an unfenced `put`. Latch first: if
+            // the budget already elapsed, the expiry owns the outcome.
+            if (!directDrive.settle()) return guardExpiry;
             directDrive.finishEarly();
             const { result } = boundedFencedSettle(
               deps.store,
@@ -1678,8 +1754,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // Task 9 handover: a DIRECT row's terminalization is the bounded
           // fenced settle, never the unbounded unfenced `failClaimedResume`.
           if (directDrive !== undefined) {
-            directDrive.finishEarly();
-            const settled = await settleDirectBounded({ status: "failed", error }, error);
+            const settled = await terminalizeDirect(
+              directDrive,
+              { status: "failed", error },
+              error,
+            );
             return { ...settled, ...flag };
           }
           await deps.store.executions.failClaimedResume(executionId, reason, errorName);
@@ -1958,21 +2037,15 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // not an unbounded `settleDirect` — a stalled store here would
           // otherwise hang `resume()` past every budget. Best effort: the
           // original fault still surfaces below whatever the write did.
-          directDrive.finishEarly();
-          const { result } = boundedFencedSettle(
-            deps.store,
-            executionId,
-            resumeAttemptId,
-            {
-              status: "failed",
-              error: {
-                name: "ConduitInternalError",
-                message: `[ExecutionManager] Resume preparation failed. Reference: ${ref}`,
-              },
-            },
-            budgets.settleWriteBudgetMs,
-          );
-          await result;
+          // Latch-or-defer, exactly as the guard sites do: if the budget
+          // already elapsed, the expiry handler owns the write and this must
+          // not issue a second one. The original fault still surfaces either
+          // way — this branch always re-throws.
+          const prepError: ExecutionError = {
+            name: "ConduitInternalError",
+            message: `[ExecutionManager] Resume preparation failed. Reference: ${ref}`,
+          };
+          await terminalizeDirect(directDrive, { status: "failed", error: prepError }, prepError);
           throw cause;
         }
         await deps.store.executions

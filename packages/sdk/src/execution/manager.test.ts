@@ -3252,6 +3252,97 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
+  it("INVARIANT §5.3 (#22/#28, latch): expiry holds the latch, so a LATE guard result defers to it — exactly one settleDirect, and never a false persist-failed", async () => {
+    // Fix round 2. Arming `onExpire` made this race live: the budget elapses
+    // just BEFORE a slow-but-returning guard read resolves. The timer has
+    // taken the latch and its write is landing; the guard must defer, not
+    // issue a second `settleDirect` and then read its own `fenced` (0 rows)
+    // as `unknown/persist-failed` — a false non-answer for a write that
+    // actually SUCCEEDED.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // The guard must REACH a terminalization for this race to exist at all:
+    // bump the generation so §5.4 step 3 fails closed (ConduitCatalogChanged)
+    // instead of the guard passing and driving the call.
+    await active.reprovision();
+
+    // A CONTROLLED deferred guard read — not a sleep. The interleaving that
+    // exposes the defect is the guard resolving while the expiry's write is
+    // still IN FLIGHT: if the expiry's write were allowed to COMPLETE first
+    // the row would already be terminal, and the store's `status='running'`
+    // fence would mask a missing latch. So the expiry's write is held open
+    // until the guard has been released.
+    let releaseGuardRead!: () => void;
+    const guardReadGate = new Promise<void>((r) => {
+      releaseGuardRead = r;
+    });
+    let releaseExpiryWrite!: () => void;
+    const expiryWriteGate = new Promise<void>((r) => {
+      releaseExpiryWrite = r;
+    });
+    let expiryWriteStarted!: () => void;
+    const expiryWriteInFlight = new Promise<void>((r) => {
+      expiryWriteStarted = r;
+    });
+    const settleAttempts: string[] = [];
+    const raced = {
+      ...active.store,
+      tools: {
+        ...active.store.tools,
+        get: async (n: string) => {
+          await guardReadGate;
+          return active!.store.tools.get(n);
+        },
+      },
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          settleAttempts.push(a[1]);
+          if (settleAttempts.length === 1) {
+            // The EXPIRY's write: announce it, then hold it open so the
+            // guard resolves while it is still in flight.
+            expiryWriteStarted();
+            await expiryWriteGate;
+          }
+          return active!.store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const racedM = createExecutionManager({ ...active.deps, store: raced, direct: fast });
+    const resuming = racedM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+    // The budget elapses while the guard read is gated → the expiry takes the
+    // latch and starts its write. Release the guard read WHILE that write is
+    // still open: the guard must now defer, not write again.
+    await expiryWriteInFlight;
+    releaseGuardRead();
+    // Give the guard's continuation real event-loop turns to reach its
+    // terminalization while the expiry's write is still open. This must stay
+    // WELL under `settleWriteBudgetMs`, or the expiry itself would time out
+    // and report persist-timeout for a reason unrelated to the latch.
+    await new Promise((r) => setTimeout(r, 30));
+    releaseExpiryWrite();
+    const out = await resuming;
+
+    // EXACTLY ONE write for this attempt: the loser deferred instead of
+    // issuing a second one.
+    expect(settleAttempts).toHaveLength(1);
+    // And the published outcome is the EXPIRY's, never a false persist-failed.
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+      decisionApplied: false,
+    });
+    expect(out.status).not.toBe("unknown");
+    expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
+    expect(active.calls).toHaveLength(0);
+  });
+
   it("INVARIANT §5.3 (guard-phase expiry): a guard READ that never returns still answers within the drive budget and terminalizes the claimed row", async () => {
     // Fix round 1, finding 1. Every §5.4 guard read is unbounded. Before the
     // fix the drive's timer fired into an UNASSIGNED `onExpire`, so a stalled
@@ -3272,12 +3363,14 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       tools: { ...active.store.tools, get: () => never },
     } as ConduitStore;
     const stuckM = createExecutionManager({ ...active.deps, store: stuckGuard, direct: fast });
-    // REAL CLOCK, deliberately (fix round 1, finding 3): this test drives a
-    // real `resume()` whose approved call crosses the harness's loopback MCP
-    // socket. Under `vi.useFakeTimers` that path deadlocks — verified: the
-    // test times out at 5 s with the clock frozen. So the budget stays real
-    // and the margin is a full SECOND, not a few hundred ms, to survive CI
-    // load; the property under test (an answer within budget, not an exact
+    // REAL CLOCK, deliberately (fix round 1, finding 3): this test's path
+    // crosses the harness's loopback MCP socket — here in the SETUP, which
+    // provisions the source and drives the initial `startDirect` to a pause
+    // (the guard terminalizes before any approved call runs). Under
+    // `vi.useFakeTimers` that socket path deadlocks — verified: the test
+    // times out at 5 s with the clock frozen. So the budget stays real and
+    // the margin is a full SECOND, not a few hundred ms, to survive CI load;
+    // the property under test (an answer within budget, not an exact
     // duration) tolerates the slack.
     const t0 = Date.now();
     const out = await Promise.race([
@@ -3321,12 +3414,14 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       },
     } as ConduitStore;
     const hostileM = createExecutionManager({ ...active.deps, store: hostile, direct: fast });
-    // REAL CLOCK, deliberately (fix round 1, finding 3): this test drives a
-    // real `resume()` whose approved call crosses the harness's loopback MCP
-    // socket. Under `vi.useFakeTimers` that path deadlocks — verified: the
-    // test times out at 5 s with the clock frozen. So the budget stays real
-    // and the margin is a full SECOND, not a few hundred ms, to survive CI
-    // load; the property under test (an answer within budget, not an exact
+    // REAL CLOCK, deliberately (fix round 1, finding 3): this test's path
+    // crosses the harness's loopback MCP socket — here in the SETUP, which
+    // provisions the source and drives the initial `startDirect` to a pause
+    // (the guard terminalizes before any approved call runs). Under
+    // `vi.useFakeTimers` that socket path deadlocks — verified: the test
+    // times out at 5 s with the clock frozen. So the budget stays real and
+    // the margin is a full SECOND, not a few hundred ms, to survive CI load;
+    // the property under test (an answer within budget, not an exact
     // duration) tolerates the slack.
     const t0 = Date.now();
     const settled = await Promise.race([
