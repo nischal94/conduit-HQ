@@ -782,6 +782,27 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). **Next: R1.*
 
 **Resolved (locked):**
 
+- **R1 Lane A landed — two recorded deviations and one accepted limit (decided 2026-09-19):** ✅
+Lane A (the SDK half of R1: execution kinds, provenance, the direct arm, scoped authority) landed with three
+departures from the R1 design spec, each deliberate. **(1) The `unknown` outcome travels on the
+wire.** The design's §10 says Lane A makes no wire change, and its §5.3 defines `unknown` —
+"the effect may have landed and the row may not yet say so" — for the direct path. Both direct paths bound
+the settle write, so `approvals.resume` can now answer `unknown`; carrying it honestly needs
+the status on the wire. `EXECUTE_STATUSES` gains `unknown`, the payload gains
+`reason` (`persist-timeout` | `persist-failed`), and `conduit approvals`
+exits non-zero with "re-list, do not retry" and never prints a verb. The change is additive.
+**(2) An out-of-scope call is refused with the SAME text as an unknown tool.** The design's §5.5
+mandated a distinct reason string; that string let a client tell a hidden tool from an absent one, while search
+and describe already made the two indistinguishable. The policy engine's unknown-tool reason now flows through
+unchanged, and the operator's distinction is a host-only log line. Reversal is one string and one test.
+**(3) Accepted limit:** if the store's `create()` outlives the direct drive budget and
+then rejects on the request-key constraint, the client has already received
+`failed: ConduitExecutionInterrupted` rather than `conflict`. Nothing was persisted for that
+id and nothing was dispatched; the next re-issue with the same key answers `conflict`. A
+`create()` slower than the drive budget is a store fault the timeout correctly surfaces.
+**Also recorded:** `resultTooLarge` is not yet projected onto the wire — an over-cap direct
+completion reaches a client as `result: null` while the stored row says `discarded`; Lane B
+decides the wire form.
 - **R1 sequencing amended — Lane A, then preview packaging, then decide profiles (decided 2026-09-11):** ✅
 The R1 build shape stays Lane A → B → C (R1 design spec §10), but publication moves between A and B.
 **Lane A first, while nothing is published:** it changes pause-path storage (the `code`
