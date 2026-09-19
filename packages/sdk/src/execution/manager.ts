@@ -943,7 +943,9 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   // non-answer for a write that actually SUCCEEDED. The SQL fence protects
   // the record; only the latch protects the published outcome.
   //
-  // `terminalizeDirect` is the ONE place this rule lives: every guard
+  // `terminalizeDirect` is the ONE place this rule lives for every FAILED
+  // terminalization; the TTL `expired` arm below repeats it inline because
+  // its settle payload is `{status:"expired"}`, not a failure. Every guard
   // terminalization and the prep-window catch call it, and it owns
   // `settleEarly()` so no caller can settle the row and forget to stop the
   // drive. The expiry handler calls `settleEarly()` itself for the same
@@ -961,8 +963,21 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   //
   // EXIT PATHS: `runDirect`'s `finally` always disposes the drive's timer and
   // awaits the tracked settle writes; `startDirect`'s `finished` disposes
-  // again (idempotent). `outcome`, `retention` and `finished` each resolve on
-  // every path — a promise that never resolves is a leak.
+  // again (idempotent). `outcome` and `retention` resolve on every path — an
+  // unresolvable `outcome` strands the caller and holds a queue slot. Only
+  // `finished` may stay pending, and only for a quarantined continuation (see
+  // its own doc in direct.ts).
+  //
+  // A THROW is an exit path too, and the one that kept being missed.
+  // `runDirect` asserts it never throws, but an assertion is not an
+  // enforcement, so both call sites treat a rejection as a real exit that must
+  // settle: `startDirect`'s backstop, and the resume path's handler, which
+  // logs the cause under a reference and settles through the latch —
+  // classifying by the DISPATCH CELL exactly as `classifyDirectFailure` and
+  // `expireDirect` do, and falling back to `unknown` if even that write
+  // cannot be started. Below them, `boundedFencedSettle` catches a
+  // SYNCHRONOUS throw from `settleDirect`, so no settle path anywhere can
+  // turn a faulting store into an unresolved outcome.
   // ─────────────────────────────────────────────────────────────────────────
 
   const budgets: DirectBudgets = { ...DIRECT_DEFAULTS, ...deps.direct };
@@ -1075,6 +1090,31 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
    */
   async function runDirect(run: DirectRun): Promise<void> {
     const { execution, drive } = run;
+    // Parse ONCE, before the try. The stored `request` is only guaranteed to
+    // be a STRING by hydration; a corrupt row can hold bytes that are not
+    // JSON. Parsing it lazily at the two use sites put one of them INSIDE the
+    // catch that handles the pause arm, where a throw escapes `runDirect`
+    // entirely — and on the resume path nothing downstream could settle the
+    // outcome. A corrupt row is a terminal failure of the row, decided here
+    // before any drive work begins, so neither use site can throw.
+    let request: unknown;
+    try {
+      request = JSON.parse(execution.call.request);
+    } catch {
+      if (!drive.settle()) return;
+      // No stored bytes and no parse position in the message: the row is
+      // handed back to the agent by `check_execution`.
+      const error: ExecutionError = {
+        name: "ConduitInternalError",
+        message: `[ExecutionManager] Stored direct_call request is not valid JSON (corrupt state); the call did not run. Context: { executionId: ${execution.id} }`,
+      };
+      await settleBounded(
+        run,
+        { status: "failed", error },
+        { status: "failed", executionId: execution.id, error },
+      );
+      return;
+    }
     let upstreamSession: UpstreamSessionScope | undefined;
     try {
       // Prep-window throws: the STORED error carries the cause, the
@@ -1116,7 +1156,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         return;
       }
 
-      const value = await invoke(execution.call.toolName, JSON.parse(execution.call.request));
+      const value = await invoke(execution.call.toolName, request);
       // §4.1: `discarded` is decided AT SETTLE against the DELIVERABLE — on
       // the resume path that is the REDACTED value, and redaction can EXPAND
       // it. Pure computation, so it may run before the latch.
@@ -1195,7 +1235,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             toolName: execution.call.toolName,
             namespace,
             sourceGeneration: generation,
-            input: JSON.parse(execution.call.request),
+            input: request,
             reason: cause.message,
             expiresAt: now() + resolveApprovalTtlMs(),
           };
@@ -1451,15 +1491,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         .catch(() => {})
         .finally(() => {
           run.drive.dispose();
-          // UNTESTED DEFENCE-IN-DEPTH, deliberately so: no reachable path
-          // gets here with the latch still free. Every branch above settles
-          // through the latch, and `mapCreateConflict`'s rejection is already
-          // absorbed by its own `.catch`, so this cannot be driven red by a
-          // test — it exists only to convert a FUTURE branch that forgets to
-          // settle from an un-resolvable `outcome` (a caller awaiting
-          // forever) into an honest non-answer. It is not a guard, carries no
-          // invariant, and no test pins it; if a later change makes a real
-          // path reach it, that path needs its own settle, not this.
+          // DEFENCE-IN-DEPTH. Every branch above is written to settle through
+          // the latch, but "no path reaches here" is an unprovable claim about
+          // future code, so this converts a branch that forgets to settle from
+          // an un-resolvable `outcome` (a caller awaiting forever) into an
+          // honest non-answer. It carries no invariant of its own; a real path
+          // that lands here needs its own settle, not this.
           // Taking the latch also stops the timer's handler from publishing a
           // second, contradictory outcome.
           if (run.drive.settle()) {
@@ -1702,7 +1739,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
        * the `unknown` contract exists to avoid.
        *
        * So: every guard terminalization and the prep-window catch call this.
-       * It also owns `finishEarly()`, so no caller can settle the row and
+       * It also owns `settleEarly()`, so no caller can settle the row and
        * forget to stop the drive.
        */
       async function terminalizeDirect(
@@ -2037,8 +2074,61 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             persisted: true,
           };
           directDrive.onExpire = () => expireDirect(run);
+          // STRUCTURAL GUARANTEE, not a defence: `runDirect` asserts it never
+          // throws, but an assertion is not an enforcement, and on THIS path
+          // nothing downstream can settle the outcome — the claimed row would
+          // stay `running` and `await outcome` below would never resolve,
+          // holding a queue slot forever. So the rejection handler both logs
+          // the cause host-side under a reference AND settles, through the
+          // latch and the ONE bounded fenced write.
+          //
+          // The published failure follows the SAME rule `classifyDirectFailure`
+          // and `expireDirect` use — the DISPATCH CELL, never elapsed time: if
+          // the cell says `dispatched`, the upstream may have performed the
+          // call, so the honest answer is ambiguous; otherwise the call did not
+          // run. No third rule.
           const finishedRun = runDirect(run)
-            .catch(() => {})
+            .catch(async (cause: unknown) => {
+              if (!directDrive.settle()) return;
+              const ref = crypto.randomUUID();
+              console.error(
+                `[ExecutionManager] direct resume continuation threw ${ref}: ${String(cause)}`,
+              );
+              const error: ExecutionError =
+                run.drive.dispatch.state === "dispatched"
+                  ? {
+                      name: OUTCOME_AMBIGUOUS_ERROR_NAME,
+                      message: `[ExecutionManager] Direct call failed after dispatch; the upstream may have performed the call. Reference: ${ref}`,
+                    }
+                  : {
+                      name: "ConduitInternalError",
+                      message: `[ExecutionManager] Direct resume continuation failed; the call did not run. Reference: ${ref}`,
+                    };
+              // TOTAL, by construction. The bounded settle is best effort —
+              // the very fault that brought us here can be a store that
+              // cannot accept a write at all, and `settleDirect` is called
+              // outside any try inside the settle helper, so it may THROW
+              // rather than reject. If it does, the intended outcome is not
+              // known to be durable, which is exactly what `unknown` means.
+              // The caller gets an answer on every path; that is the
+              // guarantee this handler exists to make.
+              try {
+                await settleBounded(
+                  run,
+                  { status: "failed", error },
+                  { status: "failed", executionId: run.execution.id, error },
+                );
+              } catch (settleCause) {
+                console.error(
+                  `[ExecutionManager] direct resume fallback settle failed ${ref}: ${String(settleCause)}`,
+                );
+                run.resolveOutcome({
+                  status: "unknown",
+                  executionId: run.execution.id,
+                  reason: "persist-failed",
+                });
+              }
+            })
             .finally(() => directDrive.dispose());
           directDrive.resolveFinished(finishedRun);
           directDrive.resolveSettledAt(settledAt);

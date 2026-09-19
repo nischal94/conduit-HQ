@@ -3794,4 +3794,104 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(out.status).toBe("failed");
     expect(active.calls).toHaveLength(0);
   });
+
+  it("INVARIANT §5.3: a resumed direct row whose stored request is CORRUPT JSON answers within budget and terminalizes, never hanging", async () => {
+    // The stored `request` is only guaranteed to be a STRING: the hydrator
+    // checked the type, and the resume guard compares it to
+    // `JSON.stringify(pausedOn.input)` as text without parsing. So bytes like
+    // `{bad` passed every guard and only threw deep inside the drive — on the
+    // resume path, inside the catch arm that handles the pause, where the
+    // throw escaped the continuation entirely. The rejection was swallowed and
+    // the drive disposed, so nothing could ever settle: `await outcome` never
+    // resolved, the row stayed `running`, and the queue slot was held forever.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // Corrupt the column with RAW SQL: the encoder cannot produce this, and
+    // the point is that a row in this state is refused rather than carried
+    // into the drive, where the parse throw had nowhere truthful to go.
+    const row = await active.client.execute({
+      sql: "SELECT direct_call FROM executions WHERE id = ?",
+      args: [paused.executionId],
+    });
+    const call = JSON.parse(String(row.rows[0]?.direct_call)) as DirectCall;
+    await active.client.execute({
+      sql: "UPDATE executions SET direct_call = ? WHERE id = ?",
+      args: [JSON.stringify({ ...call, request: "{bad" }), paused.executionId],
+    });
+    // REAL CLOCK: this test's setup crosses the harness's loopback MCP socket,
+    // which deadlocks under fake timers. The property is "answers within
+    // budget", not an exact duration, so a full second of margin is fine.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      m
+        .resume(paused.executionId, { kind: "approve" }, callId, permitDirect)
+        .catch((cause: unknown) => ({ threw: String(cause) })),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    // ANSWERS. Unbounded, the corrupt row hung `resume()` forever; now the
+    // read refuses it and the prep-window catch terminalizes the claimed row.
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // TERMINALIZED, not stranded `running`, and the pending call never ran.
+    const raw = await active.client.execute({
+      sql: "SELECT status FROM executions WHERE id = ?",
+      args: [paused.executionId],
+    });
+    expect(String(raw.rows[0]?.status)).toBe("failed");
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3: a throw from ANYWHERE inside the resumed continuation still settles the outcome within budget", async () => {
+    // The class, not the one call: three earlier hangs on this path were each
+    // fixed at the single site a reviewer named, and each time another site
+    // stayed open. The guarantee under test is structural — the place that
+    // swallows the continuation's rejection settles the outcome itself — so
+    // the injected throw deliberately comes from a DEPENDENCY the continuation
+    // calls (the invoker factory), at an arbitrary point, not from a path any
+    // specific fix targeted.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // A SYNCHRONOUS throw from a store method the continuation calls.
+    // `boundedFencedSettle` invokes `settleDirect` outside any try, so this
+    // escapes the settle helper, the continuation's own catch arms, and
+    // `runDirect` itself — an arbitrary point no earlier fix targeted, and
+    // one no prep-window catch covers.
+    const throwingStore = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        settleDirect: () => {
+          throw new Error("injected: dependency threw inside the continuation");
+        },
+      },
+    } as unknown as ConduitStore;
+    const boom = createExecutionManager({
+      ...active.deps,
+      store: throwingStore,
+      direct: fast,
+    });
+    const t0 = Date.now();
+    const out = await Promise.race([
+      boom.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // The caller gets an ANSWER. The store here cannot write at all — every
+    // settle attempt throws — so the honest answer is the non-answer, never a
+    // claimed terminal and never an unresolved promise.
+    expect(out).toMatchObject({ status: "unknown" });
+  });
 });

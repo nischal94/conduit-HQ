@@ -44,7 +44,13 @@ export interface DirectDriveHandle {
   outcome: Promise<DirectOutcome>;
   /** "released" when the continuation finished within slotRetentionMs of settle; else "abandoned". Never rejects. */
   retention: Promise<"released" | "abandoned">;
-  /** Resolves when the continuation and any tracked settle write have actually stopped. Never rejects. */
+  /**
+   * Resolves when the continuation and any tracked settle write have actually
+   * stopped. Never rejects — and may NEVER RESOLVE: a quarantined
+   * continuation (a store read that never returns) leaves it pending by
+   * design. `outcome` and `retention` always settle; only `finished` can
+   * hang. Await it only where hanging is acceptable.
+   */
   finished: Promise<void>;
 }
 
@@ -178,12 +184,14 @@ export type SettleResult = "written" | "fenced" | "failed" | "timeout";
  * path uses (the drive's own settle, the §5.4 guard terminalizations, the
  * guard-phase expiry, the TTL `expired` arm, and the prep-window catch).
  *
- * It was three hand-rolled copies of this race, and the copy in the
- * prep-window catch was missing its timeout entirely — a stalled store there
- * hung `resume()` past every budget. Keeping ONE implementation makes that
- * class of omission unrepresentable rather than merely fixed.
+ * ONE implementation, deliberately: a per-caller copy of this race is how a
+ * missing timeout hides, and a stalled store behind such a copy hangs
+ * `resume()` past every budget. A single implementation makes that class of
+ * omission unrepresentable rather than merely fixed.
  *
- * Never throws: a rejected write is `failed`, a write still pending after
+ * Never throws — synchronously either, which is why the call to
+ * `settleDirect` sits inside a try: a rejected write is `failed`, a write
+ * still pending after
  * `budgetMs` is `timeout`. The write itself is NOT cancelled on timeout — it
  * may still land — so callers that need to observe its completion push the
  * returned `write` promise onto their tracked list.
@@ -195,12 +203,20 @@ export function boundedFencedSettle(
   settle: DirectSettle,
   budgetMs: number,
 ): { result: Promise<SettleResult>; write: Promise<unknown> } {
-  const write: Promise<"written" | "fenced" | "failed"> = store.executions
-    .settleDirect(id, attempt, settle)
-    .then(
+  // `settleDirect` is called inside the try on purpose. A store method may
+  // throw SYNCHRONOUSLY rather than return a rejected promise, and this
+  // function's whole contract — and every caller's hang-freedom — rests on
+  // "never throws". An escaping synchronous throw here would bypass the
+  // `.then` rejection arm below and every settle path in the manager at once.
+  let write: Promise<"written" | "fenced" | "failed">;
+  try {
+    write = store.executions.settleDirect(id, attempt, settle).then(
       (changed) => (changed ? "written" : "fenced"),
       () => "failed",
     );
+  } catch {
+    write = Promise.resolve("failed");
+  }
   const result = (async (): Promise<SettleResult> => {
     let timerHandle: NodeJS.Timeout | undefined;
     const timer = new Promise<"timeout">((r) => {
