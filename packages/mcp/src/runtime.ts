@@ -3,6 +3,7 @@ import {
   createCatalogToolHost,
   createExecutionManager,
   createMcpUpstreamCaller,
+  createScopedCatalogToolHost,
   createStoreCredentialResolver,
   createStorePolicyEngine,
   createToolInvoker,
@@ -58,7 +59,16 @@ export async function createApprovalRuntime(opts: {
   const manager = createExecutionManager({
     store,
     sandbox,
-    makeInvoker: ({ executionId, decisions, deadline, upstreamSession }) =>
+    makeInvoker: ({
+      executionId,
+      decisions,
+      deadline,
+      upstreamSession,
+      projection,
+      clientId,
+      scope,
+      dispatch,
+    }) =>
       createToolInvoker(
         {
           store,
@@ -70,16 +80,24 @@ export async function createApprovalRuntime(opts: {
         {
           executionId,
           log,
-          // Task 8 widens the manager's makeInvoker argument to carry the
-          // drive's real projection and client id; until then this path is
-          // the shipped Code Mode drive, which is exactly these values.
-          projection: "code",
-          clientId: null,
+          // §4.3: the drive's real attribution and authority, as the manager
+          // resolved them. Production rows carry `clientId: null` until Lane B
+          // introduces named clients.
+          projection,
+          clientId,
           ...(deadline !== undefined ? { deadline } : {}),
           ...(upstreamSession !== undefined ? { upstreamSession } : {}),
+          ...(scope !== undefined ? { scope } : {}),
+          ...(dispatch !== undefined ? { dispatch } : {}),
         },
       ),
-    makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
+    // §5.4: a drive running under a resolver gets the SCOPED catalog view, so
+    // in-sandbox search/describe match the per-call authority. The scoped host
+    // logs resolver faults through the daemon's real logger, never console.
+    makeToolHost: (invoke, scoped) =>
+      scoped
+        ? createScopedCatalogToolHost(catalog, invoke, scoped.scope, scoped.projection, log)
+        : createCatalogToolHost(catalog, invoke),
   });
 
   return { manager, catalog };

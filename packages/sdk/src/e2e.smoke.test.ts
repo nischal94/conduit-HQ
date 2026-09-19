@@ -650,21 +650,18 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
         return { name: error.name, message: String(error.message ?? error) };
       }
     `);
-    expect(echoOutcome.status).toBe("completed");
-    if (echoOutcome.status === "completed") {
-      const value = echoOutcome.value as { name: string; message: string };
-      // The §9.2 best-effort tripwire (upstream.ts containsCredential) fires
-      // on the echoed credential in the 200 result body, refusing to deliver
-      // it — the call never yields a completed value carrying the secret.
-      //
-      // One-way door #3 (eng review D4): the refusal now arrives AFTER the
-      // governed body was written, so §7 classifies it ambiguous rather than
-      // as a guest-catchable ConduitUpstreamError. The invoker's name is
-      // asserted here; terminalizing it host-side (so the guest cannot catch
-      // it at all, as with a replay-divergence) is the journaling wrapper's
-      // job and is NOT yet wired — see the manager's `journal` catch.
-      expect(value.name).toBe(OUTCOME_AMBIGUOUS_ERROR_NAME);
-      expect(value.message).toContain("after dispatch");
+    // The §9.2 best-effort tripwire (upstream.ts containsCredential) fires on
+    // the echoed credential in the 200 result body, refusing to deliver it —
+    // the call never yields a completed value carrying the secret.
+    //
+    // One-way door #3 (eng review D4): the refusal arrives AFTER the governed
+    // body was written, so §7 classifies it ambiguous. The journaling wrapper
+    // terminalizes it HOST-SIDE — the guest's `catch` never runs and the
+    // execution settles `failed`, exactly as a replay-divergence does.
+    expect(echoOutcome.status).toBe("failed");
+    if (echoOutcome.status === "failed") {
+      expect(echoOutcome.error.name).toBe(OUTCOME_AMBIGUOUS_ERROR_NAME);
+      expect(echoOutcome.error.message).toContain("after dispatch");
     }
     expect(JSON.stringify(echoOutcome)).not.toContain(SECRET);
     expect(JSON.stringify(echoOutcome)).not.toContain("ghp_smoke");
@@ -672,7 +669,8 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     // The persisted `executions` row for this run — whichever settle path
     // fired — must not carry the secret in its `result` or `error` column.
     const echoRow = await manager.get(echoOutcome.executionId);
-    expect(echoRow?.status).toBe("completed");
+    expect(echoRow?.status).toBe("failed");
+    expect(echoRow?.error?.name).toBe(OUTCOME_AMBIGUOUS_ERROR_NAME);
     expect(JSON.stringify(echoRow)).not.toContain(SECRET);
     expect(JSON.stringify(echoRow)).not.toContain("ghp_smoke");
 

@@ -1,49 +1,23 @@
 import { mkdtempSync } from "node:fs";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it } from "vitest";
-import { InMemoryCatalog } from "../catalog.js";
-import { createStoreCredentialResolver } from "../credentials.js";
-import { createCatalogToolHost } from "../execute.js";
 import { normalizeMcp } from "../normalize/mcp.js";
-import { createToolInvoker } from "../pipeline/invoker.js";
-import { createMcpUpstreamCaller } from "../pipeline/upstream.js";
 import type { UpstreamSessionScope } from "../pipeline/upstream-session.js";
-import { createStorePolicyEngine } from "../policy.js";
-import { QuickJSSandbox } from "../sandbox/quickjs.js";
 import { generateSeeds, type Sandbox } from "../sandbox/sandbox.js";
+import { ALL_TOOLS, buildEffectiveScope, type ScopeResolver } from "../scope.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
-import type { Execution } from "../types.js";
+import { type Execution, NEWER_BUILD_SENTINEL } from "../types.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
 import {
   createExecutionManager,
   type ExecutionManager,
   type ExecutionManagerDeps,
 } from "./manager.js";
-
-/**
- * The callId a resume must name (spec §5.5: an approval binds to ONE pending
- * call). Read from the persisted row — the same value the CLI gets from the
- * approvals list, via a shorter path. Throws when nothing is pending, so a
- * regression that lost `pausedOn` cannot hide behind a sentinel id. Tests
- * that break `get`, or that build the paused row by hand, pass the id
- * directly.
- */
-async function pendingCallOf(
-  manager: { get(id: string): Promise<Execution | undefined> },
-  executionId: string,
-): Promise<string> {
-  const callId = (await manager.get(executionId))?.pausedOn?.callId;
-  if (callId === undefined) {
-    throw new Error(`[manager.test] ${executionId} has no pending call to resume`);
-  }
-  return callId;
-}
+import { type Harness, makeHarness, pendingCallOf } from "./manager-harness.js";
 
 /**
  * §5.5 execution-manager invariant + behavior suite. Composes the REAL stack
@@ -56,216 +30,6 @@ async function pendingCallOf(
  * NOTE: these tests use a loopback server and HANG under the Bash-tool
  * sandbox; the authoritative pass is the (unsandboxed) pre-commit hook run.
  */
-
-const SECRET = "Bearer ghp_manager_secret_do_not_leak_7b3d";
-const PREFIX = "github.acme.prod";
-
-const mcpToolsList = [
-  {
-    name: "list_issues",
-    description: "List open issues in a repository",
-    inputSchema: {
-      type: "object",
-      properties: { owner: { type: "string" }, repo: { type: "string" } },
-    },
-    annotations: { readOnlyHint: true },
-  },
-  {
-    name: "create_issue",
-    description: "Create a new issue",
-    inputSchema: { type: "object", properties: { title: { type: "string" } } },
-  },
-  {
-    name: "delete_repo",
-    description: "Permanently delete a repository",
-    inputSchema: { type: "object", properties: { repo: { type: "string" } } },
-    annotations: { destructiveHint: true },
-  },
-];
-
-interface UpstreamCall {
-  name: string;
-  arguments: unknown;
-}
-
-/**
- * A live MCP server on loopback. Records every tools/call it sees (so a test
- * can assert an approved side effect fired EXACTLY once) and echoes a
- * per-tool result. `/echo401` plays the hostile credential-echo upstream.
- */
-function startMcpServer(): Promise<{ server: Server; port: number; calls: UpstreamCall[] }> {
-  const calls: UpstreamCall[] = [];
-  const server = createServer((req, res) => {
-    let body = "";
-    req.on("data", (chunk: Buffer) => {
-      body += chunk.toString("utf8");
-    });
-    req.on("end", () => {
-      // The hostile upstream fails EVERY POST (the handshake's initialize
-      // included) with a 401 echoing the credential — same meaning as before,
-      // now surfacing on the first streamable-HTTP request.
-      if (req.url === "/echo401") {
-        res.writeHead(401, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "bad token", echoed: req.headers.authorization }));
-        return;
-      }
-      // Session teardown (ephemeral scope dispose): a bodyless DELETE — ack it.
-      if (req.method === "DELETE" || body === "") {
-        res.writeHead(200);
-        res.end();
-        return;
-      }
-      const payload = JSON.parse(body) as {
-        id: string;
-        method: string;
-        params?: { name?: string; arguments?: unknown };
-      };
-      // Streamable-HTTP handshake bookkeeping — the caller now speaks the full
-      // MCP client protocol (initialize → initialized → tools/call).
-      if (payload.method === "initialize") {
-        res.writeHead(200, {
-          "content-type": "application/json",
-          "mcp-session-id": "mgr-session-1",
-        });
-        res.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: payload.id,
-            result: {
-              protocolVersion: "2025-06-18",
-              capabilities: { tools: {} },
-              serverInfo: { name: "mgr-fixture", version: "0" },
-            },
-          }),
-        );
-        return;
-      }
-      if (payload.method === "notifications/initialized") {
-        res.writeHead(202);
-        res.end();
-        return;
-      }
-      calls.push({ name: payload.params?.name ?? "", arguments: payload.params?.arguments });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: payload.id,
-          result: { ok: true, tool: payload.params?.name },
-        }),
-      );
-    });
-  });
-  return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => {
-      resolve({ server, port: (server.address() as AddressInfo).port, calls });
-    });
-  });
-}
-
-interface Harness {
-  store: ConduitStore;
-  deps: ExecutionManagerDeps;
-  calls: UpstreamCall[];
-  cleanup: () => Promise<void>;
-  reopen: () => Promise<ConduitStore>;
-}
-
-/**
- * Stand up the full stack against a fresh on-disk store + a fresh loopback
- * MCP server, ingest the three-tool GitHub namespace, and return the manager
- * deps wired to the real invoker/sandbox. The invoker upstream opts into
- * loopback egress (trusted-code path) exactly as the e2e smoke does.
- */
-async function makeHarness(options?: {
-  location?: string;
-  /** Records the timeoutMs the invoker hands each upstream call (F1 clamp test). */
-  recordTimeout?: (timeoutMs: number) => void;
-}): Promise<Harness> {
-  const scratch = mkdtempSync(join(tmpdir(), "conduit-mgr-"));
-  const dbUrl = `file:${join(scratch, "mgr.db")}`;
-  const keyBytes = SecretBox.generateKeyBytes();
-  const clients: ReturnType<typeof createClient>[] = [];
-
-  const open = async (): Promise<ConduitStore> => {
-    const client = createClient({ url: dbUrl });
-    clients.push(client);
-    return openSqliteStore({ client, secretBox: await SecretBox.fromKeyBytes(keyBytes) });
-  };
-
-  const { server, port, calls } = await startMcpServer();
-  const location = options?.location ?? `http://127.0.0.1:${port}/mcp`;
-
-  const store = await open();
-  const tools = normalizeMcp({ namespace: "github", tools: mcpToolsList });
-  await store.sources.upsert({
-    id: "src_gh",
-    type: "mcp",
-    namespace: "github",
-    location,
-    generation: 0,
-  });
-  await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: "github" });
-  await store.connections.upsert({
-    id: "conn_gh",
-    integrationId: "int_gh",
-    prefix: PREFIX,
-    credentialRef: "cred_gh",
-  });
-  await store.secrets.put("cred_gh", SECRET);
-  await store.tools.replaceNamespace("github", tools);
-
-  const catalog = new InMemoryCatalog();
-  catalog.upsert(await store.tools.list("github"));
-
-  const policy = createStorePolicyEngine(store.policies);
-  const credentials = createStoreCredentialResolver(store.secrets);
-  const realUpstream = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
-  // Optionally record the per-call timeout the invoker computes, to prove the
-  // §16 wall-clock budget actually clamps it (F1) — not just that a deadline
-  // was supplied.
-  const upstream: typeof realUpstream = options?.recordTimeout
-    ? {
-        call: (args) => {
-          options.recordTimeout?.(args.timeoutMs);
-          return realUpstream.call(args);
-        },
-      }
-    : realUpstream;
-  const sandbox = new QuickJSSandbox();
-
-  const deps: ExecutionManagerDeps = {
-    store,
-    sandbox,
-    // Forward the manager-supplied deadline exactly as production runtime.ts
-    // does, so the wall-clock budget reaches the invoker's min(ceiling, remaining).
-    makeInvoker: ({ executionId, decisions, deadline }) =>
-      createToolInvoker(
-        { store, policy, credentials, upstream, ...(decisions !== undefined ? { decisions } : {}) },
-        {
-          executionId,
-          projection: "code",
-          clientId: null,
-          ...(deadline !== undefined ? { deadline } : {}),
-        },
-      ),
-    makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
-    makeDecisions: () => createInMemoryApprovalDecisions(),
-  };
-
-  return {
-    store,
-    deps,
-    calls,
-    reopen: open,
-    cleanup: async () => {
-      for (const c of clients) {
-        c.close();
-      }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
-  };
-}
 
 /**
  * A fresh, empty on-disk store with NO source/loopback wiring. Used by the
@@ -2083,5 +1847,173 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       expect(outcome.error.name).toBe("ConduitPolicyBlocked");
     }
     expect(outcome.decisionApplied).toBe(false);
+  });
+});
+
+describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+  });
+
+  /** D11: every named start passes a resolver (a named client without one is refused). */
+  const permitAllCode = (h: () => Harness): ScopeResolver => {
+    return async () =>
+      buildEffectiveScope(
+        { projections: { code: true, direct: false, discovery: false }, allow: ALL_TOOLS },
+        await h().store.tools.list(),
+      );
+  };
+
+  it("INVARIANT §4.1: start persists clientId and projection for a code row; default profile is null/code", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const a = await m.start("return 1");
+    const b = await m.start("return 1", {
+      clientId: "acme",
+      scope: permitAllCode(() => active as Harness),
+    });
+    expect(await m.get(a.executionId)).toMatchObject({
+      kind: "code",
+      clientId: null,
+      projection: "code",
+    });
+    expect(await m.get(b.executionId)).toMatchObject({
+      kind: "code",
+      clientId: "acme",
+      projection: "code",
+    });
+  });
+
+  it("INVARIANT §4.1 (#19): the persisted code row carries the sentinel in `code` and the program in `program` — end to end", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const { executionId } = await m.start("return 7");
+    const raw = await active.client.execute({
+      sql: "SELECT code, program FROM executions WHERE id = ?",
+      args: [executionId],
+    });
+    expect(raw.rows[0]?.code).toBe(NEWER_BUILD_SENTINEL);
+    expect(raw.rows[0]?.program).toBe("return 7");
+  });
+
+  it("INVARIANT §4.1: a pause captures namespace and sourceGeneration equal to the store's current generation", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const out = await m.start('await tools.github.create_issue({ title: "x" }); return 1;');
+    expect(out.status).toBe("paused");
+    const row = await m.get(out.executionId);
+    const gen = await active.store.sources.getGeneration("github");
+    expect(gen).toBeTypeOf("number");
+    expect(row?.pausedOn).toMatchObject({
+      toolName: "github.create_issue",
+      namespace: "github",
+      sourceGeneration: gen,
+    });
+  });
+
+  it("D-A7: a pause whose namespace has no source row terminalizes ConduitCatalogChanged instead of writing an unstamped pause", async () => {
+    active = await makeHarness();
+    // Tools and policies remain; only the provenance row is gone, so the pause
+    // cannot be stamped and the call must not run.
+    await active.store.sources.remove("src_gh");
+    const m = createExecutionManager(active.deps);
+    const out = await m.start('await tools.github.create_issue({ title: "x" }); return 1;');
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitCatalogChanged" } });
+    expect((await m.get(out.executionId))?.pausedOn).toBeUndefined();
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.2 (#15 start half): a narrowed scope makes in-sandbox search hide, describe null, and a direct tools[path]() call fail closed", async () => {
+    active = await makeHarness();
+    const scope: ScopeResolver = async () =>
+      buildEffectiveScope(
+        {
+          projections: { code: true, direct: false, discovery: false },
+          allow: ["github.list_issues"],
+        },
+        await (active as Harness).store.tools.list(),
+      );
+    const m = createExecutionManager(active.deps);
+    const out = await m.start(
+      `
+      const { items } = await tools.search({ query: "issue" });
+      const described = await tools.describe.tool({ path: "github.create_issue" });
+      try { await tools.github.create_issue({ title: "x" }); return { items: items.map(i => i.path), described, blocked: false }; }
+      catch (e) { return { items: items.map(i => i.path), described, blocked: e.name }; }
+    `,
+      { clientId: "acme", scope },
+    );
+    expect(out).toMatchObject({
+      status: "completed",
+      value: { items: ["github.list_issues"], described: null, blocked: "ConduitPolicyBlocked" },
+    });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.2 (#16): turning the code flag off mid-drive bites on the running program's NEXT call", async () => {
+    let codeOn = true;
+    // `onCall` runs on the fixture server BEFORE it answers a tools/call, so the
+    // flip lands between the first call's dispatch and the second call's scope check.
+    active = await makeHarness({
+      onCall: () => {
+        codeOn = false;
+      },
+    });
+    const scope: ScopeResolver = async () =>
+      buildEffectiveScope(
+        { projections: { code: codeOn, direct: false, discovery: false }, allow: ALL_TOOLS },
+        await (active as Harness).store.tools.list(),
+      );
+    const m = createExecutionManager(active.deps);
+    const out = await m.start(
+      `
+      await tools.github.list_issues({});
+      await tools.github.list_issues({}); // lands after the flag flipped
+      return "reached";
+    `,
+      { scope },
+    );
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitPolicyBlocked" } });
+    expect(active.calls).toHaveLength(1);
+  });
+
+  it("D11 (codex #1): start with a NAMED client and no resolver is refused before any row is written", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    await expect(m.start("return 1", { clientId: "acme" })).rejects.toThrow(
+      /named client requires a scope resolver/,
+    );
+    expect(await active.store.executions.listRunningIds()).toEqual([]);
+  });
+
+  it("INVARIANT §4.1 (#25, manager half): a named client's requestKey conflicts within that client and returns the SAME client's id; another client with the same key runs", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const scope = permitAllCode(() => active as Harness);
+    const first = await m.start("return 1", { clientId: "acme", requestKey: "k", scope });
+    const again = await m.start("return 2", { clientId: "acme", requestKey: "k", scope });
+    expect(again).toEqual({ status: "conflict", executionId: first.executionId });
+    const other = await m.start("return 3", { clientId: "beta", requestKey: "k", scope });
+    expect(other.status).toBe("completed");
+    const dflt = await m.start("return 4", { requestKey: "k" });
+    expect(dflt.status).toBe("completed");
+  });
+
+  it("INVARIANT §7 (#21/#24, Code Mode): a side-effect-then-404 upstream terminalizes the execution ConduitOutcomeAmbiguous even inside a guest try/catch, and the call is never re-sent", async () => {
+    active = await makeHarness({
+      respondToCall: (res) => {
+        res.writeHead(404);
+        res.end();
+      },
+    });
+    const m = createExecutionManager(active.deps);
+    const out = await m.start(
+      'try { await tools.github.list_issues({}); } catch (e) { return "caught " + e.name; } return "ok";',
+    );
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitOutcomeAmbiguous" } });
+    expect(active.calls).toHaveLength(1);
+    expect((await m.get(out.executionId))?.error?.name).toBe("ConduitOutcomeAmbiguous");
   });
 });

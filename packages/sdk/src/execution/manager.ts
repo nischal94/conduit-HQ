@@ -1,4 +1,5 @@
 import type { ToolInvoker } from "../execute.js";
+import type { DispatchCell } from "../pipeline/dispatch.js";
 import {
   GUEST_ERROR_NAMES,
   OUTCOME_AMBIGUOUS_ERROR_NAME,
@@ -17,14 +18,18 @@ import type {
   ToolHost,
 } from "../sandbox/sandbox.js";
 import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "../sandbox/sandbox.js";
+import { type EffectiveScope, namespaceOf, type ScopeResolver } from "../scope.js";
 import type { ConduitStore } from "../store/store.js";
 import {
   type Execution,
+  type ExecutionError,
   isPendingApproval,
   NOT_NAMEABLE_CALL_ID,
   type PendingApproval,
+  type Projection,
   type StoredPendingApproval,
 } from "../types.js";
+import { mapCreateConflict } from "./create-conflict.js";
 import type { ApprovalDecision, ApprovalDecisions } from "./decisions.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
 import { toSandboxJournal } from "./journal.js";
@@ -54,7 +59,20 @@ export interface ExecutionManager {
   /** Begin a new execution. Persists it, drives the sandbox, returns the settled state. */
   start(
     code: string,
-    opts?: { limits?: Partial<SandboxLimits>; requestKey?: string },
+    opts?: {
+      limits?: Partial<SandboxLimits>;
+      requestKey?: string;
+      /** null (or absent) = the default profile (§4.1). */
+      clientId?: string | null;
+      /**
+       * §5.2/§5.4: the authority this drive runs under. ABSENT wires NO scope
+       * (D-A3 / eng review D8): the drive takes today's unscoped path — one
+       * `tools.get` per call, no per-call `tools.list()`. That path is legal
+       * ONLY for the default profile; a NAMED client without a resolver is
+       * refused before any row is written (D11).
+       */
+      scope?: ScopeResolver;
+    },
   ): Promise<ExecutionOutcome>;
   /**
    * Resume a paused execution after a human decision on ONE pending call.
@@ -82,13 +100,17 @@ export type ExecutionOutcome =
   | { status: "completed"; executionId: string; value: unknown }
   | { status: "failed"; executionId: string; error: SandboxError }
   /**
-   * The UNION, never bare `PendingApproval`: until Task 8 captures
-   * provenance at pause time this build writes the LEGACY pause shape, so a
-   * consumer reading `pending.namespace` would compile and get `undefined`.
-   * Readers narrow through `hasProvenance` (§4.1). Task 8 may narrow this
-   * back once every pause carries the pair.
+   * Narrowed back to `PendingApproval` (§4.1): every pause this build writes
+   * is provenance-stamped at capture time, and a namespace with no source row
+   * terminalizes `ConduitCatalogChanged` instead of pausing (D-A7) — so a
+   * pause without the pair is no longer producible here.
    */
-  | { status: "paused"; executionId: string; pending: StoredPendingApproval }
+  | { status: "paused"; executionId: string; pending: PendingApproval }
+  /**
+   * Still the UNION: an `expired` pause is READ from a stored row, which may
+   * predate R1 and carry no provenance. Readers narrow through
+   * `hasProvenance` (§4.1).
+   */
   | { status: "expired"; executionId: string; pending: StoredPendingApproval }
   | { status: "conflict"; executionId: string };
 
@@ -156,9 +178,24 @@ export interface ExecutionManagerDeps {
      * drive reuse a single initialized MCP session.
      */
     upstreamSession?: UpstreamSessionScope;
+    /** §4.3/§5.5: attribution and authority for THIS drive. */
+    projection: Projection;
+    clientId: string | null;
+    /** The resolver bound to the drive's client id; absent = default profile (D-A3). */
+    scope?: () => Promise<EffectiveScope>;
+    /** §5.5: a direct drive's one cell (Task 10). */
+    dispatch?: DispatchCell;
   }) => ToolInvoker;
-  /** Wrap an invoker into the catalog-backed ToolHost (e.g. createCatalogToolHost(catalog, invoke)). */
-  makeToolHost: (invoke: ToolInvoker) => ToolHost;
+  /**
+   * Wrap an invoker into the catalog-backed ToolHost. The second argument is
+   * present IFF the drive runs under a resolver: the host must then be the
+   * scoped view (§5.4), so in-sandbox search/describe see the same authority
+   * the per-call check enforces.
+   */
+  makeToolHost: (
+    invoke: ToolInvoker,
+    scoped?: { scope: () => Promise<EffectiveScope>; projection: "code" },
+  ) => ToolHost;
   /** Defaults to `createInMemoryApprovalDecisions`; injectable for tests. */
   makeDecisions?: () => ApprovalDecisions;
   /**
@@ -239,18 +276,27 @@ interface JournalingHostContext {
  * `failed` — never a resumable pause. At most one is set per drive.
  */
 interface CapturedDriveState {
-  /**
-   * The UNION until Task 8 captures provenance at pause time: this build
-   * still assembles the legacy (pre-R1) pause shape, which resume
-   * terminalizes as "re-approve" rather than authorizing on a fabricated
-   * generation.
-   */
-  pending?: StoredPendingApproval;
+  /** §4.1: provenance-stamped at capture time — never the legacy shape. */
+  pending?: PendingApproval;
   /** design D8/F5: a completed call's result could not be journaled. */
   ambiguous?: SandboxError;
   /** design D6/F2: the first live call on resume ≠ the approved call. */
   divergence?: SandboxError;
+  /**
+   * D-A7: the pause could not be provenance-stamped because the tool's
+   * namespace has no source row. Terminal `failed`, and the call did NOT run
+   * (the pause is raised BEFORE upstream).
+   */
+  catalogChanged?: ExecutionError;
 }
+
+/**
+ * D-A7: the internal signal `assemblePending` throws when a pause cannot carry
+ * both provenance fields. Module-scope so the wrapper's catch can identify it
+ * by class rather than by message. Never reaches the guest: the wrapper
+ * converts it to a terminal `ConduitApprovalPause(true)`.
+ */
+class CatalogChangedAtPause extends Error {}
 
 export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionManager {
   const now = deps.now ?? (() => Date.now());
@@ -318,18 +364,38 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       return error instanceof Error && error.name === REPLAY_DIVERGENCE_ERROR_NAME;
     }
 
-    // Task 8 (§4.1) captures the provenance pair here. Until it does, this
-    // writes the LEGACY pause shape — both fields absent — which resume
-    // terminalizes as "re-approve" (§5.4 step 3). A fabricated
-    // `sourceGeneration` would instead be compared against the namespace's
-    // current generation and silently pass a real authorization check.
-    function assemblePending(path: string, input: unknown): StoredPendingApproval {
+    function isOutcomeAmbiguous(error: unknown): boolean {
+      return error instanceof Error && error.name === OUTCOME_AMBIGUOUS_ERROR_NAME;
+    }
+
+    /**
+     * §4.1: stamp the pause with the provenance pair a §5.4 resume checks —
+     * the tool's namespace and that namespace's generation AT PAUSE TIME.
+     * `getGeneration` is "current at read time", so a concurrent catalog bump
+     * reads newer, never stale, and resume refuses the stale pause.
+     *
+     * D-A7: when either field is unavailable the pause is REFUSED rather than
+     * stamped with a placeholder — a fabricated `sourceGeneration` would be
+     * compared against the namespace's current generation and silently pass a
+     * real authorization check.
+     */
+    async function assemblePending(path: string, input: unknown): Promise<PendingApproval> {
+      const namespace = namespaceOf(path);
+      const generation =
+        namespace === undefined ? undefined : await deps.store.sources.getGeneration(namespace);
+      if (namespace === undefined || generation === undefined) {
+        throw new CatalogChangedAtPause(
+          `[ExecutionManager] Approval pause refused: no source for the tool's namespace; re-approve after the catalog settles. Context: { executionId: ${ctx.executionId}, tool: ${path} }`,
+        );
+      }
       // reason/callId originate HOST-SIDE here (design C3) — never in the
       // sandbox. The reason is the policy verdict's message, surfaced from the
       // invoker's `ConduitPolicyDenied` throw and captured just above.
       return {
         callId: newId(),
         toolName: path,
+        namespace,
+        sourceGeneration: generation,
         input,
         reason: lastApprovalReason ?? `${path} requires approval before it can run.`,
         expiresAt: now() + resolveApprovalTtlMs(),
@@ -340,7 +406,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       op: "search" | "describe" | "call",
       request: string,
       run: () => Promise<unknown>,
-      onApprovalPause: () => StoredPendingApproval,
+      onApprovalPause: () => Promise<PendingApproval>,
     ): Promise<unknown> {
       let value: unknown;
       try {
@@ -352,8 +418,44 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // signal is set and ConduitApprovalPause is thrown, which the sandbox
           // treats as an uncatchable interrupt so the guest cannot
           // catch-and-continue past its own approval gate.
-          captured.pending = onApprovalPause();
+          try {
+            captured.pending = await onApprovalPause();
+          } catch (cause) {
+            if (cause instanceof CatalogChangedAtPause) {
+              // D-A7: no provenance → no pause. Terminal, and the call did not
+              // run, so the operator re-approves against a settled catalog.
+              captured.catalogChanged = {
+                name: "ConduitCatalogChanged",
+                message: cause.message,
+              };
+              throw new ConduitApprovalPause(true);
+            }
+            // Any other provenance failure (a store read threw) is a HOST
+            // fault. Terminal, guest-uncatchable, and OPAQUE — the cause goes
+            // to the host log, never into a guest-visible or persisted
+            // message, which could carry a store path.
+            const correlationId = crypto.randomUUID();
+            console.error(
+              `[ExecutionManager] Provenance read failed at pause ${correlationId}: ${String(cause)}`,
+            );
+            captured.ambiguous = {
+              name: "ConduitInternalError",
+              message: `[ExecutionManager] Approval pause could not be recorded. Reference: ${correlationId}`,
+            };
+            throw new ConduitApprovalPause(true);
+          }
           throw new ConduitApprovalPause();
+        }
+        if (isOutcomeAmbiguous(error)) {
+          // §7 Code Mode side: the cell read `dispatched` when the call
+          // failed, so the upstream may have performed it. Host-side,
+          // guest-uncatchable, terminal — exactly the divergence path. A
+          // guest `catch` must never continue past an ambiguous side effect.
+          captured.ambiguous = {
+            name: OUTCOME_AMBIGUOUS_ERROR_NAME,
+            message: (error as Error).message,
+          };
+          throw new ConduitApprovalPause(true);
         }
         if (isReplayDivergence(error)) {
           // Resume replay-divergence (design D6/F2): refused BEFORE upstream,
@@ -531,10 +633,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     prefix: readonly JournalEntry[],
     secret: string | undefined,
     limits: Partial<SandboxLimits> | undefined,
+    /** Present iff the drive runs under a resolver: the host is then scoped (§5.4). */
+    scoped?: { scope: () => Promise<EffectiveScope>; projection: "code" },
   ): Promise<ExecutionOutcome> {
     const captured: CapturedDriveState = {};
     const host = makeJournalingHost(
-      deps.makeToolHost(invoke),
+      deps.makeToolHost(invoke, scoped),
       { executionId: execution.id, secret },
       prefix.length,
       captured,
@@ -586,6 +690,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     // ambiguous — a side effect completed but its result could not be journaled.
     if (captured.ambiguous !== undefined) {
       return finish(execution, { status: "failed", error: captured.ambiguous });
+    }
+    // catalogChanged (D-A7) — the pause could not be provenance-stamped, so no
+    // pause was written and the gated call never ran.
+    if (captured.catalogChanged !== undefined) {
+      return finish(execution, { status: "failed", error: captured.catalogChanged });
     }
 
     switch (result.status) {
@@ -650,16 +759,39 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       : { status: "failed", executionId: execution.id, error: outcome.error };
   }
 
+  /**
+   * Bind a resolver to one client id. ABSENT stays absent (eng review D8):
+   * the drive then runs today's unscoped path — no per-call tools.list().
+   * The default profile is materialized only where a check is mandatory
+   * (resume step 4) via `defaultScopeResolver(deps.store)`.
+   */
+  function bindScope(
+    scope: ScopeResolver | undefined,
+    clientId: string | null,
+  ): (() => Promise<EffectiveScope>) | undefined {
+    return scope === undefined ? undefined : () => scope(clientId);
+  }
+
   return {
     async start(code, opts) {
-      const execution: Execution = {
+      const clientId = opts?.clientId ?? null;
+      if (clientId !== null && opts?.scope === undefined) {
+        // D11 / codex #1: a NAMED client without a resolver has no authority
+        // to run under — the unscoped path is the DEFAULT profile's alone.
+        // Refused BEFORE `create`, so no row is written.
+        throw new Error(
+          `[ExecutionManager] start refused: a named client requires a scope resolver. Context: { clientId: ${JSON.stringify(clientId)} }`,
+        );
+      }
+      const scope = bindScope(opts?.scope, clientId);
+      const execution: Extract<Execution, { kind: "code" }> = {
         id: `exec_${newId()}`,
         kind: "code",
         code,
         status: "running",
         seeds: generateSeeds(),
         startedAt: now(),
-        clientId: null,
+        clientId,
         projection: "code",
         ...(opts?.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
       };
@@ -667,22 +799,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         await deps.store.executions.create(execution);
       } catch (cause) {
         // mcp design M1: requestKey is persisted BEFORE the sandbox runs, so a
-        // duplicate key is caught here as a UNIQUE constraint violation on
-        // `executions.request_key` — never a second execution. Recognize the
-        // store's raw SQLite message (verified by the store's own unit test)
-        // rather than a typed error, since the store seam is engine-agnostic.
-        if (
-          opts?.requestKey !== undefined &&
-          String(cause).includes("UNIQUE constraint failed: executions.request_key")
-        ) {
-          const existing = await deps.store.executions.getByRequestKey(opts.requestKey, null);
-          if (existing !== undefined) {
-            return { status: "conflict", executionId: existing.id };
-          }
-          // The unique violation fired but the row it collided with cannot be
-          // found — a store fault (e.g. a read-after-write inconsistency),
-          // not a legitimate conflict. Surface the original error rather than
-          // fabricate a conflict with no execution behind it.
+        // duplicate key is caught here as a UNIQUE constraint violation —
+        // never a second execution. D-A12: the ONE conflict mapper, shared
+        // with startDirect; no inline copy of either marker string here.
+        const conflict = await mapCreateConflict(cause, opts?.requestKey, clientId, deps.store);
+        if (conflict !== undefined) {
+          return conflict;
         }
         throw cause;
       }
@@ -719,6 +841,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             executionId: execution.id,
             deadline: deadlineFor(opts?.limits),
             upstreamSession,
+            projection: "code",
+            clientId,
+            // exactOptionalPropertyTypes forbids `scope: undefined`; absent
+            // must stay absent so the invoker takes the unscoped path (D-A3).
+            ...(scope !== undefined ? { scope } : {}),
           });
         } catch (cause) {
           await finish(execution, {
@@ -730,7 +857,14 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           });
           throw cause;
         }
-        return await drive(execution, invoke, [], undefined, opts?.limits);
+        return await drive(
+          execution,
+          invoke,
+          [],
+          undefined,
+          opts?.limits,
+          scope !== undefined ? { scope, projection: "code" } : undefined,
+        );
       } finally {
         try {
           await upstreamSession.dispose();
@@ -912,6 +1046,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             decisions,
             deadline: deadlineFor(undefined),
             upstreamSession,
+            // The row's OWN persisted attribution (§4.3), not a default: a row
+            // started under a named client keeps that client id on resume.
+            // Task 9 adds the §5.4 scope re-check this drive runs under; until
+            // then a resumed drive takes the unscoped path, as the shipped
+            // build does.
+            projection: running.projection,
+            clientId: running.clientId,
           });
           const outcome = await drive(running, invoke, prefix, undefined, undefined);
           // Read AFTER the drive settles: `consumed` is host-side truth that
@@ -952,8 +1093,8 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   };
 }
 
-function neverPauses(op: string): () => PendingApproval {
-  return () => {
+function neverPauses(op: string): () => Promise<PendingApproval> {
+  return async () => {
     throw new Error(`[ExecutionManager] ${op} cannot pause; only a call gates on approval.`);
   };
 }
