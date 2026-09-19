@@ -840,6 +840,90 @@ describe("§5.5 scope check", () => {
     expect(scopeLog.mock.calls.flat().join(" ")).toContain("github.list_issues");
   });
 
+  it("INVARIANT §5.5: the out-of-scope refusal is identical on the APPROVED-decision path too — one source of the unknown-tool text", async () => {
+    // I3, the `allow` arm. `resolveDecisionVerdict` returns action "allow"
+    // for an approved decision, and the per-call scope check runs BEFORE it
+    // and can set `tool = undefined` — so the guest reason falls to the
+    // invoker's own fallback rather than the engine's text. Both are now
+    // built by `unknownToolReason`, so they cannot drift. Compared against
+    // the error the ordinary path actually produces, never a copied literal.
+    const asError = (e: unknown): Error => {
+      if (!(e instanceof Error)) throw new Error(`expected an Error, got ${String(e)}`);
+      return e;
+    };
+    const allowEngine = {
+      evaluate: () =>
+        Promise.resolve({
+          action: "allow" as const,
+          reason: "approved by decision",
+          source: "default" as const,
+          redactFields: [] as const,
+        }),
+    };
+    const onAllowPath = await createToolInvoker(
+      deps(recordingUpstream().caller, { policy: allowEngine }),
+      {
+        executionId: "exec_allow_scope",
+        projection: "code",
+        clientId: "acme",
+        scope: permitOnly(["github.delete_repo"]),
+        log: vi.fn(),
+      },
+    )("github.list_issues", {}).then(
+      () => {
+        throw new Error("expected the out-of-scope call to be refused");
+      },
+      (e: unknown) => asError(e),
+    );
+    // The SAME path through the ORDINARY engine, for a byte-for-byte compare.
+    const onPolicyPath = await createToolInvoker(deps(recordingUpstream().caller), {
+      executionId: "exec_policy_scope",
+      projection: "code",
+      clientId: "acme",
+      scope: permitOnly(["github.delete_repo"]),
+      log: vi.fn(),
+    })("github.list_issues", {}).then(
+      () => {
+        throw new Error("expected the out-of-scope call to be refused");
+      },
+      (e: unknown) => asError(e),
+    );
+    expect(onAllowPath.name).toBe(onPolicyPath.name);
+    expect(onAllowPath.message).toBe(onPolicyPath.message);
+  });
+
+  it("INVARIANT §9.2: the out-of-scope HOST log sanitizes the guest-supplied path — no forged line, bounded length", async () => {
+    // The path is guest-supplied and untrusted. A raw newline in it would
+    // forge a second host log line; an unbounded one would flood the daemon
+    // log. `printableName` strips control characters and caps at 120.
+    const scopeLog = vi.fn();
+    const hostile = `github.${"a".repeat(300)}\nFORGED host log line`;
+    // The branch is reached only when the catalog HOLDS the tool and scope
+    // then withholds it, so the lookup answers for the hostile path while
+    // the profile grants something else entirely.
+    const holdsHostile = {
+      ...deps(recordingUpstream().caller),
+      store: {
+        ...store,
+        tools: { ...store.tools, get: async () => await store.tools.get("github.list_issues") },
+      },
+    } as Parameters<typeof createToolInvoker>[0];
+    await createToolInvoker(holdsHostile, {
+      executionId: "exec_log_sanitize",
+      projection: "code",
+      clientId: "acme",
+      scope: permitOnly(["github.delete_repo"]),
+      log: scopeLog,
+    })(hostile, {}).catch(() => {});
+    const line = scopeLog.mock.calls.flat().join(" ");
+    expect(line).toContain("outside this client's scope");
+    // The interpolated name carries no newline, so the forged tail cannot
+    // start a line of its own, and the whole entry stays bounded.
+    expect(line).not.toContain("\n");
+    expect(line).not.toContain("FORGED host log line");
+    expect(line.length).toBeLessThan(400);
+  });
+
   it("the refusal names only the tool, never the profile's other entries", async () => {
     const invoke = createToolInvoker(deps(recordingUpstream().caller), {
       executionId: "exec_o",

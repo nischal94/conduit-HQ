@@ -1,7 +1,12 @@
 import type { CredentialResolver } from "../credentials.js";
 import type { ToolInvoker } from "../execute.js";
 import type { ApprovalDecisions } from "../execution/decisions.js";
-import type { PolicyEngine, PolicyVerdict } from "../policy.js";
+import {
+  type PolicyEngine,
+  type PolicyVerdict,
+  printableName,
+  unknownToolReason,
+} from "../policy.js";
 import type { EffectiveScope } from "../scope.js";
 import type { ConduitStore } from "../store/store.js";
 import type { Connection, Projection, TraceEvent } from "../types.js";
@@ -210,13 +215,12 @@ async function runCall(
     // undefined` above already routed this through the engine's own
     // unknown-tool evaluation, so `verdict.reason` IS the unknown-tool text
     // for this path. Re-deriving it here would reintroduce the oracle the
-    // moment the engine's wording and this literal drift apart — which they
-    // already had. The literal remains only for a CUSTOM engine that answers
-    // `allow` for a tool the catalog does not hold.
-    const guestReason =
-      verdict.action === "allow"
-        ? `Unknown tool "${path}": not in the catalog, so it is blocked.`
-        : verdict.reason;
+    // moment the engine's wording and this fallback drift apart — which they
+    // already had. The fallback remains only for a CUSTOM engine that answers
+    // `allow` for a tool the catalog does not hold, and it is built from the
+    // SAME `unknownToolReason` helper the engine uses, so the two texts are
+    // byte-identical by construction rather than by matching literals.
+    const guestReason = verdict.action === "allow" ? unknownToolReason(path) : verdict.reason;
     const blocked: PolicyVerdict = {
       action: "block",
       reason: guestReason,
@@ -229,9 +233,11 @@ async function runCall(
       // and `TraceEvent` has no reason field to carry it (it stores
       // `policyVerdict` only), so the distinction goes to the HOST log. The
       // tool path only: no tool input, no credential material, and nothing
-      // that crosses back to the guest.
+      // that crosses back to the guest. The path is GUEST-SUPPLIED, so it is
+      // sanitized before interpolation: a raw newline in it would forge a
+      // host log line, and an unbounded one would flood the daemon log.
       log(
-        `[ToolInvoker] Call refused: tool is outside this client's scope (reported to the guest as an unknown tool). Context: { tool: ${path}, clientId: ${JSON.stringify(options.clientId)} }`,
+        `[ToolInvoker] Call refused: tool is outside this client's scope (reported to the guest as an unknown tool). Context: { tool: ${printableName(path)}, clientId: ${JSON.stringify(options.clientId)} }`,
       );
     }
     throw policyError("block", guestReason);

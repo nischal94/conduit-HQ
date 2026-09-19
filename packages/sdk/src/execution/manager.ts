@@ -1544,11 +1544,25 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         console.error(
           `[ExecutionManager] resume kind lookup timed out ${ref}: executionId ${executionId}`,
         );
-        await deps.store.executions
-          .failClaimedResume(executionId, `resume kind lookup timed out. Reference: ${ref}`)
-          .catch(() => {
-            // The store is genuinely faulting; nothing more can persist.
-          });
+        // BOUNDED: this branch fires precisely because the store did not
+        // answer, so its own fallback write cannot be assumed to. `.catch()`
+        // handles a rejection and does nothing for a promise that never
+        // settles — unbounded, a store stalled across the board hung
+        // `resume()` here, the same hang class the `kindOf` bound above
+        // closes. The outcome below stands either way: best-effort.
+        let failTimer: NodeJS.Timeout | undefined;
+        await Promise.race([
+          deps.store.executions
+            .failClaimedResume(executionId, `resume kind lookup timed out. Reference: ${ref}`)
+            .catch(() => {
+              // The store is genuinely faulting; nothing more can persist.
+            }),
+          new Promise<void>((r) => {
+            failTimer = setTimeout(r, budgets.settleWriteBudgetMs);
+            failTimer?.unref?.();
+          }),
+        ]);
+        clearTimeout(failTimer);
         return {
           status: "unknown",
           executionId,

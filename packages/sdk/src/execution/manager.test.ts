@@ -3569,6 +3569,45 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
+  it("INVARIANT §5.3 (#45, I4b): a stalled kindOf whose fallback WRITE also stalls still answers within budget", async () => {
+    // I4b. The `kindOf`-timeout branch exists because the store is
+    // unresponsive — so its own fallback `failClaimedResume` cannot be
+    // assumed responsive either. Unbounded, a store stalled across the
+    // board hung `resume()` at that write forever: the exact hang class
+    // the branch above it was written to close. Both reads stall here.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    const stuckBoth = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        kindOf: () => never,
+        failClaimedResume: () => never,
+      },
+    } as ConduitStore;
+    const stuckM = createExecutionManager({ ...active.deps, store: stuckBoth, direct: fast });
+    // REAL CLOCK, deliberately: same reason as the I4 test above — the setup
+    // crosses the harness's loopback MCP socket, which deadlocks under fake
+    // timers. Margin ≥ 1 s over the two budgets this path can spend.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stuckM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // The outcome is unchanged by the write's fate: the stored kind is still
+    // unknown, so the honest non-answer stands either way.
+    expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout" });
+  });
+
   it("INVARIANT §5.3 (#28, I2): a guard read returning AFTER the expiry took the latch still settles resume() — never hangs", async () => {
     // I2, REPRODUCED. The `policies.get` race sits between the last
     // `raceGuard` and `runDirect`. Sequence: the budget elapses during that

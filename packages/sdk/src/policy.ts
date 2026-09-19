@@ -182,9 +182,19 @@ function overrideVerdict(
  * agent-facing pause message, so strip control characters and cap length
  * before interpolating.
  */
-function printableName(raw: string): string {
+export function printableName(raw: string): string {
   const cleaned = [...raw].filter((ch) => ch >= " " && ch !== "\u007f").join("");
   return cleaned.length > 120 ? `${cleaned.slice(0, 120)}…` : cleaned;
+}
+
+/**
+ * The ONE source of the unknown-tool refusal text. The invoker refuses an
+ * out-of-scope call with the same message the engine emits for a catalog
+ * miss (I3): the two must stay byte-identical, or the difference becomes an
+ * existence oracle the moment the two wordings drift apart.
+ */
+export function unknownToolReason(toolName: string): string {
+  return `Unknown tool "${printableName(toolName)}": not in the catalog, so it is blocked. Check the tool name or re-sync the source.`;
 }
 
 export function createStorePolicyEngine(policies: PolicyRepository): PolicyEngine {
@@ -198,7 +208,7 @@ export function createStorePolicyEngine(policies: PolicyRepository): PolicyEngin
         const stale = await policies.get(target.toolName);
         return {
           action: "block",
-          reason: `Unknown tool "${printableName(target.toolName)}": not in the catalog, so it is blocked. Check the tool name or re-sync the source.`,
+          reason: unknownToolReason(target.toolName),
           source: "unknown_tool",
           redactFields: stale?.redactFields ?? [],
         };
