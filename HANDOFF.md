@@ -53,6 +53,9 @@ amendment are committed. Post-PR gauntlet state:
 - CodeRabbit skipped itself ("manual review required for this OSS
   repository") — trigger it with an `@coderabbitai review` PR comment if
   its review is wanted; that is an outward-facing post, ask the founder.
+  ASKED 2026-09-20, no answer yet. Recommendation given: trigger it AFTER
+  the post-PR fix pass is pushed, so it reviews the corrected code; it is
+  the review the commit-routing rule names.
 - CI: 8 of 9 green; "Unit tests" failed ONCE on the known
   `--doctor --offline performs ZERO writes` fixture race (db 4096 → 131072
   bytes inside 40 ms: the fixture's seeding write landing after the
