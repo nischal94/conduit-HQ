@@ -813,6 +813,31 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
     expect(deps.stdoutLines.join("")).toBe("failed\n");
     expect(deps.stderrLines.join("")).toMatch(/ConduitPolicyBlocked: policy denied the execution/);
   });
+
+  it("INVARIANT §17 / §5: an `unknown` resume outcome is NEVER reported as a landed verb, and exits non-zero", async () => {
+    // D-A11 final: the direct arm drove the call, but the settle write is not
+    // durable. `decisionApplied` is TRUE here on purpose — it is exactly the
+    // combination that would print "denied" and exit 0 if the unknown arm
+    // were handled after the verb-truth branch instead of before it.
+    for (const reason of ["persist-timeout", "persist-failed"] as const) {
+      const outcome: ResumeOutcome = {
+        status: "unknown",
+        executionId: "exec_unknown",
+        reason,
+        decisionApplied: true,
+      };
+      const deps = depsWithOutcome(outcome);
+      const result = await runDecide("deny", "exec_unknown", "call_x", deps);
+      expect(result.exitCode).toBe(1);
+      // No verb, and no bare status line either: nothing may read as landed.
+      expect(deps.stdoutLines.join("")).toBe("");
+      const stderr = deps.stderrLines.join("");
+      expect(stderr).toMatch(/unknown/i);
+      expect(stderr).toMatch(/do not retry|don't retry/i);
+      expect(stderr).toMatch(/approvals list/);
+      expect(stderr).toContain(reason);
+    }
+  });
 });
 
 /**

@@ -1,4 +1,4 @@
-import { buildExecuteTool, type Execution, type ExecutionOutcome } from "@conduithq/sdk";
+import { buildExecuteTool, type DirectOutcome, type Execution } from "@conduithq/sdk";
 import { describe, expect, it } from "vitest";
 import {
   CHECK_BODY_STATUSES,
@@ -394,7 +394,9 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
       },
     },
     conflict: { status: "conflict", executionId: "e" },
-  } satisfies Record<ExecuteStatus, ExecutionOutcome>;
+    // D-A11 final: the direct arm's truthful non-answer, on the wire.
+    unknown: { status: "unknown", executionId: "e", reason: "persist-timeout" },
+  } satisfies Record<ExecuteStatus, DirectOutcome>;
 
   it("every EXECUTE_STATUSES arm of outcomeToPayload passes isExecutePayloadShape", () => {
     // Set coverage: the fixtures name exactly the legal members.
@@ -402,6 +404,19 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     for (const status of EXECUTE_STATUSES) {
       const payload = outcomeToPayload(executeOutcomes[status]);
       expect(payload.status).toBe(status);
+      expect(isExecutePayloadShape(payload)).toBe(true);
+    }
+  });
+
+  it("INVARIANT §5.3 (D-A11 final): the `unknown` arm round-trips its reason and never claims a terminal", () => {
+    for (const reason of ["persist-timeout", "persist-failed"] as const) {
+      const payload = outcomeToPayload({ status: "unknown", executionId: "e", reason });
+      expect(payload.status).toBe("unknown");
+      expect(payload.reason).toBe(reason);
+      // No terminal payload fields: nothing here may read as a landed result.
+      expect(payload.result).toBeUndefined();
+      expect(payload.error).toBeUndefined();
+      expect(payload.message).toContain("do not retry");
       expect(isExecutePayloadShape(payload)).toBe(true);
     }
   });

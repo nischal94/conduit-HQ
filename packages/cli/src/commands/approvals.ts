@@ -316,6 +316,23 @@ export async function runDecide(
   // failure, or pause on a new approval; in every case the deny itself
   // succeeded, so report "denied" (exit 0) plus one informational line about
   // what the drive then did.
+  // D-A11 final: the direct arm's `unknown` is the §5-ambiguity again, now
+  // from the OTHER side — the resume drove, but its settle write is not
+  // durable, so the verb may or may not have landed. Treated exactly as the
+  // IPC outcome-unknown branch above: no verb line, a non-zero exit, and an
+  // instruction to re-list rather than retry. Checked BEFORE the deny
+  // verb-truth branch, so `decisionApplied` can never print "denied" over an
+  // outcome whose record does not exist.
+  if (outcome.status === "unknown") {
+    deps.stderr(
+      `[conduit approvals] The outcome of this ${kind} is UNKNOWN: the execution was driven but ` +
+        `its result could not be durably recorded (${outcome.reason ?? "unreported"}), so the ` +
+        `call may or may not have completed. Do NOT retry it — run "conduit approvals list" and ` +
+        `"conduit check" on execution ${executionId} to see what actually landed.\n`,
+    );
+    return { exitCode: 1 };
+  }
+
   if (kind === "deny" && outcome.decisionApplied) {
     deps.stdout("denied\n");
     if (outcome.status === "paused") {

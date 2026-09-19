@@ -1,8 +1,8 @@
 import type {
   ConduitStore,
+  DirectOutcome,
   ExecuteToolDefinition,
   Execution,
-  ExecutionOutcome,
   JsonSchema,
   ResumeOutcome,
   StoredPendingApproval,
@@ -38,7 +38,20 @@ export interface PendingView {
  * accepted; the `satisfies` bindings on the projection functions below make
  * the reverse — a sender emitting a status NOT in the set — a compile error.
  */
-export const EXECUTE_STATUSES = ["completed", "failed", "paused", "expired", "conflict"] as const;
+export const EXECUTE_STATUSES = [
+  "completed",
+  "failed",
+  "paused",
+  "expired",
+  "conflict",
+  /**
+   * D-A11 final: the direct arm's truthful non-answer. The call may have
+   * completed and the record may not yet be durable — a caller RE-LISTS, it
+   * never retries. Additive: a client that does not know this member simply
+   * sees a status it cannot act on, which is exactly the intended behavior.
+   */
+  "unknown",
+] as const;
 export type ExecuteStatus = (typeof EXECUTE_STATUSES)[number];
 
 export const CHECK_BODY_STATUSES = ["running", "completed", "failed", "paused", "expired"] as const;
@@ -51,6 +64,8 @@ export interface ExecutePayload {
   error?: ErrorEnvelope;
   pending?: PendingView;
   message?: string;
+  /** Present only on the `unknown` arm: WHY the record is not durable. */
+  reason?: "persist-timeout" | "persist-failed";
 }
 
 /**
@@ -287,6 +302,9 @@ const PAUSE_MESSAGE =
 const EXPIRED_MESSAGE =
   "The approval expired before a human decided (TTL lapsed). You may re-issue execute to retry.";
 
+const UNKNOWN_MESSAGE =
+  "the call may have completed; the record is not yet durable — re-list before deciding again, do not retry";
+
 const CONFLICT_MESSAGE =
   "This requestKey was already used by an earlier execute call. Call check_execution with the " +
   "requestKey to retrieve that execution's outcome instead of re-running.";
@@ -384,7 +402,13 @@ export function assertProjection<T>(
   return payload;
 }
 
-export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
+/**
+ * D-A11 final: the parameter is `DirectOutcome` — `ExecutionOutcome` plus the
+ * `unknown` arm — because BOTH direct paths can publish it and `resume` now
+ * returns it. The code-mode `start` path still passes an `ExecutionOutcome`,
+ * which is a subtype, so no caller changes.
+ */
+export function outcomeToPayload(outcome: DirectOutcome): ExecutePayload {
   const payload = ((): ExecutePayload => {
     switch (outcome.status) {
       case "completed":
@@ -410,6 +434,13 @@ export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
         return { status: "expired", executionId: outcome.executionId, message: EXPIRED_MESSAGE };
       case "conflict":
         return { status: "conflict", executionId: outcome.executionId, message: CONFLICT_MESSAGE };
+      case "unknown":
+        return {
+          status: "unknown",
+          executionId: outcome.executionId,
+          reason: outcome.reason,
+          message: UNKNOWN_MESSAGE,
+        };
     }
   })();
   return assertProjection(payload, isExecutePayloadShape, "outcomeToPayload");

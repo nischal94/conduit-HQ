@@ -26,6 +26,14 @@ export type {
   PendingCallIdentity,
 } from "./execution/decisions.js";
 export { createInMemoryApprovalDecisions, identitiesMatch } from "./execution/decisions.js";
+export type {
+  DirectBudgets,
+  DirectDrive,
+  DirectDriveHandle,
+  DirectOutcome,
+  UnknownOutcome,
+} from "./execution/direct.js";
+export { createDirectDrive, DIRECT_DEFAULTS, deliverableBytes } from "./execution/direct.js";
 export { matchesPending, toSandboxJournal } from "./execution/journal.js";
 export type {
   ExecutionManager,

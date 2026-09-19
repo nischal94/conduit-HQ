@@ -5,6 +5,7 @@ import {
   OUTCOME_AMBIGUOUS_ERROR_NAME,
   REPLAY_DIVERGENCE_ERROR_NAME,
 } from "../pipeline/errors.js";
+import { redactSensitiveFields } from "../pipeline/redact.js";
 import {
   createUpstreamSessionScope,
   type UpstreamSessionScope,
@@ -24,7 +25,7 @@ import {
   namespaceOf,
   type ScopeResolver,
 } from "../scope.js";
-import type { ConduitStore } from "../store/store.js";
+import type { ConduitStore, DirectSettle } from "../store/store.js";
 import {
   type Execution,
   type ExecutionError,
@@ -38,6 +39,15 @@ import {
 import { mapCreateConflict } from "./create-conflict.js";
 import type { ApprovalDecision, ApprovalDecisions } from "./decisions.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
+import {
+  createDirectDrive,
+  DIRECT_DEFAULTS,
+  type DirectBudgets,
+  type DirectDriveHandle,
+  type DirectOutcome,
+  deliverableBytes,
+  type OwnedDirectDrive,
+} from "./direct.js";
 import { toSandboxJournal } from "./journal.js";
 import { scrubCredential } from "./scrub.js";
 
@@ -98,6 +108,26 @@ export interface ExecutionManager {
      */
     scope?: ScopeResolver,
   ): Promise<ResumeOutcome>;
+  /**
+   * §5.3/§5.4: run ONE governed tool call with no guest program. Returns a
+   * HANDLE, not a promise (D-A2): the client-visible `outcome` is bounded by
+   * the drive budget plus the settle-write budget, while the continuation may
+   * still be running behind it — `retention` and `finished` report on that.
+   *
+   * `scope` is REQUIRED here (spec §5.4): a direct call whose projection flag
+   * is never evaluated would be a public SDK bypass. D-A3's optional scope
+   * applies to `start`/`resume` only.
+   */
+  startDirect(
+    toolName: string,
+    input: unknown,
+    opts: {
+      clientId: string | null;
+      projection: "direct" | "discovery";
+      requestKey?: string;
+      scope: ScopeResolver;
+    },
+  ): DirectDriveHandle;
   /** Inspect the persisted execution (CLI / API surface). */
   get(executionId: string): Promise<Execution | undefined>;
 }
@@ -114,7 +144,13 @@ export interface ExecutionManager {
  * it raced on.
  */
 export type ExecutionOutcome =
-  | { status: "completed"; executionId: string; value: unknown }
+  | {
+      status: "completed";
+      executionId: string;
+      value: unknown;
+      /** §4.1: the deliverable exceeded RESULT_BYTES_MAX — settled `discarded`, no value. */
+      resultTooLarge?: true;
+    }
   | { status: "failed"; executionId: string; error: SandboxError }
   /**
    * Narrowed back to `PendingApproval` (§4.1): every pause this build writes
@@ -143,7 +179,7 @@ export type ExecutionOutcome =
  * never on the outcome's error name — error names are guest-reachable and
  * therefore spoofable; consumption is recorded host-side by the invoker.
  */
-export type ResumeOutcome = ExecutionOutcome & {
+export type ResumeOutcome = DirectOutcome & {
   decisionApplied: boolean;
   /**
    * Set ONLY by the manager's corrupt-state branches: the claimed row had no
@@ -221,6 +257,11 @@ export interface ExecutionManagerDeps {
    * proves creation/disposal timing without a real MCP session).
    */
   makeUpstreamSession?: () => UpstreamSessionScope;
+  /**
+   * §11 direct-arm budgets, overridable per field. Injectable so tests can
+   * exercise expiry without waiting out the real 60 s drive budget.
+   */
+  direct?: Partial<DirectBudgets>;
   /** Injectable clock (ms); defaults to Date.now. */
   now?: () => number;
   /** Injectable id generator; defaults to crypto.randomUUID. */
@@ -789,6 +830,340 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     return scope === undefined ? undefined : () => scope(clientId);
   }
 
+  // ─────────────────────────────────────────────────────────────────────────
+  // §5.3 direct arm — the LATCH STATE MACHINE
+  //
+  // One direct drive has exactly TWO racing settlers and ONE shared latch
+  // (`drive.settle()`), so exactly one of them ever writes the row and exactly
+  // one ever publishes the client-visible outcome.
+  //
+  //                         ┌──────────────────────────────┐
+  //                         │  drive constructed (D-A13)   │
+  //                         │  timer ARMED, latch FREE     │
+  //                         │  persisted = false           │
+  //                         └──────────────┬───────────────┘
+  //                                        │
+  //              ┌─────────────────────────┴─────────────────────────┐
+  //              │                                                   │
+  //   (A) CONTINUATION reaches a                        (B) TIMER fires at
+  //       settle point:                                     driveBudgetMs:
+  //         - completion (sized)                              expireDirect()
+  //         - pause (generation read first)
+  //         - failure / prep-window throw
+  //              │                                                   │
+  //              └──────────────► drive.settle() ◄──────────────────┘
+  //                                    │
+  //                    ┌───────────────┴───────────────┐
+  //                    │ true (WINNER, exactly one)    │ false (LOSER)
+  //                    ▼                               ▼
+  //          settleBounded(...)                  return immediately:
+  //                    │                         write nothing, publish
+  //                    │                         nothing. The winner
+  //                    │                         already answered.
+  //                    ▼
+  //        persisted === false?  ──yes──► publish the pre-dispatch outcome
+  //                    │                  directly (no row exists; nothing
+  //                    │                  could have dispatched). If create()
+  //                    │                  later SUCCEEDS, startDirect's
+  //                    │                  post-create branch re-issues the
+  //                    │                  SAME fenced timeout settle (F3).
+  //                    │ no
+  //                    ▼
+  //     settleDirect(id, attempt, settle)  ← the FENCE:
+  //         WHERE status='running' AND resume_attempt = attempt
+  //                    │
+  //         ┌──────────┼──────────────┬────────────────────┐
+  //         │          │              │                    │
+  //     "written"  "fenced"(0 rows) "failed"(reject)   "timeout"
+  //     publish     publish          publish            publish
+  //     intended    unknown/         unknown/           unknown/
+  //     outcome     persist-failed   persist-failed     persist-timeout
+  //
+  // GUARD-PHASE EXPIRY (resume): the drive is constructed right after the
+  // claim identifies a direct row, so its timer covers the §5.4 read-side
+  // guard too. A guard exit that terminalizes the row calls `finishEarly()`,
+  // which settles both lifecycle promises and cancels the timer.
+  //
+  // CLASSIFICATION at expiry is decided by the DISPATCH CELL (D-A4), never by
+  // elapsed time: cell `dispatched` → ConduitOutcomeAmbiguous ("the upstream
+  // may have performed the call"); otherwise ConduitExecutionInterrupted
+  // ("did not run").
+  //
+  // ORDERING RULE (codex #6): every UNBOUNDED read a settle needs happens
+  // BEFORE `settle()` is taken — the pause path's `getGeneration`, the
+  // create-conflict lookup — so a stalled read cannot hold the latch and
+  // deny the timer its chance to answer.
+  //
+  // EXIT PATHS: `runDirect`'s `finally` always disposes the drive's timer and
+  // awaits the tracked settle writes; `startDirect`'s `finished` disposes
+  // again (idempotent). `outcome`, `retention` and `finished` each resolve on
+  // every path — a promise that never resolves is a leak.
+  // ─────────────────────────────────────────────────────────────────────────
+
+  const budgets: DirectBudgets = { ...DIRECT_DEFAULTS, ...deps.direct };
+
+  interface DirectRun {
+    execution: Extract<Execution, { kind: "direct" }>;
+    drive: OwnedDirectDrive;
+    scope: () => Promise<EffectiveScope>;
+    decisions?: ApprovalDecisions;
+    /** resumed path: redact before measuring; sync path: raw. */
+    redactFields?: readonly string[];
+    resolveOutcome: (o: DirectOutcome) => void;
+    /** Settle writes still in flight. */
+    tracked: Promise<unknown>[];
+    /** True once create() (startDirect) or the claim (resume) put the row in place. */
+    persisted: boolean;
+  }
+
+  /**
+   * Bounded settle (both direct paths — D-A11 final): the intended outcome is
+   * published ONLY when the fenced write returned true. `false` means the
+   * fence lost — on a persisted row the latch guarantees ONE caller per
+   * drive, so a 0-row result means the row is not `running` under this
+   * attempt, an inconsistency reported honestly as `unknown`. A rejected
+   * write is "persist-failed"; a write still pending after the settle-write
+   * budget is "persist-timeout". Both mean "the effect may have landed and
+   * the row may not yet say so" — never a claimed terminal.
+   */
+  async function settleBounded(
+    run: DirectRun,
+    settle: DirectSettle,
+    outcome: DirectOutcome,
+  ): Promise<void> {
+    if (!run.persisted) {
+      // No row exists yet (the timer beat create()). There is nothing to
+      // write and nothing that could have dispatched; publish the
+      // pre-dispatch outcome directly.
+      run.resolveOutcome(outcome);
+      return;
+    }
+    const write: Promise<"written" | "fenced" | "failed"> = deps.store.executions
+      .settleDirect(run.execution.id, run.drive.attempt, settle)
+      .then(
+        (changed) => (changed ? "written" : "fenced"),
+        () => "failed",
+      );
+    run.tracked.push(write);
+    let timerHandle: NodeJS.Timeout | undefined;
+    const timer = new Promise<"timeout">((r) => {
+      timerHandle = setTimeout(() => r("timeout"), budgets.settleWriteBudgetMs);
+      timerHandle.unref?.();
+    });
+    const winner = await Promise.race([write, timer]);
+    clearTimeout(timerHandle);
+    switch (winner) {
+      case "written":
+        run.resolveOutcome(outcome);
+        return;
+      case "fenced":
+      case "failed":
+        run.resolveOutcome({
+          status: "unknown",
+          executionId: run.execution.id,
+          reason: "persist-failed",
+        });
+        return;
+      case "timeout":
+        run.resolveOutcome({
+          status: "unknown",
+          executionId: run.execution.id,
+          reason: "persist-timeout",
+        });
+        return;
+    }
+  }
+
+  /**
+   * D-A4: classify a direct failure by the CELL, not by elapsed time. Once the
+   * governed body write was attempted the upstream effect is unknowable, so a
+   * failure after `dispatched` is ambiguous — never "did not run".
+   */
+  function classifyDirectFailure(run: DirectRun, cause: unknown): ExecutionError {
+    if (
+      run.drive.dispatch.state === "dispatched" ||
+      (cause instanceof Error && cause.name === OUTCOME_AMBIGUOUS_ERROR_NAME)
+    ) {
+      return {
+        name: OUTCOME_AMBIGUOUS_ERROR_NAME,
+        message: `[ExecutionManager] Direct call failed after dispatch; the upstream may have performed the call. Context: { executionId: ${run.execution.id} }`,
+      };
+    }
+    return toSandboxError(cause);
+  }
+
+  /** The timer's settle handler (D-A13): installed via createDirectDrive's onExpire. */
+  function expireDirect(run: DirectRun): void {
+    const { execution, drive } = run;
+    if (!drive.settle()) return;
+    const error: ExecutionError =
+      drive.dispatch.state === "dispatched"
+        ? classifyDirectFailure(run, new Error("budget elapsed after dispatch"))
+        : {
+            name: "ConduitExecutionInterrupted",
+            message: `[ExecutionManager] Direct drive budget elapsed before dispatch (${budgets.driveBudgetMs}ms). Context: { executionId: ${execution.id} }`,
+          };
+    void settleBounded(
+      run,
+      { status: "failed", error },
+      { status: "failed", executionId: execution.id, error },
+    );
+  }
+
+  /**
+   * The ONE continuation. Never throws. The timer already runs (armed in
+   * `createDirectDrive`), so every path below races it through the latch.
+   */
+  async function runDirect(run: DirectRun): Promise<void> {
+    const { execution, drive } = run;
+    let upstreamSession: UpstreamSessionScope | undefined;
+    try {
+      // Prep-window throws: the STORED error carries the cause, the
+      // CLIENT-VISIBLE outcome does not — exactly as `start()` does today.
+      let invoke: ToolInvoker;
+      try {
+        upstreamSession = makeUpstreamSession();
+        invoke = deps.makeInvoker({
+          executionId: execution.id,
+          deadline: drive.deadline,
+          upstreamSession,
+          projection: execution.projection,
+          clientId: execution.clientId,
+          scope: run.scope,
+          dispatch: drive.dispatch,
+          ...(run.decisions !== undefined ? { decisions: run.decisions } : {}),
+        });
+      } catch (cause) {
+        if (!drive.settle()) return;
+        const stored: ExecutionError = {
+          name: "ConduitInternalError",
+          message: `[ExecutionManager] Direct drive preparation failed. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+        };
+        const visible: ExecutionError = {
+          name: "ConduitInternalError",
+          message: `[ExecutionManager] Direct drive preparation failed. Context: { executionId: ${execution.id} }`,
+        };
+        await settleBounded(
+          run,
+          { status: "failed", error: stored },
+          { status: "failed", executionId: execution.id, error: visible },
+        );
+        return;
+      }
+
+      const value = await invoke(execution.call.toolName, JSON.parse(execution.call.request));
+      // §4.1: `discarded` is decided AT SETTLE against the DELIVERABLE — on
+      // the resume path that is the REDACTED value, and redaction can EXPAND
+      // it. Pure computation, so it may run before the latch.
+      const deliverable =
+        run.redactFields === undefined ? value : redactSensitiveFields(value, run.redactFields);
+      if (!drive.settle()) return;
+      if (deliverableBytes(deliverable) > budgets.resultBytesMax) {
+        await settleBounded(
+          run,
+          { status: "completed", resultState: "discarded" },
+          {
+            status: "completed",
+            executionId: execution.id,
+            value: undefined,
+            resultTooLarge: true,
+          },
+        );
+      } else if (run.redactFields === undefined) {
+        await settleBounded(
+          run,
+          { status: "completed", resultState: "delivered" },
+          { status: "completed", executionId: execution.id, value: deliverable },
+        );
+      } else {
+        await settleBounded(
+          run,
+          { status: "completed", resultState: "retained", result: deliverable },
+          { status: "completed", executionId: execution.id, value: deliverable },
+        );
+      }
+    } catch (cause) {
+      if (cause instanceof Error && cause.name === GUEST_ERROR_NAMES.policyDenied) {
+        if (run.decisions === undefined) {
+          // §5.4 startDirect step 5: pause. The generation read is UNBOUNDED,
+          // so it runs BEFORE the latch (codex #6) — the timer can still
+          // settle the row while it stalls — and immediately before the
+          // write, as the spec requires.
+          const namespace = execution.call.namespace;
+          let generation: number | undefined;
+          try {
+            generation = await deps.store.sources.getGeneration(namespace);
+          } catch (readCause) {
+            // A REJECTED read is a store fault, not a catalog change. Opaque
+            // to the client; the cause goes to the host log only.
+            if (!drive.settle()) return;
+            const ref = crypto.randomUUID();
+            console.error(
+              `[ExecutionManager] Provenance read failed at direct pause ${ref}: ${String(readCause)}`,
+            );
+            const error: ExecutionError = {
+              name: "ConduitInternalError",
+              message: `[ExecutionManager] Approval pause could not be recorded. Reference: ${ref}`,
+            };
+            await settleBounded(
+              run,
+              { status: "failed", error },
+              { status: "failed", executionId: execution.id, error },
+            );
+            return;
+          }
+          if (!drive.settle()) return;
+          if (generation === undefined) {
+            const error: ExecutionError = {
+              name: "ConduitCatalogChanged",
+              message: `[ExecutionManager] Approval pause refused: no source for namespace. Context: { executionId: ${execution.id} }`,
+            };
+            await settleBounded(
+              run,
+              { status: "failed", error },
+              { status: "failed", executionId: execution.id, error },
+            );
+            return;
+          }
+          const pending: PendingApproval = {
+            callId: newId(),
+            toolName: execution.call.toolName,
+            namespace,
+            sourceGeneration: generation,
+            input: JSON.parse(execution.call.request),
+            reason: cause.message,
+            expiresAt: now() + resolveApprovalTtlMs(),
+          };
+          await settleBounded(
+            run,
+            { status: "paused", pausedOn: pending },
+            { status: "paused", executionId: execution.id, pending },
+          );
+          return;
+        }
+      }
+      if (!drive.settle()) return;
+      const error = classifyDirectFailure(run, cause);
+      await settleBounded(
+        run,
+        { status: "failed", error },
+        { status: "failed", executionId: execution.id, error },
+      );
+    } finally {
+      run.drive.dispose();
+      if (upstreamSession !== undefined) {
+        try {
+          await upstreamSession.dispose();
+        } catch (cause) {
+          console.error(
+            `[ExecutionManager] upstream session scope dispose failed after a direct drive. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+          );
+        }
+      }
+      await Promise.allSettled(run.tracked);
+    }
+  }
+
   return {
     async start(code, opts) {
       const clientId = opts?.clientId ?? null;
@@ -897,6 +1272,149 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       }
     },
 
+    startDirect(toolName, input, opts) {
+      const executionId = `exec_${newId()}`;
+      const attempt = newId();
+      let resolveOutcome!: (o: DirectOutcome) => void;
+      const outcome = new Promise<DirectOutcome>((r) => {
+        resolveOutcome = r;
+      });
+      let markSettled!: () => void;
+      const settledAt = new Promise<void>((r) => {
+        markSettled = r;
+      });
+      const request = JSON.stringify(input);
+      const execution: Extract<Execution, { kind: "direct" }> = {
+        id: executionId,
+        kind: "direct",
+        status: "running",
+        startedAt: now(),
+        clientId: opts.clientId,
+        projection: opts.projection,
+        call: {
+          toolName,
+          namespace: namespaceOf(toolName) ?? "",
+          request: request ?? "null",
+        },
+        ...(opts.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
+      };
+      // D-A13: the run object exists before the drive so `expireDirect` can
+      // settle it; the drive arms its timer at construction — before create()
+      // — so a hung first write still yields the timeout outcome in budget.
+      const run: DirectRun = {
+        execution,
+        // Assigned on the very next statement; no await intervenes, so no
+        // code can observe the placeholder.
+        drive: undefined as unknown as OwnedDirectDrive,
+        scope: () => opts.scope(opts.clientId),
+        resolveOutcome: (o) => {
+          resolveOutcome(o);
+          markSettled();
+        },
+        tracked: [],
+        persisted: false,
+      };
+      run.drive = createDirectDrive({
+        executionId,
+        attempt,
+        now,
+        budgetMs: budgets.driveBudgetMs,
+        onExpire: () => expireDirect(run),
+      });
+      const finished = (async () => {
+        if (request === undefined) {
+          // The decoder guarantees a JSON value; defend the public SDK
+          // entrypoint against a non-serializable input anyway.
+          if (run.drive.settle()) {
+            run.resolveOutcome({
+              status: "failed",
+              executionId,
+              error: {
+                name: "ConduitInternalError",
+                message: "[ExecutionManager] startDirect refused: input is not a JSON value.",
+              },
+            });
+          }
+          return;
+        }
+        try {
+          await deps.store.executions.create(execution, { attempt });
+          run.persisted = true;
+        } catch (cause) {
+          // The conflict lookup is an UNBOUNDED read — do it BEFORE taking
+          // the latch so the timer can still answer if it stalls; then
+          // publish only if we won. `opts.clientId` is the CALLER'S OWN
+          // client id, never null for a named client: that is what keeps
+          // client A's key collision from returning client B's execution id.
+          const conflict = await mapCreateConflict(
+            cause,
+            opts.requestKey,
+            opts.clientId,
+            deps.store,
+          ).catch(() => undefined);
+          if (!run.drive.settle()) return;
+          run.resolveOutcome(
+            conflict ?? {
+              status: "failed",
+              executionId,
+              error: {
+                name: "ConduitInternalError",
+                message: `[ExecutionManager] startDirect could not persist the row. Context: { executionId: ${executionId} }`,
+              },
+            },
+          );
+          return;
+        }
+        if (run.drive.settled) {
+          // F3: the timer fired while create() was in flight and its fenced
+          // settle hit 0 rows. The row now exists `running`; re-issue the
+          // SAME timeout settle (fenced on this attempt) so it cannot linger
+          // for the crash sweep to relabel, and never run the pipeline on a
+          // drive that already answered.
+          const error: ExecutionError = {
+            name: "ConduitExecutionInterrupted",
+            message: `[ExecutionManager] Direct drive budget elapsed before dispatch (${budgets.driveBudgetMs}ms). Context: { executionId: ${executionId} }`,
+          };
+          run.tracked.push(
+            deps.store.executions.settleDirect(executionId, attempt, { status: "failed", error }),
+          );
+          await Promise.allSettled(run.tracked);
+          return;
+        }
+        await runDirect(run);
+      })()
+        .catch(() => {})
+        .finally(() => {
+          run.drive.dispose();
+          // Backstop: `outcome` MUST resolve on every path — a promise that
+          // never resolves is a leak a caller would await forever. Every
+          // branch above settles through the latch, so reaching here with the
+          // latch still free means a path settled nothing; publish the honest
+          // non-answer rather than hanging. Taking the latch also stops the
+          // timer's handler from publishing a second, contradictory outcome.
+          if (run.drive.settle()) {
+            run.resolveOutcome({
+              status: "unknown",
+              executionId,
+              reason: "persist-failed",
+            });
+          }
+        });
+      let retentionTimer: NodeJS.Timeout | undefined;
+      const retention = Promise.race<"released" | "abandoned">([
+        finished.then(() => "released" as const),
+        settledAt.then(
+          () =>
+            new Promise<"abandoned">((r) => {
+              retentionTimer = setTimeout(() => r("abandoned"), budgets.slotRetentionMs);
+              retentionTimer.unref?.();
+            }),
+        ),
+      ]);
+      void finished.then(() => clearTimeout(retentionTimer));
+      return { executionId, outcome, retention, finished };
+    },
+
     async resume(executionId, decision, callId, scopeResolver) {
       // The argument must be a call id an operator could have read off the
       // list: text, not ASCII-blank. The wire decoder (mcp rpc.ts) refuses
@@ -921,6 +1439,62 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         return { status: "conflict", executionId, decisionApplied: false };
       }
 
+      // §5.3: a DIRECT row's settle write is fenced and bounded on EVERY
+      // path, the guard's terminalizations included — `failClaimedResume` is
+      // neither. Read the stored kind with no hydration (`kindOf`), because a
+      // corrupt direct row must still route through the bounded fenced settle
+      // even when `get` cannot answer for it.
+      //
+      // The drive is created HERE, before the guard runs, so its timer
+      // (D-A13) covers the guard phase too: a guard read that never returns
+      // still settles the claimed row within the drive budget rather than
+      // stranding it `running`.
+      const kind = await deps.store.executions.kindOf(executionId).catch(() => undefined);
+      const directDrive: OwnedDirectDrive | undefined =
+        kind === "direct"
+          ? createDirectDrive({
+              executionId,
+              attempt: resumeAttemptId,
+              now,
+              budgetMs: budgets.driveBudgetMs,
+            })
+          : undefined;
+
+      /**
+       * Task 9 handover: the direct row's guard terminalizations must NOT use
+       * the unbounded, unfenced `failClaimedResume`. This writes the same
+       * terminal state through the fenced `settleDirect`, bounded by the
+       * settle-write budget, and reports `unknown` rather than claiming a
+       * terminal the store may not have accepted.
+       */
+      async function settleDirectBounded(
+        settle: DirectSettle,
+        error: ExecutionError,
+      ): Promise<ResumeOutcome> {
+        const write: Promise<"written" | "fenced" | "failed"> = deps.store.executions
+          .settleDirect(executionId, resumeAttemptId, settle)
+          .then(
+            (changed) => (changed ? "written" : "fenced"),
+            () => "failed",
+          );
+        let timerHandle: NodeJS.Timeout | undefined;
+        const timer = new Promise<"timeout">((r) => {
+          timerHandle = setTimeout(() => r("timeout"), budgets.settleWriteBudgetMs);
+          timerHandle.unref?.();
+        });
+        const winner = await Promise.race([write, timer]);
+        clearTimeout(timerHandle);
+        if (winner === "written") {
+          return { status: "failed", executionId, error, decisionApplied: false };
+        }
+        return {
+          status: "unknown",
+          executionId,
+          reason: winner === "timeout" ? "persist-timeout" : "persist-failed",
+          decisionApplied: false,
+        };
+      }
+
       // The claim just flipped the row to `running`. EVERYTHING from here until
       // `drive` takes over is a fragile preparation window (design §8/F5): a
       // throw in `get` (which can surface CORRUPT stored JSON — bad seeds or
@@ -938,19 +1512,22 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         if (execution === undefined || execution.pausedOn === undefined) {
           // The claim flipped status to running but there is no pending call to
           // resume against — a corrupt state. Persist the terminal `failed`
-          // (via the raw terminalizer, since there may be no valid Execution)
           // BEFORE returning, so the row is never a stranded `running`.
-          await deps.store.executions.failClaimedResume(
-            executionId,
-            "resumed execution has no pending approval (corrupt state)",
-          );
+          const error: ExecutionError = {
+            name: "ConduitInternalError",
+            message: `[ExecutionManager] Resumed execution has no pending approval. Context: { executionId: ${executionId} }`,
+          };
+          const reason = "resumed execution has no pending approval (corrupt state)";
+          if (directDrive !== undefined) {
+            directDrive.finishEarly();
+            const settled = await settleDirectBounded({ status: "failed", error }, error);
+            return { ...settled, corruptPause: true };
+          }
+          await deps.store.executions.failClaimedResume(executionId, reason);
           return {
             status: "failed",
             executionId,
-            error: {
-              name: "ConduitInternalError",
-              message: `[ExecutionManager] Resumed execution has no pending approval. Context: { executionId: ${executionId} }`,
-            },
+            error,
             decisionApplied: false,
             corruptPause: true,
           };
@@ -972,17 +1549,22 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         const claimCallId = await deps.store.executions.claimCallId(executionId);
         const stored: unknown = execution.pausedOn;
         if (claimCallId !== callId || !isPendingApproval(stored) || stored.callId !== callId) {
-          await deps.store.executions.failClaimedResume(
-            executionId,
-            "resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run",
-          );
+          const reason =
+            "resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run";
+          const error: ExecutionError = {
+            name: "ConduitInternalError",
+            message: `[ExecutionManager] Resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run. Context: { executionId: ${executionId} }`,
+          };
+          if (directDrive !== undefined) {
+            directDrive.finishEarly();
+            const settled = await settleDirectBounded({ status: "failed", error }, error);
+            return { ...settled, corruptPause: true };
+          }
+          await deps.store.executions.failClaimedResume(executionId, reason);
           return {
             status: "failed",
             executionId,
-            error: {
-              name: "ConduitInternalError",
-              message: `[ExecutionManager] Resumed execution's pending approval carries no call id an operator could name (corrupt state); the execution is now failed and the pending call did not run. Context: { executionId: ${executionId} }`,
-            },
+            error,
             decisionApplied: false,
             corruptPause: true,
           };
@@ -992,6 +1574,33 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // TTL (design D8): lazily expire on resume. `claimForResume` already
         // flipped status to running, so persist the terminal `expired` state.
         if (now() > pausedOn.expiresAt) {
+          if (directDrive !== undefined) {
+            // §5.3: a direct row's terminal write is the fenced `settleDirect`
+            // — the `expired` arm — never an unfenced `put`.
+            directDrive.finishEarly();
+            const write: Promise<"written" | "fenced" | "failed"> = deps.store.executions
+              .settleDirect(executionId, resumeAttemptId, { status: "expired" })
+              .then(
+                (changed) => (changed ? "written" : "fenced"),
+                () => "failed",
+              );
+            let expiryTimer: NodeJS.Timeout | undefined;
+            const bound = new Promise<"timeout">((r) => {
+              expiryTimer = setTimeout(() => r("timeout"), budgets.settleWriteBudgetMs);
+              expiryTimer.unref?.();
+            });
+            const winner = await Promise.race([write, bound]);
+            clearTimeout(expiryTimer);
+            if (winner === "written") {
+              return { status: "expired", executionId, pending: pausedOn, decisionApplied: false };
+            }
+            return {
+              status: "unknown",
+              executionId,
+              reason: winner === "timeout" ? "persist-timeout" : "persist-failed",
+              decisionApplied: false,
+            };
+          }
           const expired: Execution = { ...execution, status: "expired", endedAt: now() };
           // A settled execution carries no pending approval — clear pausedOn so
           // the terminal row is not left with a stale pending call (same
@@ -1012,10 +1621,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           errorName: string,
           flag: { corruptPause?: true } = {},
         ): Promise<ResumeOutcome> => {
-          const error = {
+          const error: ExecutionError = {
             name: errorName,
             message: `[ExecutionManager] ${reason}. Context: { executionId: ${executionId} }`,
           };
+          // Task 9 handover: a DIRECT row's terminalization is the bounded
+          // fenced settle, never the unbounded unfenced `failClaimedResume`.
+          if (directDrive !== undefined) {
+            directDrive.finishEarly();
+            const settled = await settleDirectBounded({ status: "failed", error }, error);
+            return { ...settled, ...flag };
+          }
           await deps.store.executions.failClaimedResume(executionId, reason, errorName);
           return { status: "failed", executionId, error, decisionApplied: false, ...flag };
         };
@@ -1106,9 +1722,70 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             "ConduitScopeRevoked",
           );
         }
-        // Task 10 owns the direct arm's drive, result states, and latch.
+        // ── §5.4 step 5: the DIRECT resume arm ──────────────────────────────
         if (execution.kind === "direct") {
-          return terminalize("direct resume not yet implemented", "ConduitInternalError");
+          if (directDrive === undefined) {
+            // `kindOf` disagreed with the hydrated row — the stored kind is
+            // the authority for routing the settle, so refuse rather than
+            // drive a direct row through an unfenced path.
+            return terminalize(
+              "stored kind disagrees with the hydrated row (corrupt state); the pending call did not run",
+              "ConduitInternalError",
+              CORRUPT,
+            );
+          }
+          const decisions = makeDecisions();
+          decisions.stage(
+            executionId,
+            {
+              op: "call",
+              toolName: execution.call.toolName,
+              request: execution.call.request,
+            },
+            decision,
+          );
+          const policyRow = await deps.store.policies.get(execution.call.toolName);
+          let resolveOutcome!: (o: DirectOutcome) => void;
+          const outcome = new Promise<DirectOutcome>((r) => {
+            resolveOutcome = r;
+          });
+          const running: Extract<Execution, { kind: "direct" }> = {
+            ...execution,
+            status: "running",
+          };
+          delete running.pausedOn;
+          let markSettled!: () => void;
+          const settledAt = new Promise<void>((r) => {
+            markSettled = r;
+          });
+          const run: DirectRun = {
+            execution: running,
+            drive: directDrive,
+            // Step 4 above already bound the authority; the drive re-checks
+            // per call through the same resolver.
+            scope: checkScope,
+            decisions,
+            // §11: the resumed path REDACTS before measuring and before
+            // storing — `retained` holds the redacted value, and redaction
+            // can expand it past the cap (§4.1).
+            redactFields: policyRow?.redactFields ?? [],
+            resolveOutcome: (o) => {
+              resolveOutcome(o);
+              markSettled();
+            },
+            tracked: [],
+            // The claim put the row `running` under resumeAttemptId.
+            persisted: true,
+          };
+          directDrive.onExpire = () => expireDirect(run);
+          const finishedRun = runDirect(run)
+            .catch(() => {})
+            .finally(() => directDrive.dispose());
+          directDrive.resolveFinished(finishedRun);
+          directDrive.resolveSettledAt(settledAt);
+          // D-A11 final: may be `unknown` (persist-timeout / persist-failed).
+          const settled = await outcome;
+          return { ...settled, decisionApplied: decisions.consumed(executionId) };
         }
 
         // Load the durable prefix and stage the decision bound to the pending
@@ -1217,6 +1894,22 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // daemon log under a fresh reference; only the reference is persisted.
         const ref = crypto.randomUUID();
         console.error(`[ExecutionManager] resume preparation failed ${ref}: ${String(cause)}`);
+        if (directDrive !== undefined) {
+          // Task 9 handover: the prep-window catch for a DIRECT row settles
+          // through the fenced write, not `failClaimedResume`. Best effort —
+          // the original fault still surfaces below.
+          directDrive.finishEarly();
+          await deps.store.executions
+            .settleDirect(executionId, resumeAttemptId, {
+              status: "failed",
+              error: {
+                name: "ConduitInternalError",
+                message: `[ExecutionManager] Resume preparation failed. Reference: ${ref}`,
+              },
+            })
+            .catch(() => false);
+          throw cause;
+        }
         await deps.store.executions
           .failClaimedResume(executionId, `resume preparation failed. Reference: ${ref}`)
           .catch(() => {
