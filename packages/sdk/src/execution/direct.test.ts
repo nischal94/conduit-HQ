@@ -179,8 +179,11 @@ describe("DirectDrive (row #28)", () => {
   });
 
   it("deliverableBytes measures UTF-8, not string length; undefined measures as null", () => {
-    expect(deliverableBytes("ÿ")).toBe(4);
+    // A DISTINGUISHABLE string: "ÿ" also measures 4, the same as the
+    // `undefined`→null case below, so it proved nothing about either.
+    expect(deliverableBytes("€")).toBe(5);
     expect(deliverableBytes(undefined)).toBe(4);
+    expect(deliverableBytes(null)).toBe(4);
     expect(deliverableBytes({ a: "€" })).toBe(11);
   });
 });

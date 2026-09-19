@@ -139,7 +139,18 @@ describe("sweepOrphanedExecutions", () => {
       call: { toolName: "github.issues.list", namespace: "github", request: "{}" },
       startedAt: 1000,
     } as const;
-    await store.executions.create({ ...directBase, id: "exec_direct_running", status: "running" });
+    // Seeded WITH a result. Without one the "nothing is delivered" assertion
+    // below could not fail: the row had no result to keep or drop, so it
+    // passed whatever the sweep did. A stranded direct row can genuinely
+    // carry a stored result — the settle write lands in one statement, but a
+    // crash between a write and its status flip is the state this sweep
+    // exists for — and the sweep must terminalize it WITHOUT delivering it.
+    await store.executions.create({
+      ...directBase,
+      id: "exec_direct_running",
+      status: "running",
+      result: { delivered: "must not be handed back" },
+    });
     await store.executions.create({
       ...directBase,
       id: "exec_direct_paused",
@@ -160,8 +171,11 @@ describe("sweepOrphanedExecutions", () => {
     const running = await store.executions.get("exec_direct_running");
     expect(running?.status).toBe("failed");
     expect(running?.error?.name).toBe("ConduitOutcomeAmbiguous");
-    // No invented outcome: the sweep never replays, so nothing is delivered.
-    expect(running?.result).toBeUndefined();
+    // The row is terminalized as ambiguous and the stored result is NOT
+    // promoted into a delivered outcome: the sweep never replays and never
+    // decides that an unfinished call succeeded.
+    expect(running?.resultState).not.toBe("delivered");
+    expect(running?.status).not.toBe("completed");
     // The paused direct row is awaiting a human, not stranded — untouched.
     expect((await store.executions.get("exec_direct_paused"))?.status).toBe("paused");
   });

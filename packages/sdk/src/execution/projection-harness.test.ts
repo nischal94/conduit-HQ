@@ -30,7 +30,7 @@ const PAIRS: Pair[] = [
  * asserting nothing — the classic false green. This pins the parameter list
  * itself, so dropping a pair fails here rather than silently halving coverage.
  */
-it("INVARIANT §9.2: the D5 harness runs over all THREE valid (kind, projection) pairs — never zero cases", () => {
+it("INVARIANT §4.1: the D5 harness runs over all THREE valid (kind, projection) pairs — never zero cases", () => {
   expect(PAIRS).toHaveLength(3);
   expect(PAIRS.map((p) => `${p.kind}/${p.projection}`)).toEqual([
     "code/code",
@@ -99,6 +99,9 @@ describe.each(PAIRS)("D5 harness — kind=$kind projection=$projection", (pair) 
     );
     // The secret was genuinely in play: the upstream saw the governed call.
     expect(active.calls).toHaveLength(1);
+    // The wrapper name is BY DESIGN, not a coincidence of this fixture: the
+    // echo is detected after the 200, so the call may already have had its
+    // effect and the only truthful terminal is ambiguous.
     expect(out).toMatchObject({
       status: "failed",
       error: { name: "ConduitOutcomeAmbiguous" },
@@ -110,6 +113,24 @@ describe.each(PAIRS)("D5 harness — kind=$kind projection=$projection", (pair) 
       await m.get(out.executionId),
     ]);
     expect(everything).not.toContain("ghp_manager_secret");
+
+    // POSITIVE CONTROL. `ConduitOutcomeAmbiguous` is the terminal for ANY
+    // post-dispatch failure, so the assertion above alone does not show the
+    // ECHO caused it — a broken fixture would fail the same way. The SAME
+    // call without `echoCredential` must complete, which makes the echo the
+    // only difference between the two runs.
+    await active.cleanup();
+    active = await makeHarness();
+    const clean = createExecutionManager(active.deps);
+    const ok = await performOnce(
+      clean,
+      active,
+      pair,
+      "github.list_issues",
+      { owner: "o" },
+      { clientId: "acme" },
+    );
+    expect(ok.status).toBe("completed");
   });
 
   it("INVARIANT §4.3 (#10/#27): every Trace row carries this pair's projection and the client id, so Trace is comparable across projections", async () => {
