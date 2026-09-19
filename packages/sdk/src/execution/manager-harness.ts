@@ -293,7 +293,16 @@ export async function makeHarness(options?: MakeHarnessOptions): Promise<Harness
       store.provisionSource({
         source: { id: "src_gh", type: "mcp", namespace: "github", location, generation: 0 },
         integration: { id: "int_gh", sourceId: "src_gh", namespace: "github" },
-        connection: { id: "conn_gh", integrationId: "int_gh", prefix: PREFIX },
+        // `provisionSource` upserts `credential_ref = excluded.credential_ref`,
+        // so omitting it here cleared the credential the setup above installed.
+        // Every test that reprovisioned and then reached upstream was asserting
+        // against an UNAUTHENTICATED path.
+        connection: {
+          id: "conn_gh",
+          integrationId: "int_gh",
+          prefix: PREFIX,
+          credentialRef: "cred_gh",
+        },
         tools,
       }),
     cleanup: async () => {
