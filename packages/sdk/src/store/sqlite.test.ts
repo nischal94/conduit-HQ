@@ -773,6 +773,14 @@ describe("SqliteStore", () => {
       await expect(store.executions.get("m2")).rejects.toThrow(/direct_call is malformed/);
       await insert("m3", '{"toolName":"a.b","namespace":"a"}');
       await expect(store.executions.get("m3")).rejects.toThrow(/direct_call is malformed/);
+      // `request` is a STRING holding a JSON-encoded value. Checking only its
+      // type let a row whose request was unparseable pass every guard here and
+      // downstream, and fail first inside the drive — where, on the resume
+      // path, the throw had nowhere truthful to go. Fail the READ instead.
+      await insert("m4", '{"toolName":"a.b","namespace":"a","request":"{bad"}');
+      await expect(store.executions.get("m4")).rejects.toThrow(
+        /direct_call request is not valid JSON/,
+      );
     });
 
     it("invalidatePaused skips a LEGACY pause (no namespace) and an invalid-JSON pause; both stay paused", async () => {
@@ -893,6 +901,13 @@ describe("SqliteStore", () => {
       );
       const text = plan.rows.map((r) => String(r.detail)).join("\n");
       expect(text).toMatch(/USING (COVERING )?INDEX request_keys_execution/);
+      // The plan only proves an index of that NAME is used. The uniqueness is
+      // the part that carries the constraint, so read it from the catalog
+      // rather than inferring it from the join shape.
+      const list = await client.execute("PRAGMA index_list(request_keys)");
+      expect(
+        Number(list.rows.find((r) => String(r.name) === "request_keys_execution")?.unique),
+      ).toBe(1);
     });
 
     it("INVARIANT §4.1 (M3): one execution carries at most ONE request key — a second row is refused", async () => {
@@ -972,6 +987,53 @@ describe("SqliteStore", () => {
         }),
       ).rejects.toThrow(/UNIQUE constraint failed/i);
       after.close();
+    });
+
+    it("INVARIANT §4.1 (M3): a DUPLICATED key blocks the unique upgrade with a diagnostic and leaves the plain index intact", async () => {
+      // The ladder used to DROP and CREATE UNIQUE in one batch. With two key
+      // rows for one execution the CREATE failed AFTER the DROP had landed,
+      // so the database was left with no index of that name and every
+      // subsequent open failed identically — a bricked store with no repair
+      // path. Checking first means the failure is diagnosable and reversible.
+      const url = tempFileDbUrl();
+      const seed = createClient({ url });
+      await seed.execute(`CREATE TABLE request_keys (
+        client_id TEXT NOT NULL, key TEXT NOT NULL, execution_id TEXT NOT NULL,
+        PRIMARY KEY (client_id, key))`);
+      await seed.execute("CREATE INDEX request_keys_execution ON request_keys (execution_id)");
+      // Two keys, ONE execution: exactly what the unique index would forbid.
+      await seed.execute(
+        "INSERT INTO request_keys (client_id, key, execution_id) VALUES ('acme', 'k1', 'e1')",
+      );
+      await seed.execute(
+        "INSERT INTO request_keys (client_id, key, execution_id) VALUES ('acme', 'k2', 'e1')",
+      );
+      seed.close();
+
+      const message =
+        /request_keys holds more than one key for an execution; the unique index cannot be built\. Context: \{ executions: 1 \}/;
+      await expect(openTestStore(url)).rejects.toThrow(message);
+      // The SECOND attempt behaves identically — the first did not consume or
+      // damage anything, which is the whole point of checking before dropping.
+      await expect(openTestStore(url)).rejects.toThrow(message);
+
+      // The database is exactly as it was: the plain index still exists, so an
+      // operator can inspect the rows, delete the wrong one, and reopen.
+      const after = createClient({ url });
+      const list = await after.execute("PRAGMA index_list(request_keys)");
+      const row = list.rows.find((r) => String(r.name) === "request_keys_execution");
+      expect(row).toBeDefined();
+      expect(Number(row?.unique)).toBe(0);
+      // And the repair works: remove the duplicate, reopen, index is UNIQUE.
+      await after.execute("DELETE FROM request_keys WHERE key = 'k2'");
+      after.close();
+      expect(await openTestStore(url)).toBeDefined();
+      const repaired = createClient({ url });
+      const repairedList = await repaired.execute("PRAGMA index_list(request_keys)");
+      expect(
+        Number(repairedList.rows.find((r) => String(r.name) === "request_keys_execution")?.unique),
+      ).toBe(1);
+      repaired.close();
     });
 
     it("round-trips result, error, and requestKey", async () => {

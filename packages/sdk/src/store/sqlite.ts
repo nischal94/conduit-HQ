@@ -268,8 +268,29 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   const keyIndexes = await client.execute("PRAGMA index_list(request_keys)");
   const existing = keyIndexes.rows.find((row) => String(row.name) === "request_keys_execution");
   if (existing !== undefined && Number(existing.unique) !== 1) {
-    // A duplicate already in the table would make the rebuild fail; that is a
-    // real data fault, so it surfaces rather than being swallowed.
+    // CHECK BEFORE DROPPING. The DROP and the CREATE UNIQUE ran as one batch,
+    // so a duplicate in the table failed the CREATE after the DROP had already
+    // landed — leaving NO index of that name at all, and every subsequent open
+    // failing the same way with no path back. Verified by probe.
+    //
+    // So: look for the duplicate first. If one exists, touch nothing. The
+    // database is left exactly as it was (the plain index intact) and the
+    // operator can repair the rows and reopen. No automatic de-duplication —
+    // silently deleting idempotency keys would be guessing which one the
+    // caller meant.
+    const dupes = await client.execute(
+      `SELECT COUNT(*) AS n FROM (
+         SELECT execution_id FROM request_keys GROUP BY execution_id HAVING COUNT(*) > 1
+       )`,
+    );
+    const duplicated = Number(Object.values(dupes.rows[0] ?? {})[0] ?? 0);
+    if (duplicated > 0) {
+      // Count only: no execution ids and no key values, which are caller
+      // secrets, and no database path.
+      throw new Error(
+        `[SqliteStore] Open failed: request_keys holds more than one key for an execution; the unique index cannot be built. Context: { executions: ${duplicated} }`,
+      );
+    }
     await client.batch(
       [
         "DROP INDEX IF EXISTS request_keys_execution",
@@ -1608,6 +1629,14 @@ function hydrateExecutionRow(row: Row, id: string): Execution {
   ) {
     throw executionReadError("direct_call is malformed");
   }
+  // `request` holds a JSON-encoded value, so a STRING check is not enough: a
+  // row whose request is not parseable JSON would pass every guard here and
+  // every guard downstream, and only fail deep inside the drive where the
+  // throw has nowhere truthful to go. Fail the READ instead, in the same
+  // fail-loud style as the guards above.
+  parseJson((call as DirectCall).request, (cause) =>
+    executionReadError("direct_call request is not valid JSON", cause),
+  );
   const direct: Extract<Execution, { kind: "direct" }> = {
     ...base,
     kind,
