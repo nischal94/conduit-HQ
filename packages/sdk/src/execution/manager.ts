@@ -989,23 +989,50 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   // `finished` may stay pending, and only for a quarantined continuation (see
   // its own doc in direct.ts).
   //
-  // CODE-ROW GUARD EXPIRY (resume). A code row has no drive and therefore no
-  // latch — nothing races it, because nothing else can settle it. Its guard
-  // phase is bounded by its own timer, and the transition is a straight line
-  // rather than a race:
+  // CODE-ROW GUARD EXPIRY (resume). A code row has no drive, so it carries
+  // its OWN latch — `codeGuardLatched` — and it is a genuine race, not a
+  // straight line. Two writers can reach the row: the expiry timer, and the
+  // guard itself (a refusal, or the handover to the drive).
   //
-  //        budget elapses during the guard          a guard read resolves
-  //                    │                                       │
-  //                    ▼                                       ▼
-  //     terminalizeCodeRow: bounded                 the guard continues; the
-  //     failClaimedResume                           timer is cleared when the
-  //         │                                       drive takes over, and on
-  //     ┌───┴────┬──────────┐                       every throwing exit too
-  //   ok(write)  rejected   timeout
-  //   publish    publish    publish
-  //   `failed`   unknown/   unknown/
-  //   (definite) persist-   persist-
-  //              failed     timeout
+  //        budget elapses during the guard        a guard read resolves
+  //                    │                                     │
+  //                    ▼                                     ▼
+  //     timer callback: takeCodeGuardLatch() ◄── one latch ──► terminalizeCodeGuard /
+  //     as its FIRST statement                                the handover:
+  //         │                                                 takeCodeGuardLatch()
+  //     ┌───┴─── true (WINNER) ────┐                    ┌──────────┴──────────┐
+  //     │                          │                true (WINNER)      false (LOSER)
+  //  terminalizeCodeRow:      false (LOSER)         refuse / hand over  EXPIRY HOLDS IT:
+  //  bounded                  return, write         to the drive        await codeGuardExpiry
+  //  failClaimedResume        nothing                                   and return ITS
+  //     │                                                               outcome — never a
+  //  ┌──┴────┬──────────┐                                               second write
+  // ok       rejected   timeout
+  // publish  publish    publish
+  // `failed` unknown/   unknown/
+  // (defin.) persist-   persist-
+  //          failed     timeout
+  //
+  // WHY THE LATCH IS SYNCHRONOUS, and why the race alone is not enough.
+  // `codeGuardExpiry` resolves only when its terminalizing WRITE finishes, so
+  // between the callback firing and that write landing there is a window in
+  // which the expiry promise is still pending. A guard read returning inside
+  // that window WINS `Promise.race` — and if the guard then continued it
+  // would refuse on its own, or hand over and START THE GUEST PROGRAM, which
+  // can dispatch the approved call, while the expiry publishes "the pending
+  // call did not run" for the same row. The latch is taken as the callback's
+  // FIRST statement, before any await, and JS is single-threaded, so no
+  // continuation scheduled after the callback began can observe it free.
+  //
+  // WHERE IT IS ENFORCED: inside `raceGuard`, the one function every guard
+  // read already goes through — when the read wins the race, the latch is
+  // consulted and a set latch converts the win into the expiry's outcome. So
+  // "no guard step runs after an expiry fired" is a property of the shape,
+  // not of each call site remembering to ask. `terminalizeCodeGuard` and the
+  // handover re-check take the latch for the same reason, in the other
+  // direction: a guard that got there first must make a later-firing timer a
+  // no-op. The three overlap deliberately — each closes the paths the others
+  // reach first, and the row has exactly one writer on every interleaving.
   //
   // The CLASSIFICATION here is the dispatch-cell rule, not a second rule: the
   // §5.4 read-side guard runs before any invoker is built, so nothing can have
@@ -1902,10 +1929,30 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
        * `terminalizeCodeRow` decides only whether that failure is durable.
        */
       let codeGuardTimer: NodeJS.Timeout | undefined;
+      /**
+       * THE code row's latch. A direct row has `directDrive.settle()`; a code
+       * row has no drive, so this is its equivalent — and it must be taken
+       * SYNCHRONOUSLY, before any await, by whichever of the two writers gets
+       * there first. The expiry promise resolves only when its write
+       * FINISHES, so a flag that waited for the promise would leave the whole
+       * write in flight as a window in which a returning guard read still
+       * looked live.
+       */
+      let codeGuardLatched = false;
+      /** Take it, or report that someone else holds it. Never blocks. */
+      const takeCodeGuardLatch = (): boolean => {
+        if (codeGuardLatched) return false;
+        codeGuardLatched = true;
+        return true;
+      };
       const codeGuardExpiry =
         directDrive === undefined
           ? new Promise<ResumeOutcome>((resolve) => {
               codeGuardTimer = setTimeout(() => {
+                // FIRST STATEMENT, before any await or write. JS is
+                // single-threaded, so from here no guard continuation can be
+                // scheduled that does not observe the latch as taken.
+                if (!takeCodeGuardLatch()) return;
                 const error: ExecutionError = {
                   name: "ConduitExecutionInterrupted",
                   message: `[ExecutionManager] Resume budget elapsed during the read-side guard (${budgets.driveBudgetMs}ms); the pending call did not run. Context: { executionId: ${executionId} }`,
@@ -1939,15 +1986,70 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
        * the expiry outcome?" must never be a shape test on the value.
        */
       type Guarded<T> = { expired: false; value: T } | { expired: true; outcome: ResumeOutcome };
-      function raceGuard<T>(work: Promise<T>): Promise<Guarded<T>> {
+      /**
+       * The latch, for either kind. A direct row's is the drive's; a code
+       * row's is `codeGuardLatched`. Both are set SYNCHRONOUSLY by whichever
+       * writer got there first.
+       */
+      const expiryHasFired = (): boolean =>
+        directDrive === undefined ? codeGuardLatched : directDrive.settled;
+
+      /**
+       * THE latch rule for the CODE row's guard, in ONE place — the twin of
+       * `terminalizeDirect`: **take the latch, or defer to whoever holds it.**
+       *
+       * Every guard refusal for a code row goes through here. Taking the
+       * latch first means a timer that fires while this write is in flight
+       * finds it taken and writes nothing, so exactly one writer ever touches
+       * the row; losing it means the expiry got there first, and this
+       * publishes ITS outcome rather than issuing a second write and
+       * reporting a contradictory answer.
+       */
+      async function terminalizeCodeGuard(
+        reason: string,
+        error: ExecutionError,
+        errorName?: string,
+        flag: { corruptPause?: true } = {},
+      ): Promise<ResumeOutcome> {
+        if (codeGuardExpiry !== undefined && !takeCodeGuardLatch()) {
+          // The expiry handler holds the latch and is writing (or has
+          // written). Publish ITS outcome; never write a second time.
+          return await codeGuardExpiry;
+        }
+        // The guard owns the outcome now, so the timer has nothing left to
+        // do; stopping it here keeps the window short rather than relying on
+        // the latch alone.
+        clearTimeout(codeGuardTimer);
+        return await terminalizeCodeRow(executionId, reason, error, errorName, flag);
+      }
+      async function raceGuard<T>(work: Promise<T>): Promise<Guarded<T>> {
         const wrapped = work.then((value): Guarded<T> => ({ expired: false, value }));
         const expiry = directDrive === undefined ? codeGuardExpiry : guardExpiry;
-        return expiry === undefined
-          ? wrapped
-          : Promise.race([
-              wrapped,
-              expiry.then((outcome): Guarded<T> => ({ expired: true, outcome })),
-            ]);
+        if (expiry === undefined) return await wrapped;
+        const winner = await Promise.race([
+          wrapped,
+          expiry.then((outcome): Guarded<T> => ({ expired: true, outcome })),
+        ]);
+        if (winner.expired) return winner;
+        // THE READ WON THE RACE — which is not the same as "the expiry did
+        // not fire". The expiry promise resolves only when its terminalizing
+        // WRITE completes, so a read returning while that write is in flight
+        // still wins here. Continuing then would let the guard hand over and
+        // START THE DRIVE — dispatching the approved call — while the expiry
+        // publishes "the pending call did not run" for the same row, and two
+        // writers would touch it.
+        //
+        // The LATCH is the authority, never the race: it is taken
+        // synchronously in the expiry callback's first statement, so once
+        // that callback has begun, no guard continuation scheduled after it
+        // can observe the latch free. Checking it HERE — in the one function
+        // every guard read already goes through — makes "no guard step runs
+        // after an expiry fired" a property of the shape rather than of each
+        // call site remembering to ask.
+        if (expiryHasFired()) {
+          return { expired: true, outcome: await expiry };
+        }
+        return winner;
       }
 
       /**
@@ -2064,7 +2166,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             );
             return { ...settled, corruptPause: true };
           }
-          return await terminalizeCodeRow(executionId, reason, error, undefined, {
+          return await terminalizeCodeGuard(reason, error, undefined, {
             corruptPause: true,
           });
         }
@@ -2101,7 +2203,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             );
             return { ...settled, corruptPause: true };
           }
-          return await terminalizeCodeRow(executionId, reason, error, undefined, {
+          return await terminalizeCodeGuard(reason, error, undefined, {
             corruptPause: true,
           });
         }
@@ -2197,7 +2299,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             );
             return { ...settled, ...flag };
           }
-          return await terminalizeCodeRow(executionId, reason, error, errorName, flag);
+          return await terminalizeCodeGuard(reason, error, errorName, flag);
         };
         const CORRUPT = { corruptPause: true as const };
 
@@ -2440,9 +2542,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         const gotPrefix = await raceGuard(deps.store.replayJournal.listByExecution(executionId));
         if (gotPrefix.expired) return gotPrefix.outcome;
         const prefix = toSandboxJournal(gotPrefix.value);
-        // The guard phase is over: the drive owns terminalization from here,
-        // so the guard's timer must stop or it would fire into a row the
-        // drive is legitimately still working on.
+        // THE HANDOVER, re-checked once — the code row's twin of the direct
+        // arm's `if (directDrive.settled) return guardExpiry`. Between the
+        // guard read above and the drive start below there is no `await` that
+        // is not itself a `raceGuard`, so this is the last point at which an
+        // expiry can be observed before the guest program could dispatch the
+        // approved call. If the latch is gone, the expiry owns the outcome.
+        if (codeGuardExpiry !== undefined && !takeCodeGuardLatch()) {
+          return await codeGuardExpiry;
+        }
+        // The drive owns terminalization from here, and this resume now holds
+        // the latch, so the timer has nothing left to do.
         clearTimeout(codeGuardTimer);
 
         // DEFERRED: process-crash recovery of a `running` execution (design

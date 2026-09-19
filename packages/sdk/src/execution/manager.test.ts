@@ -4089,6 +4089,334 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
+  describe("no guard step proceeds once an expiry callback has started", () => {
+    /**
+     * The window is NARROW and must be forced, never timed: the budget
+     * elapses during a slow guard read, the expiry callback starts its
+     * terminalizing write, and the guard read THEN returns while that write
+     * is still in flight. If the guard is allowed to continue there, two
+     * writers touch one row and the drive can dispatch the approved call
+     * while the expiry publishes "the pending call did not run".
+     *
+     * Every interleaving below is held open by promises the test resolves by
+     * hand, so the ordering is a property of the test, not of the clock.
+     */
+    function gate(): { wait: Promise<void>; open: () => void } {
+      let open!: () => void;
+      const wait = new Promise<void>((r) => {
+        open = r;
+      });
+      return { wait, open };
+    }
+
+    it("INVARIANT §5.3 (#28): a CODE row's guard read that returns while the expiry's write is in flight never starts the drive, and the row is written once", async () => {
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const started = await m.start(
+        'return await tools.github.create_issue({ title: "from agent" });',
+      );
+      expect(started.status).toBe("paused");
+      const callId = await pendingCallOf(m, started.executionId);
+
+      const guardRead = gate();
+      const expiryWrite = gate();
+      let writes = 0;
+      let sandboxRuns = 0;
+      const interleaved = {
+        ...active.store,
+        tools: {
+          ...active.store.tools,
+          // Held OPEN across the budget, then released while the expiry's
+          // write is still in flight.
+          get: async (name: string) => {
+            await guardRead.wait;
+            return await requireActive(active).store.tools.get(name);
+          },
+        },
+        executions: {
+          ...active.store.executions,
+          failClaimedResume: async (
+            ...a: Parameters<ConduitStore["executions"]["failClaimedResume"]>
+          ) => {
+            writes += 1;
+            // The expiry's write is in flight from here until the test
+            // opens this gate.
+            await expiryWrite.wait;
+            return await requireActive(active).store.executions.failClaimedResume(...a);
+          },
+        },
+      } as unknown as ConduitStore;
+      const realSandbox = active.deps.sandbox;
+      const countingSandbox: typeof realSandbox = {
+        execute: async (...a: Parameters<typeof realSandbox.execute>) => {
+          sandboxRuns += 1;
+          return await realSandbox.execute(...a);
+        },
+      };
+      const raced = createExecutionManager({
+        ...active.deps,
+        store: interleaved,
+        sandbox: countingSandbox,
+        direct: fast,
+      });
+
+      // REAL CLOCK: the setup crosses the harness's loopback MCP socket,
+      // which deadlocks under fake timers. Margins are generous; the
+      // ORDERING is forced by the gates, not by these waits.
+      const resumed = raced.resume(started.executionId, { kind: "approve" }, callId, permitDirect);
+      // 1. Let the budget elapse while the guard read is held: the expiry
+      //    callback fires and starts its write (which the second gate holds).
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs + 40));
+      expect(writes).toBe(1);
+      // 2. NOW release the guard read, while the expiry's write is still in
+      //    flight. This is the interleaving under test. The whole hold stays
+      //    inside `settleWriteBudgetMs`, so the expiry's write COMPLETES and
+      //    the answer is its definite failure rather than a write timeout —
+      //    the timeout arm is a different property, pinned elsewhere.
+      guardRead.open();
+      await new Promise((r) => setTimeout(r, 20));
+      // 3. Release the expiry's write and take the answer.
+      expiryWrite.open();
+      const out = await Promise.race([
+        resumed,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+
+      expect(out).not.toBe("HUNG");
+      // The guard never proceeded: no drive, no upstream call.
+      expect(sandboxRuns).toBe(0);
+      expect(active.calls).toHaveLength(0);
+      // Exactly ONE writer touched the row.
+      expect(writes).toBe(1);
+      // The expiry owns the outcome, and it is the definite failure a guard
+      // exit means — nothing dispatched while the read-side guard ran.
+      expect(out).toMatchObject({
+        status: "failed",
+        error: { name: "ConduitExecutionInterrupted" },
+        decisionApplied: false,
+      });
+      const raw = await active.client.execute({
+        sql: "SELECT status FROM executions WHERE id = ?",
+        args: [started.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("failed");
+    });
+
+    it("INVARIANT §5.3 (#28): a CODE row's guard REFUSAL holds the latch — a timer firing during its write changes neither the row nor the answer", async () => {
+      // The mirror direction. The refusal takes the latch first, so the
+      // later-firing timer must find it taken and write nothing.
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const started = await m.start(
+        'return await tools.github.create_issue({ title: "from agent" });',
+      );
+      expect(started.status).toBe("paused");
+      const callId = await pendingCallOf(m, started.executionId);
+
+      const refusalReached = gate();
+      const refusalWrite = gate();
+      let writes = 0;
+      const reasons: string[] = [];
+      const interleaved = {
+        ...active.store,
+        // A guard REFUSAL: the tool no longer resolves → ConduitCatalogChanged.
+        // Held until the test says so, so the refusal is reached LATE — with
+        // the budget nearly spent — rather than by holding its write long.
+        tools: {
+          ...active.store.tools,
+          get: async () => {
+            await refusalReached.wait;
+            return undefined;
+          },
+        },
+        executions: {
+          ...active.store.executions,
+          failClaimedResume: async (
+            ...a: Parameters<ConduitStore["executions"]["failClaimedResume"]>
+          ) => {
+            writes += 1;
+            reasons.push(String(a[1]));
+            // Hold the refusal's own write open past the budget, so the
+            // timer fires while it is in flight.
+            await refusalWrite.wait;
+            return await requireActive(active).store.executions.failClaimedResume(...a);
+          },
+        },
+      } as unknown as ConduitStore;
+      const raced = createExecutionManager({
+        ...active.deps,
+        store: interleaved,
+        direct: fast,
+      });
+
+      const resumed = raced.resume(started.executionId, { kind: "approve" }, callId, permitDirect);
+      // REAL CLOCK, same reason as above: let the budget elapse while the
+      // refusal's write is held, so the timer fires into a taken latch.
+      // Reach the refusal just BEFORE the budget elapses, so it takes the
+      // latch first; its write is then still in flight when the timer fires.
+      // Both holds stay inside `settleWriteBudgetMs`, so the refusal's own
+      // write COMPLETES and the answer is its verdict, not a write timeout.
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs - 60));
+      refusalReached.open();
+      await new Promise((r) => setTimeout(r, 100));
+      refusalWrite.open();
+      const out = await Promise.race([
+        resumed,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+
+      expect(out).not.toBe("HUNG");
+      // ONE write, and it is the REFUSAL's — not the expiry's.
+      expect(writes).toBe(1);
+      expect(reasons[0]).toContain("catalog changed");
+      expect(out).toMatchObject({
+        status: "failed",
+        error: { name: "ConduitCatalogChanged" },
+      });
+      expect(active.calls).toHaveLength(0);
+    });
+
+    it("INVARIANT §5.3 (#28): a CODE row's guard step after an expiry never REFUSES on its own — the expiry's outcome stands and the row is written once", async () => {
+      // The gap the handover re-check alone cannot close. A guard read that
+      // returns after the expiry fired can reach a REFUSAL (here: the source
+      // generation no longer matches) before the handover is ever reached.
+      // Without the latch check inside `raceGuard`, that refusal issues a
+      // SECOND write and publishes ConduitCatalogChanged over the expiry's
+      // answer. This is why the check belongs in the one function every
+      // guard read goes through, not only at the handover.
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const started = await m.start(
+        'return await tools.github.create_issue({ title: "from agent" });',
+      );
+      expect(started.status).toBe("paused");
+      const callId = await pendingCallOf(m, started.executionId);
+
+      const guardRead = gate();
+      const expiryWrite = gate();
+      let writes = 0;
+      const reasons: string[] = [];
+      const interleaved = {
+        ...active.store,
+        tools: {
+          ...active.store.tools,
+          get: async (name: string) => {
+            await guardRead.wait;
+            return await requireActive(active).store.tools.get(name);
+          },
+        },
+        sources: {
+          ...active.store.sources,
+          // After the held read releases, the very next guard step would
+          // REFUSE: the generation disagrees with the stored pause.
+          getGeneration: async () => 999,
+        },
+        executions: {
+          ...active.store.executions,
+          failClaimedResume: async (
+            ...a: Parameters<ConduitStore["executions"]["failClaimedResume"]>
+          ) => {
+            writes += 1;
+            reasons.push(String(a[1]));
+            // The EXPIRY's write is held in flight, so `codeGuardExpiry` has
+            // not resolved when the guard read below returns. The race
+            // therefore cannot answer `expired` on its own — only the
+            // synchronous latch can — which is what isolates the check
+            // inside `raceGuard` from the handover re-check.
+            if (writes === 1) await expiryWrite.wait;
+            return await requireActive(active).store.executions.failClaimedResume(...a);
+          },
+        },
+      } as unknown as ConduitStore;
+      const raced = createExecutionManager({
+        ...active.deps,
+        store: interleaved,
+        direct: fast,
+      });
+
+      // REAL CLOCK, same reason as the tests above.
+      const resumed = raced.resume(started.executionId, { kind: "approve" }, callId, permitDirect);
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs + 20));
+      expect(writes).toBe(1);
+      // The expiry has fired and its write is STILL IN FLIGHT. NOW let the
+      // guard read return into a step that would otherwise refuse.
+      guardRead.open();
+      await new Promise((r) => setTimeout(r, 20));
+      expiryWrite.open();
+      const out = await Promise.race([
+        resumed,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+
+      expect(out).not.toBe("HUNG");
+      // ONE write — the expiry's — and the refusal never happened.
+      expect(writes).toBe(1);
+      expect(reasons[0]).toContain("budget elapsed");
+      expect(out).toMatchObject({
+        status: "failed",
+        error: { name: "ConduitExecutionInterrupted" },
+      });
+      expect(active.calls).toHaveLength(0);
+    });
+
+    it("INVARIANT §5.3 (#28): a DIRECT row's NON-final guard read returning after the expiry took the latch never starts the continuation", async () => {
+      // The existing handover test covers only the LAST guard read. This
+      // holds an EARLIER one, so the deferral has to come from `raceGuard`
+      // itself rather than from the pre-handover re-check.
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+
+      const guardRead = gate();
+      let settles = 0;
+      const interleaved = {
+        ...active.store,
+        tools: {
+          ...active.store.tools,
+          // NOT the last guard read: `sources.getGeneration`, `policies.get`
+          // and the scope check all still follow it.
+          get: async (name: string) => {
+            await guardRead.wait;
+            return await requireActive(active).store.tools.get(name);
+          },
+        },
+        executions: {
+          ...active.store.executions,
+          settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+            settles += 1;
+            return await requireActive(active).store.executions.settleDirect(...a);
+          },
+        },
+      } as unknown as ConduitStore;
+      const raced = createExecutionManager({
+        ...active.deps,
+        store: interleaved,
+        direct: fast,
+      });
+
+      const resumed = raced.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+      // REAL CLOCK, same reason as above.
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs + fast.settleWriteBudgetMs + 150));
+      guardRead.open();
+      const out = await Promise.race([
+        resumed,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+
+      expect(out).not.toBe("HUNG");
+      // The continuation never ran: the upstream saw nothing.
+      expect(active.calls).toHaveLength(0);
+      // Exactly ONE settle attempt — the expiry's.
+      expect(settles).toBe(1);
+      expect(out).toMatchObject({ status: "failed" });
+    });
+  });
+
   describe("a result that cannot be serialized settles a truthful terminal, never a hang", () => {
     // `deliverableBytes` calls `JSON.stringify`, which THROWS for these. A
     // custom invoker can return either. Measured after the latch, the throw
