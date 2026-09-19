@@ -914,7 +914,7 @@ describe("§5.5 scope check", () => {
         ...store,
         tools: {
           ...store.tools,
-          get: async (name: string) => {
+          get: async () => {
             seq.push("tools.get");
             return present ? await store.tools.get("github.list_issues") : undefined;
           },

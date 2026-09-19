@@ -1417,7 +1417,19 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       const settledAt = new Promise<void>((r) => {
         markSettled = r;
       });
-      const request = JSON.stringify(input);
+      // `JSON.stringify` has TWO failure modes for a non-JSON input, and only
+      // one of them returns `undefined`. A cyclic value, a `BigInt`, and a
+      // throwing `toJSON` all THROW synchronously — before the handle's three
+      // promises exist, so the caller would get no bounded outcome and no
+      // execution record at all. Collapse the throw into the same `undefined`
+      // the other non-JSON inputs produce, and let the one refusal branch
+      // below answer through the normal handle.
+      let request: string | undefined;
+      try {
+        request = JSON.stringify(input);
+      } catch {
+        request = undefined;
+      }
       const execution: Extract<Execution, { kind: "direct" }> = {
         id: executionId,
         kind: "direct",

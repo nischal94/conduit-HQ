@@ -3774,6 +3774,47 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(true).toBe(true);
   });
 
+  describe("startDirect refuses a non-serializable input through the normal handle", () => {
+    // `JSON.stringify` THROWS synchronously for these three shapes rather than
+    // returning `undefined`. A throw here escapes before the handle's promises
+    // exist, so the caller gets neither the bounded outcome nor a record.
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const throwingToJson = {
+      toJSON() {
+        throw new Error("toJSON exploded");
+      },
+    };
+    const shapes: Array<[string, unknown]> = [
+      ["a cyclic object", cyclic],
+      ["a BigInt", { n: 1n }],
+      ["a throwing toJSON", throwingToJson],
+    ];
+    for (const [label, input] of shapes) {
+      it(`${label} answers failed with the non-JSON refusal; retention and finished resolve; zero upstream calls`, async () => {
+        active = await makeHarness();
+        const m = createExecutionManager({ ...active.deps, direct: fast });
+        const handle = m.startDirect("github.list_issues", input, {
+          clientId: null,
+          projection: "direct",
+          scope: permitDirect,
+        });
+        expect(typeof handle.executionId).toBe("string");
+        const out = await handle.outcome;
+        expect(out).toMatchObject({
+          status: "failed",
+          error: { name: "ConduitInternalError" },
+        });
+        expect((out as { error: { message: string } }).error.message).toContain(
+          "input is not a JSON value",
+        );
+        expect(await handle.retention).toBe("released");
+        await handle.finished;
+        expect(active.calls).toHaveLength(0);
+      });
+    }
+  });
+
   it("INVARIANT §5.4: the scope resolver is consulted with the CALLER'S client id, and a revoked projection blocks the call", async () => {
     active = await makeHarness();
     const seen: (string | null)[] = [];
