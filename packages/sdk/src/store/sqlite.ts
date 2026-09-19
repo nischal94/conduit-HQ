@@ -148,7 +148,15 @@ const SCHEMA = [
     execution_id TEXT NOT NULL,
     PRIMARY KEY (client_id, key)
   )`,
-  `CREATE INDEX IF NOT EXISTS request_keys_execution ON request_keys (execution_id)`,
+  // UNIQUE (M3): one execution has at most ONE request key. The PK already
+  // stops two executions sharing a (client, key); this stops one execution
+  // collecting two keys, which the LEFT JOIN above would fan out into
+  // duplicate rows for a single execution read. It also still serves that
+  // join, so the D9 index requirement holds. A database created before this
+  // carries the same NAME as a PLAIN index — and `CREATE UNIQUE INDEX IF NOT
+  // EXISTS` silently does nothing when a name exists — so the ladder below
+  // drops and recreates it rather than relying on this statement.
+  `CREATE UNIQUE INDEX IF NOT EXISTS request_keys_execution ON request_keys (execution_id)`,
   `CREATE TABLE IF NOT EXISTS secrets (
     ref TEXT PRIMARY KEY,
     sealed TEXT NOT NULL,
@@ -246,6 +254,30 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   }
 
   await client.batch(SCHEMA, "write");
+
+  // M3: `request_keys_execution` shipped PLAIN and is now UNIQUE. The
+  // statement above cannot perform that upgrade — `CREATE UNIQUE INDEX IF NOT
+  // EXISTS` is a silent no-op when an index of that NAME already exists,
+  // whatever its uniqueness — so an R1 database created before this change
+  // would keep the plain index and the constraint would never take effect
+  // (the check reports green while enforcing nothing). Read the actual
+  // uniqueness from the catalog and rebuild only when it is missing.
+  // Nothing is published yet, so the only legacy database is a dev/dogfood
+  // one — but that one is real, and silently leaving it unconstrained is the
+  // failure this guards.
+  const keyIndexes = await client.execute("PRAGMA index_list(request_keys)");
+  const existing = keyIndexes.rows.find((row) => String(row.name) === "request_keys_execution");
+  if (existing !== undefined && Number(existing.unique) !== 1) {
+    // A duplicate already in the table would make the rebuild fail; that is a
+    // real data fault, so it surfaces rather than being swallowed.
+    await client.batch(
+      [
+        "DROP INDEX IF EXISTS request_keys_execution",
+        "CREATE UNIQUE INDEX IF NOT EXISTS request_keys_execution ON request_keys (execution_id)",
+      ],
+      "write",
+    );
+  }
 
   // executions.resume_attempt arrived after the first shipped schema; same
   // retrofit as trace_events.output below.

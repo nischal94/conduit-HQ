@@ -213,6 +213,15 @@ export interface ExecutionManagerDeps {
    * passes the staged `decisions` seam so the approved call resolves live.
    * Absent `decisions` (the `start` path) the invoker behaves exactly as it
    * does today.
+   *
+   * A custom `makeInvoker` MUST forward `dispatch`, `projection`, `clientId`
+   * and `scope` to the invoker it builds. They are not conveniences: dropping
+   * `dispatch` leaves the manager's cell reading `none` forever, so a failure
+   * AFTER the upstream call was written classifies as "did not run" instead
+   * of ambiguous (§7/D-A4); dropping `scope` or `clientId` runs the call
+   * without the per-call authority recheck (§5.5); dropping `projection`
+   * mis-attributes the audit row (§4.3). Absent must stay absent — under
+   * `exactOptionalPropertyTypes`, pass the key only when it is defined.
    */
   makeInvoker: (args: {
     executionId: string;
@@ -892,11 +901,41 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   //                    │                                         drive.settle()
   //         ┌──────────┴──────────┐                     ┌──────────┴──────────┐
   //     true (WINNER)        false (LOSER)          true (WINNER)      false (LOSER)
-  //     finishEarly()        return, write          finishEarly()      EXPIRY HOLDS IT:
+  //     settleEarly()        return, write          settleEarly()      EXPIRY HOLDS IT:
   //     bounded fenced       nothing                bounded fenced     await guardExpiry
   //     settle; publish                             settle; publish    and return ITS
   //     via guardExpiry                             its own outcome    outcome — never a
   //                                                                    second write
+  //
+  // THE HANDOVER (I2), the one exit that is neither of the two above. After
+  // the LAST guard read (`policies.get`) the resume path stops guarding and
+  // hands the drive to `runDirect`. `raceGuard` answers "not expired"
+  // whenever the READ wins — including when the budget elapsed DURING it and
+  // the expiry already holds the latch with its write in flight. Handing over
+  // then is fatal: `runDirect`'s first `settle()` loses and it returns having
+  // resolved nothing, so `await outcome` never resolves and `resume()` hangs
+  // forever holding a daemon queue slot. So the handover re-checks the latch
+  // itself and defers to `guardExpiry`, exactly as a late guard result does:
+  //
+  //        last guard read returns          drive.settled?
+  //                    │                   ┌──── true ────► return guardExpiry
+  //                    ▼                   │                (the expiry owns it)
+  //        if (directDrive.settled) ───────┤
+  //                                        └──── false ───► build `run`, rewire
+  //                                                         onExpire → expireDirect,
+  //                                                         runDirect takes over
+  //
+  // LIFECYCLE SPLIT (M1 / D-A2). `finishEarly()` resolves BOTH lifecycle
+  // promises; `settleEarly()` resolves only `settledAt` and clears the timer,
+  // leaving `finished` for the caller to resolve on the settle WRITE. Every
+  // guard exit that ISSUES a write now uses `settleEarly()` plus
+  // `resolveFinished(write)`, because `finished` means "the continuation and
+  // any tracked settle write have actually stopped" and Lane B holds an
+  // admission slot on it — resolving it over a live store write would release
+  // that slot while the work is still running. `settledAt` is deliberately
+  // NOT deferred: the spec measures slot retention from the moment the row is
+  // SETTLED, not from the write's completion. `finishEarly()` remains for the
+  // exits that write nothing.
   //
   // A late guard result deferring to `guardExpiry` is what keeps the loser
   // from issuing a SECOND `settleDirect` on the same (id, attempt) and then
@@ -906,8 +945,8 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   //
   // `terminalizeDirect` is the ONE place this rule lives: every guard
   // terminalization and the prep-window catch call it, and it owns
-  // `finishEarly()` so no caller can settle the row and forget to stop the
-  // drive. The expiry handler calls `finishEarly()` itself for the same
+  // `settleEarly()` so no caller can settle the row and forget to stop the
+  // drive. The expiry handler calls `settleEarly()` itself for the same
   // reason, so that exit looks like every other exit.
   //
   // CLASSIFICATION at expiry is decided by the DISPATCH CELL (D-A4), never by

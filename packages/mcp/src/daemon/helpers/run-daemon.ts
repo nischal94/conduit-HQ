@@ -25,7 +25,7 @@ import { writeFileSync } from "node:fs";
 // Explicit .ts extensions: run directly via `process.execPath` under
 // Node's native TypeScript support, never compiled by tsup, so Node's ESM
 // resolver needs the literal on-disk extension.
-import type { PendingApproval } from "@conduithq/sdk";
+import type { ExecutionOutcome, PendingApproval } from "@conduithq/sdk";
 import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
 import { FRAME_CAP } from "../frames.ts";
@@ -324,7 +324,11 @@ const createRuntime = pauseExecute
               pausedOn,
             });
             console.log("paused execute");
-            return { status: "paused", executionId: id, pending: pausedOn } as never;
+            return {
+              status: "paused",
+              executionId: id,
+              pending: pausedOn,
+            } satisfies ExecutionOutcome;
           },
         },
       };
@@ -402,7 +406,7 @@ const createRuntime = pauseExecute
                     status: "completed",
                     executionId: "exec_huge",
                     value: { oversize: "x".repeat(FRAME_CAP) },
-                  } as never;
+                  } satisfies ExecutionOutcome;
                 },
               },
             };

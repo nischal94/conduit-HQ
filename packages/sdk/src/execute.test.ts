@@ -196,4 +196,34 @@ describe("createScopedCatalogToolHost (§5.2, #43)", () => {
     expect(thrown?.message).not.toContain(".conduit");
     expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("SqliteStore");
   });
+
+  it("a resolver that RESOLVES with a malformed snapshot is as opaque as one that rejects", async () => {
+    // The boundary must cover the whole body, not just the resolver call. A
+    // snapshot whose `permits` throws is the same class of host fault as a
+    // rejecting resolver; if it escaped raw, the guest could tell the two
+    // apart by the error it gets back.
+    const log = vi.fn();
+    const malformed = async () =>
+      ({
+        permits: () => {
+          throw new TypeError("[SqliteStore] cannot read properties of undefined at ~/.conduit");
+        },
+      }) as unknown as Awaited<ReturnType<typeof scope>>;
+    const host = createScopedCatalogToolHost(catalog, invoke, malformed, "code", log);
+    for (const body of [
+      () => host.search({ query: "deploy" }),
+      () => host.describe("github.deploy"),
+    ]) {
+      let thrown: Error | undefined;
+      try {
+        await body();
+      } catch (error) {
+        if (error instanceof Error) thrown = error;
+      }
+      expect(thrown?.name).toBe("ConduitInternalError");
+      expect(thrown?.message).not.toContain("SqliteStore");
+      expect(thrown?.message).not.toContain(".conduit");
+    }
+    expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("SqliteStore");
+  });
 });

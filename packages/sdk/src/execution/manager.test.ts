@@ -1214,10 +1214,11 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
  * Wrap `store.executions.put` so its (n+1)th call — 0-indexed by `faultAt` —
  * throws once, then all subsequent calls (including the retry from
  * `persistOrFinalizeFailed`'s fallback) pass through to the real store. This
- * targets the SETTLE write specifically (the second `put` in every scenario
- * below: `start`/`claimForResume` already durably wrote the first `running`
- * row through a DIFFERENT path — a raw put or the guarded UPDATE — so the
- * fault lands exactly on the terminal/paused/expired write under test).
+ * targets the SETTLE write specifically. Every scenario below passes
+ * `faultAt: 0` — the FIRST `put` — because `start`/`claimForResume` already
+ * durably wrote the `running` row through a DIFFERENT path (a raw insert or
+ * the guarded UPDATE), so the first `put` this wrapper ever sees is the
+ * terminal/paused/expired write under test.
  */
 function withPutFaultAt(store: ConduitStore, faultAt: number): ConduitStore {
   const realPut = store.executions.put.bind(store.executions);

@@ -894,6 +894,19 @@ describe("SqliteStore", () => {
       const text = plan.rows.map((r) => String(r.detail)).join("\n");
       expect(text).toMatch(/USING (COVERING )?INDEX request_keys_execution/);
     });
+
+    it("INVARIANT §4.1 (M3): one execution carries at most ONE request key — a second row is refused", async () => {
+      // The PK (client_id, key) stops two executions sharing a key; this
+      // stops ONE execution collecting two, which the hydrating LEFT JOIN
+      // would fan out into duplicate rows for a single execution read.
+      await store.executions.create(codeRow({ id: "u1", clientId: "acme", requestKey: "k1" }));
+      await expect(
+        client.execute({
+          sql: "INSERT INTO request_keys (client_id, key, execution_id) VALUES (?, ?, ?)",
+          args: ["acme", "k2", "u1"],
+        }),
+      ).rejects.toThrow(/UNIQUE constraint failed/i);
+    });
   });
 
   describe("execution outcome persistence (mcp design M4)", () => {
@@ -919,6 +932,47 @@ describe("SqliteStore", () => {
         VALUES ('exec_old', '1', 'completed', '{"now":1,"random":0.5}', 1, 2)`);
       return { url, client };
     }
+
+    it("INVARIANT §4.1 (M3): a database carrying the OLD PLAIN index is upgraded to UNIQUE on reopen", async () => {
+      // The trap this pins: `CREATE UNIQUE INDEX IF NOT EXISTS` is a silent
+      // no-op when an index of that NAME already exists, whatever its
+      // uniqueness. A database created with the plain index would keep it and
+      // the constraint would enforce nothing while every surface read green.
+      // Nothing is published yet, so the only such database is a dev/dogfood
+      // one — but that one is real and must not be stranded.
+      const url = tempFileDbUrl();
+      const seed = createClient({ url });
+      await seed.execute(`CREATE TABLE request_keys (
+        client_id TEXT NOT NULL, key TEXT NOT NULL, execution_id TEXT NOT NULL,
+        PRIMARY KEY (client_id, key))`);
+      // Exactly what shipped: same NAME, NOT unique.
+      await seed.execute("CREATE INDEX request_keys_execution ON request_keys (execution_id)");
+      await seed.execute(
+        "INSERT INTO request_keys (client_id, key, execution_id) VALUES ('acme', 'k1', 'e1')",
+      );
+      const before = await seed.execute("PRAGMA index_list(request_keys)");
+      expect(
+        Number(before.rows.find((r) => String(r.name) === "request_keys_execution")?.unique),
+      ).toBe(0);
+      seed.close();
+
+      // Opening the store runs the ladder.
+      const store = await openTestStore(url);
+      expect(store).toBeDefined();
+      const after = createClient({ url });
+      const list = await after.execute("PRAGMA index_list(request_keys)");
+      expect(
+        Number(list.rows.find((r) => String(r.name) === "request_keys_execution")?.unique),
+      ).toBe(1);
+      // And the constraint now actually bites: a SECOND key for e1 is refused.
+      await expect(
+        after.execute({
+          sql: "INSERT INTO request_keys (client_id, key, execution_id) VALUES (?, ?, ?)",
+          args: ["acme", "k2", "e1"],
+        }),
+      ).rejects.toThrow(/UNIQUE constraint failed/i);
+      after.close();
+    });
 
     it("round-trips result, error, and requestKey", async () => {
       const store = await openTestStore();

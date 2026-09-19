@@ -1,5 +1,5 @@
 import type { Catalog } from "./catalog.js";
-import { infraError } from "./pipeline/errors.js";
+import { ConduitCallError, infraError } from "./pipeline/errors.js";
 import type { ToolHost } from "./sandbox/sandbox.js";
 import type { EffectiveScope } from "./scope.js";
 import type { JsonSchema, Projection } from "./types.js";
@@ -136,16 +136,34 @@ export function createScopedCatalogToolHost(
     scope().catch((cause) => {
       throw infraError(cause, log);
     });
+  /**
+   * The whole body, not just the resolver call. `resolve()` above converts a
+   * REJECTING resolver into the opaque infra error, but a resolver that
+   * RESOLVES with a malformed snapshot is just as much a host fault — and its
+   * `permits` would throw raw into the guest (a TypeError carrying host
+   * internals), making the two failure modes distinguishable from inside the
+   * sandbox. Same boundary, same opacity, whichever way the fault arrives.
+   */
+  const guard = async <T>(body: () => Promise<T>): Promise<T> => {
+    try {
+      return await body();
+    } catch (cause) {
+      throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
+    }
+  };
   return {
-    search: async (options) => {
-      const snapshot = await resolve();
-      const ranked = catalog.search({ query: options.query, limit: Number.MAX_SAFE_INTEGER });
-      return ranked
-        .filter((hit) => snapshot.permits(projection, hit.path))
-        .slice(0, options.limit ?? DEFAULT_LIMIT);
-    },
-    describe: async (path, options) =>
-      (await resolve()).permits(projection, path) ? catalog.describe(path, options) : undefined,
+    search: (options) =>
+      guard(async () => {
+        const snapshot = await resolve();
+        const ranked = catalog.search({ query: options.query, limit: Number.MAX_SAFE_INTEGER });
+        return ranked
+          .filter((hit) => snapshot.permits(projection, hit.path))
+          .slice(0, options.limit ?? DEFAULT_LIMIT);
+      }),
+    describe: (path, options) =>
+      guard(async () =>
+        (await resolve()).permits(projection, path) ? catalog.describe(path, options) : undefined,
+      ),
     call: (path, input) => invoke(path, input),
   };
 }
