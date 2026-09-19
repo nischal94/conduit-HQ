@@ -834,14 +834,14 @@ describe("SqliteStore", () => {
     it("INVARIANT §4.1 (#25): a named key never collides with a default-profile key, including a legacy key containing U+0000", async () => {
       await client.execute({
         sql: "INSERT INTO executions (id, code, status, seeds, started_at, request_key) VALUES ('legacy', 'x', 'completed', '{}', 0, ?)",
-        args: ["acme k"],
+        args: ["acme\u0000k"],
       });
       await store.executions.create(codeRow({ id: "d1", requestKey: "k" })); // default profile, raw column
       await store.executions.create(codeRow({ id: "n2", clientId: "acme", requestKey: "k" })); // named, table
       expect((await store.executions.getByRequestKey("k", null))?.id).toBe("d1");
       expect((await store.executions.getByRequestKey("k", "acme"))?.id).toBe("n2");
-      expect((await store.executions.getByRequestKey("acme k", null))?.id).toBe("legacy");
-      expect(await store.executions.getByRequestKey("acme k", "acme")).toBeUndefined(); // unreachable from a named client
+      expect((await store.executions.getByRequestKey("acme\u0000k", null))?.id).toBe("legacy");
+      expect(await store.executions.getByRequestKey("acme\u0000k", "acme")).toBeUndefined(); // unreachable from a named client
     });
 
     it("INVARIANT §4.1 (#25): a duplicate named key fails the create atomically — no execution row, no key row", async () => {
