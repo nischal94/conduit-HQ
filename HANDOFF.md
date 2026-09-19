@@ -121,6 +121,50 @@ from `git log` on the branch. Carried items a fresh session must not lose:
   read: most test bodies, `types.ts`/`store.ts`/`index.ts`/`fixtures.ts`,
   design-spec §3.1/§4.1–4.3/§5.3/§9–§11, and it did not re-verify the
   `--doctor --offline` zero-write claim — point the PR gauntlet there.
+- **Pre-PR Tier 2 review (pr-review-toolkit ×5, head `9331313`; the
+  simplifier was deliberately not run — it edits the tree): 2 Critical,
+  ~7 Important, plus comment defects — ALL FIXED in `b8514a7`, `fdc5ab3`,
+  `1b8294d`, `0c84634`, `4ce5111`, `831067f` (sdk 639, mcp 439, cli 118,
+  Biome 0 warnings). These six commits have had NO independent review yet:
+  the post-PR gauntlet is their review. Point it first at
+  `boundedFencedSettle` — closing the hang class exposed that it documented
+  "Never throws" while calling the store outside any `try`, so a
+  SYNCHRONOUS store throw escaped every settle path (a fifth route, found
+  by the fix agent, not by a reviewer). Also: the A1 resume arm is NOT
+  reachable through the §5.4 guard (no JS value stringifies to unparseable
+  bytes, so the guard's text comparison blocks a corrupt request first);
+  the fix still matters for `startDirect`, which has no such guard.** (A1, Critical) a corrupt stored
+  `direct_call.request` makes `JSON.parse` throw INSIDE `runDirect`'s own
+  catch; resume's `.catch(() => {})` swallows it, `dispose()` clears the
+  timer, the outcome never resolves — `resume()` hangs forever and the row
+  strands `running`. The FOURTH hang in this area; required fix closes the
+  CLASS (nothing thrown inside `runDirect` or the guard phase may leave the
+  outcome pending). (A2, Critical, probed) the UNIQUE-index ladder step
+  bricks a database holding two key rows for one execution — **ruling:
+  check before drop; on duplicates throw a count-only diagnostic and leave
+  the database untouched; no automatic de-duplication.** (B1, High)
+  `String(cause)` is persisted on five code-row paths and readable through
+  `check_execution`. Also: two swallowed `failClaimedResume` rejections with
+  no log, one unbounded; the demo script exits 0 on `paused`/`expired`;
+  `hasProvenance` sound only after `isPendingApproval`; `ExecutePayload`
+  accepts `reason` on any status; `DirectSettle`/`ExecutionError` not
+  exported; three factually wrong comments on the latch code; ~35
+  process-residue references ("Task N", "codex #", "fix round", finding
+  ids) in branch-added comments and FIVE test names — all stripped, with
+  the ledger citations that quote renamed tests updated.
+- **Follow-ups the pre-PR review named (NOT in this PR):** brand
+  `ExecutionId`/`CallId`/`AttemptId`/`Namespace` — this branch raised the
+  urgency: `claimForResume(id, resumeAttemptId, callId)` takes three bare
+  strings and swapping `settleDirect`'s two silently defeats the fence;
+  split `Source` into read/write models (`generation` is ignored on write);
+  have the manager apply `dispatch`/`projection`/`clientId`/`scope` itself
+  so a custom `makeInvoker` cannot drop them (a docstring is the only guard
+  today); adopt a `design §x.y` prefix for design-spec section refs — bare
+  `§4.1`/`§5.4` in code and test names currently mean the R1 design spec,
+  not `conduitspec.md`, whose sections with those numbers differ; a
+  repo-wide sweep of the ~60 pre-existing `Task N` comments; a structural
+  check that every store call on a client-visible manager path goes through
+  a bounded helper (four hangs were each fixed one call at a time).
 - **PR description "Deviations" (from the final review, verified against
   code):** the `unknown` wire status and the F12 accepted limit (both need
   spec §18 entries); `startDirect` returns a handle, not the spec's
