@@ -40,6 +40,7 @@ function sourceAt(port: number): Source {
     type: "mcp",
     namespace: "github",
     location: `http://127.0.0.1:${port}/mcp`,
+    generation: 0,
   };
 }
 
@@ -240,6 +241,7 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
       type: "mcp",
       namespace: "github",
       location: `http://rebind.example:${port}/mcp`,
+      generation: 0,
     };
     // Pre-flight resolves public → passes.
     vi.mocked(lookupPromises).mockResolvedValueOnce([
@@ -753,6 +755,7 @@ describe("INVARIANT §18-C5: the stored upstream name is sent on the wire", () =
         type: "mcp",
         namespace: "context7",
         location: `http://127.0.0.1:${port}/mcp`,
+        generation: 0,
       },
       input: {},
       auth: { headers: {} },
@@ -791,6 +794,7 @@ describe("INVARIANT §18-C5: the stored upstream name is sent on the wire", () =
         type: "mcp",
         namespace: "context7",
         location: `http://127.0.0.1:${port}/mcp`,
+        generation: 0,
       },
       input: {},
       auth: { headers: {} },

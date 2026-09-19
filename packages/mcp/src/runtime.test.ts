@@ -171,7 +171,13 @@ describe("createApprovalRuntime — INVARIANT §9.3 direct pin", () => {
         },
       ],
     });
-    await store.sources.upsert({ id: "src_loop", type: "mcp", namespace: "loop", location });
+    await store.sources.upsert({
+      id: "src_loop",
+      type: "mcp",
+      namespace: "loop",
+      location,
+      generation: 0,
+    });
     await store.integrations.upsert({ id: "int_loop", sourceId: "src_loop", namespace: "loop" });
     await store.connections.upsert({ id: "conn_loop", integrationId: "int_loop", prefix: "loop" });
     await store.tools.replaceNamespace("loop", tools);

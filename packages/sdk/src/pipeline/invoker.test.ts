@@ -53,6 +53,7 @@ beforeEach(async () => {
     type: "mcp",
     namespace: "github",
     location: "https://mcp.example.com/github",
+    generation: 0,
   });
   await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: "github" });
   await store.connections.upsert({

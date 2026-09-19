@@ -91,6 +91,14 @@ export type {
   ToolHost,
 } from "./sandbox/sandbox.js";
 export { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "./sandbox/sandbox.js";
+export type { EffectiveScope, ScopeGrant, ScopeResolver } from "./scope.js";
+export {
+  ALL_TOOLS,
+  buildEffectiveScope,
+  DEFAULT_PROFILE_GRANT,
+  defaultScopeResolver,
+  namespaceOf,
+} from "./scope.js";
 export { SecretBox } from "./secrets.js";
 export {
   CANARY_REF,
@@ -115,18 +123,32 @@ export type {
 } from "./store/store.js";
 export type {
   Connection,
+  DirectCall,
   Execution,
+  ExecutionBase,
+  ExecutionKind,
   ExecutionStatus,
   Integration,
   JsonSchema,
+  LegacyPendingApproval,
   PendingApproval,
   Policy,
   PolicyAction,
+  Projection,
+  ResultState,
   RiskClass,
   Source,
   SourceSemantics,
   SourceType,
+  StoredPendingApproval,
   Tool,
   TraceEvent,
 } from "./types.js";
-export { isPendingApproval, NOT_NAMEABLE_CALL_ID } from "./types.js";
+export {
+  hasProvenance,
+  isPendingApproval,
+  isValidProjectionForKind,
+  NEWER_BUILD_SENTINEL,
+  NOT_NAMEABLE_CALL_ID,
+  PROJECTIONS,
+} from "./types.js";

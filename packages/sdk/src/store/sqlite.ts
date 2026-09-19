@@ -3,23 +3,30 @@ import { redactSensitiveFields } from "../pipeline/redact.js";
 import type { SecretBox } from "../secrets.js";
 import type {
   Connection,
+  DirectCall,
   Execution,
+  ExecutionBase,
   ExecutionError,
+  ExecutionKind,
   ExecutionStatus,
   Integration,
   JsonSchema,
   PendingApproval,
   Policy,
   PolicyAction,
+  Projection,
+  ResultState,
   RiskClass,
   Source,
   SourceSemantics,
   SourceType,
+  StoredPendingApproval,
   Tool,
   TraceEvent,
 } from "../types.js";
+import { isValidProjectionForKind, NEWER_BUILD_SENTINEL, PROJECTIONS } from "../types.js";
 import { CANARY_REF, ensureKeyCanary, type StoreKeyContext } from "./key-lifecycle.js";
-import type { ConduitStore, ReplayJournalRow } from "./store.js";
+import type { ConduitStore, DirectSettle, ReplayJournalRow } from "./store.js";
 
 /**
  * libSQL/SQLite implementation of the ConduitStore seam. Single file
@@ -88,7 +95,14 @@ const SCHEMA = [
     resume_attempt TEXT,
     result TEXT,
     error TEXT,
-    request_key TEXT
+    request_key TEXT,
+    kind TEXT NOT NULL DEFAULT 'code' CHECK (kind IN ('code', 'direct')),
+    projection TEXT NOT NULL DEFAULT 'code' CHECK (projection IN ('code', 'direct', 'discovery')),
+    direct_call TEXT,
+    client_id TEXT,
+    program TEXT,
+    result_state TEXT CHECK (result_state IN ('delivered', 'retained', 'discarded')),
+    CHECK ((kind = 'code' AND projection = 'code') OR (kind = 'direct' AND projection IN ('direct', 'discovery')))
   )`,
   `CREATE TABLE IF NOT EXISTS trace_events (
     seq INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -101,7 +115,9 @@ const SCHEMA = [
     upstream_status INTEGER,
     latency_ms INTEGER,
     policy_verdict TEXT NOT NULL CHECK (policy_verdict IN ('allow', 'require_approval', 'block')),
-    at INTEGER NOT NULL
+    at INTEGER NOT NULL,
+    projection TEXT NOT NULL DEFAULT 'code' CHECK (projection IN ('code', 'direct', 'discovery')),
+    client_id TEXT
   )`,
   `CREATE INDEX IF NOT EXISTS trace_execution ON trace_events (execution_id, seq)`,
   `CREATE TABLE IF NOT EXISTS replay_journal (
@@ -195,6 +211,24 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
     "CREATE UNIQUE INDEX IF NOT EXISTS idx_executions_request_key ON executions(request_key)",
   );
 
+  // R1 §4.1: kind / projection / direct_call / client_id / program /
+  // result_state. Same PRAGMA-then-ALTER retrofit; the CHECKs in SCHEMA
+  // protect fresh schemas only — hydrateExecutionRow guards legacy rows
+  // read-side.
+  const r1ExecutionColumns: readonly (readonly [string, string])[] = [
+    ["kind", "kind TEXT NOT NULL DEFAULT 'code'"],
+    ["projection", "projection TEXT NOT NULL DEFAULT 'code'"],
+    ["direct_call", "direct_call TEXT"],
+    ["client_id", "client_id TEXT"],
+    ["program", "program TEXT"],
+    ["result_state", "result_state TEXT"],
+  ];
+  for (const [name, ddl] of r1ExecutionColumns) {
+    if (!executionColumns.rows.some((row) => row.name === name)) {
+      await tolerateSchemaRace(() => client.execute(`ALTER TABLE executions ADD COLUMN ${ddl}`));
+    }
+  }
+
   // policies.redact_fields arrived with §11 redaction; same retrofit
   // pattern as trace_events.output below. Must run BEFORE the trace_events
   // migration below, which SELECTs this column to build per-tool masking.
@@ -256,6 +290,18 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       }
       await client.execute("ALTER TABLE trace_events DROP COLUMN output");
     });
+  }
+
+  // R1 §4.3: attribution columns on trace_events. Re-read the PRAGMA — the
+  // block above may have reshaped the table since the first read.
+  const traceColumnsAfter = await client.execute("PRAGMA table_info(trace_events)");
+  for (const [name, ddl] of [
+    ["projection", "projection TEXT NOT NULL DEFAULT 'code'"],
+    ["client_id", "client_id TEXT"],
+  ] as const) {
+    if (!traceColumnsAfter.rows.some((row) => row.name === name)) {
+      await tolerateSchemaRace(() => client.execute(`ALTER TABLE trace_events ADD COLUMN ${ddl}`));
+    }
   }
 
   // Design §2 (2026-07-19): wrong master key fails loud HERE, at open —
@@ -433,27 +479,74 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
     },
 
     executions: {
-      async put(execution: Execution): Promise<void> {
-        await client.execute({
+      async create(execution: Execution, opts?: { attempt?: string }): Promise<void> {
+        const c = executionWriteColumns(execution);
+        const named = execution.clientId !== null && execution.requestKey !== undefined;
+        const insert = {
           sql: `INSERT INTO executions
-                  (id, code, status, seeds, paused_on, started_at, ended_at, result, error, request_key)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                  code = excluded.code, status = excluded.status, seeds = excluded.seeds,
-                  paused_on = excluded.paused_on, started_at = excluded.started_at,
-                  ended_at = excluded.ended_at, result = excluded.result,
-                  error = excluded.error, request_key = excluded.request_key`,
+                  (id, code, status, seeds, paused_on, started_at, ended_at, result, error, request_key,
+                   kind, projection, direct_call, client_id, program, result_state, resume_attempt)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
             execution.id,
-            execution.code,
+            c.code,
             execution.status,
-            JSON.stringify(execution.seeds),
+            c.seeds,
             execution.pausedOn === undefined ? null : JSON.stringify(execution.pausedOn),
             execution.startedAt,
             execution.endedAt ?? null,
             execution.result === undefined ? null : JSON.stringify(execution.result),
             execution.error === undefined ? null : JSON.stringify(execution.error),
-            execution.requestKey ?? null,
+            named ? null : (execution.requestKey ?? null),
+            c.kind,
+            c.projection,
+            c.directCall,
+            c.clientId,
+            c.program,
+            c.resultState,
+            opts?.attempt ?? null,
+          ],
+        };
+        if (!named) {
+          await client.execute(insert);
+          return;
+        }
+        // Task 3 adds the request_keys statement to this batch.
+        await client.batch([insert], "write");
+      },
+      async put(execution: Execution): Promise<void> {
+        const c = executionWriteColumns(execution);
+        await client.execute({
+          sql: `INSERT INTO executions
+                  (id, code, status, seeds, paused_on, started_at, ended_at, result, error, request_key,
+                   kind, projection, direct_call, client_id, program, result_state)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(id) DO UPDATE SET
+                  code = excluded.code, status = excluded.status, seeds = excluded.seeds,
+                  paused_on = excluded.paused_on, started_at = excluded.started_at,
+                  ended_at = excluded.ended_at, result = excluded.result,
+                  error = excluded.error, request_key = excluded.request_key,
+                  kind = excluded.kind, projection = excluded.projection,
+                  direct_call = excluded.direct_call, client_id = excluded.client_id,
+                  program = excluded.program, result_state = excluded.result_state`,
+          args: [
+            execution.id,
+            c.code,
+            execution.status,
+            c.seeds,
+            execution.pausedOn === undefined ? null : JSON.stringify(execution.pausedOn),
+            execution.startedAt,
+            execution.endedAt ?? null,
+            execution.result === undefined ? null : JSON.stringify(execution.result),
+            execution.error === undefined ? null : JSON.stringify(execution.error),
+            // A named row's key lives in `request_keys` (§4.1), never here.
+            execution.clientId === null ? (execution.requestKey ?? null) : null,
+            c.kind,
+            c.projection,
+            c.directCall,
+            c.clientId,
+            c.program,
+            c.resultState,
           ],
         });
       },
@@ -465,7 +558,25 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         const row = rs.rows[0];
         return row === undefined ? undefined : hydrateExecutionRow(row, id);
       },
-      async getByRequestKey(key: string): Promise<Execution | undefined> {
+      async kindOf(id: string): Promise<ExecutionKind | undefined> {
+        // Deliberately unhydrated (§5.4): the caller needs the routing
+        // discriminator for a row whose other columns may be corrupt.
+        const rs = await client.execute({
+          sql: "SELECT kind FROM executions WHERE id = ?",
+          args: [id],
+        });
+        const row = rs.rows[0];
+        if (row === undefined) {
+          return undefined;
+        }
+        const kind = maybeText(row, "kind");
+        return kind !== undefined && isOneOf(kind, EXECUTION_KINDS) ? kind : undefined;
+      },
+      async getByRequestKey(key: string, clientId: string | null): Promise<Execution | undefined> {
+        if (clientId !== null) {
+          // The named-client lookup reads `request_keys`, which Task 3 creates.
+          return undefined;
+        }
         const rs = await client.execute({
           sql: "SELECT * FROM executions WHERE request_key = ?",
           args: [key],
@@ -562,6 +673,53 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
           args: [Date.now(), JSON.stringify({ name: errorName, message: reason }), id],
         });
       },
+      async settleDirect(id: string, attempt: string, settle: DirectSettle): Promise<boolean> {
+        // §5.3 exactly-once: ONE guarded UPDATE. The fence is three-part —
+        // the row must still be `running`, must belong to THIS attempt, and
+        // must be a direct row. A late continuation whose timer already
+        // terminalized the row, or a duplicate settle, matches nothing.
+        const endedAt = settle.status === "paused" ? null : Date.now();
+        const rs = await client.execute({
+          sql: `UPDATE executions SET status = ?, ended_at = ?, paused_on = ?, result = ?, error = ?, result_state = ?
+                WHERE id = ? AND status = 'running' AND resume_attempt = ? AND kind = 'direct'`,
+          args: [
+            settle.status,
+            endedAt,
+            settle.status === "paused" ? JSON.stringify(settle.pausedOn) : null,
+            settle.status === "completed" && settle.resultState === "retained"
+              ? JSON.stringify(settle.result ?? null)
+              : null,
+            settle.status === "failed" ? JSON.stringify(settle.error) : null,
+            settle.status === "completed" ? settle.resultState : null,
+            id,
+            attempt,
+          ],
+        });
+        return rs.rowsAffected === 1;
+      },
+      async invalidatePaused(namespace: string): Promise<number> {
+        // Namespace EQUALITY, never LIKE: `_` is a legal namespace
+        // character and a LIKE wildcard, so `github` would sweep
+        // `github_x`. The json_valid/json_type arms come first because
+        // `json_extract` throws on invalid JSON — a legacy pause (no
+        // namespace) and a corrupt one are both skipped, not failed.
+        const rs = await client.execute({
+          sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL, error = ?
+                WHERE status = 'paused'
+                  AND json_valid(paused_on)
+                  AND json_type(paused_on, '$.namespace') = 'text'
+                  AND json_extract(paused_on, '$.namespace') = ?`,
+          args: [
+            Date.now(),
+            JSON.stringify({
+              name: "ConduitCatalogChanged",
+              message: "catalog changed — re-approve",
+            }),
+            namespace,
+          ],
+        });
+        return rs.rowsAffected;
+      },
       async listPaused(): Promise<Execution[]> {
         // `claim_call_id` is the call id THE CLAIM SEES: `claimForResume`
         // compares `json_extract(paused_on, '$.callId')`, and SQLite's
@@ -609,10 +767,13 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             const claimCallId = maybeText(row, "claim_call_id");
             return {
               id,
+              kind: "code",
               code: "",
               status: "paused",
               seeds: { now: 0, random: 0 },
               startedAt: maybeInteger(row, "started_at") ?? 0,
+              clientId: null,
+              projection: "code",
               ...(claimCallId === undefined
                 ? {}
                 : { pausedOn: { callId: claimCallId } as PendingApproval }),
@@ -638,8 +799,9 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         await client.execute({
           sql: `INSERT INTO trace_events
                   (call_id, execution_id, tool_name, connection_prefix, input,
-                   output_summary, upstream_status, latency_ms, policy_verdict, at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+                   output_summary, upstream_status, latency_ms, policy_verdict, at,
+                   projection, client_id)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
           args: [
             event.callId,
             event.executionId,
@@ -651,6 +813,8 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
             event.latencyMs ?? null,
             event.policyVerdict,
             event.at,
+            event.projection,
+            event.clientId,
           ],
         });
       },
@@ -906,6 +1070,9 @@ const EXECUTION_STATUSES: readonly ExecutionStatus[] = [
   "expired",
 ];
 
+const EXECUTION_KINDS: readonly ExecutionKind[] = ["code", "direct"];
+const RESULT_STATES: readonly ResultState[] = ["delivered", "retained", "discarded"];
+
 const REPLAY_OPS: readonly ReplayJournalRow["op"][] = ["search", "describe", "call"];
 const GRAPHQL_OPERATIONS: readonly ("query" | "mutation")[] = ["query", "mutation"];
 const SEMANTICS_KINDS: readonly SourceSemantics["kind"][] = [
@@ -1033,6 +1200,8 @@ function rowToSource(row: Row): Source {
     type,
     namespace: text(row, "namespace"),
     location: text(row, "location"),
+    // Task 4 (§4.1a) adds the `generation` column and reads it here.
+    generation: 0,
   };
   const baseUrl = maybeText(row, "base_url");
   if (baseUrl !== undefined) {
@@ -1126,6 +1295,45 @@ function rowToPolicy(row: Row): Policy {
   };
 }
 
+/**
+ * The R1 row shape for INSERT/UPSERT (§4.1): the sentinel goes in `code`,
+ * the real program in `program`. An older build reads `code` only, so it
+ * gets a program that throws rather than resuming a direct row as an empty
+ * program or a narrowed code row under the unscoped invoker.
+ */
+function executionWriteColumns(execution: Execution): {
+  code: string;
+  seeds: string;
+  program: string | null;
+  directCall: string | null;
+  kind: Execution["kind"];
+  projection: string;
+  clientId: string | null;
+  resultState: string | null;
+} {
+  return execution.kind === "code"
+    ? {
+        code: NEWER_BUILD_SENTINEL,
+        seeds: JSON.stringify(execution.seeds),
+        program: execution.code,
+        directCall: null,
+        kind: "code",
+        projection: execution.projection,
+        clientId: execution.clientId,
+        resultState: null,
+      }
+    : {
+        code: NEWER_BUILD_SENTINEL,
+        seeds: "{}",
+        program: null,
+        directCall: JSON.stringify(execution.call),
+        kind: "direct",
+        projection: execution.projection,
+        clientId: execution.clientId,
+        resultState: execution.resultState ?? null,
+      };
+}
+
 /** Shared row→Execution hydration for `get` and `getByRequestKey`. */
 function hydrateExecutionRow(row: Row, id: string): Execution {
   const status = text(row, "status");
@@ -1141,42 +1349,120 @@ function hydrateExecutionRow(row: Row, id: string): Execution {
       `[SqliteStore] Failed to read execution: ${detail}. Context: { id: ${JSON.stringify(id)} }`,
       cause === undefined ? undefined : { cause },
     );
-  const execution: Execution = {
+  // The (kind, projection) pair is enforced in three independent places
+  // (§9.2): the TYPE, the fresh DDL CHECK, and here. Legacy tables carry no
+  // CHECK, so this read-side guard is their only layer — without it a
+  // {kind:"direct", projection:"code"} row would be authorized under the
+  // Code flag and dispatched through the direct arm.
+  const kind = maybeText(row, "kind") ?? "code";
+  if (!isOneOf(kind, EXECUTION_KINDS)) {
+    throw executionReadError(`unrecognized kind ${JSON.stringify(kind)}`);
+  }
+  const projection = maybeText(row, "projection") ?? "code";
+  if (!isOneOf(projection, PROJECTIONS)) {
+    throw executionReadError(`unrecognized projection ${JSON.stringify(projection)}`);
+  }
+  if (!isValidProjectionForKind(kind, projection)) {
+    throw executionReadError(`kind '${kind}' cannot carry projection '${projection}'`);
+  }
+  const directCall = maybeText(row, "direct_call");
+  if (kind === "direct" && directCall === undefined) {
+    throw executionReadError("kind = 'direct' requires direct_call");
+  }
+  if (kind === "code" && directCall !== undefined) {
+    throw executionReadError("kind = 'code' forbids direct_call");
+  }
+  const resultStateRaw = maybeText(row, "result_state");
+  const resultRaw = maybeText(row, "result");
+  if (kind === "code" && resultStateRaw !== undefined) {
+    throw executionReadError("result_state is set on a code row");
+  }
+  if (kind === "direct" && status === "completed") {
+    if (resultStateRaw === undefined || !isOneOf(resultStateRaw, RESULT_STATES)) {
+      throw executionReadError(
+        `completed direct row has result_state ${JSON.stringify(resultStateRaw)}`,
+      );
+    }
+    if (resultStateRaw === "retained" && resultRaw === undefined) {
+      throw executionReadError("result_state 'retained' with no result");
+    }
+    if (resultStateRaw !== "retained" && resultRaw !== undefined) {
+      throw executionReadError(`result_state '${resultStateRaw}' with a stored result`);
+    }
+  }
+  if (kind === "direct" && status !== "completed" && resultStateRaw !== undefined) {
+    throw executionReadError("result_state on a non-completed direct row");
+  }
+
+  const base: Omit<ExecutionBase, "projection"> & { projection: Projection } = {
     id: text(row, "id"),
-    code: text(row, "code"),
     status,
-    seeds: parseJson(text(row, "seeds"), (cause) =>
-      executionReadError("seeds is not valid JSON", cause),
-    ) as Execution["seeds"],
     startedAt: integer(row, "started_at"),
+    clientId: maybeText(row, "client_id") ?? null,
+    projection,
   };
   const pausedOn = maybeText(row, "paused_on");
   if (pausedOn !== undefined) {
-    execution.pausedOn = parseJson(pausedOn, (cause) =>
+    base.pausedOn = parseJson(pausedOn, (cause) =>
       executionReadError("paused_on is not valid JSON", cause),
-    ) as PendingApproval;
+    ) as StoredPendingApproval;
   }
   const endedAt = maybeInteger(row, "ended_at");
   if (endedAt !== undefined) {
-    execution.endedAt = endedAt;
+    base.endedAt = endedAt;
   }
-  const result = maybeText(row, "result");
-  if (result !== undefined) {
-    execution.result = parseJson(result, (cause) =>
+  if (resultRaw !== undefined) {
+    base.result = parseJson(resultRaw, (cause) =>
       executionReadError("result is not valid JSON", cause),
     );
   }
   const error = maybeText(row, "error");
   if (error !== undefined) {
-    execution.error = parseJson(error, (cause) =>
+    base.error = parseJson(error, (cause) =>
       executionReadError("error is not valid JSON", cause),
     ) as ExecutionError;
   }
-  const requestKey = maybeText(row, "request_key");
+  // The legacy column first, then the named join column Task 3 adds.
+  const requestKey = maybeText(row, "request_key") ?? maybeText(row, "named_request_key");
   if (requestKey !== undefined) {
-    execution.requestKey = requestKey;
+    base.requestKey = requestKey;
   }
-  return execution;
+
+  if (kind === "code") {
+    // A legacy row has no `program`: its real program is still in `code`.
+    const program = maybeText(row, "program");
+    return {
+      ...base,
+      kind,
+      projection: "code",
+      code: program ?? text(row, "code"),
+      seeds: parseJson(text(row, "seeds"), (cause) =>
+        executionReadError("seeds is not valid JSON", cause),
+      ) as Extract<Execution, { kind: "code" }>["seeds"],
+    };
+  }
+  const call = parseJson(directCall as string, (cause) =>
+    executionReadError("direct_call is not valid JSON", cause),
+  );
+  if (
+    typeof call !== "object" ||
+    call === null ||
+    typeof (call as DirectCall).toolName !== "string" ||
+    typeof (call as DirectCall).namespace !== "string" ||
+    typeof (call as DirectCall).request !== "string"
+  ) {
+    throw executionReadError("direct_call is malformed");
+  }
+  const direct: Extract<Execution, { kind: "direct" }> = {
+    ...base,
+    kind,
+    projection: projection as "direct" | "discovery",
+    call: call as DirectCall,
+  };
+  if (resultStateRaw !== undefined) {
+    direct.resultState = resultStateRaw as ResultState;
+  }
+  return direct;
 }
 
 function rowToTraceEvent(row: Row): TraceEvent {
@@ -1194,11 +1480,21 @@ function rowToTraceEvent(row: Row): TraceEvent {
       `[SqliteStore] Failed to read trace event: ${detail}. Context: { callId: ${JSON.stringify(callId)} }`,
       cause === undefined ? undefined : { cause },
     );
+  // Absent on a legacy table (the column post-dates those rows): default to
+  // the only projection that existed then.
+  const projection = maybeText(row, "projection") ?? "code";
+  if (!isOneOf(projection, PROJECTIONS)) {
+    throw new Error(
+      `[SqliteStore] Failed to read trace event: unrecognized projection ${JSON.stringify(projection)}. Context: { callId: ${JSON.stringify(callId)} }`,
+    );
+  }
   const event: TraceEvent = {
     callId,
     executionId: text(row, "execution_id"),
     toolName: text(row, "tool_name"),
     connectionPrefix: text(row, "connection_prefix"),
+    projection,
+    clientId: maybeText(row, "client_id") ?? null,
     input: parseJson(text(row, "input"), (cause) =>
       traceReadError("input is not valid JSON", cause),
     ),

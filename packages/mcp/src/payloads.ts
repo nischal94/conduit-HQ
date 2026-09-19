@@ -4,8 +4,8 @@ import type {
   Execution,
   ExecutionOutcome,
   JsonSchema,
-  PendingApproval,
   ResumeOutcome,
+  StoredPendingApproval,
 } from "@conduithq/sdk";
 import { isPendingApproval, NOT_NAMEABLE_CALL_ID } from "@conduithq/sdk";
 import type { ProvisionPayload } from "./daemon/provision.js";
@@ -348,7 +348,7 @@ export function toErrorEnvelope(error: { name: string; message: string }): Error
   };
 }
 
-function toPendingView(pending: PendingApproval): PendingView {
+function toPendingView(pending: StoredPendingApproval): PendingView {
   return { toolName: pending.toolName, reason: pending.reason, expiresAt: pending.expiresAt };
 }
 

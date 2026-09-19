@@ -198,7 +198,13 @@ async function makeHarness(options?: {
 
   const store = await open();
   const tools = normalizeMcp({ namespace: "github", tools: mcpToolsList });
-  await store.sources.upsert({ id: "src_gh", type: "mcp", namespace: "github", location });
+  await store.sources.upsert({
+    id: "src_gh",
+    type: "mcp",
+    namespace: "github",
+    location,
+    generation: 0,
+  });
   await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: "github" });
   await store.connections.upsert({
     id: "conn_gh",
@@ -891,6 +897,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       expiresAt: Date.now() + 3_600_000,
     };
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return await tools.github.create_issue({ title: 'from agent' });",
       status: "paused",
@@ -985,6 +994,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
       expiresAt: Date.now() + 3_600_000,
     };
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return await tools.github.create_issue({ title: 'from agent' });",
       status: "paused",
@@ -1050,6 +1062,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Seed a real paused row so the (real) claimForResume succeeds…
     const id = "exec_i3_corruptget";
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return await tools.github.create_issue({ title: 'x' });",
       status: "paused",
@@ -1272,6 +1287,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // wrapped `get` that returns the row WITHOUT pausedOn — simulating the
     // corrupt state the branch guards.
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return 1;",
       status: "paused",
@@ -1432,9 +1450,9 @@ describe("outcome persistence (mcp design M4)", () => {
     sandbox,
   }) => {
     const store = await makeBareStore();
-    // Fault the SECOND put (index 1): the first (index 0) is `start`'s
-    // initial `running` row; the second is the settle write under test.
-    const faultyStore = withPutFaultAt(store, 1);
+    // Fault the FIRST put (index 0): `start` now writes its initial
+    // `running` row with `create`, so the first `put` IS the settle write.
+    const faultyStore = withPutFaultAt(store, 0);
     const deps = makeStubDeps(faultyStore, sandbox(), { newId: () => "settle_fault" });
     const manager = createExecutionManager(deps);
 
@@ -1451,9 +1469,10 @@ describe("outcome persistence (mcp design M4)", () => {
   it("INVARIANT M4: paused persistence faulted — fallback carries ConduitPersistError", async () => {
     const h = await makeHarness();
     active = h;
-    // Fault the SECOND put (index 1): the first (index 0) is `start`'s
-    // initial `running` row; the second is the `paused` write in drive().
-    const faultyStore = withPutFaultAt(h.store, 1);
+    // Fault the FIRST put (index 0): `start` now writes its initial
+    // `running` row with `create`, so the first `put` is drive()'s `paused`
+    // write.
+    const faultyStore = withPutFaultAt(h.store, 0);
     // Deterministic id so the row can be recovered after `start` rejects.
     const deps: ExecutionManagerDeps = {
       ...h.deps,
@@ -1547,7 +1566,7 @@ describe("requestKey (mcp design M1)", () => {
     const manager = createExecutionManager(makeStubDeps(store, throwingSandbox));
 
     await expect(manager.start("x", { requestKey: "k1" })).rejects.toThrow();
-    expect(await store.executions.getByRequestKey("k1")).toBeDefined();
+    expect(await store.executions.getByRequestKey("k1", null)).toBeDefined();
   });
 
   it("duplicate key → conflict with the existing execution's id, no second run", async () => {
@@ -1775,7 +1794,7 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
       .then((r) => ({ kind: "resolved" as const, r }))
       .catch((e) => ({ kind: "threw" as const, e }));
     // Whether it rejects or resolves-failed, the persisted row MUST be terminal.
-    const row = await h.store.executions.getByRequestKey("rk-scope-throw");
+    const row = await h.store.executions.getByRequestKey("rk-scope-throw", null);
     expect(row).toBeDefined();
     expect(row?.status).toBe("failed");
     expect(row?.endedAt).toBeDefined();
@@ -1802,7 +1821,7 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
     // The window from the running-state persist until drive() takes over must
     // terminalize on ANY throw (§6: running must reach a terminal). A stranded
     // `running` row is un-resumable forever.
-    const row = await h.store.executions.getByRequestKey("rk-invoker-throw");
+    const row = await h.store.executions.getByRequestKey("rk-invoker-throw", null);
     expect(row).toBeDefined();
     expect(row?.status).toBe("failed");
     expect(row?.endedAt).toBeDefined();
@@ -2034,6 +2053,9 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       }),
     };
     const paused: Execution = {
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id: "exec_spoof",
       code: "irrelevant (stub sandbox)",
       status: "paused",

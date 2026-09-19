@@ -306,11 +306,16 @@ const createRuntime = pauseExecute
             const pausedOn: PendingApproval = {
               callId: `call_${id}`,
               toolName: "github.delete_repo",
+              namespace: "github",
+              sourceGeneration: 0,
               input: {},
               reason: "policy requires approval",
               expiresAt: Date.now() + approvalTtlMs,
             };
-            await runtimeOpts.store.executions.put({
+            await runtimeOpts.store.executions.create({
+              kind: "code",
+              clientId: null,
+              projection: "code",
               id,
               code,
               status: "paused",
@@ -429,7 +434,10 @@ const createRuntime = pauseExecute
                     // and the precondition the crash-terminal sweep recovers.
                     // Stalling before the write would leave nothing to sweep.
                     start: async (code: string) => {
-                      await runtimeOpts.store.executions.put({
+                      await runtimeOpts.store.executions.create({
+                        kind: "code",
+                        clientId: null,
+                        projection: "code",
                         id: `exec_stalled_${Date.now()}`,
                         code,
                         status: "running",

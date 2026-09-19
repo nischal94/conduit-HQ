@@ -956,7 +956,7 @@ async function handleRequest(
       return;
     }
     case "execution.getByRequestKey": {
-      const execution = await store.executions.getByRequestKey(request.requestKey);
+      const execution = await store.executions.getByRequestKey(request.requestKey, null);
       sendResult(ctx, requestId, executionToCheckPayload(execution, Date.now()), log);
       return;
     }

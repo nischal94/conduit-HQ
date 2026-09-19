@@ -332,6 +332,7 @@ async function seedStoreAt(targetDb: string, policy: "allow" | "require_approval
     type: "mcp",
     namespace: NAMESPACE,
     location: mcpLocation,
+    generation: 0,
   });
   await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: NAMESPACE });
   await store.connections.upsert({
@@ -697,6 +698,7 @@ describe("ring-2: spawned bin integration", () => {
         type: "mcp",
         namespace: NAMESPACE,
         location: `http://127.0.0.1:${slow.port}/mcp`,
+        generation: 0,
       });
       client.close();
 
@@ -747,6 +749,7 @@ describe("ring-2: spawned bin integration", () => {
         type: "mcp",
         namespace: NAMESPACE,
         location: mcpLocation,
+        generation: 0,
       });
       client.close();
     }
@@ -1189,6 +1192,7 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
       // in another block's beforeAll: nothing here ever contacts the
       // upstream, so the row only has to be well-formed and countable.
       location: "http://127.0.0.1:1/mcp",
+      generation: 0,
     });
     client.close();
   }

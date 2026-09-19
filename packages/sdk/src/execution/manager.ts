@@ -19,6 +19,7 @@ import {
   isPendingApproval,
   NOT_NAMEABLE_CALL_ID,
   type PendingApproval,
+  type StoredPendingApproval,
 } from "../types.js";
 import type { ApprovalDecision, ApprovalDecisions } from "./decisions.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
@@ -227,7 +228,13 @@ interface JournalingHostContext {
  * `failed` — never a resumable pause. At most one is set per drive.
  */
 interface CapturedDriveState {
-  pending?: PendingApproval;
+  /**
+   * The UNION until Task 8 captures provenance at pause time: this build
+   * still assembles the legacy (pre-R1) pause shape, which resume
+   * terminalizes as "re-approve" rather than authorizing on a fabricated
+   * generation.
+   */
+  pending?: StoredPendingApproval;
   /** design D8/F5: a completed call's result could not be journaled. */
   ambiguous?: SandboxError;
   /** design D6/F2: the first live call on resume ≠ the approved call. */
@@ -300,7 +307,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       return error instanceof Error && error.name === REPLAY_DIVERGENCE_ERROR_NAME;
     }
 
-    function assemblePending(path: string, input: unknown): PendingApproval {
+    // Task 8 (§4.1) captures the provenance pair here. Until it does, this
+    // writes the LEGACY pause shape — both fields absent — which resume
+    // terminalizes as "re-approve" (§5.4 step 3). A fabricated
+    // `sourceGeneration` would instead be compared against the namespace's
+    // current generation and silently pass a real authorization check.
+    function assemblePending(path: string, input: unknown): StoredPendingApproval {
       // reason/callId originate HOST-SIDE here (design C3) — never in the
       // sandbox. The reason is the policy verdict's message, surfaced from the
       // invoker's `ConduitPolicyDenied` throw and captured just above.
@@ -317,7 +329,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       op: "search" | "describe" | "call",
       request: string,
       run: () => Promise<unknown>,
-      onApprovalPause: () => PendingApproval,
+      onApprovalPause: () => StoredPendingApproval,
     ): Promise<unknown> {
       let value: unknown;
       try {
@@ -502,7 +514,8 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
    * `captured.ambiguous` (see appendBarrier), needing no cross-drive marker.
    */
   async function drive(
-    execution: Execution,
+    // Code rows only: the direct arm is a separate drive (Task 10).
+    execution: Extract<Execution, { kind: "code" }>,
     invoke: ToolInvoker,
     prefix: readonly JournalEntry[],
     secret: string | undefined,
@@ -598,7 +611,9 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             pausedOn: pending,
           }),
         );
-        return { status: "paused", executionId: execution.id, pending };
+        // Task 8 makes the captured pause a real `PendingApproval`; until
+        // then the outcome reports the legacy shape this build writes.
+        return { status: "paused", executionId: execution.id, pending: pending as PendingApproval };
       }
     }
   }
@@ -630,14 +645,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     async start(code, opts) {
       const execution: Execution = {
         id: `exec_${newId()}`,
+        kind: "code",
         code,
         status: "running",
         seeds: generateSeeds(),
         startedAt: now(),
+        clientId: null,
+        projection: "code",
         ...(opts?.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
       };
       try {
-        await deps.store.executions.put(execution);
+        await deps.store.executions.create(execution);
       } catch (cause) {
         // mcp design M1: requestKey is persisted BEFORE the sandbox runs, so a
         // duplicate key is caught here as a UNIQUE constraint violation on
@@ -648,7 +666,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           opts?.requestKey !== undefined &&
           String(cause).includes("UNIQUE constraint failed: executions.request_key")
         ) {
-          const existing = await deps.store.executions.getByRequestKey(opts.requestKey);
+          const existing = await deps.store.executions.getByRequestKey(opts.requestKey, null);
           if (existing !== undefined) {
             return { status: "conflict", executionId: existing.id };
           }
@@ -809,7 +827,10 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             corruptPause: true,
           };
         }
-        const pausedOn: PendingApproval = stored;
+        // Task 9 adds the §5.4 generation check, which narrows this by
+        // `hasProvenance`; until then a legacy pause flows on as it does
+        // in the shipped build.
+        const pausedOn = stored as PendingApproval;
 
         // TTL (design D8): lazily expire on resume. `claimForResume` already
         // flipped status to running, so persist the terminal `expired` state.
@@ -863,7 +884,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // un-journaled call → runs live via the decision seam (allow), or
         // resolves ConduitPolicyBlocked (deny). Continue to completed / failed /
         // next pause. drive() owns terminalization from here on.
-        const running: Execution = { ...execution, status: "running" };
+        // Task 9 routes by kind here; R1's shipped resume drives code rows only.
+        const running: Extract<Execution, { kind: "code" }> = {
+          ...(execution as Extract<Execution, { kind: "code" }>),
+          status: "running",
+        };
         delete running.pausedOn;
         // `deadlineFor(undefined)` is DELIBERATE, not a missing argument: the
         // original `start()` limits are not persisted on the Execution row, so

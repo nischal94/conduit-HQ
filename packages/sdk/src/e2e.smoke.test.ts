@@ -237,6 +237,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       type: "mcp",
       namespace: "github",
       location: mcpLocation,
+      generation: 0,
     });
     await first.store.integrations.upsert({
       id: "int_gh",
@@ -574,6 +575,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       type: "mcp",
       namespace: "github",
       location: `http://127.0.0.1:${port}/echo401`,
+      generation: 0,
     });
     const rejected = await sandbox.execute({
       code: `
@@ -623,6 +625,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       type: "mcp",
       namespace: "github",
       location: `http://127.0.0.1:${port}/echoInBody`,
+      generation: 0,
     });
     const echoOutcome = await manager.start(`
       try {

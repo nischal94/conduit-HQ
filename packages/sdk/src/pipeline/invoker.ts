@@ -367,6 +367,10 @@ async function appendTrace(
     // Refusals are traced before any connection is engaged: empty prefix
     // records exactly that.
     connectionPrefix: details.connection?.prefix ?? "",
+    // Placeholder attribution: Task 6 threads the real projection and
+    // client id through the invoker (§4.3).
+    projection: "code",
+    clientId: null,
     // §11: the audit row is redacted at append time (builtins + the
     // verdict's per-tool additions). Non-mutating by contract (redact.ts)
     // — the caller's `input` reference is journaled for replay later.

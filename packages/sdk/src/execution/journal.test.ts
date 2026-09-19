@@ -98,6 +98,8 @@ describe("matchesPending (§5.5 design F2)", () => {
   const pausedOn: PendingApproval = {
     callId: "call_1",
     toolName: "github.delete_repo",
+    namespace: "github",
+    sourceGeneration: 0,
     input: { repo: "x" },
     reason: "destructive",
     expiresAt: Date.now() + 60_000,

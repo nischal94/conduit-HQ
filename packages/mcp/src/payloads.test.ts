@@ -56,6 +56,8 @@ describe("outcomeToPayload (execute)", () => {
       pending: {
         callId: "c",
         toolName: "github.delete_repo",
+        namespace: "github",
+        sourceGeneration: 0,
         input: {},
         reason: "destructive",
         expiresAt: 99,
@@ -124,6 +126,8 @@ describe("resumeToPayload (approvals.resume)", () => {
       pending: {
         callId: "c1",
         toolName: "github.push",
+        namespace: "github",
+        sourceGeneration: 0,
         input: { token: "should-never-cross-the-socket" },
         reason: "review",
         expiresAt: 9,
@@ -144,7 +148,15 @@ describe("resumeToPayload (approvals.resume)", () => {
       resumeToPayload({
         status: "expired",
         executionId: "e4",
-        pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 1 },
+        pending: {
+          callId: "c",
+          toolName: "t",
+          namespace: "n",
+          sourceGeneration: 0,
+          input: {},
+          reason: "r",
+          expiresAt: 1,
+        },
         decisionApplied: false,
       }).status,
     ).toBe("expired");
@@ -160,7 +172,15 @@ describe("resumeToPayload (approvals.resume)", () => {
 });
 
 describe("executionToCheckPayload (check_execution)", () => {
-  const base = { id: "e", code: "1", seeds, startedAt: 1 } as const;
+  const base = {
+    kind: "code",
+    clientId: null,
+    projection: "code",
+    id: "e",
+    code: "1",
+    seeds,
+    startedAt: 1,
+  } as const;
   it("not_found for unknown executions", () => {
     expect(executionToCheckPayload(undefined, 10)).toEqual({ status: "not_found" });
   });
@@ -220,7 +240,15 @@ describe("executionToCheckPayload (check_execution)", () => {
 });
 
 describe("pausedToListRow (the approvals.list projection)", () => {
-  const base = { id: "e", code: "1", seeds, startedAt: 1_000 } as const;
+  const base = {
+    kind: "code",
+    clientId: null,
+    projection: "code",
+    id: "e",
+    code: "1",
+    seeds,
+    startedAt: 1_000,
+  } as const;
 
   it("INVARIANT §17: the paused call's ARGUMENTS never cross the socket on approvals.list", () => {
     // The stored `pausedOn` is a raw `PendingApproval` whose `input` is the
@@ -234,6 +262,8 @@ describe("pausedToListRow (the approvals.list projection)", () => {
       pausedOn: {
         callId: "c1",
         toolName: "github.delete_repo",
+        namespace: "github",
+        sourceGeneration: 0,
         input: { token: "should-never-cross-the-socket" },
         reason: "requires approval",
         expiresAt: 9,
@@ -290,6 +320,8 @@ describe("pausedToListRow (the approvals.list projection)", () => {
       pausedOn: {
         callId: "call_A",
         toolName: "t",
+        namespace: "github",
+        sourceGeneration: 0,
         input: {},
         reason: "r",
         expiresAt: "bogus",
@@ -320,7 +352,15 @@ describe("pausedToListRow (the approvals.list projection)", () => {
  * caught here too.
  */
 describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the client guard uses", () => {
-  const base = { id: "e", code: "1", seeds, startedAt: 1 } as const;
+  const base = {
+    kind: "code",
+    clientId: null,
+    projection: "code",
+    id: "e",
+    code: "1",
+    seeds,
+    startedAt: 1,
+  } as const;
 
   // One representative outcome per execute status. Every member of
   // EXECUTE_STATUSES must appear as a key, or the set-coverage check fails.
@@ -330,12 +370,28 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     paused: {
       status: "paused",
       executionId: "e",
-      pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
+      pending: {
+        callId: "c",
+        toolName: "t",
+        namespace: "n",
+        sourceGeneration: 0,
+        input: {},
+        reason: "r",
+        expiresAt: 9,
+      },
     },
     expired: {
       status: "expired",
       executionId: "e",
-      pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
+      pending: {
+        callId: "c",
+        toolName: "t",
+        namespace: "n",
+        sourceGeneration: 0,
+        input: {},
+        reason: "r",
+        expiresAt: 9,
+      },
     },
     conflict: { status: "conflict", executionId: "e" },
   } satisfies Record<ExecuteStatus, ExecutionOutcome>;

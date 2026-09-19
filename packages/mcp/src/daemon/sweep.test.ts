@@ -19,14 +19,17 @@ async function newStore(): Promise<ConduitStore> {
   });
 }
 
-const base: Omit<Execution, "id" | "status"> = {
+const base = {
+  kind: "code",
+  clientId: null,
+  projection: "code",
   code: "return 1",
   seeds: { now: 1000, random: 0.5 },
   startedAt: 1000,
-};
+} as const;
 
 async function seed(store: ConduitStore, rows: Array<Pick<Execution, "id" | "status">>) {
-  for (const row of rows) await store.executions.put({ ...base, ...row });
+  for (const row of rows) await store.executions.put({ ...base, ...row } as Execution);
 }
 
 describe("sweepOrphanedExecutions", () => {

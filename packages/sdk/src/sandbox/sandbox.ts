@@ -60,7 +60,7 @@ export interface JournalEntry {
 }
 
 /** The `{ now, random }` pair recorded per execution (spec §5.5). */
-export type ExecutionSeeds = Execution["seeds"];
+export type ExecutionSeeds = Extract<Execution, { kind: "code" }>["seeds"];
 
 /** Per-execution resource caps (spec §16): a runaway is interrupted, not babysat. */
 export interface SandboxLimits {

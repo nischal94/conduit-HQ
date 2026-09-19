@@ -3,8 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
 import { beforeEach, describe, expect, it } from "vitest";
+import { QuickJSSandbox } from "../sandbox/quickjs.js";
+import type { ToolHost } from "../sandbox/sandbox.js";
 import { SecretBox } from "../secrets.js";
+import { codeRow, directRow, pause } from "../test/fixtures.js";
 import type {
+  Execution,
   ExecutionStatus,
   PolicyAction,
   RiskClass,
@@ -12,6 +16,7 @@ import type {
   SourceType,
   Tool,
 } from "../types.js";
+import { NEWER_BUILD_SENTINEL } from "../types.js";
 import { CANARY_REF } from "./key-lifecycle.js";
 import { openSqliteStore } from "./sqlite.js";
 import type { ConduitStore } from "./store.js";
@@ -54,6 +59,7 @@ describe("SqliteStore", () => {
         type: "openapi",
         namespace: "petstore",
         location: "https://example.com/openapi.json",
+        generation: 0,
       });
       const loaded = await store.sources.getByNamespace("petstore");
       expect(loaded?.id).toBe("src_1");
@@ -66,6 +72,7 @@ describe("SqliteStore", () => {
         type: "openapi" as const,
         namespace: "petstore",
         location: "https://a",
+        generation: 0,
       };
       await store.sources.upsert(base);
       await store.sources.upsert({ ...base, location: "https://b", baseUrl: "https://api" });
@@ -187,6 +194,9 @@ describe("SqliteStore", () => {
   describe("executions", () => {
     it("claimForResume: exactly one caller wins the paused→running transition", async () => {
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "e",
         code: "",
         status: "paused",
@@ -204,6 +214,9 @@ describe("SqliteStore", () => {
 
     it("claimForResume: returns false when not paused", async () => {
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "e2",
         code: "",
         status: "running",
@@ -222,6 +235,9 @@ describe("SqliteStore", () => {
         expiresAt: Number.MAX_SAFE_INTEGER,
       });
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "e3",
         code: "",
         status: "paused",
@@ -236,6 +252,9 @@ describe("SqliteStore", () => {
       expect(await store.executions.claimForResume("e3", "attempt-2", "call_A")).toBe(true);
       // The program runs on and pauses AGAIN, on a different call.
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "e3",
         code: "",
         status: "paused",
@@ -251,6 +270,9 @@ describe("SqliteStore", () => {
 
     it("INVARIANT §5.5: concurrent claims naming DIFFERENT calls — only the one naming the pending call wins", async () => {
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "e4",
         code: "",
         status: "paused",
@@ -406,6 +428,9 @@ describe("SqliteStore", () => {
 
     it("failClaimedResume is a no-op for a row this caller never claimed (the claim lost)", async () => {
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "e5",
         code: "",
         status: "paused",
@@ -422,6 +447,9 @@ describe("SqliteStore", () => {
 
     it("round-trips executions including pause state and seeds", async () => {
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "exec_1",
         code: "await tools.github.issues.list({})",
         status: "paused",
@@ -437,9 +465,337 @@ describe("SqliteStore", () => {
       });
       const loaded = await store.executions.get("exec_1");
       expect(loaded?.status).toBe("paused");
-      expect(loaded?.seeds.random).toBe(0.42);
+      expect(loaded?.kind === "code" && loaded.seeds.random).toBe(0.42);
       expect(loaded?.pausedOn?.reason).toBe("Policy requires approval");
       expect(loaded && "endedAt" in loaded).toBe(false);
+    });
+
+    it("INVARIANT §4.1 (#19): every new row stores the sentinel in `code` and the program in `program`; hydration reads `program`", async () => {
+      await store.executions.create(codeRow({ id: "e_new", code: "return 42" }));
+      const raw = await client.execute({
+        sql: "SELECT code, program, kind, seeds FROM executions WHERE id = ?",
+        args: ["e_new"],
+      });
+      expect(raw.rows[0]?.code).toBe(NEWER_BUILD_SENTINEL);
+      expect(raw.rows[0]?.program).toBe("return 42");
+      const back = await store.executions.get("e_new");
+      expect(back?.kind === "code" && back.code).toBe("return 42");
+    });
+
+    it("INVARIANT §4.1 (#19): an OLDER build (reads `code` only) gets a program that THROWS — verbatim literal, executed, no tool dispatch", async () => {
+      await store.executions.create(codeRow({ id: "e_c" }));
+      await store.executions.create(directRow({ id: "e_d" }));
+      const legacyView = await client.execute("SELECT id, code FROM executions ORDER BY id");
+      // The literal, not the constant — a non-throwing sentinel would pass a constant comparison.
+      const LITERAL = 'throw new Error("conduit: row written by a newer build")';
+      expect(legacyView.rows.map((r) => r.code)).toEqual([LITERAL, LITERAL]);
+      // Simulate the pre-R1 drive: the sandbox runs `code` with a real tool host that records calls.
+      const calls: string[] = [];
+      const host: ToolHost = {
+        search: async () => [],
+        describe: async () => undefined,
+        call: async (path: string) => {
+          calls.push(path);
+          return {};
+        },
+      };
+      const result = await new QuickJSSandbox().execute({
+        code: String(legacyView.rows[0]?.code),
+        tools: host,
+      });
+      expect(result.status).toBe("failed");
+      expect(result.status === "failed" && result.error.message).toContain("newer build");
+      expect(calls).toEqual([]);
+      const direct = await client.execute({
+        sql: "SELECT program, seeds FROM executions WHERE id = ?",
+        args: ["e_d"],
+      });
+      expect(direct.rows[0]?.program).toBeNull();
+      expect(direct.rows[0]?.seeds).toBe("{}");
+    });
+
+    it("a legacy row (program NULL, kind defaulted) hydrates its program from `code` as today", async () => {
+      await client.execute({
+        sql: "INSERT INTO executions (id, code, status, seeds, started_at) VALUES (?, ?, 'completed', '{\"now\":1,\"random\":0.5}', 1)",
+        args: ["e_old", "return 'old'"],
+      });
+      const row = await store.executions.get("e_old");
+      expect(row?.kind).toBe("code");
+      expect(row?.kind === "code" && row.code).toBe("return 'old'");
+      expect(row?.clientId).toBeNull();
+      expect(row?.projection).toBe("code");
+    });
+
+    it("INVARIANT §9.2: only the three valid (kind, projection) pairs hydrate; a mismatched pair is refused on read and by the fresh CHECK", async () => {
+      await client.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection) VALUES ('legacyish', 'x', 'running', '{}', 0, 'code', 'code')",
+      );
+      await expect(
+        client.execute(
+          "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call) VALUES ('bad', 'x', 'running', '{}', 0, 'direct', 'code', '{\"toolName\":\"a.b\",\"namespace\":\"a\",\"request\":\"{}\"}')",
+        ),
+      ).rejects.toThrow(/check/i);
+      await expect(
+        client.execute(
+          "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection) VALUES ('bad2', 'x', 'running', '{}', 0, 'code', 'discovery')",
+        ),
+      ).rejects.toThrow(/check/i);
+      // A legacy table has no pair CHECK: the read-side guard is the only layer there.
+      const legacy = createClient({ url: ":memory:" });
+      await legacy.execute(`CREATE TABLE executions (
+        id TEXT PRIMARY KEY, code TEXT NOT NULL, status TEXT NOT NULL, seeds TEXT NOT NULL,
+        paused_on TEXT, started_at INTEGER NOT NULL, ended_at INTEGER)`);
+      const legacyStore = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+      await legacy.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call) VALUES ('bad', 'x', 'running', '{}', 0, 'direct', 'code', '{\"toolName\":\"a.b\",\"namespace\":\"a\",\"request\":\"{}\"}')",
+      );
+      await expect(legacyStore.executions.get("bad")).rejects.toThrow(/cannot carry projection/);
+      await legacy.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection) VALUES ('bad2', 'x', 'running', '{}', 0, 'code', 'discovery')",
+      );
+      await expect(legacyStore.executions.get("bad2")).rejects.toThrow(/cannot carry projection/);
+    });
+
+    it("INVARIANT §4.1: the read-side kind guard refuses a row whose kind and direct_call disagree", async () => {
+      await client.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection) VALUES ('bad1', 'x', 'running', '{}', 0, 'direct', 'direct')",
+      );
+      await expect(store.executions.get("bad1")).rejects.toThrow(
+        /kind = 'direct' requires direct_call/,
+      );
+      await client.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call) VALUES ('bad2', 'x', 'running', '{}', 0, 'code', 'code', '{}')",
+      );
+      await expect(store.executions.get("bad2")).rejects.toThrow(
+        /kind = 'code' forbids direct_call/,
+      );
+    });
+
+    it("INVARIANT §4.1 (#41): a completed direct row needs a consistent result_state/result pair", async () => {
+      const insert = (id: string, resultState: string | null, result: string | null) =>
+        client.execute({
+          sql: `INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call, result_state, result)
+                VALUES (?, 'x', 'completed', '{}', 0, 'direct', 'direct', '{"toolName":"a.b","namespace":"a","request":"{}"}', ?, ?)`,
+          args: [id, resultState, result],
+        });
+      await insert("d_null", null, null);
+      await expect(store.executions.get("d_null")).rejects.toThrow(/result_state/);
+      await insert("d_deliv_with_result", "delivered", '{"x":1}');
+      await expect(store.executions.get("d_deliv_with_result")).rejects.toThrow(/result_state/);
+      await insert("d_retained_no_result", "retained", null);
+      await expect(store.executions.get("d_retained_no_result")).rejects.toThrow(/result_state/);
+      await insert("d_ok", "discarded", null);
+      const ok = await store.executions.get("d_ok");
+      expect(ok?.kind === "direct" && ok.resultState).toBe("discarded");
+      expect(ok?.result).toBeUndefined();
+    });
+
+    it("INVARIANT §4.1: the request round-trip property holds through the store", async () => {
+      const input = { b: 1, a: [true, null, "x"], nested: { z: 0, y: "ÿ" } };
+      const request = JSON.stringify(input);
+      await store.executions.create(
+        directRow({
+          id: "d_rt",
+          call: { toolName: "github.issues.list", namespace: "github", request },
+        }),
+      );
+      const back = await store.executions.get("d_rt");
+      const stored = back?.kind === "direct" ? back.call.request : "";
+      expect(stored).toBe(request);
+      expect(JSON.stringify(JSON.parse(stored))).toBe(request);
+    });
+
+    it("INVARIANT §5.3 (#22, store half): settleDirect is fenced on status AND attempt", async () => {
+      await store.executions.create(directRow({ id: "d_f" }), { attempt: "att-1" });
+      expect(
+        await store.executions.settleDirect("d_f", "att-WRONG", {
+          status: "failed",
+          error: { name: "X", message: "m" },
+        }),
+      ).toBe(false);
+      expect((await store.executions.get("d_f"))?.status).toBe("running");
+      expect(
+        await store.executions.settleDirect("d_f", "att-1", {
+          status: "failed",
+          error: { name: "ConduitOutcomeAmbiguous", message: "m" },
+        }),
+      ).toBe(true);
+      // a late completion with the RIGHT attempt still loses: the row is no longer running
+      expect(
+        await store.executions.settleDirect("d_f", "att-1", {
+          status: "completed",
+          resultState: "delivered",
+        }),
+      ).toBe(false);
+      const row = await store.executions.get("d_f");
+      expect(row?.status).toBe("failed");
+      expect(row?.error?.name).toBe("ConduitOutcomeAmbiguous");
+    });
+
+    it("settleDirect paused writes pausedOn and keeps status transitions fenced", async () => {
+      await store.executions.create(directRow({ id: "d_p" }), { attempt: "a" });
+      const pausedOn = {
+        callId: "c",
+        toolName: "github.issues.list",
+        namespace: "github",
+        sourceGeneration: 3,
+        input: {},
+        reason: "r",
+        expiresAt: 9e12,
+      };
+      expect(await store.executions.settleDirect("d_p", "a", { status: "paused", pausedOn })).toBe(
+        true,
+      );
+      expect((await store.executions.get("d_p"))?.pausedOn).toEqual(pausedOn);
+    });
+
+    it("settleDirect expired terminalizes the row and clears paused_on", async () => {
+      await store.executions.create(directRow({ id: "d_x", status: "running" }), { attempt: "a" });
+      expect(await store.executions.settleDirect("d_x", "a", { status: "expired" })).toBe(true);
+      const row = await store.executions.get("d_x");
+      expect(row?.status).toBe("expired");
+      expect(row?.pausedOn).toBeUndefined();
+      expect(row?.endedAt).toBeTypeOf("number");
+    });
+
+    it("INVARIANT §4.1 (D3 sweep): invalidatePaused flips paused rows of BOTH kinds by namespace EQUALITY, returns the count", async () => {
+      await store.executions.create(
+        codeRow({ id: "p_code", status: "paused", pausedOn: pause("github") }),
+      );
+      await store.executions.create(
+        directRow({ id: "p_direct", status: "paused", pausedOn: pause("github") }),
+      );
+      // `_` is a legal namespace char, not a wildcard
+      await store.executions.create(
+        codeRow({ id: "p_other", status: "paused", pausedOn: pause("github_x") }),
+      );
+      await store.executions.create(codeRow({ id: "p_running", status: "running" }));
+      expect(await store.executions.invalidatePaused("github")).toBe(2);
+      for (const id of ["p_code", "p_direct"]) {
+        const row = await store.executions.get(id);
+        expect(row?.status).toBe("failed");
+        expect(row?.error).toEqual({
+          name: "ConduitCatalogChanged",
+          message: "catalog changed — re-approve",
+        });
+        expect(row?.pausedOn).toBeUndefined();
+        expect(row?.endedAt).toBeTypeOf("number");
+      }
+      expect((await store.executions.get("p_other"))?.status).toBe("paused");
+      expect((await store.executions.get("p_running"))?.status).toBe("running");
+    });
+
+    it("§7 crash sweep: a running DIRECT row is listed by id (store half)", async () => {
+      await store.executions.create(directRow({ id: "d_run" }));
+      expect(await store.executions.listRunningIds()).toContain("d_run");
+    });
+
+    it("kindOf answers from the kind column alone, even when the row cannot hydrate", async () => {
+      await client.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call) VALUES ('k_bad', 'x', 'running', '{}', 0, 'direct', 'direct', '{not json')",
+      );
+      await expect(store.executions.get("k_bad")).rejects.toThrow();
+      expect(await store.executions.kindOf("k_bad")).toBe("direct");
+      await store.executions.create(codeRow({ id: "k_code" }));
+      expect(await store.executions.kindOf("k_code")).toBe("code");
+      expect(await store.executions.kindOf("k_missing")).toBeUndefined();
+      // An unrecognized kind is only reachable on a legacy table: the fresh
+      // DDL CHECK refuses it at INSERT.
+      const legacy = createClient({ url: ":memory:" });
+      await legacy.execute(`CREATE TABLE executions (
+        id TEXT PRIMARY KEY, code TEXT NOT NULL, status TEXT NOT NULL, seeds TEXT NOT NULL,
+        paused_on TEXT, started_at INTEGER NOT NULL, ended_at INTEGER)`);
+      const legacyStore = await openSqliteStore({
+        client: legacy,
+        secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+      });
+      await legacy.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, kind) VALUES ('k_bogus', 'x', 'running', '{}', 0, 'bogus')",
+      );
+      expect(await legacyStore.executions.kindOf("k_bogus")).toBeUndefined();
+    });
+
+    it("settleDirect on a CODE row is a no-op (kind fence), even with the right attempt", async () => {
+      await store.executions.create(codeRow({ id: "c_f" }), { attempt: "a" });
+      expect(
+        await store.executions.settleDirect("c_f", "a", {
+          status: "failed",
+          error: { name: "X", message: "m" },
+        }),
+      ).toBe(false);
+      expect((await store.executions.get("c_f"))?.status).toBe("running");
+    });
+
+    it("put never changes resume_attempt", async () => {
+      await store.executions.create(codeRow({ id: "p_k" }), { attempt: "att" });
+      await store.executions.put({
+        ...codeRow({ id: "p_k" }),
+        status: "completed",
+        result: 1,
+      } as Execution);
+      const raw = await client.execute({
+        sql: "SELECT resume_attempt FROM executions WHERE id = ?",
+        args: ["p_k"],
+      });
+      expect(raw.rows[0]?.resume_attempt).toBe("att");
+    });
+
+    it("the read-side guard refuses a malformed direct_call (not JSON, not an object, missing field)", async () => {
+      const insert = (id: string, directCallJson: string) =>
+        client.execute({
+          sql: "INSERT INTO executions (id, code, status, seeds, started_at, kind, projection, direct_call) VALUES (?, 'x', 'running', '{}', 0, 'direct', 'direct', ?)",
+          args: [id, directCallJson],
+        });
+      await insert("m1", "{not json");
+      await expect(store.executions.get("m1")).rejects.toThrow(/direct_call is not valid JSON/);
+      await insert("m2", "[]");
+      await expect(store.executions.get("m2")).rejects.toThrow(/direct_call is malformed/);
+      await insert("m3", '{"toolName":"a.b","namespace":"a"}');
+      await expect(store.executions.get("m3")).rejects.toThrow(/direct_call is malformed/);
+    });
+
+    it("invalidatePaused skips a LEGACY pause (no namespace) and an invalid-JSON pause; both stay paused", async () => {
+      await store.executions.create(
+        codeRow({
+          id: "lp",
+          status: "paused",
+          pausedOn: { callId: "c", toolName: "github.t", input: {}, reason: "r", expiresAt: 9e12 },
+        }),
+      );
+      await client.execute(
+        "INSERT INTO executions (id, code, status, seeds, started_at, paused_on) VALUES ('bad', 'x', 'paused', '{}', 0, '{oops')",
+      );
+      expect(await store.executions.invalidatePaused("github")).toBe(0);
+      expect((await store.executions.get("lp"))?.status).toBe("paused");
+      expect(
+        (await client.execute("SELECT status FROM executions WHERE id = 'bad'")).rows[0]?.status,
+      ).toBe("paused");
+    });
+
+    it("fresh DDL CHECKs refuse an unknown kind, projection, result_state, and trace projection", async () => {
+      await expect(
+        client.execute(
+          "INSERT INTO executions (id, code, status, seeds, started_at, kind) VALUES ('k', 'x', 'running', '{}', 0, 'bogus')",
+        ),
+      ).rejects.toThrow(/check/i);
+      await expect(
+        client.execute(
+          "INSERT INTO executions (id, code, status, seeds, started_at, projection) VALUES ('p', 'x', 'running', '{}', 0, 'bogus')",
+        ),
+      ).rejects.toThrow(/check/i);
+      await expect(
+        client.execute(
+          "INSERT INTO executions (id, code, status, seeds, started_at, result_state) VALUES ('r', 'x', 'running', '{}', 0, 'bogus')",
+        ),
+      ).rejects.toThrow(/check/i);
+      await expect(
+        client.execute(
+          "INSERT INTO trace_events (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at, projection) VALUES ('c','e','a','p','{}','allow',0,'bogus')",
+        ),
+      ).rejects.toThrow(/check/i);
     });
   });
 
@@ -470,6 +826,9 @@ describe("SqliteStore", () => {
     it("round-trips result, error, and requestKey", async () => {
       const store = await openTestStore();
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "exec_a",
         code: "return 1",
         status: "completed",
@@ -483,6 +842,9 @@ describe("SqliteStore", () => {
       expect(a?.result).toEqual({ ok: true });
       expect(a?.requestKey).toBe("key_a");
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "exec_b",
         code: "throw",
         status: "failed",
@@ -497,6 +859,9 @@ describe("SqliteStore", () => {
     it("resolves by requestKey and rejects duplicates", async () => {
       const store = await openTestStore();
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "exec_k1",
         code: "1",
         status: "running",
@@ -504,10 +869,13 @@ describe("SqliteStore", () => {
         startedAt: 1,
         requestKey: "dup",
       });
-      expect((await store.executions.getByRequestKey("dup"))?.id).toBe("exec_k1");
-      expect(await store.executions.getByRequestKey("nope")).toBeUndefined();
+      expect((await store.executions.getByRequestKey("dup", null))?.id).toBe("exec_k1");
+      expect(await store.executions.getByRequestKey("nope", null)).toBeUndefined();
       await expect(
         store.executions.put({
+          kind: "code",
+          clientId: null,
+          projection: "code",
           id: "exec_k2",
           code: "1",
           status: "running",
@@ -521,6 +889,9 @@ describe("SqliteStore", () => {
     it("failClaimedResume records its reason as the error payload", async () => {
       const store = await openTestStore();
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "exec_f",
         code: "1",
         status: "paused",
@@ -537,7 +908,14 @@ describe("SqliteStore", () => {
 
     it("INVARIANT: listPaused returns only paused rows, oldest-first with id tiebreak", async () => {
       const store = await openTestStore();
-      const base = { code: "x", seeds: { now: 1, random: 1 }, startedAt: 0 } as const;
+      const base = {
+        kind: "code",
+        clientId: null,
+        projection: "code",
+        code: "x",
+        seeds: { now: 1, random: 1 },
+        startedAt: 0,
+      } as const;
       const pending = { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9e12 };
       // two paused rows with the SAME startedAt → id tiebreak must order them
       await store.executions.put({
@@ -578,6 +956,9 @@ describe("SqliteStore", () => {
       const store = await openTestStore();
       const big = "x".repeat(900_000); // just under the 1MB output cap
       await store.executions.put({
+        kind: "code",
+        clientId: null,
+        projection: "code",
         id: "exec_big",
         code: "1",
         status: "completed",
@@ -600,6 +981,38 @@ describe("SqliteStore", () => {
         expect(String(Object.values(mode.rows[0] ?? {})[0]).toLowerCase()).toBe("wal");
         const busy = await client.execute("PRAGMA busy_timeout");
         expect(Number(Object.values(busy.rows[0] ?? {})[0])).toBe(5000);
+      });
+
+      it("M5: two simultaneous opens of a legacy db with the R1 columns pending both succeed", async () => {
+        const { url } = await legacyDb();
+        const [a, b] = await Promise.all([
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+          openSqliteStore({ client: createClient({ url }), secretBox: await testSecretBox() }),
+        ]);
+        expect((await a.executions.get("exec_old"))?.kind).toBe("code");
+        expect((await b.executions.get("exec_old"))?.projection).toBe("code");
+        // Assert EVERY R1 retrofit landed exactly once.
+        const probe = createClient({ url });
+        const cols = (await probe.execute("PRAGMA table_info(executions)")).rows.map((r) =>
+          String(r.name),
+        );
+        for (const c of [
+          "kind",
+          "projection",
+          "direct_call",
+          "client_id",
+          "program",
+          "result_state",
+        ]) {
+          expect(cols.filter((n) => n === c)).toHaveLength(1);
+        }
+        const trace = (await probe.execute("PRAGMA table_info(trace_events)")).rows.map((r) =>
+          String(r.name),
+        );
+        expect(trace).toEqual(expect.arrayContaining(["projection", "client_id"]));
+        // Known limit: Promise.all does not force both openers into the
+        // PRAGMA→ALTER window; this is the same shape the shipped M5 tests
+        // use. `tolerateSchemaRace` itself is pinned by those tests.
       });
 
       it("two simultaneous opens of a legacy db both succeed (migration race, M5)", async () => {
@@ -666,6 +1079,8 @@ describe("SqliteStore", () => {
       for (const [i, toolName] of ["a.first", "a.second", "a.third"].entries()) {
         await store.trace.append({
           callId: `call_${i}`,
+          projection: "code",
+          clientId: null,
           executionId: "exec_1",
           toolName,
           connectionPrefix: "a.org.main",
@@ -676,6 +1091,8 @@ describe("SqliteStore", () => {
       }
       await store.trace.append({
         callId: "other",
+        projection: "code",
+        clientId: null,
         executionId: "exec_2",
         toolName: "b.x",
         connectionPrefix: "b.org.main",
@@ -691,6 +1108,8 @@ describe("SqliteStore", () => {
     it("round-trips TraceEvent.outputSummary through the trace table", async () => {
       await store.trace.append({
         callId: "call_out",
+        projection: "code",
+        clientId: null,
         executionId: "exec_out",
         toolName: "a.tool",
         connectionPrefix: "a.org.main",
@@ -708,6 +1127,8 @@ describe("SqliteStore", () => {
     it("omits output on rows that never had one (denied/failed calls)", async () => {
       await store.trace.append({
         callId: "call_denied",
+        projection: "code",
+        clientId: null,
         executionId: "exec_denied",
         toolName: "a.tool",
         connectionPrefix: "a.org.main",
@@ -781,6 +1202,8 @@ describe("SqliteStore", () => {
       // (d) new writes still work and carry no output.
       await reopenedAgain.trace.append({
         callId: "c2",
+        projection: "code",
+        clientId: null,
         executionId: "e1",
         toolName: "github.list_issues",
         connectionPrefix: "p",
@@ -791,6 +1214,27 @@ describe("SqliteStore", () => {
       const events = await reopenedAgain.trace.listByExecution("e1");
       expect(events).toHaveLength(2);
       expect(events.every((event) => !("output" in event))).toBe(true);
+    });
+
+    it("§4.3 (#27 store half): trace rows carry projection and client_id; legacy rows default to code / null", async () => {
+      await store.trace.append({
+        callId: "t1",
+        executionId: "e",
+        toolName: "a.b",
+        connectionPrefix: "p",
+        input: {},
+        policyVerdict: "allow",
+        at: 1,
+        projection: "discovery",
+        clientId: "acme",
+      });
+      await client.execute(
+        "INSERT INTO trace_events (call_id, execution_id, tool_name, connection_prefix, input, policy_verdict, at) VALUES ('t0','e','a.b','p','{}','allow',0)",
+      );
+      // Insertion order is seq order: the R1 append (t1) precedes the raw legacy row (t0).
+      const [r1, legacy] = await store.trace.listByExecution("e");
+      expect([legacy?.projection, legacy?.clientId]).toEqual(["code", null]);
+      expect([r1?.projection, r1?.clientId]).toEqual(["discovery", "acme"]);
     });
   });
 
@@ -1143,7 +1587,13 @@ describe("SqliteStore", () => {
       });
       for (const [i, type] of sourceTypes.entries()) {
         const id = `src_vocab_${i}`;
-        await store.sources.upsert({ id, type, namespace: `vocab${i}`, location: "https://x" });
+        await store.sources.upsert({
+          id,
+          type,
+          namespace: `vocab${i}`,
+          location: "https://x",
+          generation: 0,
+        });
         expect((await store.sources.get(id))?.type).toBe(type);
       }
       const statuses = vocabulary<ExecutionStatus>({
@@ -1156,6 +1606,9 @@ describe("SqliteStore", () => {
       for (const [i, status] of statuses.entries()) {
         const id = `exec_vocab_${i}`;
         await store.executions.put({
+          kind: "code",
+          clientId: null,
+          projection: "code",
           id,
           code: "return 1",
           status,
@@ -1172,6 +1625,8 @@ describe("SqliteStore", () => {
       for (const [i, policyVerdict] of verdicts.entries()) {
         await store.trace.append({
           callId: `call_vocab_${i}`,
+          projection: "code",
+          clientId: null,
           executionId: "exec_vocab_0",
           toolName: "x.search",
           connectionPrefix: "x.acme.prod",
@@ -1505,7 +1960,7 @@ describe("SqliteStore", () => {
 
       await expect(
         store.provisionSource({
-          source: { id: "src_x", type: "mcp", namespace: "x", location: "http://u" },
+          source: { id: "src_x", type: "mcp", namespace: "x", location: "http://u", generation: 0 },
           integration: { id: "int_x", sourceId: "src_x", namespace: "x" },
           connection: {
             id: "conn_x",
@@ -1525,7 +1980,7 @@ describe("SqliteStore", () => {
 
     it("writes the full §5.3 chain in one shot and seeds NO policy rows", async () => {
       await store.provisionSource({
-        source: { id: "src_y", type: "mcp", namespace: "y", location: "http://u" },
+        source: { id: "src_y", type: "mcp", namespace: "y", location: "http://u", generation: 0 },
         integration: { id: "int_y", sourceId: "src_y", namespace: "y" },
         connection: {
           id: "conn_y",
@@ -1551,7 +2006,7 @@ describe("SqliteStore", () => {
 
     it("omits the secrets INSERT when no new secret is provided (connection.credentialRef pre-resolved)", async () => {
       await store.provisionSource({
-        source: { id: "src_z", type: "mcp", namespace: "z", location: "http://u" },
+        source: { id: "src_z", type: "mcp", namespace: "z", location: "http://u", generation: 0 },
         integration: { id: "int_z", sourceId: "src_z", namespace: "z" },
         connection: {
           id: "conn_z",
@@ -1577,7 +2032,7 @@ describe("SqliteStore", () => {
       expect(await store.secrets.reveal("cred_w_old")).toBe("Bearer old-token");
 
       await store.provisionSource({
-        source: { id: "src_w", type: "mcp", namespace: "w", location: "http://u" },
+        source: { id: "src_w", type: "mcp", namespace: "w", location: "http://u", generation: 0 },
         integration: { id: "int_w", sourceId: "src_w", namespace: "w" },
         connection: { id: "conn_w", integrationId: "int_w", prefix: "w.acme.prod" },
         removeSecretRef: "cred_w_old",
@@ -1600,7 +2055,7 @@ describe("SqliteStore", () => {
 
       await expect(
         store.provisionSource({
-          source: { id: "src_v", type: "mcp", namespace: "v", location: "http://u" },
+          source: { id: "src_v", type: "mcp", namespace: "v", location: "http://u", generation: 0 },
           integration: { id: "int_v", sourceId: "src_v", namespace: "v" },
           connection: { id: "conn_v", integrationId: "int_v", prefix: "v.acme.prod" },
           removeSecretRef: "cred_v_old",
@@ -1621,7 +2076,13 @@ describe("SqliteStore", () => {
       });
       await expect(
         store.provisionSource({
-          source: { id: "src_canary1", type: "mcp", namespace: "canary1", location: "http://u" },
+          source: {
+            id: "src_canary1",
+            type: "mcp",
+            namespace: "canary1",
+            location: "http://u",
+            generation: 0,
+          },
           integration: { id: "int_canary1", sourceId: "src_canary1", namespace: "canary1" },
           connection: {
             id: "conn_canary1",
@@ -1643,7 +2104,13 @@ describe("SqliteStore", () => {
     it("INVARIANT §16.3: provisionSource refuses removeSecretRef === CANARY_REF — canary intact", async () => {
       await expect(
         store.provisionSource({
-          source: { id: "src_canary2", type: "mcp", namespace: "canary2", location: "http://u" },
+          source: {
+            id: "src_canary2",
+            type: "mcp",
+            namespace: "canary2",
+            location: "http://u",
+            generation: 0,
+          },
           integration: { id: "int_canary2", sourceId: "src_canary2", namespace: "canary2" },
           connection: {
             id: "conn_canary2",
@@ -1665,7 +2132,7 @@ describe("SqliteStore", () => {
     it("throws when both `secret` and `removeSecretRef` are provided (contract violation)", async () => {
       await expect(
         store.provisionSource({
-          source: { id: "src_u", type: "mcp", namespace: "u", location: "http://u" },
+          source: { id: "src_u", type: "mcp", namespace: "u", location: "http://u", generation: 0 },
           integration: { id: "int_u", sourceId: "src_u", namespace: "u" },
           connection: { id: "conn_u", integrationId: "int_u", prefix: "u.acme.prod" },
           secret: { ref: "cred_u_new", value: "Bearer new" },
