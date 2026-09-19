@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 
-// Interim demo approver (task 9). Opens the store from the same env contract
-// as the bin, composes a manager EXACTLY as packages/mcp/src/server.ts does
+// Interim demo approver. Opens the store from the same env contract as the
+// bin, composes a manager EXACTLY as packages/mcp/src/server.ts does
 // (per-call: fresh catalog snapshot, fresh invoker factory wired to the
 // decisions seam), and resumes one paused execution with an approve
-// decision. Task 10's ring-2 suite execs this file as its cross-process
-// approver — the argv/exit/stdio contract below is load-bearing, not
-// incidental.
+// decision. The ring-2 suite execs this file as its cross-process approver —
+// the argv/exit/stdio contract below is load-bearing, not incidental.
 //
 // Usage: node scripts/approve-demo.mjs <executionId> <callId>
 // stdout: NOTHING, ever.
 // stderr: the outcome status line (or the failure reason).
-// exit 0: resume settled (completed / paused / expired).
-// exit 1: resume could not settle as approved (conflict / failed) or threw.
+// exit 0: the approve decision was APPLIED — the pending call ran.
+// exit 1: anything else. `conflict`, `failed`, `unknown`, and a resume that
+//         settled without applying the decision (`paused` on a later call,
+//         `expired`) all mean the call this run was asked to approve did not
+//         run, so none of them is a success.
 
 import { createRequire } from "node:module";
 import { ensureDbDir, resolveEnv } from "../packages/mcp/dist/index.js";
@@ -99,14 +101,14 @@ async function main() {
   const outcome = await manager.resume(executionId, { kind: "approve" }, callId);
   console.error(`[ApproveDemo] outcome: ${outcome.status}`);
 
-  // D-A11 final: `unknown` is NOT success. The resume drove the call but its
+  // D-A11: `unknown` is NOT success. The resume drove the call but its
   // settle write is not durable, so the call may or may not have landed — the
   // one thing that must never happen is a retry. Mirrors the CLI's unknown
   // arm: no landed verb, a non-zero exit, and an instruction to re-list.
   if (outcome.status === "unknown") {
     console.error(
       `[ApproveDemo] The outcome of this approval is UNKNOWN: the execution was driven but ` +
-        `its result could not be durably recorded (${outcome.reason ?? "unreported"}), so the ` +
+        `its result could not be durably recorded (${outcome.reason}), so the ` +
         `call may or may not have completed. Do NOT retry it — re-list the approvals, or use ` +
         `the "check_execution" tool on execution ${executionId}, to see what actually landed.`,
     );

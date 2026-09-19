@@ -36,8 +36,8 @@ import type { UpstreamSessionScope } from "./upstream-session.js";
  * unknown, or out-of-scope tool never engages the connection or credential
  * machinery. The deadline gate sits after the last unbounded store read and
  * before credentials, so a continuation stalled on a read never holds live
- * credential material (codex #7, F2); a final gate inside the caller's
- * `beforeSend` covers the awaits that follow (codex #2).
+ * credential material; a final gate inside the caller's
+ * `beforeSend` covers the awaits that follow.
  *
  * Every failure is classified at this boundary (pipeline/errors.ts): only
  * the four guest-safe names cross into the sandbox. An outermost catch
@@ -206,7 +206,7 @@ async function runCall(
   // denial name — which would also mis-drive §5.5 replay stripping.
   if (tool === undefined) {
     // The GUEST-VISIBLE refusal for an out-of-scope tool is byte-identical to
-    // the unknown-tool refusal (I3, controller ruling). Search and describe
+    // the unknown-tool refusal (controller ruling). Search and describe
     // already make the two indistinguishable; a CALL that said "outside this
     // client's scope" was an EXISTENCE ORACLE — a probing client learned the
     // tool exists and only its grant is missing. Both now produce the same
@@ -257,7 +257,7 @@ async function runCall(
     throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
   });
 
-  // 4. Source read — the LAST unbounded store read before the wire (codex #7,
+  // 4. Source read — the LAST unbounded store read before the wire
   //    F2). It comes before the deadline gate so a continuation that stalls
   //    here has its budget re-read afterwards, not before.
   const source = await deps.store.sources.getByNamespace(tool.namespace).catch((cause) => {
@@ -303,7 +303,7 @@ async function runCall(
       auth,
       timeoutMs,
       dispatch,
-      // The pre-write gate (codex #2): the checks above still precede egress
+      // The pre-write gate: the checks above still precede egress
       // pre-flight and the session handshake, both of which await. The caller
       // re-reads this immediately before the body write.
       ...(options.deadline !== undefined ? { deadline: options.deadline } : {}),

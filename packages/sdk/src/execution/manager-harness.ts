@@ -20,8 +20,8 @@ import { createInMemoryApprovalDecisions } from "./decisions.js";
 import type { ExecutionManagerDeps } from "./manager.js";
 
 /**
- * The shared §5.5 manager test harness (F13): extracted from manager.test.ts so
- * Tasks 9–11 compose the SAME real stack — an MCP source normalized → persisted
+ * The shared §5.5 manager test harness: one place where the suites compose
+ * the SAME real stack — an MCP source normalized → persisted
  * to SQLite → catalog rehydrated → policy + credential resolver + QuickJS
  * sandbox wired through the real §5.3 pipeline against a loopback node:http MCP
  * server. Nothing in the call path is a stand-in.
@@ -241,7 +241,7 @@ export async function makeHarness(options?: MakeHarnessOptions): Promise<Harness
   const credentials = createStoreCredentialResolver(store.secrets);
   const realUpstream = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
   // Optionally record the per-call timeout the invoker computes, to prove the
-  // §16 wall-clock budget actually clamps it (F1) — not just that a deadline
+  // §16 wall-clock budget actually clamps it — not just that a deadline
   // was supplied.
   const upstream: typeof realUpstream = options?.recordTimeout
     ? {

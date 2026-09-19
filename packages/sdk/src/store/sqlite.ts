@@ -139,7 +139,7 @@ const SCHEMA = [
   // §4.1: a named client's request key lives here, never in
   // executions.request_key — the PK namespaces the key by client, so two
   // clients may reuse one key string and a default-profile (NULL client)
-  // key can never collide with a named one. The index on execution_id
+  // key can never collide with a named one. The index on execution_id below
   // serves the LEFT JOIN every execution read performs (eng review D9);
   // without it that join scans this append-only table.
   `CREATE TABLE IF NOT EXISTS request_keys (
@@ -148,7 +148,7 @@ const SCHEMA = [
     execution_id TEXT NOT NULL,
     PRIMARY KEY (client_id, key)
   )`,
-  // UNIQUE (M3): one execution has at most ONE request key. The PK already
+  // UNIQUE: one execution has at most ONE request key. The PK already
   // stops two executions sharing a (client, key); this stops one execution
   // collecting two keys, which the LEFT JOIN above would fan out into
   // duplicate rows for a single execution read. It also still serves that
@@ -255,7 +255,7 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
 
   await client.batch(SCHEMA, "write");
 
-  // M3: `request_keys_execution` shipped PLAIN and is now UNIQUE. The
+  // `request_keys_execution` shipped PLAIN and is now UNIQUE. The
   // statement above cannot perform that upgrade — `CREATE UNIQUE INDEX IF NOT
   // EXISTS` is a silent no-op when an index of that NAME already exists,
   // whatever its uniqueness — so an R1 database created before this change
@@ -778,7 +778,7 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         // admit. A present-but-
         // unmatchable callId (a JSON number, `""`) would otherwise fall
         // through to the equality arm, never match, and strand the row
-        // listed-but-undecidable (codex review, 2026-09-11).
+        // listed-but-undecidable.
         //
         // A CASE, not an OR chain: SQLite documents lazy evaluation for
         // CASE only, and `json_extract` on invalid JSON throws — so the
@@ -1500,6 +1500,9 @@ function executionWriteColumns(execution: Execution): {
       }
     : {
         code: NEWER_BUILD_SENTINEL,
+        // FILLER for a NOT NULL column. A direct row has no seeds — there is
+        // no program to replay — and this value is never read back: hydration
+        // parses `seeds` only on the code arm.
         seeds: "{}",
         program: null,
         directCall: JSON.stringify(execution.call),
@@ -1598,7 +1601,7 @@ function hydrateExecutionRow(row: Row, id: string): Execution {
       executionReadError("error is not valid JSON", cause),
     ) as ExecutionError;
   }
-  // The legacy column first, then the named join column Task 3 adds.
+  // The legacy column first, then the named join column.
   const requestKey = maybeText(row, "request_key") ?? maybeText(row, "named_request_key");
   if (requestKey !== undefined) {
     base.requestKey = requestKey;

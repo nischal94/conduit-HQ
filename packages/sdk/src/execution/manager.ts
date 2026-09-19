@@ -246,7 +246,7 @@ export interface ExecutionManagerDeps {
     clientId: string | null;
     /** The resolver bound to the drive's client id; absent = default profile (D-A3). */
     scope?: () => Promise<EffectiveScope>;
-    /** §5.5: a direct drive's one cell (Task 10). */
+    /** §5.5: a direct drive's one cell. */
     dispatch?: DispatchCell;
   }) => ToolInvoker;
   /**
@@ -708,7 +708,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
    * `captured.ambiguous` (see appendBarrier), needing no cross-drive marker.
    */
   async function drive(
-    // Code rows only: the direct arm is a separate drive (Task 10).
+    // Code rows only: the direct arm is a separate drive.
     execution: Extract<Execution, { kind: "code" }>,
     invoke: ToolInvoker,
     prefix: readonly JournalEntry[],
@@ -894,7 +894,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   //                    │                  could have dispatched). If create()
   //                    │                  later SUCCEEDS, startDirect's
   //                    │                  post-create branch re-issues the
-  //                    │                  SAME fenced timeout settle (F3).
+  //                    │                  SAME fenced timeout settle.
   //                    │ no
   //                    ▼
   //     settleDirect(id, attempt, settle)  ← the FENCE:
@@ -925,7 +925,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   //     via guardExpiry                             its own outcome    outcome — never a
   //                                                                    second write
   //
-  // THE HANDOVER (I2), the one exit that is neither of the two above. After
+  // THE HANDOVER, the one exit that is neither of the two above. After
   // the LAST guard read (`policies.get`) the resume path stops guarding and
   // hands the drive to `runDirect`. `raceGuard` answers "not expired"
   // whenever the READ wins — including when the budget elapsed DURING it and
@@ -974,7 +974,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   // may have performed the call"); otherwise ConduitExecutionInterrupted
   // ("did not run").
   //
-  // ORDERING RULE (codex #6): every UNBOUNDED read a settle needs happens
+  // ORDERING RULE: every UNBOUNDED read a settle needs happens
   // BEFORE `settle()` is taken — the pause path's `getGeneration`, the
   // create-conflict lookup — so a stalled read cannot hold the latch and
   // deny the timer its chance to answer.
@@ -1015,7 +1015,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   }
 
   /**
-   * Bounded settle (both direct paths — D-A11 final): the intended outcome is
+   * Bounded settle (both direct paths — D-A11): the intended outcome is
    * published ONLY when the fenced write returned true. `false` means the
    * fence lost — on a persisted row the latch guarantees ONE caller per
    * drive, so a 0-row result means the row is not `running` under this
@@ -1152,7 +1152,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         });
       } catch (cause) {
         if (!drive.settle()) return;
-        // M2: the STORED reason is opaque too. A prep-window fault here can
+        // The STORED reason is opaque too. A prep-window fault here can
         // carry host-only detail (a database path, an upstream body) and the
         // stored row is handed back to the agent by `check_execution`. The
         // cause goes to the daemon log under a fresh reference; only the
@@ -1209,7 +1209,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       if (cause instanceof Error && cause.name === GUEST_ERROR_NAMES.policyDenied) {
         if (run.decisions === undefined) {
           // §5.4 startDirect step 5: pause. The generation read is UNBOUNDED,
-          // so it runs BEFORE the latch (codex #6) — the timer can still
+          // so it runs BEFORE the latch — the timer can still
           // settle the row while it stalls — and immediately before the
           // write, as the spec requires.
           const namespace = execution.call.namespace;
@@ -1291,7 +1291,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     async start(code, opts) {
       const clientId = opts?.clientId ?? null;
       if (clientId !== null && opts?.scope === undefined) {
-        // D11 / codex #1: a NAMED client without a resolver has no authority
+        // D11: a NAMED client without a resolver has no authority
         // to run under — the unscoped path is the DEFAULT profile's alone.
         // Refused BEFORE `create`, so no row is written.
         throw new Error(
@@ -1313,7 +1313,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       try {
         await deps.store.executions.create(execution);
       } catch (cause) {
-        // mcp design M1: requestKey is persisted BEFORE the sandbox runs, so a
+        // requestKey is persisted BEFORE the sandbox runs, so a
         // duplicate key is caught here as a UNIQUE constraint violation —
         // never a second execution. D-A12: the ONE conflict mapper, shared
         // with startDirect; no inline copy of either marker string here.
@@ -1327,7 +1327,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // `drive` takes over must terminalize the row on a throw, or it strands
       // `running` forever (§6 state machine: running must reach a terminal).
       // `makeUpstreamSession()` — or the `randomBytes` inside the default scope
-      // factory — can throw; it must be INSIDE this guard, not before it (F-5).
+      // factory — can throw; it must be INSIDE this guard, not before it.
       let upstreamSession: UpstreamSessionScope;
       try {
         upstreamSession = makeUpstreamSession();
@@ -1507,7 +1507,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           return;
         }
         if (run.drive.settled) {
-          // F3: the timer fired while create() was in flight and its fenced
+          // The timer fired while create() was in flight and its fenced
           // settle hit 0 rows. The row now exists `running`; re-issue the
           // SAME timeout settle (fenced on this attempt) so it cannot linger
           // for the crash sweep to relabel, and never run the pipeline on a
@@ -1725,7 +1725,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
        * (which takes it on the caller's behalf). Everything else goes through
        * `terminalizeDirect`.
        *
-       * Task 9 handover: the direct row's guard terminalizations must NOT use
+       * The direct row's guard terminalizations must NOT use
        * the unbounded, unfenced `failClaimedResume`. This writes the same
        * terminal state through the ONE bounded fenced settle, and reports
        * `unknown` rather than claiming a terminal the store may not have
@@ -1768,7 +1768,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
        * THE latch rule for the resume path, in ONE place: **take the latch, or
        * defer to whoever holds it.**
        *
-       * Arming `onExpire` (fix round 1) made a previously-dead race live. The
+       * Arming `onExpire` made a previously-dead race live. The
        * budget can elapse just before a slow-but-returning guard read
        * resolves: the timer callback has then already taken the latch and
        * started its write, and a guard terminalization that wrote anyway
@@ -1793,7 +1793,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // written). Publish ITS outcome; never write a second time.
           return guardExpiry;
         }
-        // M1 / D-A2: `settleEarly` (not `finishEarly`) — the row is decided,
+        // D-A2: `settleEarly` (not `finishEarly`) — the row is decided,
         // so `settledAt` resolves and retention starts, but `finished` waits
         // on the settle write below, which is still live work.
         drive.settleEarly();
@@ -1940,7 +1940,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             name: errorName,
             message: `[ExecutionManager] ${reason}. Context: { executionId: ${executionId} }`,
           };
-          // Task 9 handover: a DIRECT row's terminalization is the bounded
+          // A DIRECT row's terminalization is the bounded
           // fenced settle, never the unbounded unfenced `failClaimedResume`.
           if (directDrive !== undefined) {
             const settled = await terminalizeDirect(
@@ -2070,7 +2070,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           );
           const gotPolicy = await raceGuard(deps.store.policies.get(execution.call.toolName));
           if (gotPolicy.expired) return gotPolicy.outcome;
-          // I2: `raceGuard` answers "not expired" whenever the READ wins the
+          // `raceGuard` answers "not expired" whenever the READ wins the
           // race — including when the budget elapsed during it and the expiry
           // has already taken the latch with its write still in flight. The
           // handover below hands the drive to `runDirect`, whose first
@@ -2173,7 +2173,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             .finally(() => directDrive.dispose());
           directDrive.resolveFinished(finishedRun);
           directDrive.resolveSettledAt(settledAt);
-          // D-A11 final: may be `unknown` (persist-timeout / persist-failed).
+          // D-A11: may be `unknown` (persist-timeout / persist-failed).
           const settled = await outcome;
           return { ...settled, decisionApplied: decisions.consumed(executionId) };
         }
@@ -2188,7 +2188,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // DEFERRED: process-crash recovery of a `running` execution (design
         // D8/F5). An earlier revision wrote an attempt marker before each live
         // upstream call so a resume could detect a "fired-but-unjournaled" side
-        // effect. It was removed (Codex pass-4 P1) because it delivered no
+        // effect. It was removed because it delivered no
         // reachable in-scope guarantee: a marker is only read on this
         // PAUSED-recovery path, but a genuine host crash mid-call leaves the row
         // `running` (start persists running then drives; the claim above flips
@@ -2218,7 +2218,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // un-journaled call → runs live via the decision seam (allow), or
         // resolves ConduitPolicyBlocked (deny). Continue to completed / failed /
         // next pause. drive() owns terminalization from here on.
-        // Task 9 routes by kind here; R1's shipped resume drives code rows only.
+        // Routed by kind here; R1's shipped resume drives code rows only.
         const running: Extract<Execution, { kind: "code" }> = {
           ...(execution as Extract<Execution, { kind: "code" }>),
           status: "running",
@@ -2285,7 +2285,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         const ref = crypto.randomUUID();
         console.error(`[ExecutionManager] resume preparation failed ${ref}: ${String(cause)}`);
         if (directDrive !== undefined) {
-          // Task 9 handover: the prep-window catch for a DIRECT row settles
+          // The prep-window catch for a DIRECT row settles
           // through the ONE bounded fenced write, not `failClaimedResume` and
           // not an unbounded `settleDirect` — a stalled store here would
           // otherwise hang `resume()` past every budget. Best effort: the

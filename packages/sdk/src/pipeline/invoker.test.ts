@@ -1071,7 +1071,7 @@ describe("§7 post-dispatch classification", () => {
     expect(cell.state).toBe("dispatched"); // F6: would read "none" if the invoker minted its own cell
   });
 
-  it("INVARIANT §5.3 (F2): the budget is re-checked AFTER the source read — a stall there never dispatches once the budget is gone", async () => {
+  it("INVARIANT §5.3: the budget is re-checked AFTER the source read — a stall there never dispatches once the budget is gone", async () => {
     let remaining = 100;
     const slowSources: ConduitStore = {
       ...store,

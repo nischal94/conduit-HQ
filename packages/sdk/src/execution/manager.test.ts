@@ -2061,7 +2061,7 @@ describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
     expect(active.calls).toHaveLength(1);
   });
 
-  it("D11 (codex #1): start with a NAMED client and no resolver is refused before any row is written", async () => {
+  it("D11: start with a NAMED client and no resolver is refused before any row is written", async () => {
     active = await makeHarness();
     const m = createExecutionManager(active.deps);
     await expect(m.start("return 1", { clientId: "acme" })).rejects.toThrow(
@@ -2415,7 +2415,7 @@ describe("INVARIANT §5.4 (#50): post-claim read-side guard, one test per dispos
     });
   });
 
-  it("D11 (codex #1): a NAMED row resumed with no resolver fails closed — never the default profile, never an unscoped drive", async () => {
+  it("D11: a NAMED row resumed with no resolver fails closed — never the default profile, never an unscoped drive", async () => {
     const gen = await currentGen();
     await store.executions.create(
       codeRow({
@@ -2894,7 +2894,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     });
   });
 
-  it("D-A11 final: on RESUME a stalled settle write yields unknown/persist-timeout within budget, with decisionApplied", async () => {
+  it("D-A11: on RESUME a stalled settle write yields unknown/persist-timeout within budget, with decisionApplied", async () => {
     active = await makeHarness();
     let release!: () => void;
     const gate = new Promise<void>((r) => {
@@ -2917,7 +2917,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       },
     } as ConduitStore;
     const slowM = createExecutionManager({ ...active.deps, store: slowSettle, direct: fast });
-    // REAL CLOCK, deliberately (fix round 1, finding 3): this test drives a
+    // REAL CLOCK, deliberately: this test drives a
     // real `resume()` whose approved call crosses the harness's loopback MCP
     // socket. Under `vi.useFakeTimers` that path deadlocks — verified: the
     // test times out at 5 s with the clock frozen. So the budget stays real
@@ -2947,7 +2947,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     });
   });
 
-  it("INVARIANT §5.3 (F2): a source read that outlives the budget never dispatches — the row settles pre-dispatch and the upstream sees nothing", async () => {
+  it("INVARIANT §5.3: a source read that outlives the budget never dispatches — the row settles pre-dispatch and the upstream sees nothing", async () => {
     active = await makeHarness();
     // The stall must sit on the read the INVOKER makes (the manager itself
     // performs no source read on this path), so stub the invoker to await it.
@@ -3112,7 +3112,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("INVARIANT §5.3 (#45): a create rejection whose CONFLICT LOOKUP also rejects still answers — outcome, retention and finished all settle", async () => {
-    // NOTE (fix round 1, finding 4): this pins the create-rejection BRANCH,
+    // NOTE: this pins the create-rejection BRANCH,
     // not the `finished.finally` backstop. `mapCreateConflict` is wrapped in
     // `.catch(() => undefined)`, so this path always reaches `settle()` and
     // publishes `failed` itself; deleting the backstop leaves this test
@@ -3178,7 +3178,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("INVARIANT §4.1 (#25): a requestKey collision NEVER crosses clients — client B's same key sees its own row, not client A's", async () => {
-    // Task 8 handover: `mapCreateConflict`'s isolation rests on the caller
+    // `mapCreateConflict`'s isolation rests on the caller
     // threading ITS OWN clientId into `getByRequestKey`. If startDirect
     // passed `null` (or another client's id), A's execution id would leak to
     // B as a `conflict` payload.
@@ -3220,7 +3220,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     ]);
   });
 
-  it("Task 9 handover: a DIRECT row's guard terminalization uses the bounded FENCED settle, not failClaimedResume", async () => {
+  it("a DIRECT row's guard terminalization uses the bounded FENCED settle, not failClaimedResume", async () => {
     active = await makeHarness();
     const m = createExecutionManager({ ...active.deps, direct: fast });
     const paused = await m.startDirect(
@@ -3268,7 +3268,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("INVARIANT §5.3 (#22/#28, latch): expiry holds the latch, so a LATE guard result defers to it — exactly one settleDirect, and never a false persist-failed", async () => {
-    // Fix round 2. Arming `onExpire` made this race live: the budget elapses
+    // Arming `onExpire` made this race live: the budget elapses
     // just BEFORE a slow-but-returning guard read resolves. The timer has
     // taken the latch and its write is landing; the guard must defer, not
     // issue a second `settleDirect` and then read its own `fenced` (0 rows)
@@ -3359,7 +3359,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("INVARIANT §5.3 (guard-phase expiry): a guard READ that never returns still answers within the drive budget and terminalizes the claimed row", async () => {
-    // Fix round 1, finding 1. Every §5.4 guard read is unbounded. Before the
+    // Every §5.4 guard read is unbounded. Before the
     // fix the drive's timer fired into an UNASSIGNED `onExpire`, so a stalled
     // guard read left the row `running` forever and `resume()` never settled.
     active = await makeHarness();
@@ -3378,7 +3378,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       tools: { ...active.store.tools, get: () => never },
     } as ConduitStore;
     const stuckM = createExecutionManager({ ...active.deps, store: stuckGuard, direct: fast });
-    // REAL CLOCK, deliberately (fix round 1, finding 3): this test's path
+    // REAL CLOCK, deliberately: this test's path
     // crosses the harness's loopback MCP socket — here in the SETUP, which
     // provisions the source and drives the initial `startDirect` to a pause
     // (the guard terminalizes before any approved call runs). Under
@@ -3405,8 +3405,8 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
-  it("INVARIANT §5.3 (#28, I1): a FROZEN injected clock cannot re-open the budget after the timer settled — zero upstream calls", async () => {
-    // I1, manager half. `deadline()` subtracted an injected `now()` while the
+  it("INVARIANT §5.3 (#28): a FROZEN injected clock cannot re-open the budget after the timer settled — zero upstream calls", async () => {
+    // `deadline()` subtracted an injected `now()` while the
     // budget timer ran on `setTimeout`. With `now` frozen, the timer still
     // fires and publishes "elapsed before dispatch" — but an un-latched
     // `deadline()` kept reporting the FULL budget, so the invoker's pre-write
@@ -3462,8 +3462,8 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
-  it("INVARIANT §5.3 (#45, M1): `finished` stays PENDING while the settle write is still open — D-A2 cleanup means the work has actually stopped", async () => {
-    // M1 / D-A2. `finished` is the CLEANUP promise the spec ties the admission
+  it("INVARIANT §5.3 (#45): `finished` stays PENDING while the settle write is still open — D-A2 cleanup means the work has actually stopped", async () => {
+    // D-A2. `finished` is the CLEANUP promise the spec ties the admission
     // slot to: "the slot is held until the drive SETTLES … resources are held
     // until the work has actually stopped". A tracked settle write still in
     // flight IS live work, so resolving `finished` before it lands would let
@@ -3532,7 +3532,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(out).toMatchObject({ status: "failed", error: { name: "ConduitCatalogChanged" } });
   });
 
-  it("INVARIANT §5.3 (#28, I4): a stalled kindOf after the claim still answers within budget — the row is never stranded running", async () => {
+  it("INVARIANT §5.3 (#28): a stalled kindOf after the claim still answers within budget — the row is never stranded running", async () => {
     // I4. `kindOf` runs AFTER `claimForResume` flipped the row to `running`
     // and BEFORE any drive (and therefore any timer) exists — it is the one
     // post-claim read nothing bounds. A store that never answers there left
@@ -3569,7 +3569,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
-  it("INVARIANT §5.3 (#45, I4b): a stalled kindOf whose fallback WRITE also stalls still answers within budget", async () => {
+  it("INVARIANT §5.3 (#45): a stalled kindOf whose fallback WRITE also stalls still answers within budget", async () => {
     // I4b. The `kindOf`-timeout branch exists because the store is
     // unresponsive — so its own fallback `failClaimedResume` cannot be
     // assumed responsive either. Unbounded, a store stalled across the
@@ -3608,8 +3608,8 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout" });
   });
 
-  it("INVARIANT §5.3 (#28, I2): a guard read returning AFTER the expiry took the latch still settles resume() — never hangs", async () => {
-    // I2, REPRODUCED. The `policies.get` race sits between the last
+  it("INVARIANT §5.3 (#28): a guard read returning AFTER the expiry took the latch still settles resume() — never hangs", async () => {
+    // The `policies.get` race sits between the last
     // `raceGuard` and `runDirect`. Sequence: the budget elapses during that
     // read; the expiry takes the latch and its write is in flight; the read
     // then returns, so `raceGuard` reports NOT expired; handover runs
@@ -3694,8 +3694,8 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
   });
 
-  it("INVARIANT §5.3 (finding 2): a prep-window fault whose fenced settle STALLS still returns within budget, never hangs resume()", async () => {
-    // Fix round 1, finding 2. The prep-window catch awaited `settleDirect`
+  it("INVARIANT §5.3: a prep-window fault whose fenced settle STALLS still returns within budget, never hangs resume()", async () => {
+    // The prep-window catch awaited `settleDirect`
     // with no timeout: a stalled store hung `resume()` past every budget.
     active = await makeHarness();
     const m = createExecutionManager({ ...active.deps, direct: fast });
@@ -3718,7 +3718,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       },
     } as ConduitStore;
     const hostileM = createExecutionManager({ ...active.deps, store: hostile, direct: fast });
-    // REAL CLOCK, deliberately (fix round 1, finding 3): this test's path
+    // REAL CLOCK, deliberately: this test's path
     // crosses the harness's loopback MCP socket — here in the SETUP, which
     // provisions the source and drives the initial `startDirect` to a pause
     // (the guard terminalizes before any approved call runs). Under
@@ -3740,7 +3740,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
   });
 
-  it("Task 9 handover: a direct row's guard terminalization whose fenced write STALLS reports unknown, never a claimed terminal", async () => {
+  it("a direct row's guard terminalization whose fenced write STALLS reports unknown, never a claimed terminal", async () => {
     active = await makeHarness();
     const m = createExecutionManager({ ...active.deps, direct: fast });
     const paused = await m.startDirect(

@@ -66,7 +66,7 @@ const DENY_ALL: EffectiveScope = {
  * The default profile, read fresh from the store on every call (D-A3). The
  * default profile is the UNNAMED one: for any non-null clientId this resolver
  * answers DENY_ALL — D11 must hold inside the function, not only at its call
- * sites. Narrow parameter so a `{ tools: { list } }` stub satisfies it (F10a).
+ * sites. Narrow parameter so a `{ tools: { list } }` stub satisfies it.
  */
 export function defaultScopeResolver(store: {
   tools: Pick<ToolRepository, "list">;

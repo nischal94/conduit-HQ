@@ -316,7 +316,7 @@ export async function runDecide(
   // failure, or pause on a new approval; in every case the deny itself
   // succeeded, so report "denied" (exit 0) plus one informational line about
   // what the drive then did.
-  // D-A11 final: the direct arm's `unknown` is the §5-ambiguity again, now
+  // D-A11: the direct arm's `unknown` is the §5-ambiguity again, now
   // from the OTHER side — the resume drove, but its settle write is not
   // durable, so the verb may or may not have landed. Treated exactly as the
   // IPC outcome-unknown branch above: no verb line, a non-zero exit, and an
@@ -326,7 +326,7 @@ export async function runDecide(
   if (outcome.status === "unknown") {
     deps.stderr(
       `[conduit approvals] The outcome of this ${kind} is UNKNOWN: the execution was driven but ` +
-        `its result could not be durably recorded (${outcome.reason ?? "unreported"}), so the ` +
+        `its result could not be durably recorded (${outcome.reason}), so the ` +
         `call may or may not have completed. Do NOT retry it — run "conduit approvals list", or ` +
         `use the "check_execution" tool on execution ${executionId}, to see what actually landed.\n`,
     );

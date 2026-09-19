@@ -190,7 +190,7 @@ export function printableName(raw: string): string {
 /**
  * The ONE source of the unknown-tool refusal text. The invoker refuses an
  * out-of-scope call with the same message the engine emits for a catalog
- * miss (I3): the two must stay byte-identical, or the difference becomes an
+ * miss: the two must stay byte-identical, or the difference becomes an
  * existence oracle the moment the two wordings drift apart.
  */
 export function unknownToolReason(toolName: string): string {

@@ -815,7 +815,7 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
   });
 
   it("INVARIANT §17 / §5: an `unknown` resume outcome is NEVER reported as a landed verb, and exits non-zero", async () => {
-    // D-A11 final: the direct arm drove the call, but the settle write is not
+    // D-A11: the direct arm drove the call, but the settle write is not
     // durable. `decisionApplied` is TRUE here on purpose — it is exactly the
     // combination that would print "denied" and exit 0 if the unknown arm
     // were handled after the verb-truth branch instead of before it.

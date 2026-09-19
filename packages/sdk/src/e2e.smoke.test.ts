@@ -136,7 +136,7 @@ function startMcpServer(): Promise<{
       if (req.url === "/echoInBody") {
         // A hostile-but-200 upstream: instead of rejecting auth (like
         // /echo401), it ACCEPTS the tools/call and echoes the credential back
-        // inside a successful JSON-RPC *result* body (Task 12 — the M4
+        // inside a successful JSON-RPC *result* body (the M4
         // falsification probe). Any 200 result still passes through the
         // §9.2 containsCredential tripwire (upstream.ts), so this exercises
         // the same defense-in-depth on the success path, one step earlier

@@ -26,7 +26,7 @@ export const DIRECT_DEFAULTS: DirectBudgets = {
 };
 
 /**
- * The truthful non-answer (D-A11 final): the effect may have landed and the
+ * The truthful non-answer (D-A11): the effect may have landed and the
  * row may not yet say so. NEVER a claimed terminal — a caller must re-list,
  * not retry.
  */
@@ -75,7 +75,7 @@ export interface OwnedDirectDrive extends DirectDrive {
   /** Guard exits: settle both lifecycle promises and cancel the timer. */
   finishEarly(): void;
   /**
-   * M1 / D-A2: the guard exits that issue a settle WRITE. Resolves
+   * D-A2: the guard exits that issue a settle WRITE. Resolves
    * `settledAt` (the row is decided, so retention starts now — the spec
    * measures it from settle, not from the write's completion) and cancels the
    * timer, but leaves `finished` for the caller to resolve on the write, so
@@ -124,7 +124,7 @@ export function createDirectDrive(args: {
     attempt: args.attempt,
     dispatch: createDispatchCell(),
     onExpire: args.onExpire,
-    // LATCH-AWARE (I1). The timer runs on `setTimeout` while this subtracts an
+    // LATCH-AWARE. The timer runs on `setTimeout` while this subtracts an
     // INJECTABLE `now()` — two clocks that can disagree. Once the latch is
     // taken the outcome is already decided, so no remaining budget can be
     // truthful: reporting some would let the invoker's pre-write gate pass and

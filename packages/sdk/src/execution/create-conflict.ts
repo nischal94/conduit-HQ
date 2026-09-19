@@ -15,7 +15,7 @@ const UNIQUE_MARKERS = [
 
 /**
  * Maps a failed `executions.create` to a `conflict` outcome when the cause is
- * the request-key uniqueness rule (M1): default profile → the legacy column's
+ * the request-key uniqueness rule: default profile → the legacy column's
  * unique index; named client → the request_keys primary key. Returns undefined
  * for any other cause so the caller rethrows it.
  *

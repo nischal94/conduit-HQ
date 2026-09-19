@@ -85,6 +85,8 @@ describe("SqliteStore", () => {
       expect(stored).not.toBe(7);
       expect((await store.sources.get("src_gen"))?.generation).toBe(stored);
       expect((await store.sources.getByNamespace("gen"))?.generation).toBe(stored);
+      // `.every` is vacuously true on an empty list — assert there IS a row.
+      expect(await store.sources.list()).toHaveLength(1);
       expect((await store.sources.list()).every((s) => s.generation === stored)).toBe(true);
     });
 
@@ -910,7 +912,7 @@ describe("SqliteStore", () => {
       ).toBe(1);
     });
 
-    it("INVARIANT §4.1 (M3): one execution carries at most ONE request key — a second row is refused", async () => {
+    it("INVARIANT §4.1: one execution carries at most ONE request key — a second row is refused", async () => {
       // The PK (client_id, key) stops two executions sharing a key; this
       // stops ONE execution collecting two, which the hydrating LEFT JOIN
       // would fan out into duplicate rows for a single execution read.
@@ -948,7 +950,7 @@ describe("SqliteStore", () => {
       return { url, client };
     }
 
-    it("INVARIANT §4.1 (M3): a database carrying the OLD PLAIN index is upgraded to UNIQUE on reopen", async () => {
+    it("INVARIANT §4.1: a database carrying the OLD PLAIN index is upgraded to UNIQUE on reopen", async () => {
       // The trap this pins: `CREATE UNIQUE INDEX IF NOT EXISTS` is a silent
       // no-op when an index of that NAME already exists, whatever its
       // uniqueness. A database created with the plain index would keep it and
@@ -989,7 +991,7 @@ describe("SqliteStore", () => {
       after.close();
     });
 
-    it("INVARIANT §4.1 (M3): a DUPLICATED key blocks the unique upgrade with a diagnostic and leaves the plain index intact", async () => {
+    it("INVARIANT §4.1: a DUPLICATED key blocks the unique upgrade with a diagnostic and leaves the plain index intact", async () => {
       // The ladder used to DROP and CREATE UNIQUE in one batch. With two key
       // rows for one execution the CREATE failed AFTER the DROP had landed,
       // so the database was left with no index of that name and every
@@ -2405,7 +2407,7 @@ describe("SqliteStore", () => {
     });
 
     it("INVARIANT §4.1a (#47): every write path bumps — standalone INSERT (sources.upsert), zero-tool revalidate, retarget", async () => {
-      // same id as provision() uses: sources.namespace is UNIQUE (F8)
+      // same id as provision() uses: sources.namespace is UNIQUE
       await store.sources.upsert({
         id: "src_solo",
         type: "mcp",
