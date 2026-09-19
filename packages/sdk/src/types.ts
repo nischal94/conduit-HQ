@@ -39,7 +39,7 @@ export interface Source {
   /**
    * §4.1a provenance, allocated by SQLite triggers. Present on every
    * hydrated row; `sources.upsert` and `provisionSource` IGNORE it on write
-   * (the database owns it). Required, per the spec (F11): callers that
+   * (the database owns it). Required, per the spec: callers that
    * construct a Source for a write pass `generation: 0` — the value is
    * never written.
    */
@@ -157,7 +157,7 @@ export interface DirectCall {
   request: string;
 }
 
-// The valid (kind, projection) pairs are exactly three (§9.2): ("code","code"),
+// The valid (kind, projection) pairs are exactly three (design §4.1): ("code","code"),
 // ("direct","direct"), ("direct","discovery"). The pair is enforced in the TYPE
 // (below), in fresh DDL (a CHECK), and read-side in hydration: independent
 // guards would let {kind:"direct", projection:"code"} be authorized under the
@@ -201,8 +201,18 @@ export type LegacyPendingApproval = Omit<PendingApproval, "namespace" | "sourceG
 
 export type StoredPendingApproval = PendingApproval | LegacyPendingApproval;
 
+/**
+ * SOUND STANDALONE. This is exported, and its result feeds an authorization
+ * comparison (§5.4 step 3 matches `sourceGeneration` against the namespace's
+ * current generation), so it must not assume a caller validated the shape
+ * first: a presence check alone would accept `sourceGeneration: "7"`, which
+ * compares unequal to every number and fails closed only by accident. Check
+ * the TYPES of both provenance fields.
+ */
 export function hasProvenance(pause: StoredPendingApproval): pause is PendingApproval {
-  return "sourceGeneration" in pause;
+  if (!("sourceGeneration" in pause) || !("namespace" in pause)) return false;
+  const { sourceGeneration, namespace } = pause;
+  return typeof sourceGeneration === "number" && typeof namespace === "string";
 }
 
 /**

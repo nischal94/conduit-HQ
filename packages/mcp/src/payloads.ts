@@ -45,7 +45,7 @@ export const EXECUTE_STATUSES = [
   "expired",
   "conflict",
   /**
-   * D-A11 final: the direct arm's truthful non-answer. The call may have
+   * D-A11: the direct arm's truthful non-answer. The call may have
    * completed and the record may not yet be durable — a caller RE-LISTS, it
    * never retries. Additive: a client that does not know this member simply
    * sees a status it cannot act on, which is exactly the intended behavior.
@@ -303,7 +303,8 @@ const EXPIRED_MESSAGE =
   "The approval expired before a human decided (TTL lapsed). You may re-issue execute to retry.";
 
 const UNKNOWN_MESSAGE =
-  "the call may have completed; the record is not yet durable — re-list before deciding again, do not retry";
+  "The call may have completed; the record is not yet durable. Re-list before deciding again — do " +
+  "not retry.";
 
 const CONFLICT_MESSAGE =
   "This requestKey was already used by an earlier execute call. Call check_execution with the " +
@@ -403,7 +404,7 @@ export function assertProjection<T>(
 }
 
 /**
- * D-A11 final: the parameter is `DirectOutcome` — `ExecutionOutcome` plus the
+ * D-A11: the parameter is `DirectOutcome` — `ExecutionOutcome` plus the
  * `unknown` arm — because BOTH direct paths can publish it and `resume` now
  * returns it. The code-mode `start` path still passes an `ExecutionOutcome`,
  * which is a subtype, so no caller changes.
@@ -529,10 +530,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * access can throw on them, and validating them here would be the drifting
  * second copy of the projection the guard's docblock rules out. The status
  * membership + `executionId` are the STRUCTURAL floor a consumer relies on.
+ *
+ * `reason` is the one exception, because the SDK's invariant ties it to a
+ * single status: it is the `unknown` arm's WHY, and the `unknown` arm is
+ * meaningless without it. A guard that accepted `reason` on any status — or
+ * `unknown` without one — would let a payload through that says less than
+ * the type promises. So the correspondence is checked in BOTH directions.
  */
 export function isExecutePayloadShape(payload: unknown): payload is ExecutePayload {
   if (!isRecord(payload)) return false;
   if (!(EXECUTE_STATUSES as readonly string[]).includes(payload.status as string)) return false;
+  if ((payload.reason !== undefined) !== (payload.status === "unknown")) return false;
   return typeof payload.executionId === "string";
 }
 

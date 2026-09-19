@@ -68,6 +68,21 @@ export class ConduitOutcomeAmbiguous extends Error {
   }
 }
 
+/**
+ * The HOST-terminal error names as a closed set — the mirror of
+ * `GUEST_ERROR_NAMES`. These two never cross into the sandbox: each
+ * terminates the execution instead. Naming the set gives a reader one place
+ * to see that it is exactly two, and gives a caller a type to switch on
+ * rather than two loose string constants.
+ */
+export const HOST_TERMINAL_ERROR_NAMES = {
+  replayDivergence: REPLAY_DIVERGENCE_ERROR_NAME,
+  outcomeAmbiguous: OUTCOME_AMBIGUOUS_ERROR_NAME,
+} as const;
+
+export type HostTerminalErrorName =
+  (typeof HOST_TERMINAL_ERROR_NAMES)[keyof typeof HOST_TERMINAL_ERROR_NAMES];
+
 export class ConduitCallError extends Error {
   readonly kind: CallErrorKind;
   readonly correlationId: string | undefined;

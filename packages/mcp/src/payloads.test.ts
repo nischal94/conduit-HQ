@@ -206,7 +206,18 @@ describe("executionToCheckPayload (check_execution)", () => {
       {
         ...base,
         status: "paused",
-        pausedOn: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 50 },
+        // The R1 pause shape, provenance fields included: every other
+        // fixture here is the LEGACY shape, so without this one the
+        // projection was never exercised against a real stored pause.
+        pausedOn: {
+          callId: "c",
+          toolName: "t",
+          namespace: "t",
+          sourceGeneration: 3,
+          input: {},
+          reason: "r",
+          expiresAt: 50,
+        },
       },
       10,
     );
@@ -345,11 +356,12 @@ describe("pausedToListRow (the approvals.list projection)", () => {
  * The point of these tests is not that a given arm renders some fields —
  * that is covered above — but that EVERY status arm a sender can produce
  * passes the SAME shape predicate the client (`client.ts`) refuses on. If a
- * projection ever emitted an arm the guard would reject, this fails; that is
- * what makes "single source of truth" a checked property rather than a
- * claim. The status-set exhaustiveness (each legal member is exercised) is
- * asserted alongside, so an added union member with no covering arm is
- * caught here too.
+ * projection ever emitted an arm the guard would reject, this fails.
+ *
+ * What is pinned here is STATUS-SET COVERAGE: every legal status member is
+ * exercised by some arm, and every arm passes the predicate. It is not a
+ * claim that each arm's payload fields are themselves validated — the
+ * predicate checks a structural floor, by design (see its docblock).
  */
 describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the client guard uses", () => {
   const base = {
@@ -394,7 +406,7 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
       },
     },
     conflict: { status: "conflict", executionId: "e" },
-    // D-A11 final: the direct arm's truthful non-answer, on the wire.
+    // D-A11: the direct arm's truthful non-answer, on the wire.
     unknown: { status: "unknown", executionId: "e", reason: "persist-timeout" },
   } satisfies Record<ExecuteStatus, DirectOutcome>;
 
@@ -408,7 +420,7 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     }
   });
 
-  it("INVARIANT §5.3 (D-A11 final): the `unknown` arm round-trips its reason and never claims a terminal", () => {
+  it("INVARIANT §5.3 (D-A11): the `unknown` arm round-trips its reason and never claims a terminal", () => {
     for (const reason of ["persist-timeout", "persist-failed"] as const) {
       const payload = outcomeToPayload({ status: "unknown", executionId: "e", reason });
       expect(payload.status).toBe("unknown");
@@ -468,6 +480,21 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     expect(isCheckPayloadShape({ status: "conflict", executionId: "e" })).toBe(false);
     // And a legal status missing the mandatory executionId is rejected.
     expect(isExecutePayloadShape({ status: "completed" })).toBe(false);
+  });
+
+  it("`reason` and the `unknown` status imply each other — the SDK's invariant, checked both ways", () => {
+    // `reason` is the `unknown` arm's WHY, and `unknown` says nothing useful
+    // without it. Accepting either half alone would pass a payload that
+    // promises less than the type does.
+    expect(isExecutePayloadShape({ status: "unknown", executionId: "e" })).toBe(false);
+    expect(
+      isExecutePayloadShape({ status: "completed", executionId: "e", reason: "persist-failed" }),
+    ).toBe(false);
+    // Both halves together are accepted, as is neither.
+    expect(
+      isExecutePayloadShape({ status: "unknown", executionId: "e", reason: "persist-timeout" }),
+    ).toBe(true);
+    expect(isExecutePayloadShape({ status: "completed", executionId: "e" })).toBe(true);
   });
 });
 

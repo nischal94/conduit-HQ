@@ -130,6 +130,7 @@ export { openSqliteStore } from "./store/sqlite.js";
 export type {
   ConduitStore,
   ConnectionRepository,
+  DirectSettle,
   ExecutionRepository,
   IntegrationRepository,
   PolicyRepository,
@@ -143,6 +144,7 @@ export type {
   DirectCall,
   Execution,
   ExecutionBase,
+  ExecutionError,
   ExecutionKind,
   ExecutionStatus,
   Integration,
