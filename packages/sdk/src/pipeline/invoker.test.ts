@@ -892,6 +892,165 @@ describe("§5.5 scope check", () => {
     expect(onAllowPath.message).toBe(onPolicyPath.message);
   });
 
+  /**
+   * The refusal TEXT was already identical. What still separated the two
+   * cases was the SCHEDULE: an absent name skipped the resolver entirely
+   * while a present-but-ungranted name awaited it, so the guest read
+   * existence off latency, off a resolver rejection that surfaced for one
+   * case only, and off a hang. These pin the schedule, not the text.
+   */
+  describe("INVARIANT §5.5: on the scoped path, an absent tool and an out-of-scope tool are indistinguishable by SCHEDULE", () => {
+    const asError = (e: unknown): Error => {
+      if (!(e instanceof Error)) throw new Error(`expected an Error, got ${String(e)}`);
+      return e;
+    };
+    /** Records the store method names the invoker calls, in order. */
+    function trackingStore(present: boolean): {
+      store: ConduitStore;
+      seq: string[];
+    } {
+      const seq: string[] = [];
+      const tracked = {
+        ...store,
+        tools: {
+          ...store.tools,
+          get: async (name: string) => {
+            seq.push("tools.get");
+            return present ? await store.tools.get("github.list_issues") : undefined;
+          },
+          list: async () => {
+            seq.push("tools.list");
+            return await store.tools.list();
+          },
+        },
+        policies: {
+          ...store.policies,
+          get: async (name: string) => {
+            seq.push("policies.get");
+            return await store.policies.get(name);
+          },
+        },
+        trace: {
+          ...store.trace,
+          append: async (...a: Parameters<ConduitStore["trace"]["append"]>) => {
+            seq.push("trace.append");
+            return await store.trace.append(...a);
+          },
+        },
+      } as ConduitStore;
+      return { store: tracked, seq };
+    }
+
+    it("calls the resolver exactly once for BOTH, and makes the same store calls in the same order", async () => {
+      const absent = trackingStore(false);
+      const present = trackingStore(true);
+      const absentCalls: number[] = [];
+      const presentCalls: number[] = [];
+      const countingScope = (into: number[]) => async () => {
+        into.push(1);
+        return await permitOnly(["github.delete_repo"])();
+      };
+      const run = async (t: { store: ConduitStore }, into: number[], id: string) =>
+        await createToolInvoker(
+          { ...deps(recordingUpstream().caller), store: t.store } as Parameters<
+            typeof createToolInvoker
+          >[0],
+          {
+            executionId: id,
+            projection: "code",
+            clientId: "acme",
+            scope: countingScope(into),
+            log: vi.fn(),
+          },
+        )("github.list_issues", {}).then(
+          () => {
+            throw new Error("expected the call to be refused");
+          },
+          (e: unknown) => asError(e),
+        );
+      const absentError = await run(absent, absentCalls, "exec_sched_absent");
+      const presentError = await run(present, presentCalls, "exec_sched_present");
+      // (a) the resolver runs exactly once on each path.
+      expect(absentCalls).toHaveLength(1);
+      expect(presentCalls).toHaveLength(1);
+      // (c) the same store-call sequence, compared as a whole.
+      expect(absent.seq).toEqual(present.seq);
+      // The refusal itself stays identical too.
+      expect(absentError.name).toBe(presentError.name);
+      expect(absentError.message).toBe(presentError.message);
+    });
+
+    it("a REJECTING resolver produces the same error class and message for BOTH", async () => {
+      const rejecting = async () => {
+        throw new Error("resolver exploded: internal detail");
+      };
+      const run = async (present: boolean, id: string) =>
+        await createToolInvoker(
+          {
+            ...deps(recordingUpstream().caller),
+            store: trackingStore(present).store,
+          } as Parameters<typeof createToolInvoker>[0],
+          {
+            executionId: id,
+            projection: "code",
+            clientId: "acme",
+            scope: rejecting,
+            log: vi.fn(),
+          },
+        )("github.list_issues", {}).then(
+          () => {
+            throw new Error("expected the call to be refused");
+          },
+          (e: unknown) => asError(e),
+        );
+      const absentError = await run(false, "exec_rej_absent");
+      const presentError = await run(true, "exec_rej_present");
+      expect(absentError.name).toBe(presentError.name);
+      // The opaque reference is deliberately fresh per refusal, so compare the
+      // message with it normalized away — everything else must be byte-equal.
+      const normalize = (m: string) =>
+        m.replace(/[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}/g, "<ref>");
+      expect(normalize(absentError.message)).toBe(normalize(presentError.message));
+      // And the resolver's own detail never reaches the guest on either path.
+      expect(absentError.message).not.toContain("internal detail");
+      expect(presentError.message).not.toContain("internal detail");
+    });
+  });
+
+  it("INVARIANT §5.5: the UNSCOPED path makes exactly one tools.get per call and consults no resolver", async () => {
+    // Shipped Code Mode takes the unscoped path (D-A3). Closing the oracle
+    // on the scoped path must not add a resolver call or a second catalog
+    // read here.
+    const seq: string[] = [];
+    const tracked = {
+      ...store,
+      tools: {
+        ...store.tools,
+        get: async (name: string) => {
+          seq.push("tools.get");
+          return await store.tools.get(name);
+        },
+        list: async () => {
+          seq.push("tools.list");
+          return await store.tools.list();
+        },
+      },
+    } as ConduitStore;
+    await createToolInvoker(
+      { ...deps(recordingUpstream().caller), store: tracked } as Parameters<
+        typeof createToolInvoker
+      >[0],
+      {
+        executionId: "exec_unscoped_once",
+        projection: "code",
+        clientId: null,
+        log: vi.fn(),
+      },
+    )("github.list_issues", {}).catch(() => {});
+    expect(seq.filter((s) => s === "tools.get")).toHaveLength(1);
+    expect(seq).not.toContain("tools.list");
+  });
+
   it("the out-of-scope HOST log sanitizes the guest-supplied path — no forged line, bounded length", async () => {
     // The path is guest-supplied and untrusted. A raw newline in it would
     // forge a second host log line; an unbounded one would flood the daemon

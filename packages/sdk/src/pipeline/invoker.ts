@@ -154,12 +154,26 @@ async function runCall(
   // §5.5: scope is authority recomputed per call. Out of scope ≡ unknown —
   // the same block, the same audit row, and no upstream contact, so the
   // refusal cannot be used to probe what the profile grants.
+  //
+  // The resolver runs on the scoped path whether or not the catalog holds the
+  // name, and BEFORE the outcome depends on catalog presence. Gating it on
+  // `tool !== undefined` made the SCHEDULE itself an existence oracle even
+  // though the refusal text was identical: an unknown name returned without
+  // ever awaiting the resolver, so a guest read existence off the latency, off
+  // a resolver rejection that surfaced as `infraError` for existing names
+  // only, and off a resolver that hung for one case and not the other. The
+  // number and order of awaited resolver and store calls must not depend on
+  // catalog membership. The UNSCOPED path is untouched — no resolver exists
+  // there, so it keeps its one `tools.get` per call.
   let outOfScope = false;
-  if (tool !== undefined && options.scope !== undefined) {
+  if (options.scope !== undefined) {
     const scope = await options.scope().catch((cause) => {
       throw infraError(cause, log);
     });
-    if (!scope.permits(options.projection, path)) {
+    // An absent tool is already refused below; recording `outOfScope` only
+    // when the catalog HELD it keeps the host log's operator distinction
+    // truthful, and it never reaches the guest.
+    if (tool !== undefined && !scope.permits(options.projection, path)) {
       tool = undefined;
       outOfScope = true;
     }
