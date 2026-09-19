@@ -8,6 +8,7 @@ import { normalizeMcp } from "../normalize/mcp.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { Source, Tool } from "../types.js";
+import { createDispatchCell } from "./dispatch.js";
 import { GUEST_ERROR_NAMES } from "./errors.js";
 import { createMcpUpstreamCaller } from "./upstream.js";
 import { createUpstreamSessionScope } from "./upstream-session.js";
@@ -832,5 +833,103 @@ describe("INVARIANT F1: handshake + call share request.timeoutMs", () => {
     await expect(attempt).rejects.toThrow(/timed out after 50ms/);
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
     expect(toolsCallRequest(requests)).toBeUndefined(); // never reached tools/call
+  });
+});
+
+describe("INVARIANT §5.5: the per-call dispatch cell", () => {
+  it("INVARIANT §5.5: the caller advances the dispatch cell — initializing before the handshake, dispatched before the governed call", async () => {
+    const states: string[] = [];
+    const cell = createDispatchCell();
+    const { port } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+      // Only JSON-RPC posts are recorded; the ephemeral scope's teardown
+      // DELETE carries no body and is not part of the dispatch sequence.
+      if (parsed.method !== undefined) {
+        states.push(`server:${parsed.method}:${cell.state}`);
+      }
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "x", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { content: [] } }));
+    });
+    const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    await caller.call({
+      tool,
+      source: sourceAt(port),
+      input: {},
+      auth: { headers: {} },
+      timeoutMs: 5000,
+      dispatch: cell,
+    });
+    expect(states).toEqual([
+      "server:initialize:initializing",
+      "server:notifications/initialized:initializing",
+      "server:tools/call:dispatched",
+    ]);
+    expect(cell.state).toBe("dispatched");
+  });
+
+  it("INVARIANT §7 (#21): a side-effect-then-404 upstream surfaces as ONE dispatch and an HTTP 404 upstream error with the cell at dispatched", async () => {
+    const { port, requests } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "x", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    const cell = createDispatchCell();
+    const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    await expect(
+      caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: {} },
+        timeoutMs: 5000,
+        dispatch: cell,
+      }),
+    ).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+      message: expect.stringContaining("HTTP 404"),
+    });
+    expect(requests.filter((r) => r.body.includes('"tools/call"'))).toHaveLength(1);
+    expect(requests.filter((r) => r.body.includes('"initialize"'))).toHaveLength(1);
+    expect(cell.state).toBe("dispatched");
   });
 });

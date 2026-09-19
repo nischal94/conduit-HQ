@@ -37,14 +37,18 @@ export type {
   NormalizeOpenApiOptions,
 } from "./normalize/openapi.js";
 export { normalizeOpenApi } from "./normalize/openapi.js";
+export type { DispatchCell, DispatchState } from "./pipeline/dispatch.js";
+export { createDispatchCell } from "./pipeline/dispatch.js";
 export type { EgressOptions } from "./pipeline/egress.js";
 export { assertEgressAllowed, createPinnedLookup, isPrivateAddress } from "./pipeline/egress.js";
 export type { CallErrorKind, GuestErrorName } from "./pipeline/errors.js";
 export {
   ConduitCallError,
+  ConduitOutcomeAmbiguous,
   GUEST_ERROR_NAMES,
   infraError,
   NON_MEMOIZABLE_ERROR_NAMES,
+  OUTCOME_AMBIGUOUS_ERROR_NAME,
   policyError,
   upstreamError,
 } from "./pipeline/errors.js";

@@ -91,7 +91,7 @@ export interface McpEndpoint {
 }
 
 /**
- * A caller-owned, mutable session handle. `listTools`/`callTool` may replace
+ * A caller-owned, mutable session handle. `listTools` may replace
  * `sessionId` in place on a scoped 404-expiry retry (design D3) — but ONLY
  * when, at the moment the retry is about to publish, this object's
  * `sessionId` still strictly equals the id that 404'd. If some other
@@ -108,10 +108,18 @@ export interface McpSession {
 export interface McpClient {
   initialize(): Promise<McpSession>;
   listTools(session: McpSession, maxTools: number): Promise<unknown[]>;
+  /**
+   * §5.5/§7: `hooks.beforeSend` runs SYNCHRONOUSLY immediately before the
+   * `tools/call` body is written to the socket, and never for an
+   * initialize/initialized/ping post. Callers use it to flip a per-call
+   * dispatch cell, so a failure inside the write still classifies as
+   * post-dispatch (the body may have reached the upstream).
+   */
   callTool(
     session: McpSession,
     name: string,
     args: unknown,
+    hooks?: { beforeSend?: () => void },
   ): Promise<{ result: unknown; status: number }>;
   deleteSession(session: McpSession): Promise<void>;
 }
@@ -232,11 +240,15 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
    * reader that `onResponse` builds arms its own timer from the remaining
    * budget, so the two phases can never race each other. Pre-response failures
    * (timeout / socket error) reject.
+   *
+   * `beforeSend` (§5.5) runs synchronously immediately before the body write,
+   * so a caller can record that the request is about to leave this process.
    */
   function openPost<T>(
     body: object,
     session: McpSession | undefined,
     onResponse: (res: IncomingMessage, req: ReturnType<typeof httpRequest>) => Promise<T>,
+    beforeSend?: () => void,
   ): Promise<T> {
     const remaining = budget.deadline();
     if (remaining <= 0) {
@@ -287,6 +299,7 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
           }),
         );
       });
+      beforeSend?.();
       req.end(payload);
     });
   }
@@ -407,8 +420,12 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
    * two-phase deadline, cumulative `bytes` counter, redirect refusal, non-2xx
    * drain-then-throw, and unsupported-content-type contracts.
    */
-  function postClassified(body: object, ctx: ClassifyContext): Promise<ClassifiedResult> {
-    return openPost(body, ctx.session, (res) => readClassified(res, ctx));
+  function postClassified(
+    body: object,
+    ctx: ClassifyContext,
+    beforeSend?: () => void,
+  ): Promise<ClassifiedResult> {
+    return openPost(body, ctx.session, (res) => readClassified(res, ctx), beforeSend);
   }
 
   function readClassified(res: IncomingMessage, ctx: ClassifyContext): Promise<ClassifiedResult> {
@@ -563,16 +580,21 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
     session: McpSession | undefined,
     expectedId: string,
     allowBatch: boolean,
+    beforeSend?: () => void,
   ): Promise<{
     result: unknown;
     error?: { code: number; message: string };
     headers: IncomingHttpHeaders;
   }> {
-    const { matched, payloads, headers } = await postClassified(body, {
-      expectedId,
-      allowBatch,
-      ...(session !== undefined ? { session } : {}),
-    });
+    const { matched, payloads, headers } = await postClassified(
+      body,
+      {
+        expectedId,
+        allowBatch,
+        ...(session !== undefined ? { session } : {}),
+      },
+      beforeSend,
+    );
     if (matched !== undefined) {
       return {
         result: matched.result,
@@ -699,6 +721,9 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
   }
 
   /**
+   * Serves `listTools` ONLY (§7: a governed `tools/call` is never re-sent —
+   * see `callTool` below).
+   *
    * Runs `op` against `session`. If it fails with a 404 that carried a
    * session id, re-initializes ONCE into a fresh LOCAL session and retries
    * `op` against that fresh session — never a second retry (a counter in
@@ -784,6 +809,7 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
     session: McpSession,
     name: string,
     args: unknown,
+    beforeSend?: () => void,
   ): Promise<{ result: unknown; status: number }> {
     const id = randomUUID();
     const { result, error } = await requestAndAwait(
@@ -796,6 +822,7 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       session,
       id,
       session.protocolVersion !== "2025-06-18",
+      beforeSend,
     );
     if (error !== undefined) {
       // Parity with upstream.ts's error-member mapping: a JSON-RPC `error`
@@ -930,10 +957,15 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
       session: McpSession,
       name: string,
       args: unknown,
+      hooks?: { beforeSend?: () => void },
     ): Promise<{ result: unknown; status: number }> {
-      return withSessionExpiryRetry(session, (activeSession) =>
-        callToolOnce(activeSession, name, args),
-      );
+      // §7: NO session-expiry retry for a governed tools/call. The upstream
+      // may have performed the call before answering 404; re-sending it after
+      // re-initialization would be a second dispatch under one approval.
+      // Session renewal may prepare a LATER, separately authorized call
+      // (the next `initialize`), never this one. `listTools`/`initialize`
+      // keep the retry: they have no side effects.
+      return callToolOnce(session, name, args, hooks?.beforeSend);
     },
     deleteSession,
   };
