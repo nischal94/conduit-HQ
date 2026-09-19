@@ -41,10 +41,14 @@ at session start).** Plan execution is under way via
 pre-commit typecheck cannot pass on Task 1 alone). Task 3 DONE
 (`c583398` + fix `502fe90`), Task 4 DONE (`e46b20c`, the Task 4 carried
 items below are closed), Task 5 DONE (`22a5d89`), Task 6 DONE
-(`a03bc8d`), Task 7 DONE (`b56a2bb`) — all task-reviewed. Task 8
-committed `b7049e4` (it closes the Task 8 carried items below), task
-review pending. NEXT: Task 9 → 11 in order, then the final whole-branch
-review, then the PR gauntlet. Run `packages/mcp` `integration.test.ts` and
+(`a03bc8d`), Task 7 DONE (`b56a2bb`), Task 8 DONE (`b7049e4`; it closed
+the Task 8 carried items below), Task 9 DONE (`c25a97e`) — all
+task-reviewed. **Task 10 committed `36d0fc3`; its review returned four
+Important findings; fix round 1 committed `2cc4852`; the scoped re-review
+is pending** (see the Task 10 bullet below — confirm each finding reads
+ADDRESSED before closing the task). NEXT: close Task 10's fix loop →
+Task 11 → the final whole-branch
+review → the PR gauntlet. Run `packages/mcp` `integration.test.ts` and
 `packages/cli` `key.test.ts` from their package directory (from the repo
 root they fail `MODULE_NOT_FOUND` — a harness artifact). The recovery map is the git-ignored
 ledger `.superpowers/sdd/2026-09-12-r1-lane-a-store-manager/progress.md`
@@ -72,6 +76,30 @@ from `git log` on the branch. Carried items a fresh session must not lose:
 - **Tasks 8/10 dispatch:** `manager.ts` still matches the legacy
   `executions.request_key` UNIQUE text; `mapCreateConflict` (D-A12) must
   own both UNIQUE strings once named clients reach `create`.
+- **Task 10 open findings (fix round 1, head `36d0fc3`):** (1) the resume
+  drive's `onExpire` is assigned only AFTER the guard phase, so a stalled
+  guard read (`tools.get`, `getGeneration`, `checkScope`, …) strands the
+  row `running` and hangs `resume()` — the latch comment draws the
+  transition, no code implements it; same class as the P1 Greptile found
+  in the plan text; (2) the prep-window catch's direct settle is fenced but
+  not bounded by `SETTLE_WRITE_BUDGET_MS`; (3) the manager direct suite
+  uses real 400/200/150 ms budgets and 900 ms stalls instead of
+  `vi.useFakeTimers()` (this file's own implementer note); (4) the
+  `outcome` backstop in `finished.finally` has no test that fails without
+  it. A task is closed only after a scoped re-review says ADDRESSED.
+- **Task 11 dispatch:** replace the 7 `active!` non-null warnings in
+  `manager.test.ts` with a throwing harness accessor; consider collapsing
+  the three hand-rolled bounded-fenced-settle races into one helper in
+  `direct.ts` if Task 10's fix did not.
+- **PR Deviations + Lane B decision:** `resultTooLarge` is not projected
+  onto the wire — an over-cap direct completion reaches an MCP client as
+  `result: null` while the stored row says `discarded`. Also for the PR:
+  the spec §18 entries for the D-A11 `unknown` wire status and the F12
+  accepted limit; and two behaviour changes visible to shipped Code Mode
+  users, both quiz material — a resume after ANY write to the paused call's
+  namespace now refuses (`ConduitCatalogChanged`, re-approve; D3), and
+  every upstream failure after the write attempt reclassifies from
+  `ConduitUpstreamError` to a terminal `ConduitOutcomeAmbiguous`.
 - **Ruling to check at Task 11:** `INVARIANTS.md` rows flip in Task 11's
   commit, not per task (no brief 1–10 edits the ledger; the branch squashes
   to one commit on main). Task 11 must cover the eight `INVARIANT §` tests
