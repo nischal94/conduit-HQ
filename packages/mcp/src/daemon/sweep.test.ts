@@ -13,10 +13,20 @@ import { sweepOrphanedExecutions } from "./sweep.js";
  */
 
 async function newStore(): Promise<ConduitStore> {
-  return openSqliteStore({
-    client: createClient({ url: ":memory:" }),
+  return (await newStoreWithClient()).store;
+}
+
+/** Same store, with the raw client kept so a test can read COLUMNS. */
+async function newStoreWithClient(): Promise<{
+  store: ConduitStore;
+  client: ReturnType<typeof createClient>;
+}> {
+  const client = createClient({ url: ":memory:" });
+  const store = await openSqliteStore({
+    client,
     secretBox: await SecretBox.fromKeyBytes(Buffer.alloc(32, 7)),
   });
+  return { store, client };
 }
 
 const base = {
@@ -131,7 +141,7 @@ describe("sweepOrphanedExecutions", () => {
     // row — its upstream call may well have landed. This pins that a
     // future kind-aware change cannot silently skip direct rows and leave
     // them `running` forever.
-    const store = await newStore();
+    const { store, client } = await newStoreWithClient();
     const directBase = {
       kind: "direct",
       clientId: null,
@@ -175,8 +185,21 @@ describe("sweepOrphanedExecutions", () => {
     // promoted into a delivered outcome: the sweep never replays and never
     // decides that an unfinished call succeeded.
     expect(running?.kind).toBe("direct");
-    expect(running?.kind === "direct" ? running.resultState : "not-direct").not.toBe("delivered");
-    expect(running?.status).not.toBe("completed");
+    // ABSENCE, not "not delivered". A failed row must not CARRY the body at
+    // all: a terminalized-ambiguous row that still holds the upstream's
+    // result keeps that payload stored for anything that later reads the row,
+    // and "resultState is not delivered" passes while it sits there.
+    expect(running?.kind === "direct" ? running.result : undefined).toBeUndefined();
+    expect(running?.kind === "direct" ? running.resultState : undefined).toBeUndefined();
+    expect(running?.status).toBe("failed");
+    // The RAW columns, not the hydrated view: the hydrator could mask a
+    // stored body by declining to surface it on a failed row.
+    const rawDirect = await client.execute({
+      sql: "SELECT result, result_state FROM executions WHERE id = ?",
+      args: ["exec_direct_running"],
+    });
+    expect(rawDirect.rows[0]?.result).toBeNull();
+    expect(rawDirect.rows[0]?.result_state).toBeNull();
     // The paused direct row is awaiting a human, not stranded — untouched.
     expect((await store.executions.get("exec_direct_paused"))?.status).toBe("paused");
   });
