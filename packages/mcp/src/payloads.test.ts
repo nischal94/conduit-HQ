@@ -16,6 +16,7 @@ import {
   outcomeToPayload,
   pausedToListRow,
   resumeToPayload,
+  UNKNOWN_REASONS,
 } from "./payloads.js";
 
 const seeds = { now: 1, random: 0.5 };
@@ -495,6 +496,23 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
       isExecutePayloadShape({ status: "unknown", executionId: "e", reason: "persist-timeout" }),
     ).toBe(true);
     expect(isExecutePayloadShape({ status: "completed", executionId: "e" })).toBe(true);
+  });
+
+  it("`reason` on the `unknown` arm must be one of the two legal VALUES, not merely present", () => {
+    // Presence alone let `{ status: "unknown", reason: "other" }` — and a
+    // numeric or null reason — narrow to `ExecutePayload`, so a consumer
+    // reading `reason` as one of two known strings could be handed anything.
+    for (const bogus of ["other", "", 42, null, true, {}]) {
+      expect(isExecutePayloadShape({ status: "unknown", executionId: "e", reason: bogus })).toBe(
+        false,
+      );
+    }
+    // Both legal values are accepted, and they come from the one constant.
+    for (const legal of UNKNOWN_REASONS) {
+      expect(isExecutePayloadShape({ status: "unknown", executionId: "e", reason: legal })).toBe(
+        true,
+      );
+    }
   });
 });
 

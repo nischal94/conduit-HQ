@@ -54,6 +54,15 @@ export const EXECUTE_STATUSES = [
 ] as const;
 export type ExecuteStatus = (typeof EXECUTE_STATUSES)[number];
 
+/**
+ * The ONE source of the `unknown` arm's legal reasons. The guard and the
+ * payload type both derive from it, so a new reason cannot be accepted by one
+ * and rejected by the other — which is what repeating the two literals in
+ * both places would eventually produce.
+ */
+export const UNKNOWN_REASONS = ["persist-timeout", "persist-failed"] as const;
+export type UnknownReason = (typeof UNKNOWN_REASONS)[number];
+
 export const CHECK_BODY_STATUSES = ["running", "completed", "failed", "paused", "expired"] as const;
 export type CheckBodyStatus = (typeof CHECK_BODY_STATUSES)[number];
 
@@ -65,7 +74,7 @@ export interface ExecutePayload {
   pending?: PendingView;
   message?: string;
   /** Present only on the `unknown` arm: WHY the record is not durable. */
-  reason?: "persist-timeout" | "persist-failed";
+  reason?: UnknownReason;
 }
 
 /**
@@ -540,7 +549,15 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 export function isExecutePayloadShape(payload: unknown): payload is ExecutePayload {
   if (!isRecord(payload)) return false;
   if (!(EXECUTE_STATUSES as readonly string[]).includes(payload.status as string)) return false;
-  if ((payload.reason !== undefined) !== (payload.status === "unknown")) return false;
+  // BOTH directions, and the VALUE too: a guard that checked only presence
+  // narrowed `{ status: "unknown", reason: "other" }` — and a numeric or null
+  // reason — to `ExecutePayload`, so a consumer reading `reason` as one of
+  // two known strings could be handed anything at all.
+  if (payload.status === "unknown") {
+    if (!(UNKNOWN_REASONS as readonly unknown[]).includes(payload.reason)) return false;
+  } else if (payload.reason !== undefined) {
+    return false;
+  }
   return typeof payload.executionId === "string";
 }
 
