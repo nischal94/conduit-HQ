@@ -44,10 +44,15 @@ items below are closed), Task 5 DONE (`22a5d89`), Task 6 DONE
 (`a03bc8d`), Task 7 DONE (`b56a2bb`), Task 8 DONE (`b7049e4`; it closed
 the Task 8 carried items below), Task 9 DONE (`c25a97e`) — all
 task-reviewed. Task 10 DONE (`36d0fc3` + fixes `2cc4852`, `cbc14cc`;
-two fix rounds, the Task 10 findings below are CLOSED). **Task 11
-committed `06be1a5`; its review found three ledger-truthfulness findings;
-fix round 1 committed `d33fb5d`; the scoped re-review is pending** (see
-the Task 11 bullet below). NEXT: close Task 11's fix loop → the final
+two fix rounds, the Task 10 findings below are CLOSED). Task 11 DONE
+(`06be1a5` + fix `d33fb5d`; the Task 11 findings below are CLOSED).
+**ALL ELEVEN TASKS ARE DONE. The final whole-branch review (top-tier
+model, head `b89ce7c`) returned "ready to open the PR WITH FIXES":
+0 Critical, 7 Important, 6 Minor; the ONE permitted fix wave is
+COMMITTED (`3eccd59`, `cd8459d`, `0691aae`, `3279521`); its scoped
+re-review is pending** (see the "Final review" bullet below). NEXT: ONE
+scoped re-review of `b89ce7c..3279521` (no second wave; residuals go to the founder)
+→ push `feat/r1-lane-a` and open the PR → the
 whole-branch
 review → the PR gauntlet. Run `packages/mcp` `integration.test.ts` and
 `packages/cli` `key.test.ts` from their package directory (from the repo
@@ -88,6 +93,50 @@ from `git log` on the branch. Carried items a fresh session must not lose:
   `vi.useFakeTimers()` (this file's own implementer note); (4) the
   `outcome` backstop in `finished.finally` has no test that fails without
   it. A task is closed only after a scoped re-review says ADDRESSED.
+- **Final review findings (fix wave in progress from `b89ce7c`; the full
+  list with exact changes and required tests is in the git-ignored
+  workspace as `final-review-fixlist.md` — if that file is gone, this
+  bullet is the record):** (I1) `direct.ts` `deadline()` reads the
+  injectable `now()` while the timer uses `setTimeout` — two clocks, a
+  false "did not run" window; fix `deadline: () => (settled ? 0 : end -
+  now())`. (I2, REPRODUCED) `resume()` on a direct row hangs forever when
+  the expiry takes the latch during the LAST guard read and the read then
+  returns — the handover runs a `runDirect` that has lost the latch; fix:
+  after the `policies.get` race, `if (directDrive.settled) return
+  guardExpiry;`. (I3) the out-of-scope CALL refusal text differs from the
+  unknown-tool text — an existence oracle; **controller ruling: make the
+  guest-visible refusal byte-identical to the unknown-tool refusal,
+  operator distinction host-side only; needs a design-spec §5.5 note at PR
+  time and the founder's eye — reversal is one string and one test.**
+  (I4) `kindOf` after the resume claim is unbounded. (I5)
+  `scripts/approve-demo.mjs` treats `unknown` as success. (I6) the CLI's
+  `unknown` message names a nonexistent `conduit check`. (I7) ledger rows
+  #41a and #22a carry clauses no Lane A test pins → move to #41b / #22b;
+  §18-C4 rows wrongly list `initialize` as retried. Minors in the wave:
+  `finished` must resolve after the settle write (D-A2); `String(cause)`
+  in `runDirect`'s stored prep error; `request_keys.execution_id` index →
+  UNIQUE (mind an existing dev database holding the plain index);
+  `makeInvoker` "MUST forward" docstring; scoped host infra boundary;
+  `run-daemon.ts` casts → `satisfies`. The reviewer stated what it did NOT
+  read: most test bodies, `types.ts`/`store.ts`/`index.ts`/`fixtures.ts`,
+  design-spec §3.1/§4.1–4.3/§5.3/§9–§11, and it did not re-verify the
+  `--doctor --offline` zero-write claim — point the PR gauntlet there.
+- **PR description "Deviations" (from the final review, verified against
+  code):** the `unknown` wire status and the F12 accepted limit (both need
+  spec §18 entries); `startDirect` returns a handle, not the spec's
+  `Promise<ExecutionOutcome>`, and `resume`'s scope is optional where the
+  spec says required (spec notes); out-of-scope refusal checked before the
+  policy verdict (the plan's snippet was wrong; matches the spec); every
+  `UpstreamRequest` carries a dispatch cell, so Code Mode failures after
+  the body write reclassify as terminal-ambiguous; a Code Mode resume after
+  a catalog write to the paused namespace is refused (D3) and the old
+  test's subject was moved; `paused` arm narrowed, `expired` keeps the
+  stored union; `kindOf` is a store method the plan did not list;
+  `getGeneration` fails loud and `provisionSource` throws where the brief
+  cast; five (not three) retry tests moved to `listTools`; row #43's test
+  lives in `execute.test.ts` (D-A6); three manager tests keep a real clock
+  with a 1 s margin; `resultTooLarge` not projected onto the wire (Lane B);
+  ledger rows flipped in one commit, not per task.
 - **Task 10 round 2 (closed, recorded for LEARNINGS):** arming the
   guard-phase `onExpire` made a dead race live — the guard's own
   terminalizations cleared the timer without taking the latch, so expiry
