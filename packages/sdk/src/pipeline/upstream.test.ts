@@ -932,4 +932,55 @@ describe("INVARIANT §5.5: the per-call dispatch cell", () => {
     expect(requests.filter((r) => r.body.includes('"initialize"'))).toHaveLength(1);
     expect(cell.state).toBe("dispatched");
   });
+
+  it("INVARIANT §5.3 pre-write gate: a budget that elapses during the handshake refuses before tools/call is written — the cell stays initializing", async () => {
+    // The governed call's LAST check runs inside beforeSend. The budget is
+    // alive when the request is built and gone once the handshake is served,
+    // so only the in-hook gate can catch it.
+    let remaining = 5_000;
+    const { port, requests } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "x", version: "0" },
+            },
+          }),
+        );
+        remaining = 0; // the drive's budget burns during the handshake
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { ok: true } }));
+    });
+    const cell = createDispatchCell();
+    const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    await expect(
+      caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: {} },
+        timeoutMs: 5000,
+        dispatch: cell,
+        deadline: () => remaining,
+      }),
+    ).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+      message: expect.stringContaining("timed out"),
+    });
+    expect(requests.filter((r) => r.body.includes('"tools/call"'))).toHaveLength(0);
+    expect(cell.state).toBe("initializing");
+  });
 });

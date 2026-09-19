@@ -242,7 +242,12 @@ async function makeHarness(options?: {
     makeInvoker: ({ executionId, decisions, deadline }) =>
       createToolInvoker(
         { store, policy, credentials, upstream, ...(decisions !== undefined ? { decisions } : {}) },
-        { executionId, ...(deadline !== undefined ? { deadline } : {}) },
+        {
+          executionId,
+          projection: "code",
+          clientId: null,
+          ...(deadline !== undefined ? { deadline } : {}),
+        },
       ),
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
     makeDecisions: () => createInMemoryApprovalDecisions(),

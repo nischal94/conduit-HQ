@@ -11,7 +11,7 @@ import { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execu
 import { createInMemoryApprovalDecisions } from "./execution/decisions.js";
 import { createExecutionManager, type ExecutionManagerDeps } from "./execution/manager.js";
 import { normalizeMcp } from "./normalize/mcp.js";
-import { GUEST_ERROR_NAMES } from "./pipeline/errors.js";
+import { GUEST_ERROR_NAMES, OUTCOME_AMBIGUOUS_ERROR_NAME } from "./pipeline/errors.js";
 import { createToolInvoker } from "./pipeline/invoker.js";
 import { createMcpUpstreamCaller } from "./pipeline/upstream.js";
 import { createStorePolicyEngine } from "./policy.js";
@@ -298,7 +298,12 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
         // applies here; Phase 9 proves the default blocks it.
         upstream: createMcpUpstreamCaller({ egress: { allowPrivate: true } }),
       },
-      { executionId: "exec_smoke", log: (message) => hostLog.push(message) },
+      {
+        executionId: "exec_smoke",
+        projection: "code",
+        clientId: null,
+        log: (message) => hostLog.push(message),
+      },
     );
 
     const host = createCatalogToolHost(catalog, invoke);
@@ -367,7 +372,12 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
             upstream: createMcpUpstreamCaller({ egress: { allowPrivate: true } }),
             ...(decisions !== undefined ? { decisions } : {}),
           },
-          { executionId, log: (message) => hostLog.push(message) },
+          {
+            executionId,
+            projection: "code",
+            clientId: null,
+            log: (message) => hostLog.push(message),
+          },
         ),
       makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
       makeDecisions: () => createInMemoryApprovalDecisions(),
@@ -544,7 +554,12 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
         credentials: resolver,
         upstream: createMcpUpstreamCaller(), // §9.3 defaults: no allowPrivate
       },
-      { executionId: "exec_egress", log: (message) => hostLog.push(message) },
+      {
+        executionId: "exec_egress",
+        projection: "code",
+        clientId: null,
+        log: (message) => hostLog.push(message),
+      },
     );
     const guardedHost = createCatalogToolHost(catalog, guardedInvoke);
     const egressBlocked = await sandbox.execute({
@@ -640,10 +655,16 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       const value = echoOutcome.value as { name: string; message: string };
       // The §9.2 best-effort tripwire (upstream.ts containsCredential) fires
       // on the echoed credential in the 200 result body, refusing to deliver
-      // it — the call surfaces as an upstream error, not a completed value
-      // carrying the secret.
-      expect(value.name).toBe(GUEST_ERROR_NAMES.upstream);
-      expect(value.message).toContain("echoed the connection's credential");
+      // it — the call never yields a completed value carrying the secret.
+      //
+      // One-way door #3 (eng review D4): the refusal now arrives AFTER the
+      // governed body was written, so §7 classifies it ambiguous rather than
+      // as a guest-catchable ConduitUpstreamError. The invoker's name is
+      // asserted here; terminalizing it host-side (so the guest cannot catch
+      // it at all, as with a replay-divergence) is the journaling wrapper's
+      // job and is NOT yet wired — see the manager's `journal` catch.
+      expect(value.name).toBe(OUTCOME_AMBIGUOUS_ERROR_NAME);
+      expect(value.message).toContain("after dispatch");
     }
     expect(JSON.stringify(echoOutcome)).not.toContain(SECRET);
     expect(JSON.stringify(echoOutcome)).not.toContain("ghp_smoke");

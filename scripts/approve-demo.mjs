@@ -82,7 +82,12 @@ async function main() {
           upstream,
           ...(decisions !== undefined ? { decisions } : {}),
         },
-        { executionId: execId, log: (line) => console.error(line) },
+        {
+          executionId: execId,
+          projection: "code",
+          clientId: null,
+          log: (line) => console.error(line),
+        },
       ),
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
   });

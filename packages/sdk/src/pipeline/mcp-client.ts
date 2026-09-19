@@ -114,6 +114,10 @@ export interface McpClient {
    * initialize/initialized/ping post. Callers use it to flip a per-call
    * dispatch cell, so a failure inside the write still classifies as
    * post-dispatch (the body may have reached the upstream).
+   *
+   * A hook that THROWS aborts the post with nothing written: the request is
+   * destroyed and `callTool` rejects with the hook's error. That is the
+   * §5.3 pre-write gate — the last chance to refuse before any byte leaves.
    */
   callTool(
     session: McpSession,
@@ -299,7 +303,18 @@ export function createMcpClient(endpoint: McpEndpoint, budget: McpBudget): McpCl
           }),
         );
       });
-      beforeSend?.();
+      // A throwing `beforeSend` (the §5.3 pre-write gate) aborts the POST
+      // with NOTHING written: the socket is destroyed and the promise
+      // rejects with the hook's own error, so the caller classifies the
+      // failure pre-dispatch.
+      try {
+        beforeSend?.();
+      } catch (hookError) {
+        clearTimeout(preResponseTimer);
+        req.destroy();
+        reject(hookError);
+        return;
+      }
       req.end(payload);
     });
   }

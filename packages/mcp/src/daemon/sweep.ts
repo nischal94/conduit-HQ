@@ -24,7 +24,7 @@
  * is the honest answer, and the row is terminalized as `failed` carrying
  * that reason rather than being retried or silently completed.
  */
-import type { ConduitStore } from "@conduithq/sdk";
+import { type ConduitStore, OUTCOME_AMBIGUOUS_ERROR_NAME } from "@conduithq/sdk";
 
 /**
  * The stored `error.name` on a swept row. Distinct from an ordinary
@@ -32,7 +32,7 @@ import type { ConduitStore } from "@conduithq/sdk";
  * status command) must be able to tell "this code threw" from "a daemon
  * died while this was in flight and nobody knows what happened".
  */
-export const OUTCOME_AMBIGUOUS = "ConduitOutcomeAmbiguous";
+export const OUTCOME_AMBIGUOUS = OUTCOME_AMBIGUOUS_ERROR_NAME;
 
 const SWEEP_REASON =
   "daemon died while this execution was running; the outcome is unknown and was not replayed";

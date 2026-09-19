@@ -40,6 +40,14 @@ export interface UpstreamRequest {
   session?: UpstreamSessionScope;
   /** §5.5 per-call dispatch cell; advanced by this caller. */
   dispatch?: DispatchCell;
+  /**
+   * §5.3 pre-write gate: the drive's remaining wall-clock budget, re-read
+   * inside `beforeSend` immediately before the governed body write. The
+   * invoker's own gate runs before egress pre-flight and the session
+   * handshake, both of which await — this is the LAST check, so a budget
+   * that elapses during those awaits still refuses before any byte is sent.
+   */
+  deadline?: () => number;
 }
 
 export interface UpstreamOutcome {
@@ -161,7 +169,19 @@ export function createMcpUpstreamCaller(
           session,
           upstreamName,
           request.input ?? {},
-          { beforeSend: () => request.dispatch?.advance("dispatched") },
+          {
+            beforeSend: () => {
+              // The gate fires BEFORE the cell advances, so a refusal here
+              // classifies pre-dispatch: nothing of the body was written.
+              if (request.deadline !== undefined && request.deadline() <= 0) {
+                throw new McpClientError(
+                  "timeout",
+                  "drive budget elapsed before the governed call was written",
+                );
+              }
+              request.dispatch?.advance("dispatched");
+            },
+          },
         );
         assertNoCredentialEcho(result, request);
         return { result: result ?? null, status, latencyMs: Date.now() - startedAt };

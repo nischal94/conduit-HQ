@@ -1,5 +1,9 @@
 import type { ToolInvoker } from "../execute.js";
-import { GUEST_ERROR_NAMES, REPLAY_DIVERGENCE_ERROR_NAME } from "../pipeline/errors.js";
+import {
+  GUEST_ERROR_NAMES,
+  OUTCOME_AMBIGUOUS_ERROR_NAME,
+  REPLAY_DIVERGENCE_ERROR_NAME,
+} from "../pipeline/errors.js";
 import {
   createUpstreamSessionScope,
   type UpstreamSessionScope,
@@ -401,7 +405,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // durable — the call is outcome-ambiguous and must never be re-run
         // (design D8/F5). Record it and fail the execution terminally.
         captured.ambiguous = {
-          name: "ConduitOutcomeAmbiguous",
+          name: OUTCOME_AMBIGUOUS_ERROR_NAME,
           message:
             `[ExecutionManager] Result of a completed upstream call could not be journaled; ` +
             `the execution is outcome-ambiguous and not resumable. Context: { executionId: ${ctx.executionId}, ordinal: ${at}, cause: ${String(cause)} }`,

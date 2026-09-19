@@ -70,6 +70,11 @@ export async function createApprovalRuntime(opts: {
         {
           executionId,
           log,
+          // Task 8 widens the manager's makeInvoker argument to carry the
+          // drive's real projection and client id; until then this path is
+          // the shipped Code Mode drive, which is exactly these values.
+          projection: "code",
+          clientId: null,
           ...(deadline !== undefined ? { deadline } : {}),
           ...(upstreamSession !== undefined ? { upstreamSession } : {}),
         },

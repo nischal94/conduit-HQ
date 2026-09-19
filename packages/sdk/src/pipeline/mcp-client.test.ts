@@ -1,7 +1,12 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMcpClient, type McpSession, SUPPORTED_PROTOCOL_VERSIONS } from "./mcp-client.js";
+import {
+  createMcpClient,
+  McpClientError,
+  type McpSession,
+  SUPPORTED_PROTOCOL_VERSIONS,
+} from "./mcp-client.js";
 
 let server: Server | undefined;
 afterEach(() => new Promise<void>((r) => (server ? server.close(() => r()) : r())));
@@ -1107,6 +1112,45 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     expect(sendIndex).toBeGreaterThan(-1);
     expect(sendIndex).toBeLessThan(callIndex);
     expect(order.filter((o) => o === "client:beforeSend")).toHaveLength(1);
+  });
+
+  it("INVARIANT §5.3: a THROWING beforeSend aborts the post — callTool rejects with the hook's error and the server records no tools/call", async () => {
+    const methods: string[] = [];
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        methods.push(String(parsed.method));
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    const gate = new McpClientError("timeout", "drive budget elapsed before the write");
+    await expect(
+      client.callTool(
+        session,
+        "demo",
+        {},
+        {
+          beforeSend: () => {
+            throw gate;
+          },
+        },
+      ),
+    ).rejects.toBe(gate);
+    expect(methods).not.toContain("tools/call");
   });
 
   it("INVARIANT §5.5 (#24): connection loss at the write — zero bytes delivered — still fires beforeSend first, so the failure classifies post-dispatch", async () => {

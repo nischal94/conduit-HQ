@@ -1,15 +1,24 @@
+import { createServer, type Server } from "node:http";
+import type { AddressInfo } from "node:net";
 import { createClient } from "@libsql/client";
-import { beforeEach, describe, expect, it, vi } from "vitest";
+import { afterAll, beforeEach, describe, expect, it, vi } from "vitest";
 import { createStoreCredentialResolver } from "../credentials.js";
 import { createInMemoryApprovalDecisions } from "../execution/decisions.js";
 import { createStorePolicyEngine } from "../policy.js";
+import { ALL_TOOLS, buildEffectiveScope } from "../scope.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
-import type { Tool } from "../types.js";
-import { GUEST_ERROR_NAMES, upstreamError } from "./errors.js";
+import type { Connection, Tool } from "../types.js";
+import { createDispatchCell } from "./dispatch.js";
+import {
+  ConduitOutcomeAmbiguous,
+  GUEST_ERROR_NAMES,
+  OUTCOME_AMBIGUOUS_ERROR_NAME,
+  upstreamError,
+} from "./errors.js";
 import { createToolInvoker, type ToolInvokerDeps } from "./invoker.js";
-import type { UpstreamCaller, UpstreamRequest } from "./upstream.js";
+import { createMcpUpstreamCaller, type UpstreamCaller, type UpstreamRequest } from "./upstream.js";
 
 const SECRET = "Bearer ghp_invoker_secret_4c5d";
 const PREFIX = "github.acme.prod";
@@ -39,6 +48,61 @@ function recordingUpstream(result: unknown = { content: [] }): {
       },
     },
   };
+}
+
+const servers: Server[] = [];
+afterAll(async () => {
+  await Promise.all(
+    servers.map((server) => new Promise<void>((resolve) => server.close(() => resolve()))),
+  );
+});
+
+/**
+ * A loopback streamable-HTTP MCP server whose handshake succeeds and whose
+ * `tools/call` 200 body echoes the connection's bearer — the §9.2 tripwire's
+ * input, arriving AFTER the governed body was written.
+ */
+async function serveEchoingMcp(): Promise<number> {
+  const server = createServer((req, res) => {
+    let body = "";
+    req.on("data", (chunk: Buffer) => {
+      body += chunk.toString("utf8");
+    });
+    req.on("end", () => {
+      const parsed = JSON.parse(body || "{}") as { id?: string; method?: string };
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "sess-echo" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: "2025-06-18",
+              capabilities: { tools: {} },
+              serverInfo: { name: "echo", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(
+        JSON.stringify({
+          jsonrpc: "2.0",
+          id: parsed.id,
+          result: { echoed: req.headers.authorization ?? "" },
+        }),
+      );
+    });
+  });
+  servers.push(server);
+  await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
+  return (server.address() as AddressInfo).port;
 }
 
 let store: ConduitStore;
@@ -88,7 +152,12 @@ describe("createToolInvoker (spec §5.3)", () => {
     await store.secrets.remove("cred_gh"); // connection still promises cred_gh
     const { caller, requests } = recordingUpstream();
     const log = vi.fn();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log,
+      projection: "code",
+      clientId: null,
+    });
 
     let thrown: unknown;
     try {
@@ -113,7 +182,12 @@ describe("createToolInvoker (spec §5.3)", () => {
 
   it("denied calls throw ConduitPolicyDenied with the verdict reason and never reach upstream", async () => {
     const { caller, requests } = recordingUpstream();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     const attempt = invoke("github.delete_repo", { repo: "site" });
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.policyDenied });
@@ -129,7 +203,12 @@ describe("createToolInvoker (spec §5.3)", () => {
 
   it("blocked/unknown tools throw ConduitPolicyBlocked; refusals are traced with their verdict", async () => {
     const { caller, requests } = recordingUpstream();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     await expect(invoke("github.no_such_tool", {})).rejects.toMatchObject({
       name: GUEST_ERROR_NAMES.policyBlocked,
@@ -168,6 +247,8 @@ describe("createToolInvoker (spec §5.3)", () => {
     const { caller, requests } = recordingUpstream();
     const invoke = createToolInvoker(deps(caller, { policy: permissivePolicy }), {
       executionId: "exec_unknown",
+      projection: "code",
+      clientId: null,
       log: vi.fn(),
     });
 
@@ -198,7 +279,12 @@ describe("createToolInvoker (spec §5.3)", () => {
       call: () => Promise.resolve({ result: circular, status: 200, latencyMs: 1 }),
     };
     const log = vi.fn();
-    const invoke = createToolInvoker(deps(badCaller), { executionId: "exec_h1", log });
+    const invoke = createToolInvoker(deps(badCaller), {
+      executionId: "exec_h1",
+      log,
+      projection: "code",
+      clientId: null,
+    });
 
     const result = await invoke("github.list_issues", {});
     expect(result).toBe(circular);
@@ -214,6 +300,8 @@ describe("createToolInvoker (spec §5.3)", () => {
     const log = vi.fn();
     const invoke = createToolInvoker(deps(caller, { policy: rejectingPolicy }), {
       executionId: "exec_t",
+      projection: "code",
+      clientId: null,
       log,
     });
 
@@ -233,7 +321,12 @@ describe("createToolInvoker (spec §5.3)", () => {
       credentialRef: "cred_gh",
     });
     const { caller, requests } = recordingUpstream();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     const attempt = invoke("github.list_issues", {});
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.infra });
@@ -245,7 +338,12 @@ describe("createToolInvoker (spec §5.3)", () => {
   it("a missing connection fails with a guest-actionable message carrying no refs", async () => {
     await store.connections.remove("conn_gh");
     const { caller } = recordingUpstream();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     let thrown: unknown;
     try {
@@ -267,7 +365,12 @@ describe("createToolInvoker (spec §5.3)", () => {
       }),
     ]);
     const { caller, requests } = recordingUpstream();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     const attempt = invoke("github.rest_call", {});
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
@@ -280,6 +383,8 @@ describe("createToolInvoker (spec §5.3)", () => {
 
     const deadlineBound = createToolInvoker(deps(caller), {
       executionId: "exec_t",
+      projection: "code",
+      clientId: null,
       log: vi.fn(),
       deadline: () => 5_000, // ceiling defaults to 30 000
     });
@@ -288,6 +393,8 @@ describe("createToolInvoker (spec §5.3)", () => {
 
     const ceilingBound = createToolInvoker(deps(caller), {
       executionId: "exec_t",
+      projection: "code",
+      clientId: null,
       log: vi.fn(),
       upstreamTimeoutMs: 100,
       deadline: () => 5_000,
@@ -295,12 +402,19 @@ describe("createToolInvoker (spec §5.3)", () => {
     await ceilingBound("github.list_issues", {});
     expect(requests[1]?.timeoutMs).toBe(100);
 
-    const unbounded = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const unbounded = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
     await unbounded("github.list_issues", {});
     expect(requests[2]?.timeoutMs).toBe(30_000);
 
     const nearlyExpired = createToolInvoker(deps(caller), {
       executionId: "exec_t",
+      projection: "code",
+      clientId: null,
       log: vi.fn(),
       deadline: () => 0.5, // sub-ms budget still clamps to a 1ms floor
     });
@@ -312,6 +426,8 @@ describe("createToolInvoker (spec §5.3)", () => {
     const { caller, requests } = recordingUpstream();
     const expired = createToolInvoker(deps(caller), {
       executionId: "exec_budget",
+      projection: "code",
+      clientId: null,
       log: vi.fn(),
       deadline: () => -50,
     });
@@ -332,7 +448,12 @@ describe("createToolInvoker (spec §5.3)", () => {
     ]);
     const { caller, requests } = recordingUpstream();
     const log = vi.fn();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_orphan", log });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_orphan",
+      log,
+      projection: "code",
+      clientId: null,
+    });
 
     let thrown: unknown;
     try {
@@ -350,7 +471,12 @@ describe("createToolInvoker (spec §5.3)", () => {
   it("a successful call appends one TraceEvent with summary, latency, status, verdict allow", async () => {
     const upstreamResult = { content: [{ type: "text", text: "3 open issues" }] };
     const { caller } = recordingUpstream(upstreamResult);
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     const result = await invoke("github.list_issues", { owner: "acme" });
     expect(result).toEqual(upstreamResult);
@@ -373,6 +499,8 @@ describe("createToolInvoker (spec §5.3)", () => {
     };
     const invoke = createToolInvoker(deps(failingUpstream), {
       executionId: "exec_t",
+      projection: "code",
+      clientId: null,
       log: vi.fn(),
     });
 
@@ -398,6 +526,8 @@ describe("createToolInvoker (spec §5.3)", () => {
     const log = vi.fn();
     const invoke = createToolInvoker(deps(caller, { store: auditless }), {
       executionId: "exec_t",
+      projection: "code",
+      clientId: null,
       log,
     });
 
@@ -410,7 +540,12 @@ describe("createToolInvoker (spec §5.3)", () => {
 
   it("auth material appears in the UpstreamRequest and nowhere in any thrown error or trace row", async () => {
     const { caller, requests } = recordingUpstream();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_t", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_t",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     await invoke("github.list_issues", {});
     expect(requests[0]?.auth.headers.Authorization).toBe(SECRET);
@@ -435,6 +570,8 @@ describe("createToolInvoker (spec §5.3)", () => {
       );
       const invoke = createToolInvoker(deps(caller, { decisions }), {
         executionId: "exec_approve",
+        projection: "code",
+        clientId: null,
         log: vi.fn(),
       });
 
@@ -470,6 +607,8 @@ describe("createToolInvoker (spec §5.3)", () => {
       );
       const invoke = createToolInvoker(deps(caller, { decisions }), {
         executionId: "exec_divergence",
+        projection: "code",
+        clientId: null,
         log: vi.fn(),
       });
 
@@ -494,6 +633,8 @@ describe("createToolInvoker (spec §5.3)", () => {
       );
       const invoke = createToolInvoker(deps(caller, { decisions }), {
         executionId: "exec_input_div",
+        projection: "code",
+        clientId: null,
         log: vi.fn(),
       });
 
@@ -516,6 +657,8 @@ describe("createToolInvoker (spec §5.3)", () => {
       );
       const invoke = createToolInvoker(deps(caller, { decisions }), {
         executionId: "exec_deny",
+        projection: "code",
+        clientId: null,
         log: vi.fn(),
       });
 
@@ -536,6 +679,8 @@ describe("createToolInvoker (spec §5.3)", () => {
       const decisions = createInMemoryApprovalDecisions();
       const invoke = createToolInvoker(deps(caller, { decisions }), {
         executionId: "exec_empty",
+        projection: "code",
+        clientId: null,
         log: vi.fn(),
       });
 
@@ -561,7 +706,12 @@ describe("createToolInvoker (spec §5.3)", () => {
     const { caller } = recordingUpstream({
       content: [{ password: "echoed-pw", repoLabel: "internal", ok: true }],
     });
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_redact", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_redact",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
 
     await invoke("github.list_issues", { token: "sk-live", repo_label: "internal", repo: "hq" });
 
@@ -585,16 +735,258 @@ describe("createToolInvoker (spec §5.3)", () => {
 
   it("§11: the upstream call itself still receives the UNREDACTED input (redaction is trace-only)", async () => {
     const { caller, requests } = recordingUpstream();
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_live", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_live",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
     await invoke("github.list_issues", { token: "sk-live", repo: "hq" });
     expect(requests[0]?.input).toEqual({ token: "sk-live", repo: "hq" });
   });
 
   it("§11: a sensitive value's head never leaks through the 160-char summary slice (redact-then-slice, R7)", async () => {
     const { caller } = recordingUpstream({ secret: `sk-${"x".repeat(400)}`, note: "fine" });
-    const invoke = createToolInvoker(deps(caller), { executionId: "exec_slice", log: vi.fn() });
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_slice",
+      log: vi.fn(),
+      projection: "code",
+      clientId: null,
+    });
     await invoke("github.list_issues", {});
     const [event] = await store.trace.listByExecution("exec_slice");
     expect(String(event?.outputSummary)).not.toContain("sk-x");
+  });
+});
+
+const permitAll = async () =>
+  buildEffectiveScope(
+    { projections: { code: true, direct: true, discovery: true }, allow: ALL_TOOLS },
+    await store.tools.list(),
+  );
+const permitOnly = (names: string[]) => async () =>
+  buildEffectiveScope(
+    { projections: { code: true, direct: true, discovery: true }, allow: names },
+    await store.tools.list(),
+  );
+
+describe("§5.5 scope check", () => {
+  it("INVARIANT §5.5: an out-of-scope tool is treated exactly as an unknown tool — blocked, audited, no upstream contact", async () => {
+    const { caller, requests } = recordingUpstream();
+    const invoke = createToolInvoker(deps(caller), {
+      executionId: "exec_s",
+      projection: "code",
+      clientId: "acme",
+      scope: permitOnly(["github.delete_repo"]),
+      log: vi.fn(),
+    });
+    await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.policyBlocked,
+      message: 'Tool "github.list_issues" is outside this client\'s scope.',
+    });
+    expect(requests).toHaveLength(0);
+    const [row] = await store.trace.listByExecution("exec_s");
+    expect(row).toMatchObject({
+      toolName: "github.list_issues",
+      policyVerdict: "block",
+      projection: "code",
+      clientId: "acme",
+    });
+  });
+
+  it("the refusal names only the tool, never the profile's other entries", async () => {
+    const invoke = createToolInvoker(deps(recordingUpstream().caller), {
+      executionId: "exec_o",
+      projection: "direct",
+      clientId: "acme",
+      scope: permitOnly(["github.delete_repo"]),
+      log: vi.fn(),
+    });
+    await expect(invoke("github.list_issues", {})).rejects.toSatisfy(
+      (e: Error) => !e.message.includes("delete_repo"),
+    );
+  });
+
+  it("a permitted tool proceeds; an absent scope behaves as today", async () => {
+    const { caller, requests } = recordingUpstream();
+    await createToolInvoker(deps(caller), {
+      executionId: "exec_p",
+      projection: "code",
+      clientId: null,
+      scope: permitAll,
+      log: vi.fn(),
+    })("github.list_issues", {});
+    await createToolInvoker(deps(caller), {
+      executionId: "exec_q",
+      projection: "code",
+      clientId: null,
+      log: vi.fn(),
+    })("github.list_issues", {});
+    expect(requests).toHaveLength(2);
+  });
+
+  it("INVARIANT §4.3 (#27): every trace row carries projection and clientId, on allow and on refusal", async () => {
+    const invoke = createToolInvoker(deps(recordingUpstream().caller), {
+      executionId: "exec_t2",
+      projection: "discovery",
+      clientId: "acme",
+      log: vi.fn(),
+    });
+    await invoke("github.list_issues", {});
+    await invoke("github.delete_repo", {}).catch(() => {});
+    const rows = await store.trace.listByExecution("exec_t2");
+    expect(rows).toHaveLength(2);
+    for (const r of rows) expect([r.projection, r.clientId]).toEqual(["discovery", "acme"]);
+  });
+});
+
+describe("§7 post-dispatch classification", () => {
+  function dispatchingCaller(fail: () => Error): UpstreamCaller {
+    return {
+      async call(request: UpstreamRequest) {
+        request.dispatch?.advance("initializing");
+        request.dispatch?.advance("dispatched");
+        throw fail();
+      },
+    };
+  }
+
+  it("the ambiguity class's name equals the exported constant every reader keys on", () => {
+    expect(new ConduitOutcomeAmbiguous("x").name).toBe(OUTCOME_AMBIGUOUS_ERROR_NAME);
+  });
+
+  it("INVARIANT §7 (#24): an upstream failure after dispatch surfaces as ConduitOutcomeAmbiguous, not a guest-catchable upstream error", async () => {
+    const invoke = createToolInvoker(deps(dispatchingCaller(() => upstreamError("HTTP 404"))), {
+      executionId: "exec_a",
+      projection: "code",
+      clientId: null,
+      log: vi.fn(),
+    });
+    await expect(invoke("github.list_issues", {})).rejects.toBeInstanceOf(ConduitOutcomeAmbiguous);
+  });
+
+  it("INVARIANT §7 (#24): classification survives error REPLACEMENT — a failing refusal audit after dispatch is still ambiguous", async () => {
+    const failingTrace: ConduitStore = {
+      ...store,
+      trace: { ...store.trace, append: () => Promise.reject(new Error("disk full")) },
+    };
+    const invoke = createToolInvoker(
+      deps(
+        dispatchingCaller(() => upstreamError("HTTP 404")),
+        { store: failingTrace },
+      ),
+      { executionId: "exec_b", projection: "code", clientId: null, log: vi.fn() },
+    );
+    await expect(invoke("github.list_issues", {})).rejects.toBeInstanceOf(ConduitOutcomeAmbiguous);
+  });
+
+  it("a failure while the cell is initializing (handshake) keeps its own classification", async () => {
+    const initOnly: UpstreamCaller = {
+      async call(request: UpstreamRequest) {
+        request.dispatch?.advance("initializing");
+        throw upstreamError("handshake refused");
+      },
+    };
+    const invoke = createToolInvoker(deps(initOnly), {
+      executionId: "exec_c",
+      projection: "code",
+      clientId: null,
+      log: vi.fn(),
+    });
+    await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+    });
+  });
+
+  it("REGRESSION (one-way door #3, eng review D4): a credential echo after a 200 is post-dispatch — ConduitOutcomeAmbiguous, result never delivered", async () => {
+    // A real loopback MCP server: initialize + tools/call both succeed, and the
+    // 200 body echoes the bearer — so the §9.2 tripwire fires AFTER dispatch.
+    const port = await serveEchoingMcp();
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: "github",
+      location: `http://127.0.0.1:${port}/mcp`,
+      generation: 0,
+    });
+    const echoing = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    const invoke = createToolInvoker(deps(echoing), {
+      executionId: "exec_echo",
+      projection: "code",
+      clientId: null,
+      log: vi.fn(),
+    });
+    await expect(invoke("github.list_issues", {})).rejects.toBeInstanceOf(ConduitOutcomeAmbiguous);
+    const rows = await store.trace.listByExecution("exec_echo");
+    expect(JSON.stringify(rows)).not.toContain("ghp_invoker_secret");
+  });
+
+  it("a caller-supplied cell (direct drive) is the one the upstream caller advances", async () => {
+    const cell = createDispatchCell();
+    const advancing: UpstreamCaller = {
+      async call(request: UpstreamRequest) {
+        request.dispatch?.advance("initializing");
+        request.dispatch?.advance("dispatched");
+        return { result: {}, status: 200, latencyMs: 1 };
+      },
+    };
+    const invoke = createToolInvoker(deps(advancing), {
+      executionId: "exec_d",
+      projection: "direct",
+      clientId: null,
+      dispatch: cell,
+      log: vi.fn(),
+    });
+    await invoke("github.list_issues", {});
+    expect(cell.state).toBe("dispatched"); // F6: would read "none" if the invoker minted its own cell
+  });
+
+  it("INVARIANT §5.3 (F2): the budget is re-checked AFTER the source read — a stall there never dispatches once the budget is gone", async () => {
+    let remaining = 100;
+    const slowSources: ConduitStore = {
+      ...store,
+      sources: {
+        ...store.sources,
+        getByNamespace: async (ns: string) => {
+          remaining = 0;
+          return store.sources.getByNamespace(ns);
+        },
+      },
+    };
+    const { caller, requests } = recordingUpstream();
+    const invoke = createToolInvoker(deps(caller, { store: slowSources }), {
+      executionId: "exec_f2",
+      projection: "direct",
+      clientId: null,
+      deadline: () => remaining,
+      log: vi.fn(),
+    });
+    await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+      message: expect.stringContaining("budget is exhausted"),
+    });
+    expect(requests).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 quarantine gate: an exhausted deadline refuses BEFORE credentials are resolved", async () => {
+    const resolve = vi.fn();
+    const credentials = {
+      resolve: async (c: Connection) => {
+        resolve();
+        return createStoreCredentialResolver(store.secrets).resolve(c);
+      },
+    };
+    const invoke = createToolInvoker(deps(recordingUpstream().caller, { credentials }), {
+      executionId: "exec_e",
+      projection: "code",
+      clientId: null,
+      deadline: () => 0,
+      log: vi.fn(),
+    });
+    await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+      message: expect.stringContaining("budget is exhausted"),
+    });
+    expect(resolve).not.toHaveBeenCalled();
   });
 });
