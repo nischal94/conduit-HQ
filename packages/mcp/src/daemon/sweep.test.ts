@@ -174,7 +174,8 @@ describe("sweepOrphanedExecutions", () => {
     // The row is terminalized as ambiguous and the stored result is NOT
     // promoted into a delivered outcome: the sweep never replays and never
     // decides that an unfinished call succeeded.
-    expect(running?.resultState).not.toBe("delivered");
+    expect(running?.kind).toBe("direct");
+    expect(running?.kind === "direct" ? running.resultState : "not-direct").not.toBe("delivered");
     expect(running?.status).not.toBe("completed");
     // The paused direct row is awaiting a human, not stranded — untouched.
     expect((await store.executions.get("exec_direct_paused"))?.status).toBe("paused");
