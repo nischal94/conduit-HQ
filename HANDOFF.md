@@ -38,8 +38,10 @@ the main tripwire cannot see it; `git branch -a` + `git log main..feat/r1-lane-a
 at session start).** Plan execution is under way via
 `superpowers:subagent-driven-development`. Tasks 1–2 DONE and reviewed
 (`44f5bd1` + fix `a2cb86c`; one commit for both by plan design — the
-pre-commit typecheck cannot pass on Task 1 alone). Task 3 committed
-`c583398`, task review pending. The recovery map is the git-ignored
+pre-commit typecheck cannot pass on Task 1 alone). Task 3 DONE
+(`c583398` + fix `502fe90`), Task 4 DONE (`e46b20c`, the Task 4 carried
+items below are closed), Task 5 DONE (`22a5d89`) — all task-reviewed.
+NEXT: Task 6, then 7 → 11 in order. The recovery map is the git-ignored
 ledger `.superpowers/sdd/2026-09-12-r1-lane-a-store-manager/progress.md`
 (rulings, deferred minors, per-task BASE shas); if it is gone, rebuild
 from `git log` on the branch. Carried items a fresh session must not lose:
@@ -55,6 +57,13 @@ from `git log` on the branch. Carried items a fresh session must not lose:
   until Task 8 writes real provenance. `ExecutionOutcome.pending` was
   widened to `StoredPendingApproval` for the interim; narrow it back if
   Task 8 makes that truthful.
+- **Tasks 6/10 dispatch:** `"ConduitOutcomeAmbiguous"` is hand-written in
+  `packages/mcp/src/daemon/sweep.ts` and `manager.ts`; import
+  `OUTCOME_AMBIGUOUS_ERROR_NAME` there when the first thrower of the new
+  class lands, and pin the equality with a test.
+- **Task 9 dispatch:** `provisionSource` reads the generation outside the
+  write batch — the contract is "current at read time" (a concurrent bump
+  reads newer, never stale: fail-closed for the resume guard).
 - **Tasks 8/10 dispatch:** `manager.ts` still matches the legacy
   `executions.request_key` UNIQUE text; `mapCreateConflict` (D-A12) must
   own both UNIQUE strings once named clients reach `create`.
