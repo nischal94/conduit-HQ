@@ -14,7 +14,12 @@ export type {
   ExecuteToolDefinition,
   ToolInvoker,
 } from "./execute.js";
-export { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execute.js";
+export {
+  buildExecuteTool,
+  createCatalogToolHost,
+  createScopedCatalogToolHost,
+  estimateTokens,
+} from "./execute.js";
 export type {
   ApprovalDecision,
   ApprovalDecisions,
