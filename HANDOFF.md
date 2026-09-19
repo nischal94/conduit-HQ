@@ -33,6 +33,49 @@ at session start.
 
 ## Current handoff — updated 2026-09-13 ~12:10 (**Lane A plan WRITTEN, REVIEWED, and MERGED — PR #61 `1022b2e`**, founder-named merge; branches = main only; NEXT: execute the plan on `feat/r1-lane-a`)
 
+**PR #62 IS OPEN (2026-09-20) — `feat/r1-lane-a` → main, pushed through
+`83773b4`. RESUME HERE.** The founder confirmed the PR body and both spec
+notes verbatim; conduitspec §18 (2026-09-19 entry) and the design-spec §5.5
+amendment are committed. Post-PR gauntlet state:
+- DONE: `/security-review` — no finding met the bar. One note for Lane B:
+  the daemon does not filter `executions.get` by client id; harmless while
+  every row has `clientId: null`, but reads by execution id MUST be
+  authorized against the caller's client id once named clients reach the
+  daemon.
+- DONE: Greptile — TWO P1s, both real, NOT YET FIXED: (1) `startDirect`
+  calls `JSON.stringify(input)` before building the handle, so a cyclic
+  input, a `BigInt`, or a throwing `toJSON` throws synchronously — no
+  bounded outcome, no execution record; fix: catch it and answer the same
+  failed outcome other non-JSON inputs get, with a test per input shape.
+  (2) the timeout settle re-issued after a LATE `create()` success calls
+  `settleDirect` unbounded, so a stalled write leaves the row `running`;
+  fix: route it through `boundedFencedSettle` and keep tracking the write.
+- CodeRabbit skipped itself ("manual review required for this OSS
+  repository") — trigger it with an `@coderabbitai review` PR comment if
+  its review is wanted; that is an outward-facing post, ask the founder.
+- CI: 8 of 9 green; "Unit tests" failed ONCE on the known
+  `--doctor --offline performs ZERO writes` fixture race (db 4096 → 131072
+  bytes inside 40 ms: the fixture's seeding write landing after the
+  baseline stat), rerun started. This branch's larger schema lengthens the
+  seeding write and WIDENS that race — expect it more often; the fixture
+  fix (fingerprint after setup settles, or assert content not mtime) is now
+  worth doing. Also new: mcp full-suite runs can fail once with run-daemon
+  "Bind refused: existing entry is not a socket" on a temp socket path.
+- RUNNING when this was written: the codex adversarial pass
+  (`gpt-5.6-sol`, `high`; triggers: authorization boundary, concurrency/
+  CAS, persistence invariant, >8 files). Record model, effort, trigger and
+  finding counts in the PR when it reports.
+- NOT STARTED: `/aikido:scan`; `code-review:code-review` on the PR; ONE fix
+  pass for Greptile + codex findings (then re-verify all three suites and
+  `tsc -p packages/mcp` YOURSELF — a fix agent's "tsc clean" was false once
+  this session; the pre-commit hook does not typecheck mcp tests the way
+  CI's `pnpm typecheck` does); `/explain-diff` explainer + quiz covering
+  the three one-way doors, the `unknown` wire deviation, the scope-refusal
+  change, and the two Code Mode behaviour changes; then the founder's quiz
+  pass and the founder's word to merge.
+- Dependabot: GitHub's push banner reports 15 alerts on main (14 moderate,
+  1 low); this file last recorded 6 medium / 1 low — audit triage is due.
+
 **IN-PROGRESS CHECKPOINT (2026-09-19, lives on `feat/r1-lane-a` only —
 the main tripwire cannot see it; `git branch -a` + `git log main..feat/r1-lane-a`
 at session start).** Plan execution is under way via
