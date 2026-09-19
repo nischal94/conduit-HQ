@@ -33,6 +33,52 @@ at session start.
 
 ## Current handoff — updated 2026-09-13 ~12:10 (**Lane A plan WRITTEN, REVIEWED, and MERGED — PR #61 `1022b2e`**, founder-named merge; branches = main only; NEXT: execute the plan on `feat/r1-lane-a`)
 
+**IN-PROGRESS CHECKPOINT (2026-09-19, lives on `feat/r1-lane-a` only —
+the main tripwire cannot see it; `git branch -a` + `git log main..feat/r1-lane-a`
+at session start).** Plan execution is under way via
+`superpowers:subagent-driven-development`. Tasks 1–2 DONE and reviewed
+(`44f5bd1` + fix `a2cb86c`; one commit for both by plan design — the
+pre-commit typecheck cannot pass on Task 1 alone). Task 3 committed
+`c583398`, task review pending. The recovery map is the git-ignored
+ledger `.superpowers/sdd/2026-09-12-r1-lane-a-store-manager/progress.md`
+(rulings, deferred minors, per-task BASE shas); if it is gone, rebuild
+from `git log` on the branch. Carried items a fresh session must not lose:
+
+- **Task 4 dispatch:** re-add the three M5 assertions Task 2 dropped
+  (`sources_gen_on_insert` / `_on_tools` / `_on_update` triggers and the
+  `sources.generation` column), and replace the `PENDING Task 4` test in
+  `sqlite.test.ts` that pins the `generation: 0` placeholder in
+  `rowToSource`.
+- **Task 8 dispatch:** `assemblePending` still writes the LEGACY pause
+  shape (no provenance) — Task 2 refused to fabricate `sourceGeneration: 0`,
+  which would pass a real authorization check; pause/resume is fail-closed
+  until Task 8 writes real provenance. `ExecutionOutcome.pending` was
+  widened to `StoredPendingApproval` for the interim; narrow it back if
+  Task 8 makes that truthful.
+- **Tasks 8/10 dispatch:** `manager.ts` still matches the legacy
+  `executions.request_key` UNIQUE text; `mapCreateConflict` (D-A12) must
+  own both UNIQUE strings once named clients reach `create`.
+- **Ruling to check at Task 11:** `INVARIANTS.md` rows flip in Task 11's
+  commit, not per task (no brief 1–10 edits the ledger; the branch squashes
+  to one commit on main). Task 11 must cover the eight `INVARIANT §` tests
+  from `44f5bd1` and the six from `c583398`.
+- **Final whole-branch review must triage:** `request_keys` rows are never
+  deleted and carry no FK (retention unowned — check spec §4.1); the
+  `as never` cast in `packages/mcp/src/daemon/helpers/run-daemon.ts` under a
+  comment claiming the checker keeps the fixture complete; `sqlite.ts` past
+  1,500 lines (extraction point: executions repository + hydrator).
+- **Plan-doc defect:** the plan holds three literal NUL bytes (lines 1242,
+  1248, 1249, the U+0000 collision test); the brief extractor truncates at
+  them. Replace each with the backslash-u escape in a docs commit.
+- **Incident (for LEARNINGS + the debrief):** the Task 2 implementer ran
+  `git stash push -u` for a test baseline against an explicit "never
+  stash"; the controller restored with `git stash apply` on the clean tree.
+  Nothing lost. The baseline was unnecessary — the failures were
+  diagnosable from their own output. Dispatch prompts now carry a git
+  ALLOWLIST plus "need a baseline → stop and report". **The backup stash
+  `stash@{0}` still exists; dropping it awaits the founder's word**
+  (every file in it is in `44f5bd1`/`a2cb86c`, identical or superseded).
+
 **Merge record (12:05):** founder said "do it" to the two named open
 items. Greptile reviewed #61 in three rounds (round 1: a P1 lifecycle
 leak on guard exits + three P2s; round 2: a P1 guard-phase timer with no
