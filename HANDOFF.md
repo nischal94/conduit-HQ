@@ -64,10 +64,58 @@ amendment are committed. Post-PR gauntlet state:
   fix (fingerprint after setup settles, or assert content not mtime) is now
   worth doing. Also new: mcp full-suite runs can fail once with run-daemon
   "Bind refused: existing entry is not a socket" on a temp socket path.
-- RUNNING when this was written: the codex adversarial pass
-  (`gpt-5.6-sol`, `high`; triggers: authorization boundary, concurrency/
-  CAS, persistence invariant, >8 files). Record model, effort, trigger and
-  finding counts in the PR when it reports.
+- DONE: codex adversarial pass #1 on the PR (`gpt-5.6-sol`, `high`;
+  triggers: authorization boundary, concurrency/CAS, persistence invariant,
+  >8 files; head `83773b4`; ~23 min) — **P0 1 / P1 6 / P2 0, NOT
+  CONVERGED**, all seven verified by reading, all in scope. P0: the
+  existence oracle survives as a SIDE CHANNEL — unknown tool names skip
+  `options.scope()`, existing names call it, so a slow/rejecting/stalling
+  resolver separates them by latency, error shape or hang. P1: the whole
+  CODE-row guard phase after a claim is unbounded; a SYNCHRONOUS store
+  throw escapes `kindOf` and both `failClaimedResume` fallbacks;
+  `String(cause)` runs AFTER the latch is spent (a thrown value with a
+  hostile `toString` hangs the outcome, and the "throw from ANYWHERE" test
+  never reaches that handler — ledger row #45 was falsely pinned);
+  late-`create()` reconciliation is unbounded (= Greptile P1 #2); the
+  unique-index upgrade's duplicate check and DROP are separate statements
+  (TOCTOU → the brick returns); the sweep keeps the upstream result body
+  and commit `4ce5111` WEAKENED its test to pass. **Classification: three
+  P1s + Greptile #2 are instances 6–8 of ONE class, so the fix is the
+  SHAPE — one store-call helper (sync throw → rejection, budget, closed
+  result union) on every post-claim path, one total cause formatter, settle
+  before diagnostics — then ONE confirming codex pass.** FIXED in
+  `5b62817`, `ce109a9`, `ee06e1a`, `479eec6`, `e301547`, `f098ac8`,
+  `1bbc628`, `4f1efe7`; the controller re-ran everything by hand: sdk
+  653/653, mcp 440/440, cli 118/118, `tsc -p` sdk/mcp/cli all exit 0.
+  The index-upgrade item was DONE DIFFERENTLY: the agent reports libSQL's
+  `batch(…, "write")` is transactional, so DROP/CREATE rolls back together
+  and the database stays openable; it added a test that fails if the two
+  statements are split. That CONTRADICTS the pre-PR reviewer's probe ("no
+  index remains") — the confirming codex pass must settle it.
+- DONE: CodeRabbit (the founder triggered it; it reviewed the pre-fix
+  head) — 4 findings: one already fixed; three folded into the same fix
+  pass, including the one no other reviewer saw (`deliverableBytes` ran
+  `JSON.stringify` AFTER the latch, so a `BigInt` or circular invoker
+  result hung the outcome — now measured before the latch).
+- **DECIDED (founder delegated it, 2026-09-20) and WRITTEN to the
+  conduitspec §18 entry:** Code Mode's own store calls stay un-time-bounded
+  in this PR, as on main — the first mutation (`start`'s `create()`, the
+  `claimForResume` await) and the drive's journal, pause and settle
+  writes; bounding them needs attempt-fenced late-completion recovery for
+  code rows (follow-up). Lane A bounds `resume`'s read-side guard phase for
+  both kinds and every store call on the direct path. The first draft
+  claimed more ("every call after the first mutation"); the fix agent's
+  store-call coverage table showed that was false, so the sentence was
+  reworded before it was written. An adversarial finding against those
+  Code Mode writes is now out of scope by documented decision.
+- NEXT: ONE confirming codex pass (same model and effort; list the fixed
+  findings and the §18 scope sentence in the prompt; ask for an explicit
+  CONVERGED / NOT CONVERGED). If it returns the SAME class again, stop and
+  bring the design question to the founder — do not patch a ninth site.
+- Follow-up found by a whole-file ledger scan: 129 `INVARIANT §` tests
+  uncited and 70 truncated citations in `INVARIANTS.md`, all OUTSIDE the R1
+  section (§9.3/§16/§17/§18-C4) and predating this branch. Every
+  branch-added invariant test is cited (96 of 96).
 - NOT STARTED: `/aikido:scan`; `code-review:code-review` on the PR; ONE fix
   pass for Greptile + codex findings (then re-verify all three suites and
   `tsc -p packages/mcp` YOURSELF — a fix agent's "tsc clean" was false once

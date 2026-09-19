@@ -802,7 +802,12 @@ id and nothing was dispatched; the next re-issue with the same key answers `conf
 `create()` slower than the drive budget is a store fault the timeout correctly surfaces.
 **Also recorded:** `resultTooLarge` is not yet projected onto the wire — an over-cap direct
 completion reaches a client as `result: null` while the stored row says `discarded`; Lane B
-decides the wire form.
+decides the wire form. **Also out of scope for Lane A:** Code Mode's own store calls are not
+time-bounded, as on main today — the first mutation (`start`'s `create()`, the
+`claimForResume` await) and the drive's journal, pause and settle writes; a store that commits and
+never answers hangs that call. Bounding them needs attempt-fenced late-completion recovery for code rows and is a
+follow-up. What Lane A bounds: every store call in `resume`'s read-side guard phase, for both kinds,
+and every store call on the direct path.
 - **R1 sequencing amended — Lane A, then preview packaging, then decide profiles (decided 2026-09-11):** ✅
 The R1 build shape stays Lane A → B → C (R1 design spec §10), but publication moves between A and B.
 **Lane A first, while nothing is published:** it changes pause-path storage (the `code`
