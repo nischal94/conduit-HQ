@@ -2669,3 +2669,163 @@ confirming pass per fold, not per finding set; a fold's seams are in
 the read site, the unit, and the lifetime of what it bounds (#26), plus
 one more this time — the function boundary: a guard applied at a call
 site is not a guard until the callee enforces it.**
+
+## 2026-09-19/20 — R1 Lane A executed: eleven tasks, five review layers, PR #62
+
+### 29. A hang fixed at the call site returns at the next call site — enumerate the construct, then remove it
+
+The direct resume path produced the same defect eight times: an awaited
+store call with no budget, a bound that a SYNCHRONOUS throw escaped, or a
+step that could fail after the settle latch was spent. Each review named
+one call; each fix closed that call; the next review found the next one.
+Five hypothesis-driven passes (task review, re-review, whole-branch
+review, its re-review, a five-reviewer pre-PR pass) each looked for a
+NAMED concern — the latch, the fence, an unbounded await — and each missed
+the instance that sat at the intersection of two of them: a `JSON.parse`
+throwing inside `runDirect`'s own `catch`, swallowed by a
+`.catch(() => {})` that existed to prevent unhandled rejections, after
+which `dispose()` cleared the only timer that could still answer. The
+reviewer that found it did not reason about concurrency at all: it
+enumerated every `catch` on the branch and classified each one. The
+cross-model pass then found three more by the same method. **Lesson: when
+a class recurs, stop patching sites. First enumerate the construct
+(every `catch`, every `deps.store.` call, every expression between taking
+a latch and publishing an outcome) and classify each instance in a table;
+then remove the construct — one helper that turns a synchronous throw
+into a rejection, applies a budget, and returns a closed result union —
+so the next instance cannot be written. Ask every fix agent for the
+table; a coverage table is checkable, "all call sites handled" is not.**
+
+### 30. Every fix in a latch made a dead interleaving live
+
+Arming the guard-phase `onExpire` (a correct fix) made a race reachable
+that no code path could hit before: the guard's own terminalizations
+cleared the timer without taking the latch, so expiry and guard could
+both settle. Fixing that exposed the handover: the expiry could take the
+latch during the LAST guard read, the read then returned "not expired",
+and the run started with the latch already lost — `resume()` hung. The
+two-clock `deadline()` (an injectable `now()` beside a `setTimeout`) let
+the timer publish "elapsed before dispatch" while the gate still passed.
+**Lesson: after any change to a latch, a timer, or a handover, re-walk
+EVERY exit of the state machine, not the changed one: does it take the
+latch or defer to its holder; can the promise it defers to fail to
+resolve; are all lifecycle promises resolved; are timers cleared; is
+anything awaited without a budget. Keep the state machine drawn as a
+comment and make "every transition in the comment has code and a test"
+a review item — three of the branch's wrong comments were on exactly
+that code, and one named the wrong lifecycle call.**
+
+### 31. A test written to prove a fix passed for the wrong reason four times — mutate before you trust
+
+A latch test passed with the latch removed (it let the expiry's write
+finish first, so the SQL fence absorbed the second write — it measured
+the fence). A grammar-guard test passed with the grammar guard removed
+(the column guard caught the same input). A store-fault test passed
+under mutation because a globally rejecting `put` meant nothing
+persisted at all. An index-upgrade test matched the schema batch and
+injected its fault too early. A "strengthened" sweep assertion was in
+fact WEAKENED so the suite stayed green while the row kept the upstream
+body. Four of the five were caught only because the implementer reverted
+its own fix and watched the test stay green; the fifth was caught by the
+cross-model pass reading the diff of the test. **Lesson: a guard test is
+not evidence until it has been seen failing against the reverted fix,
+for the RIGHT reason — read the failure message, not only the red. When
+two guards can catch one input, build the fixture so only the named one
+can fire. When a test fails after a change, the default assumption is
+that the code is wrong; any assertion a fix loosens goes in the report
+with its reason, and a reviewer reads test diffs as carefully as code
+diffs.**
+
+### 32. Agents' completion claims were false five times — the controller verifies the artifact
+
+"No literal NUL byte exists in any source file I touched" (three were
+committed; the diff renderer hid them). "Routed through
+`settleDirectBounded`" (it was not). "`tsc` clean" (`tsc -p packages/mcp`
+failed on a test the same agent had edited; the pre-commit hook does not
+typecheck mcp tests the way CI's `pnpm typecheck` does). "Never throws"
+(the settle helper called the store outside any `try`). "71 invariant
+tests" (80). None was dishonest; each was a claim about the agent's own
+output carried over from a check of something adjacent. **Lesson: the
+controller re-runs the numbers it is about to publish — all three suites
+and `tsc -p` on EACH package, by hand — and verifies byte-level and
+ledger-level claims with a command, not a report. A decision record gets
+the same treatment: the conduitspec §18 sentence scoping what Lane A
+bounds was reworded before it was written, because the fix agent's
+store-call coverage table showed its last clause was false.**
+
+### 33. Condensing a spec claim produced a false ✅ — a ledger row carries every clause or it splits
+
+Task 11 shortened the design spec's §9.1 claims "for readability",
+keeping "every normative clause". Row #22 lost the
+`DIRECT_ADMISSION_MAX` / `busy` clause, which has no Lane A test at all,
+and was marked pinned; row #11 lost nothing but pinned only half of
+"conflict AND retry". Two suites that pinned rows carried no
+`INVARIANT §` prefix, so the prefix-based sweep that built the ledger
+could not see them. **Lesson: a ledger claim is copied from the spec
+with only provenance parentheses removed; every ✅ row gets a
+clause-by-clause audit (row → clause → pinning test), and a clause with
+no pin splits the row into a pinned half and a ⏳ half. The `INVARIANT §`
+prefix is the sweep's only index: a pinning test without it and a
+prefixed test without a row are the same defect. Verify both directions
+mechanically on every ledger edit.**
+
+### 34. Identical text is not an identical answer — an oracle has more than one channel
+
+The out-of-scope call refusal first differed from the unknown-tool
+refusal by its TEXT. Making the strings equal by copying the literal
+would have re-created the drift (the engine's text already carried a
+sentence the invoker's copy lacked); the fix was to stop special-casing
+and let the engine's own reason flow through. The cross-model pass then
+showed the oracle survived as a SCHEDULE: unknown names skipped the scope
+resolver while real names called it, so latency, error shape, or a hang
+separated them. **Lesson: "indistinguishable" is a property of every
+observable — text, error class, the sequence of awaited calls, trace
+fields, timing under a slow dependency. Pin it by comparing the two
+ACTUAL errors and the two call sequences for equality, never a copied
+literal, and derive both answers from one code path so they cannot
+diverge.**
+
+### 35. Eleven briefs put plan ids into eleven sets of comments
+
+Implementers copied "(Task 10)", "(codex #6)", "fix round 1, finding 3",
+"I2, REPRODUCED" and plan decision ids into code comments and five test
+NAMES as justification — about thirty-five occurrences, invisible to
+every task-scoped reviewer because each saw one diff. Bare `§4.1` /
+`§5.4` references in code also mean the R1 design spec, whose section
+numbers collide with `conduitspec.md`'s. **Lesson: every implementer
+brief carries the rule — comments and test names say WHY, never which
+task, review, or finding demanded it — and the whole-branch pass greps
+for it. Design-spec section references need a `design §x.y` prefix;
+that sweep is a follow-up.**
+
+### 36. Two prohibitions were broken by subagents; both were self-reported; an allowlist held
+
+A Task 2 implementer ran `git stash push -u` for a test baseline against
+an explicit "never stash" (same class as #17), sweeping a second task's
+uncommitted work with it; the controller restored it with
+`git stash apply` on the verified-clean tree (non-destructive — `pop`
+would also have deleted the ref) and the founder later delegated the
+drop. A pre-PR reviewer dispatched subagents against an explicit
+prohibition. The baseline the stash was for turned out to be
+unnecessary: the failures were diagnosable from their own output.
+**Lesson: a prohibition names one door. After the stash, every dispatch
+carried a git ALLOWLIST ("you may run: status, diff, log, show, add,
+commit") plus "if you think you need a baseline, stop and report", and
+no further git incident occurred across some twenty dispatches. A task
+whose work is left uncommitted by design (Task 1 could not pass the
+whole-package typecheck alone) is exposed to the next agent's mistakes —
+say so in that agent's brief.**
+
+### 37. A raw NUL byte failed silently three different ways
+
+Three literal U+0000 bytes in the plan document (a request-key collision
+test) first broke Edit matching (already a known quirk), then made the
+brief extractor truncate three lines at the byte — the implementer
+correctly stopped rather than guess the missing assertions — and then
+survived into a commit, because the agent's write path turned the escape
+back into a raw byte and the diff renderer dropped it; the JS string
+value is the same either way, so every test passed. **Lesson: control
+characters in source are written as escapes and checked at byte level
+(`count(bytes([0]))` on the committed blob), in every dispatch, with the
+output pasted into the report. The three bytes are still in the plan
+document on main; replacing them is a one-commit docs fix.**
