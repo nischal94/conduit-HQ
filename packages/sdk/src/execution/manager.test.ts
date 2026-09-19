@@ -3894,4 +3894,108 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     // claimed terminal and never an unresolved promise.
     expect(out).toMatchObject({ status: "unknown" });
   });
+
+  it("a store fault's host detail never reaches the persisted error or the returned outcome — only a reference", async () => {
+    // `check_execution` hands the stored `error` back to the AGENT, so a
+    // store fault's own text — which carries the database path and the SQL —
+    // must not be persisted. The cause goes to the host log under a fresh
+    // reference; only the reference is stored.
+    active = await makeHarness();
+    const HOST_DETAIL = "/var/secret-host-path/conduit.db: SQL near SELECT";
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(" "));
+    });
+    try {
+      // The settle-write site. The FIRST `put` (the settle) rejects with the
+      // host detail; the finalize `put` that follows must succeed, or nothing
+      // persists and the stored column proves nothing.
+      let puts = 0;
+      const faulting = {
+        ...active.store,
+        executions: {
+          ...active.store.executions,
+          put: (row: Execution) => {
+            puts += 1;
+            return puts === 1
+              ? Promise.reject(new Error(HOST_DETAIL))
+              : active?.store.executions.put(row);
+          },
+        },
+      } as unknown as ConduitStore;
+      const m = createExecutionManager({ ...active.deps, store: faulting });
+      await expect(m.start("return 1;")).rejects.toThrow();
+      // The settle path really was exercised, not skipped.
+      expect(puts).toBeGreaterThan(1);
+
+      // The session-creation site: the outcome the caller sees, too.
+      const boom = createExecutionManager({
+        ...active.deps,
+        makeUpstreamSession: () => {
+          throw new Error(HOST_DETAIL);
+        },
+      });
+      await expect(boom.start("return 1;")).rejects.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+    // The persisted column, read through raw SQL — not the hydrated object.
+    const rows = await active.client.execute(
+      "SELECT error FROM executions WHERE error IS NOT NULL",
+    );
+    expect(rows.rows.length).toBeGreaterThan(0);
+    for (const row of rows.rows) {
+      const stored = String(row.error);
+      expect(stored).not.toContain(HOST_DETAIL);
+      expect(stored).not.toContain("secret-host-path");
+      expect(stored).toMatch(/Reference: [0-9a-f-]{36}/);
+    }
+    // The operator has NOT lost the cause: it is on the host log, joined to
+    // the stored row by that same reference.
+    expect(errors.some((line) => line.includes(HOST_DETAIL))).toBe(true);
+  });
+
+  it("a CODE row whose prep-window fault meets a STALLED failClaimedResume still answers within budget", async () => {
+    // The direct arm bounds every post-claim write; this code-row path awaited
+    // `failClaimedResume` with no bound at all, on a client-visible path. A
+    // store that accepts the call and never answers held `resume()` open past
+    // every budget — the same hang class, one arm over.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const started = await m.start(
+      'return await tools.github.create_issue({ title: "from agent" });',
+    );
+    expect(started.status).toBe("paused");
+    const callId = await pendingCallOf(m, started.executionId);
+    const never = new Promise<never>(() => {});
+    const stalled = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        // Force the prep window to throw…
+        get: () => Promise.reject(new Error("injected prep-window fault")),
+        // …and make the terminalizing write never answer.
+        failClaimedResume: () => never,
+      },
+    } as unknown as ConduitStore;
+    const stalledM = createExecutionManager({ ...active.deps, store: stalled, direct: fast });
+    // REAL CLOCK: the setup crosses the harness's loopback MCP socket, which
+    // deadlocks under fake timers. A full second of margin for CI load; the
+    // property is "answers within budget", not an exact duration.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stalledM
+        .resume(started.executionId, { kind: "approve" }, callId, permitDirect)
+        // The path re-throws the ORIGINAL fault by contract; answering at all
+        // is what is under test.
+        .then(
+          (o) => o,
+          (cause: unknown) => ({ threw: String(cause) }),
+        ),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.settleWriteBudgetMs + 1_000);
+    expect(out).toMatchObject({ threw: expect.stringContaining("injected prep-window fault") });
+  });
 });

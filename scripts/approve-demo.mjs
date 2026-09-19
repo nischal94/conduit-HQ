@@ -112,14 +112,27 @@ async function main() {
     );
     process.exit(1);
   }
-  if (outcome.status === "conflict" || outcome.status === "failed") {
-    if (outcome.status === "failed") {
-      console.error(`[ApproveDemo] error: ${outcome.error.name}: ${outcome.error.message}`);
-    } else {
-      console.error(
-        `[ApproveDemo] conflict: execution ${executionId} was not paused (race or not found).`,
-      );
-    }
+  if (outcome.status === "failed") {
+    console.error(`[ApproveDemo] error: ${outcome.error.name}: ${outcome.error.message}`);
+    process.exit(1);
+  }
+  if (outcome.status === "conflict") {
+    console.error(
+      `[ApproveDemo] conflict: execution ${executionId} was not paused (race or not found).`,
+    );
+    process.exit(1);
+  }
+  // The ONLY success is a decision that was actually applied — the same test
+  // the CLI uses. A resume can end `paused` (the execution paused again on a
+  // LATER call, which this decision did not authorize) or `expired` (the
+  // approval window closed before the decision was staged); in both the
+  // pending call this run was asked to approve did not run, so exiting 0
+  // would report success for work that never happened.
+  if (outcome.decisionApplied !== true) {
+    console.error(
+      `[ApproveDemo] outcome: ${outcome.status} — the pending call did not run. ` +
+        `Re-list the approvals to see the current state of execution ${executionId}.`,
+    );
     process.exit(1);
   }
   process.exit(0);

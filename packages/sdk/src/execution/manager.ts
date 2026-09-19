@@ -574,11 +574,20 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // The side effect (if any) already happened but its result is not
         // durable — the call is outcome-ambiguous and must never be re-run
         // (design D8/F5). Record it and fail the execution terminally.
+        // The stored reason is OPAQUE: a store fault's text carries the
+        // database path and SQL, and this row is handed back to the agent by
+        // `check_execution`. The cause goes to the host log under a fresh
+        // reference; only the reference is persisted. `ordinal` stays — it is
+        // host-generated, not derived from the fault.
+        const ref = crypto.randomUUID();
+        console.error(
+          `[ExecutionManager] journal append failed after a completed call ${ref}: ${String(cause)}`,
+        );
         captured.ambiguous = {
           name: OUTCOME_AMBIGUOUS_ERROR_NAME,
           message:
             `[ExecutionManager] Result of a completed upstream call could not be journaled; ` +
-            `the execution is outcome-ambiguous and not resumable. Context: { executionId: ${ctx.executionId}, ordinal: ${at}, cause: ${String(cause)} }`,
+            `the execution is outcome-ambiguous and not resumable. Context: { executionId: ${ctx.executionId}, ordinal: ${at} } Reference: ${ref}`,
         };
         throw new ConduitApprovalPause(true);
       }
@@ -660,13 +669,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     try {
       await write();
     } catch (cause) {
+      // OPAQUE: a store fault's text carries the database path and SQL, and
+      // this row is handed back to the agent by `check_execution`.
+      const ref = crypto.randomUUID();
+      console.error(`[ExecutionManager] settle write failed ${ref}: ${String(cause)}`);
       const failed: Execution = {
         ...execution,
         status: "failed",
         endedAt: now(),
         error: execution.error ?? {
           name: "ConduitPersistError",
-          message: `[ExecutionManager] Settle write failed; outcome not persisted. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+          message: `[ExecutionManager] Settle write failed; outcome not persisted. Context: { executionId: ${execution.id} } Reference: ${ref}`,
         },
       };
       delete failed.pausedOn;
@@ -736,11 +749,16 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // and persist it BEFORE re-throwing, so the row is never stranded in
       // `running`. Not swallowed: the terminal state records the reason and the
       // original error still surfaces to the caller.
+      // OPAQUE for the same reason as the settle-write fault above: a store
+      // or bootstrap fault's text carries host-only detail into a row
+      // `check_execution` hands back to the agent.
+      const ref = crypto.randomUUID();
+      console.error(`[ExecutionManager] sandbox execution threw ${ref}: ${String(cause)}`);
       await finish(execution, {
         status: "failed",
         error: {
           name: "ConduitExecutionError",
-          message: `[ExecutionManager] Sandbox execution threw unexpectedly; execution finalized as failed. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+          message: `[ExecutionManager] Sandbox execution threw unexpectedly; execution finalized as failed. Context: { executionId: ${execution.id} } Reference: ${ref}`,
         },
       });
       throw cause;
@@ -1316,11 +1334,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       } catch (cause) {
         // Sibling of drive()'s catch: finalize the just-persisted `running` row
         // to terminal `failed` BEFORE re-throwing, so it is never stranded.
+        // OPAQUE: the injected scope factory's fault can carry host-only
+        // detail, and the row is agent-readable through `check_execution`.
+        const ref = crypto.randomUUID();
+        console.error(
+          `[ExecutionManager] upstream session scope creation failed at start() ${ref}: ${String(cause)}`,
+        );
         await finish(execution, {
           status: "failed",
           error: {
             name: "ConduitInternalError",
-            message: `[ExecutionManager] Upstream session scope creation failed at start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+            message: `[ExecutionManager] Upstream session scope creation failed at start(). Context: { executionId: ${execution.id} } Reference: ${ref}`,
           },
         });
         throw cause;
@@ -1345,11 +1369,16 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             ...(scope !== undefined ? { scope } : {}),
           });
         } catch (cause) {
+          // OPAQUE, same reason as the scope-creation fault above.
+          const ref = crypto.randomUUID();
+          console.error(
+            `[ExecutionManager] invoker creation failed at start() ${ref}: ${String(cause)}`,
+          );
           await finish(execution, {
             status: "failed",
             error: {
               name: "ConduitInternalError",
-              message: `[ExecutionManager] Invoker creation failed at start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+              message: `[ExecutionManager] Invoker creation failed at start(). Context: { executionId: ${execution.id} } Reference: ${ref}`,
             },
           });
           throw cause;
@@ -1456,7 +1485,14 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             opts.requestKey,
             opts.clientId,
             deps.store,
-          ).catch(() => undefined);
+          ).catch((c: unknown) => {
+            // A failed lookup is not a conflict; the generic persist failure
+            // below is the honest answer. The cause is not silently lost.
+            console.error(
+              `[ExecutionManager] conflict lookup failed for ${executionId}: ${String(c)}`,
+            );
+            return undefined;
+          });
           if (!run.drive.settle()) return;
           run.resolveOutcome(
             conflict ?? {
@@ -1591,8 +1627,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         await Promise.race([
           deps.store.executions
             .failClaimedResume(executionId, `resume kind lookup timed out. Reference: ${ref}`)
-            .catch(() => {
+            .catch((cause: unknown) => {
               // The store is genuinely faulting; nothing more can persist.
+              // The cause still reaches the host log, under the SAME reference
+              // the stored reason carries, so an operator can join the two.
+              console.error(
+                `[ExecutionManager] failClaimedResume also failed ${ref}: ${String(cause)}`,
+              );
             }),
           new Promise<void>((r) => {
             failTimer = setTimeout(r, budgets.settleWriteBudgetMs);
@@ -2260,12 +2301,29 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           await terminalizeDirect(directDrive, { status: "failed", error: prepError }, prepError);
           throw cause;
         }
-        await deps.store.executions
-          .failClaimedResume(executionId, `resume preparation failed. Reference: ${ref}`)
-          .catch(() => {
-            // The store is genuinely faulting; nothing more can persist. Surface
-            // the original fault regardless.
-          });
+        // BOUNDED, on the same budget the direct arm's settle write gets.
+        // This is a CLIENT-VISIBLE path: awaited unbounded, a store that
+        // never answers here held `resume()` open past every budget — the
+        // same hang class the `kindOf` bound and the guard-phase timer close
+        // for the direct arm. Best effort either way: the original fault is
+        // re-thrown below whatever the write did.
+        let prepFailTimer: NodeJS.Timeout | undefined;
+        await Promise.race([
+          deps.store.executions
+            .failClaimedResume(executionId, `resume preparation failed. Reference: ${ref}`)
+            .catch((failCause: unknown) => {
+              // The store is genuinely faulting; nothing more can persist.
+              // The cause still reaches the host log under the same reference.
+              console.error(
+                `[ExecutionManager] failClaimedResume also failed ${ref}: ${String(failCause)}`,
+              );
+            }),
+          new Promise<void>((r) => {
+            prepFailTimer = setTimeout(r, budgets.settleWriteBudgetMs);
+            prepFailTimer?.unref?.();
+          }),
+        ]);
+        clearTimeout(prepFailTimer);
         throw cause;
       }
     },
