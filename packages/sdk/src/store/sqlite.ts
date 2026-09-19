@@ -54,7 +54,15 @@ const SCHEMA = [
     type TEXT NOT NULL CHECK (type IN ('openapi', 'graphql', 'mcp', 'custom_js')),
     namespace TEXT NOT NULL UNIQUE,
     location TEXT NOT NULL,
-    base_url TEXT
+    base_url TEXT,
+    generation INTEGER NOT NULL DEFAULT 0
+  )`,
+  // §4.1a: the generation ledger. AUTOINCREMENT, so a removed-then-re-added
+  // namespace never reuses a value a pause may still carry (row #17).
+  `CREATE TABLE IF NOT EXISTS source_generations (
+    gen INTEGER PRIMARY KEY AUTOINCREMENT,
+    namespace TEXT NOT NULL,
+    at INTEGER NOT NULL
   )`,
   `CREATE TABLE IF NOT EXISTS integrations (
     id TEXT PRIMARY KEY,
@@ -146,6 +154,40 @@ const SCHEMA = [
     sealed TEXT NOT NULL,
     created_at INTEGER NOT NULL
   )`,
+];
+
+/**
+ * §4.1a: generation advancement lives INSIDE SQLite, not in the R1 writer.
+ * An older daemon run after R1 provisions through the shipped statements,
+ * which leave `generation` untouched; the R1 daemon would then accept the
+ * obsolete provenance on resume. These triggers close that for every writer
+ * version, so any INSERT or UPDATE of a source row — and any tool INSERT —
+ * allocates a fresh sequence value.
+ *
+ * `sources_gen_on_update` is guarded `WHEN NEW.generation = OLD.generation`
+ * so its own write does not recurse; the same guard keeps the generation
+ * writes of the other two triggers from firing it a second time.
+ *
+ * Created separately from SCHEMA: they reference `sources.generation`, so on
+ * a legacy database they may only run after the ALTER in the ladder below.
+ */
+const GENERATION_TRIGGERS = [
+  `CREATE TRIGGER IF NOT EXISTS sources_gen_on_update AFTER UPDATE ON sources
+   WHEN NEW.generation = OLD.generation
+   BEGIN
+     INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
+     UPDATE sources SET generation = last_insert_rowid() WHERE id = NEW.id;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS sources_gen_on_insert AFTER INSERT ON sources
+   BEGIN
+     INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
+     UPDATE sources SET generation = last_insert_rowid() WHERE id = NEW.id;
+   END`,
+  `CREATE TRIGGER IF NOT EXISTS sources_gen_on_tools AFTER INSERT ON tools
+   BEGIN
+     INSERT INTO source_generations (namespace, at) VALUES (NEW.namespace, strftime('%s','now')*1000);
+     UPDATE sources SET generation = last_insert_rowid() WHERE namespace = NEW.namespace;
+   END`,
 ];
 
 /**
@@ -326,6 +368,19 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
     }
   }
 
+  // R1 §4.1a: sources.generation, then the three triggers. The triggers
+  // reference the column, so they are created only after the ALTER on a
+  // legacy database. CREATE TRIGGER IF NOT EXISTS is idempotent and lives
+  // in the database file: a pre-R1 build's ladder knows no triggers and
+  // drops none (row #47, trigger survival).
+  const sourceColumns = await client.execute("PRAGMA table_info(sources)");
+  if (!sourceColumns.rows.some((row) => row.name === "generation")) {
+    await tolerateSchemaRace(() =>
+      client.execute("ALTER TABLE sources ADD COLUMN generation INTEGER NOT NULL DEFAULT 0"),
+    );
+  }
+  await client.batch(GENERATION_TRIGGERS, "write");
+
   // Design §2 (2026-07-19): wrong master key fails loud HERE, at open —
   // not at the first secret decrypt. Every product bin routes through this.
   await ensureKeyCanary(client, secretBox, options.keyContext);
@@ -359,6 +414,17 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       },
       async remove(id: string): Promise<void> {
         await client.execute({ sql: "DELETE FROM sources WHERE id = ?", args: [id] });
+      },
+      async getGeneration(namespace: string): Promise<number | undefined> {
+        const rs = await client.execute({
+          sql: "SELECT generation FROM sources WHERE namespace = ?",
+          args: [namespace],
+        });
+        // `integer`, not `maybeInteger`: absence of a row is `undefined`, but a
+        // row holding a non-integer generation is corruption, and this value is
+        // an authorization input (§5.4). Fail loud rather than read as "no source".
+        const row = rs.rows[0];
+        return row === undefined ? undefined : integer(row, "generation");
       },
     },
 
@@ -976,7 +1042,7 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
       secret?: { ref: string; value: string };
       removeSecretRef?: string;
       tools: readonly Tool[];
-    }): Promise<void> {
+    }): Promise<{ generation: number }> {
       if (input.secret !== undefined && input.removeSecretRef !== undefined) {
         throw new Error(
           "[ConduitStore] provisionSource: `secret` and `removeSecretRef` are mutually exclusive.",
@@ -1060,6 +1126,19 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         })),
       ];
       await client.batch(statements, "write");
+      // §4.1a rev 11: no explicit ledger insert — the triggers have already
+      // allocated every bump this batch earned. Read back what they stored.
+      const rs = await client.execute({
+        sql: "SELECT generation FROM sources WHERE id = ?",
+        args: [source.id],
+      });
+      const row = rs.rows[0];
+      if (row === undefined) {
+        throw new Error(
+          `[SqliteStore] provisionSource failed: the provisioned source row is missing after commit. Context: { id: ${JSON.stringify(source.id)} }`,
+        );
+      }
+      return { generation: integer(row, "generation") };
     },
   };
 }
@@ -1244,8 +1323,8 @@ function rowToSource(row: Row): Source {
     type,
     namespace: text(row, "namespace"),
     location: text(row, "location"),
-    // Task 4 (§4.1a) adds the `generation` column and reads it here.
-    generation: 0,
+    // §4.1a: the database allocates this; a caller's value on write is ignored.
+    generation: integer(row, "generation"),
   };
   const baseUrl = maybeText(row, "base_url");
   if (baseUrl !== undefined) {

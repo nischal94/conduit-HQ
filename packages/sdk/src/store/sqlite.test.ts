@@ -65,14 +65,11 @@ describe("SqliteStore", () => {
       expect(loaded && "baseUrl" in loaded).toBe(false);
     });
 
-    it("PENDING Task 4: a hydrated source reports generation 0 until the generation column lands", async () => {
-      // `rowToSource` hardcodes `generation: 0` — there is no `generation`
-      // column yet (§4.1a, Task 4 adds it with the three SQLite triggers).
-      // This pins the PLACEHOLDER, not the behaviour: §5.4's authorization
-      // check compares a pause's `sourceGeneration` against this value, so
-      // Task 4 must consciously replace both the column read and this test.
-      // Until then, every hydrated Source reports 0 regardless of what a
-      // caller passed on write.
+    it("a hydrated source reports the stored generation on every read path, never the caller's value", async () => {
+      // §4.1a: the database allocates the generation (INSERT trigger); the
+      // value a caller passes on write is ignored. §5.4's authorization
+      // check compares a pause's `sourceGeneration` against what these
+      // reads return, so all three must agree with the column.
       await store.sources.upsert({
         id: "src_gen",
         type: "openapi",
@@ -80,9 +77,15 @@ describe("SqliteStore", () => {
         location: "https://example.com/openapi.json",
         generation: 7,
       });
-      expect((await store.sources.get("src_gen"))?.generation).toBe(0);
-      expect((await store.sources.getByNamespace("gen"))?.generation).toBe(0);
-      expect((await store.sources.list()).every((s) => s.generation === 0)).toBe(true);
+      const stored = Number(
+        (await client.execute("SELECT generation FROM sources WHERE id = 'src_gen'")).rows[0]
+          ?.generation,
+      );
+      expect(stored).toBeGreaterThan(0);
+      expect(stored).not.toBe(7);
+      expect((await store.sources.get("src_gen"))?.generation).toBe(stored);
+      expect((await store.sources.getByNamespace("gen"))?.generation).toBe(stored);
+      expect((await store.sources.list()).every((s) => s.generation === stored)).toBe(true);
     });
 
     it("upserts on conflict and removes", async () => {
@@ -1104,6 +1107,20 @@ describe("SqliteStore", () => {
           String(r.name),
         );
         expect(trace).toEqual(expect.arrayContaining(["projection", "client_id"]));
+        // §4.1a: the generation column and its three triggers are part of the
+        // same ladder, and must land exactly once under a concurrent open.
+        const sourceCols = (await probe.execute("PRAGMA table_info(sources)")).rows.map((r) =>
+          String(r.name),
+        );
+        expect(sourceCols.filter((n) => n === "generation")).toHaveLength(1);
+        const triggers = (
+          await probe.execute("SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name")
+        ).rows.map((r) => String(r.name));
+        expect(triggers).toEqual([
+          "sources_gen_on_insert",
+          "sources_gen_on_tools",
+          "sources_gen_on_update",
+        ]);
         // Known limit: Promise.all does not force both openers into the
         // PRAGMA→ALTER window; this is the same shape the shipped M5 tests
         // use. `tolerateSchemaRace` itself is pinned by those tests.
@@ -2234,6 +2251,135 @@ describe("SqliteStore", () => {
           tools: [tool({ name: "u.search", namespace: "u" })],
         }),
       ).rejects.toThrow(/\[ConduitStore\].*mutually exclusive/);
+    });
+  });
+
+  describe("source generation (§4.1a)", () => {
+    const gen = (ns: string) => store.sources.getGeneration(ns);
+    const ledgerCount = async () =>
+      Number((await client.execute("SELECT COUNT(*) AS n FROM source_generations")).rows[0]?.n);
+
+    async function provision(
+      namespace: string,
+      toolNames: string[],
+      location = "https://x.example/mcp",
+    ) {
+      return store.provisionSource({
+        source: { id: `src_${namespace}`, type: "mcp", namespace, location, generation: 0 },
+        integration: { id: `int_${namespace}`, sourceId: `src_${namespace}`, namespace },
+        connection: {
+          id: `conn_${namespace}`,
+          integrationId: `int_${namespace}`,
+          prefix: `${namespace}.acme.prod`,
+        },
+        tools: toolNames.map((n) => tool({ name: `${namespace}.${n}`, namespace })),
+      });
+    }
+
+    it("INVARIANT §4.1a (#47): a provision with N tools writes exactly N+1 ledger rows and the namespace's generation is the last", async () => {
+      const before = await ledgerCount();
+      const { generation } = await provision("gh", ["a", "b", "c"]);
+      expect((await ledgerCount()) - before).toBe(4);
+      const max = Number(
+        (await client.execute("SELECT MAX(gen) AS m FROM source_generations")).rows[0]?.m,
+      );
+      expect(generation).toBe(max);
+      expect(await gen("gh")).toBe(generation);
+      expect((await store.sources.getByNamespace("gh"))?.generation).toBe(generation);
+    });
+
+    it("INVARIANT §4.1a (#47): every write path bumps — standalone INSERT (sources.upsert), zero-tool revalidate, retarget", async () => {
+      // same id as provision() uses: sources.namespace is UNIQUE (F8)
+      await store.sources.upsert({
+        id: "src_solo",
+        type: "mcp",
+        namespace: "solo",
+        location: "https://a",
+        generation: 0,
+      });
+      const g0 = await gen("solo");
+      expect(g0).toBeGreaterThan(0); // INSERT trigger: never the column default
+      await provision("solo", []); // zero tools: the source-row trigger bumps alone
+      const g1 = await gen("solo");
+      expect(g1).toBeGreaterThan(g0 as number);
+      await provision("solo", [], "https://b"); // retarget under the same id: DO UPDATE path bumps
+      expect(await gen("solo")).toBeGreaterThan(g1 as number);
+    });
+
+    it("INVARIANT §4.1a (#47): the SHIPPED pre-R1 SQL bumps too — the database enforces it, not the writer", async () => {
+      await provision("old", ["t"]);
+      const g0 = await gen("old");
+      // the exact statements sqlite.ts shipped before R1 (upsert leaves unknown columns untouched)
+      await client.execute({
+        sql: "UPDATE sources SET location = ? WHERE id = ?",
+        args: ["https://moved", "src_old"],
+      });
+      const g1 = await gen("old");
+      expect(g1).toBeGreaterThan(g0 as number);
+      await client.batch(
+        [
+          { sql: "DELETE FROM tools WHERE namespace = ?", args: ["old"] },
+          {
+            sql: "INSERT INTO tools (name, namespace, description, input_schema, output_schema, risk_class, source_semantics) VALUES ('old.t2','old',NULL,'{}','{}','safe','{\"kind\":\"mcp\"}')",
+            args: [],
+          },
+        ],
+        "write",
+      );
+      expect(await gen("old")).toBeGreaterThan(g1 as number);
+    });
+
+    it("INVARIANT §4.1a (#17): remove then re-add never reuses a generation — including deleting the current maximum and every source", async () => {
+      await provision("x", ["t"]);
+      await provision("y", ["t"]);
+      const gx = await gen("x");
+      const gy = await gen("y"); // current maximum
+      await store.sources.remove("src_y");
+      await store.sources.remove("src_x");
+      expect(await gen("x")).toBeUndefined();
+      await provision("y", ["t"]);
+      await provision("x", ["t"]);
+      expect(await gen("y")).toBeGreaterThan(gy as number);
+      expect(await gen("x")).toBeGreaterThan(gy as number);
+      expect(await gen("x")).not.toBe(gx);
+    });
+
+    it("INVARIANT §4.1a (#47): the triggers survive a pre-R1 build opening the database", async () => {
+      // A pre-R1 ladder is CREATE TABLE IF NOT EXISTS over the pre-R1 schema:
+      // it knows no triggers and drops none.
+      const preR1 = [
+        `CREATE TABLE IF NOT EXISTS sources (id TEXT PRIMARY KEY, type TEXT NOT NULL, namespace TEXT NOT NULL UNIQUE, location TEXT NOT NULL, base_url TEXT)`,
+        `CREATE TABLE IF NOT EXISTS tools (name TEXT PRIMARY KEY, namespace TEXT NOT NULL, description TEXT, input_schema TEXT NOT NULL, output_schema TEXT NOT NULL, risk_class TEXT NOT NULL, source_semantics TEXT NOT NULL)`,
+      ];
+      await provision("surv", ["t"]);
+      const g0 = await gen("surv");
+      await client.batch(preR1, "write");
+      await client.execute({
+        sql: "UPDATE sources SET location = 'https://again' WHERE id = ?",
+        args: ["src_surv"],
+      });
+      expect(await gen("surv")).toBeGreaterThan(g0 as number);
+      const triggers = await client.execute(
+        "SELECT name FROM sqlite_master WHERE type = 'trigger' ORDER BY name",
+      );
+      expect(triggers.rows.map((r) => r.name)).toEqual([
+        "sources_gen_on_insert",
+        "sources_gen_on_tools",
+        "sources_gen_on_update",
+      ]);
+    });
+
+    it("the update trigger does not recurse: exactly one allocation per statement with recursive_triggers on or off", async () => {
+      await provision("gh", ["a"]);
+      for (const mode of ["OFF", "ON"]) {
+        await client.execute(`PRAGMA recursive_triggers = ${mode}`);
+        const before = await ledgerCount();
+        await client.execute({
+          sql: "UPDATE sources SET location = ? WHERE id = ?",
+          args: [`https://${mode}`, "src_gh"],
+        });
+        expect((await ledgerCount()) - before).toBe(1);
+      }
     });
   });
 });

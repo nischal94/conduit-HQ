@@ -54,7 +54,7 @@ export interface ConduitStore {
      * with `secret`. */
     removeSecretRef?: string;
     tools: readonly Tool[];
-  }): Promise<void>;
+  }): Promise<{ generation: number }>;
 }
 
 export interface SourceRepository {
@@ -63,6 +63,13 @@ export interface SourceRepository {
   getByNamespace(namespace: string): Promise<Source | undefined>;
   list(): Promise<Source[]>;
   remove(id: string): Promise<void>;
+  /**
+   * The namespace's current §4.1a generation, or `undefined` when no source
+   * row exists. SQLite's triggers allocate the value — never the writer — so
+   * this is the authoritative provenance §5.4's resume check compares a
+   * pause's `sourceGeneration` against.
+   */
+  getGeneration(namespace: string): Promise<number | undefined>;
 }
 
 export interface IntegrationRepository {
