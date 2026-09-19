@@ -2,7 +2,7 @@ import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
-import { afterEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMcp } from "../normalize/mcp.js";
 import type { UpstreamSessionScope } from "../pipeline/upstream-session.js";
 import { generateSeeds, type Sandbox } from "../sandbox/sandbox.js";
@@ -10,12 +10,19 @@ import { ALL_TOOLS, buildEffectiveScope, type ScopeResolver } from "../scope.js"
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
-import { type Execution, NEWER_BUILD_SENTINEL } from "../types.js";
+import {
+  type DirectCall,
+  type Execution,
+  NEWER_BUILD_SENTINEL,
+  type PendingApproval,
+  type Tool,
+} from "../types.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
 import {
   createExecutionManager,
   type ExecutionManager,
   type ExecutionManagerDeps,
+  type ResumeOutcome,
 } from "./manager.js";
 import { type Harness, makeHarness, pendingCallOf } from "./manager-harness.js";
 
@@ -46,6 +53,42 @@ async function makeBareStore(): Promise<ConduitStore> {
   });
 }
 const bareClients: ReturnType<typeof createClient>[] = [];
+
+/**
+ * Seed the catalog rows a provenance-stamped pause needs on a bare store, and
+ * return the pause's `{ namespace, sourceGeneration }` pair. §5.4 step 3
+ * refuses any pause whose generation does not match the namespace's current
+ * one, so a bare-store test that wants to reach the DRIVE — rather than the
+ * guard — must stamp its pause from the live generation.
+ */
+async function seedProvenance(
+  store: ConduitStore,
+  toolName: string,
+): Promise<{ namespace: string; sourceGeneration: number }> {
+  const namespace = toolName.slice(0, toolName.indexOf("."));
+  await store.sources.upsert({
+    id: `src_${namespace}`,
+    type: "mcp",
+    namespace,
+    location: `https://${namespace}`,
+    generation: 0,
+  });
+  await store.tools.replaceNamespace(namespace, [
+    {
+      name: toolName,
+      namespace,
+      inputSchema: { type: "object" },
+      outputSchema: {},
+      riskClass: "review",
+      sourceSemantics: { kind: "mcp" },
+    },
+  ]);
+  const sourceGeneration = await store.sources.getGeneration(namespace);
+  if (sourceGeneration === undefined) {
+    throw new Error(`[test] no generation for seeded namespace ${namespace}`);
+  }
+  return { namespace, sourceGeneration };
+}
 
 /**
  * Manager deps wired to a stub Sandbox. The invoker/host/decisions seams are
@@ -273,17 +316,28 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(rows.map((r) => r.op)).toEqual(["search", "describe"]);
     const firstPathBeforeMutation = started.pending.input;
 
-    // MUTATE the catalog underneath: refresh the namespace with a DIFFERENT
-    // tool set. Live re-reads would return different search results and the
-    // divergence guard would fail the run; journaled reads keep replay stable.
+    // MUTATE the catalog underneath: add a whole new namespace the guest's
+    // search would now match. Live re-reads would return different search
+    // results and the divergence guard would fail the run; journaled reads
+    // keep replay stable.
+    //
+    // The mutation is deliberately in ANOTHER namespace. Touching `github`
+    // bumps ITS §4.1a generation (the `sources_gen_on_tools` trigger), and
+    // §5.4 step 3 then refuses the resume outright — a different invariant,
+    // pinned by "INVARIANT §4.1 (#14)" below. What this test pins is replay
+    // stability, which needs the resume to actually run.
+    await h.store.sources.upsert({
+      id: "src_tracker",
+      type: "mcp",
+      namespace: "tracker",
+      location: "https://tracker",
+      generation: 0,
+    });
     await h.store.tools.replaceNamespace(
-      "github",
+      "tracker",
       normalizeMcp({
-        namespace: "github",
-        tools: [
-          { name: "create_issue", inputSchema: { type: "object" } },
-          { name: "unrelated_new_tool", inputSchema: { type: "object" } },
-        ],
+        namespace: "tracker",
+        tools: [{ name: "unrelated_new_issue_tool", inputSchema: { type: "object" } }],
       }),
     );
 
@@ -661,6 +715,10 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const pausedOn = {
       callId: "call_1",
       toolName: "github.create_issue",
+      // §5.4: the pause must carry live provenance, or the resume guard
+      // terminalizes it before the sandbox — and the sandbox throw under
+      // test would never happen.
+      ...(await seedProvenance(store, "github.create_issue")),
       input: { title: "from agent" },
       reason: "github.create_issue requires approval before it can run.",
       expiresAt: Date.now() + 3_600_000,
@@ -758,6 +816,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const pausedOn = {
       callId: "call_1",
       toolName: "github.create_issue",
+      // §5.4: live provenance, so the guard passes and the post-sandbox
+      // persistence fault under test is the one that fires.
+      ...(await seedProvenance(store, "github.create_issue")),
       input: { title: "from agent" },
       reason: "github.create_issue requires approval before it can run.",
       expiresAt: Date.now() + 3_600_000,
@@ -1833,6 +1894,9 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       pausedOn: {
         callId: "call_spoof",
         toolName: "github.create_issue",
+        // §5.4: live provenance, so the drive runs and the guest's spoofed
+        // error name is what the outcome carries.
+        ...(await seedProvenance(store, "github.create_issue")),
         input: { title: "x" },
         reason: "requires approval",
         expiresAt: Date.now() + 60_000,
@@ -2015,5 +2079,429 @@ describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
     expect(out).toMatchObject({ status: "failed", error: { name: "ConduitOutcomeAmbiguous" } });
     expect(active.calls).toHaveLength(1);
     expect((await m.get(out.executionId))?.error?.name).toBe("ConduitOutcomeAmbiguous");
+  });
+});
+
+/**
+ * §5.4 steps 2–4: the post-claim read-side guard. An approval granted against
+ * one catalog state, one call, and one client's authority must never be spent
+ * against another. Every case below drives a HAND-BUILT row through the real
+ * claim and the real store, with a Sandbox that rejects: the guard fires
+ * before any drive, so a sandbox rejection means the guard let something
+ * through.
+ */
+describe("§5.4 step 2 — post-claim read-side guard (row #50), one test per disposition row", () => {
+  let store: ConduitStore;
+  let client: ReturnType<typeof createClient>;
+  let manager: ExecutionManager;
+
+  /** F10c: a Sandbox whose execute rejects — the guard under test fires BEFORE any drive. */
+  const throwingSandbox = (): Sandbox => ({
+    execute: () =>
+      Promise.reject(new Error("[test] sandbox must not run: the resume guard terminalizes first")),
+  });
+
+  const tool = (name: string, namespace: string): Tool => ({
+    name,
+    namespace,
+    inputSchema: { type: "object" },
+    outputSchema: {},
+    riskClass: "review",
+    sourceSemantics: { kind: "mcp" },
+  });
+
+  const pause = (over: Partial<PendingApproval> = {}): PendingApproval => ({
+    callId: "c1",
+    toolName: "github.list_issues",
+    namespace: "github",
+    sourceGeneration: 0,
+    input: { a: 1 },
+    reason: "r",
+    expiresAt: 9e12,
+    ...over,
+  });
+
+  const directCall = (over: Partial<DirectCall> = {}): DirectCall => ({
+    toolName: "github.list_issues",
+    namespace: "github",
+    request: JSON.stringify({ a: 1 }),
+    ...over,
+  });
+
+  const codeRow = (over: Partial<Extract<Execution, { kind: "code" }>>): Execution => ({
+    id: "e",
+    kind: "code",
+    code: "return 1;",
+    status: "paused",
+    seeds: generateSeeds(),
+    startedAt: Date.now(),
+    clientId: null,
+    projection: "code",
+    ...over,
+  });
+
+  const directRow = (over: Partial<Extract<Execution, { kind: "direct" }>>): Execution => ({
+    id: "d",
+    kind: "direct",
+    call: directCall(),
+    status: "paused",
+    startedAt: Date.now(),
+    clientId: null,
+    projection: "direct",
+    ...over,
+  });
+
+  const permitAll: ScopeResolver = async () =>
+    buildEffectiveScope(
+      { projections: { code: true, direct: true, discovery: true }, allow: ALL_TOOLS },
+      await store.tools.list(),
+    );
+
+  beforeEach(async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "conduit-guard-"));
+    client = createClient({ url: `file:${join(scratch, "guard.db")}` });
+    bareClients.push(client);
+    store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+    });
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: "github",
+      location: "https://gh",
+      generation: 0,
+    });
+    await store.tools.replaceNamespace("github", [tool("github.list_issues", "github")]);
+    manager = createExecutionManager(makeStubDeps(store, throwingSandbox()));
+  });
+
+  afterEach(() => {
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
+  });
+
+  const currentGen = async (): Promise<number> => {
+    const generation = await store.sources.getGeneration("github");
+    if (generation === undefined) {
+      throw new Error("[test] the seeded source has no generation");
+    }
+    return generation;
+  };
+
+  /**
+   * Seed a well-formed paused row, then overwrite `paused_on` with hand-crafted
+   * JSON `put` could not write, and resume it. The row must be created with a
+   * VALID pause first so `claimForResume` has a claimable `callId`.
+   */
+  async function resumeRaw(id: string, rawPausedOn: string, callId = "c1"): Promise<ResumeOutcome> {
+    await client.execute({
+      sql: "UPDATE executions SET paused_on = ? WHERE id = ?",
+      args: [rawPausedOn, id],
+    });
+    return manager.resume(id, { kind: "approve" }, callId, permitAll);
+  }
+
+  const corrupt = {
+    status: "failed",
+    decisionApplied: false,
+    corruptPause: true,
+    error: { name: "ConduitInternalError" },
+  };
+
+  it.each([
+    ["toolName not text", { ...pause(), toolName: 5 }],
+    ["reason not text", { ...pause(), reason: null }],
+    [
+      "input absent",
+      (() => {
+        const { input: _i, ...rest } = pause();
+        return rest;
+      })(),
+    ],
+    ["expiresAt not finite", { ...pause(), expiresAt: "never" }],
+    [
+      "namespace present, sourceGeneration absent",
+      (() => {
+        const { sourceGeneration: _g, ...rest } = pause();
+        return rest;
+      })(),
+    ],
+    ["namespace not text", { ...pause(), namespace: 7 }],
+    ["sourceGeneration not finite", { ...pause(), sourceGeneration: "7" }],
+  ])("terminalizes corrupt: %s", async (_label, stored) => {
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    expect(await resumeRaw("e", JSON.stringify(stored))).toMatchObject(corrupt);
+    expect((await store.executions.get("e"))?.status).toBe("failed");
+  });
+
+  it("terminalizes corrupt: namespace disagrees with the grammar-derived namespace of toolName", async () => {
+    // The GRAMMAR half alone must catch this. A pause naming `github.x` with
+    // namespace "slack" would also be caught by the COLUMN half, so it cannot
+    // tell the two guards apart: seed a tool row whose COLUMN agrees with the
+    // stored namespace ("slack") while its NAME parses to "github". Only the
+    // grammar check can fire.
+    await client.execute("UPDATE tools SET namespace = 'slack' WHERE name = 'github.list_issues'");
+    await store.sources.upsert({
+      id: "src_slack",
+      type: "mcp",
+      namespace: "slack",
+      location: "https://slack",
+      generation: 0,
+    });
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    const slackGen = await store.sources.getGeneration("slack");
+    if (slackGen === undefined) {
+      throw new Error("[test] the seeded slack source has no generation");
+    }
+    expect(
+      await resumeRaw(
+        "e",
+        JSON.stringify(pause({ namespace: "slack", sourceGeneration: slackGen })),
+      ),
+    ).toMatchObject(corrupt);
+    expect((await store.executions.get("e"))?.status).toBe("failed");
+  });
+
+  it("terminalizes corrupt: namespace agrees with the grammar but not with the resolved tool row's namespace COLUMN", async () => {
+    // A `{ name: "github.list_issues", namespace: "b" }` row: the invoker
+    // dispatches connection and source through the COLUMN, so validating
+    // generation "github" and dispatching through "b" must never happen.
+    await client.execute("UPDATE tools SET namespace = 'b' WHERE name = 'github.list_issues'");
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    const gen = await currentGen();
+    expect(await resumeRaw("e", JSON.stringify(pause({ sourceGeneration: gen })))).toMatchObject(
+      corrupt,
+    );
+  });
+
+  it("catalog change, not corruption: toolName no longer resolves → ConduitCatalogChanged", async () => {
+    await store.executions.create(
+      codeRow({
+        status: "paused",
+        pausedOn: pause({ toolName: "github.gone", sourceGeneration: await currentGen() }),
+      }),
+    );
+    const out = await manager.resume("e", { kind: "approve" }, "c1", permitAll);
+    expect(out).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitCatalogChanged" },
+    });
+    expect((out as { corruptPause?: true }).corruptPause).toBeUndefined();
+  });
+
+  it("legacy pause (both provenance fields absent) → ConduitCatalogChanged before any source read (§5.4 step 3, row #14)", async () => {
+    const legacy = {
+      callId: "c1",
+      toolName: "github.list_issues",
+      input: {},
+      reason: "r",
+      expiresAt: 9e12,
+    };
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    const spy = vi.spyOn(store.sources, "getGeneration");
+    const out = await resumeRaw("e", JSON.stringify(legacy));
+    expect(out).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitCatalogChanged" },
+    });
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it.each([
+    ["toolName", directCall({ toolName: "github.other" })],
+    ["namespace", directCall({ namespace: "slack" })],
+    ["request", directCall({ request: '{"a":1000}' })],
+  ])("direct row: direct_call disagrees with pausedOn on %s → terminalize corrupt, the call never runs", async (_f, call) => {
+    await store.executions.create(
+      directRow({
+        status: "paused",
+        call,
+        pausedOn: pause({ sourceGeneration: await currentGen() }),
+      }),
+    );
+    expect(await manager.resume("d", { kind: "approve" }, "c1", permitAll)).toMatchObject(corrupt);
+  });
+
+  it("INVARIANT §5.4 step 3 (#14/#42, D3 authority): generation mismatch → ConduitCatalogChanged for BOTH kinds", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({ id: "c", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    await store.executions.create(
+      directRow({ id: "d", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    // The §4.1a triggers own the generation: an UPDATE bumps it.
+    await client.execute("UPDATE sources SET location = 'https://moved' WHERE id = 'src_gh'");
+    expect(await currentGen()).not.toBe(gen);
+    for (const id of ["c", "d"]) {
+      expect(await manager.resume(id, { kind: "approve" }, "c1", permitAll)).toMatchObject({
+        status: "failed",
+        decisionApplied: false,
+        error: { name: "ConduitCatalogChanged" },
+      });
+    }
+  });
+
+  it("INVARIANT §4.1a (#17): remove then re-add never revives a paused row of either kind", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({ id: "c", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    await store.sources.remove("src_gh");
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: "github",
+      location: "https://gh",
+      generation: 0,
+    });
+    expect(await manager.resume("c", { kind: "approve" }, "c1", permitAll)).toMatchObject({
+      error: { name: "ConduitCatalogChanged" },
+    });
+  });
+
+  it("INVARIANT §5.4 step 4 (#16): a projection flag turned off, or the grant narrowed, revokes on resume — ConduitScopeRevoked", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({ id: "c", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    const codeOff: ScopeResolver = async () =>
+      buildEffectiveScope(
+        { projections: { code: false, direct: true, discovery: true }, allow: ALL_TOOLS },
+        await store.tools.list(),
+      );
+    expect(await manager.resume("c", { kind: "approve" }, "c1", codeOff)).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitScopeRevoked" },
+    });
+    await store.executions.create(
+      directRow({ id: "d", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    // D-A3: no resolver = the default profile, whose `direct` flag is off.
+    expect(await manager.resume("d", { kind: "approve" }, "c1")).toMatchObject({
+      error: { name: "ConduitScopeRevoked" },
+    });
+  });
+
+  it("D11 (codex #1): a NAMED row resumed with no resolver fails closed — never the default profile, never an unscoped drive", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({
+        id: "named",
+        clientId: "acme",
+        status: "paused",
+        pausedOn: pause({ sourceGeneration: gen }),
+      }),
+    );
+    const spy = vi.spyOn(store.tools, "list");
+    expect(await manager.resume("named", { kind: "approve" }, "c1")).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitScopeRevoked" },
+    });
+    // The default profile was not even consulted.
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("the prep-window catch persists an OPAQUE reason: no host detail reaches the agent-readable row", async () => {
+    // The guard's reads flow through the shipped catch; a store rejection
+    // carries host-only detail (a database path) that `check_execution`
+    // would hand to the agent.
+    const secret = "/Users/hostonly/private/conduit.db";
+    const faulty: ConduitStore = {
+      ...store,
+      tools: {
+        ...store.tools,
+        get: () => Promise.reject(new Error(`SQLITE_CANTOPEN: unable to open ${secret}`)),
+      },
+    };
+    const m = createExecutionManager(makeStubDeps(faulty, throwingSandbox()));
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    await expect(m.resume("e", { kind: "approve" }, "c1", permitAll)).rejects.toThrow(
+      /SQLITE_CANTOPEN/,
+    );
+    const row = await client.execute({
+      sql: "SELECT status, error FROM executions WHERE id = ?",
+      args: ["e"],
+    });
+    expect(row.rows[0]?.status).toBe("failed");
+    const stored = String(row.rows[0]?.error);
+    expect(stored).not.toContain(secret);
+    expect(stored).toContain("resume preparation failed. Reference:");
+  });
+});
+
+describe("§5.4 resume under scope — real stack", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+  });
+
+  it("INVARIANT §5.4 (#15): a code row that paused under a narrowed profile resumes UNDER that profile — an out-of-scope call after resume is blocked", async () => {
+    active = await makeHarness();
+    const narrow: ScopeResolver = async () =>
+      buildEffectiveScope(
+        {
+          projections: { code: true, direct: false, discovery: false },
+          allow: ["github.create_issue"],
+        },
+        await (active as Harness).store.tools.list(),
+      );
+    const m = createExecutionManager(active.deps);
+    const paused = await m.start(
+      'await tools.github.create_issue({ title: "x" }); try { await tools.github.list_issues({}); return "leaked"; } catch (e) { return e.name; }',
+      { clientId: "acme", scope: narrow },
+    );
+    expect(paused.status).toBe("paused");
+    const out = await m.resume(
+      paused.executionId,
+      { kind: "approve" },
+      await pendingCallOf(m, paused.executionId),
+      narrow,
+    );
+    expect(out).toMatchObject({
+      status: "completed",
+      value: "ConduitPolicyBlocked",
+      decisionApplied: true,
+    });
+    expect(active.calls.map((c) => c.name)).toEqual(["create_issue"]);
+  });
+
+  it("INVARIANT §4.1 (#14): a provision AFTER the pause invalidates it — resume fails closed re-approve and the upstream never sees the call", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const paused = await m.start('await tools.github.create_issue({ title: "x" }); return 1;');
+    const callId = await pendingCallOf(m, paused.executionId);
+    // F13: triggers bump the generation.
+    await active.reprovision();
+    // No sweep in the SDK; the daemon runs it (Lane B).
+    expect(await active.store.executions.get(paused.executionId)).toMatchObject({
+      status: "paused",
+    });
+    const out = await m.resume(paused.executionId, { kind: "approve" }, callId);
+    expect(out).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitCatalogChanged" },
+    });
+    expect(active.calls).toHaveLength(0);
   });
 });

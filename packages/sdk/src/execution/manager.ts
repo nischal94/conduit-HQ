@@ -18,11 +18,17 @@ import type {
   ToolHost,
 } from "../sandbox/sandbox.js";
 import { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "../sandbox/sandbox.js";
-import { type EffectiveScope, namespaceOf, type ScopeResolver } from "../scope.js";
+import {
+  defaultScopeResolver,
+  type EffectiveScope,
+  namespaceOf,
+  type ScopeResolver,
+} from "../scope.js";
 import type { ConduitStore } from "../store/store.js";
 import {
   type Execution,
   type ExecutionError,
+  hasProvenance,
   isPendingApproval,
   NOT_NAMEABLE_CALL_ID,
   type PendingApproval,
@@ -80,7 +86,18 @@ export interface ExecutionManager {
    * is no longer paused on that call (already decided, or paused again on a
    * later call) the resume is a `conflict`, never a decision on another call.
    */
-  resume(executionId: string, decision: ApprovalDecision, callId: string): Promise<ResumeOutcome>;
+  resume(
+    executionId: string,
+    decision: ApprovalDecision,
+    callId: string,
+    /**
+     * §5.4 step 4: the authority the resumed drive runs under. ABSENT means
+     * the DEFAULT profile — legal only for a default-profile row (clientId
+     * null, D8). A NAMED row without a resolver has no authority to resume
+     * under and is terminalized `ConduitScopeRevoked` (D11).
+     */
+    scope?: ScopeResolver,
+  ): Promise<ResumeOutcome>;
   /** Inspect the persisted execution (CLI / API surface). */
   get(executionId: string): Promise<Execution | undefined>;
 }
@@ -880,7 +897,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       }
     },
 
-    async resume(executionId, decision, callId) {
+    async resume(executionId, decision, callId, scopeResolver) {
       // The argument must be a call id an operator could have read off the
       // list: text, not ASCII-blank. The wire decoder (mcp rpc.ts) refuses
       // anything else, but this is a public SDK entrypoint — an embedder
@@ -970,9 +987,6 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             corruptPause: true,
           };
         }
-        // Task 9 adds the §5.4 generation check, which narrows this by
-        // `hasProvenance`; until then a legacy pause flows on as it does
-        // in the shipped build.
         const pausedOn = stored;
 
         // TTL (design D8): lazily expire on resume. `claimForResume` already
@@ -985,6 +999,116 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           delete expired.pausedOn;
           await persistOrFinalizeFailed(execution, () => deps.store.executions.put(expired));
           return { status: "expired", executionId, pending: pausedOn, decisionApplied: false };
+        }
+
+        // ── §5.4 steps 2–4: the post-claim read-side guard ──────────────────
+        // An approval granted against ONE catalog state, ONE call, and ONE
+        // client's authority must never be spent against another. Order is
+        // part of the requirement: the claim already won (so the row can
+        // never strand `paused`), and every branch below terminalizes the
+        // claimed row before any upstream call or credential resolution.
+        const terminalize = async (
+          reason: string,
+          errorName: string,
+          flag: { corruptPause?: true } = {},
+        ): Promise<ResumeOutcome> => {
+          const error = {
+            name: errorName,
+            message: `[ExecutionManager] ${reason}. Context: { executionId: ${executionId} }`,
+          };
+          await deps.store.executions.failClaimedResume(executionId, reason, errorName);
+          return { status: "failed", executionId, error, decisionApplied: false, ...flag };
+        };
+        const CORRUPT = { corruptPause: true as const };
+
+        // Legacy branch (§5.4 step 3, rev 13): a pause written before R1 has
+        // no provenance pair, so nothing can verify it. Fail it closed as a
+        // re-approve BEFORE any source read — the checks below read
+        // `pausedOn.namespace`, which the legacy arm does not have.
+        if (!hasProvenance(pausedOn)) {
+          return terminalize(
+            "catalog changed — re-approve (pause predates provenance)",
+            "ConduitCatalogChanged",
+          );
+        }
+        // Namespace agreement, grammar half (§8.3: `namespace.local`).
+        if (namespaceOf(pausedOn.toolName) !== pausedOn.namespace) {
+          return terminalize(
+            "stored pause's namespace disagrees with its tool name (corrupt state); the pending call did not run",
+            "ConduitInternalError",
+            CORRUPT,
+          );
+        }
+        // Namespace agreement, COLUMN half: `tools.name` and `tools.namespace`
+        // are stored and hydrated independently, and the invoker dispatches
+        // connection and source through the column — a `{ name: "a.x",
+        // namespace: "b" }` row must not validate generation A and dispatch
+        // through B. A tool that no longer resolves is catalog change, not
+        // corruption.
+        const toolRow = await deps.store.tools.get(pausedOn.toolName);
+        if (toolRow === undefined) {
+          return terminalize(
+            "catalog changed — re-approve (tool no longer exists)",
+            "ConduitCatalogChanged",
+          );
+        }
+        if (toolRow.namespace !== pausedOn.namespace) {
+          return terminalize(
+            "stored pause's namespace disagrees with the tool row's namespace column (corrupt state); the pending call did not run",
+            "ConduitInternalError",
+            CORRUPT,
+          );
+        }
+        // A direct execution performs exactly ONE call: the call it was
+        // started for and the call it paused on are the same, in name,
+        // namespace, and canonical arguments, or the row is corrupt. Without
+        // this, `pausedOn.input = { amount: 1 }` beside `request =
+        // '{"amount":1000}'` would run 1000 under the approval of 1.
+        if (execution.kind === "direct") {
+          const { call } = execution;
+          if (
+            call.toolName !== pausedOn.toolName ||
+            call.namespace !== pausedOn.namespace ||
+            call.request !== JSON.stringify(pausedOn.input)
+          ) {
+            return terminalize(
+              "direct_call disagrees with the stored pause (corrupt state); the pending call did not run",
+              "ConduitInternalError",
+              CORRUPT,
+            );
+          }
+        }
+        // Step 3 — generation check (D3 authority, both kinds). Runs AFTER
+        // the claim, so a provision that commits between the sweep and the
+        // claim is still caught. `getGeneration` is "current at read time": a
+        // concurrent bump reads NEWER, never stale, which fails closed here.
+        const currentGeneration = await deps.store.sources.getGeneration(pausedOn.namespace);
+        if (currentGeneration === undefined || currentGeneration !== pausedOn.sourceGeneration) {
+          return terminalize("catalog changed — re-approve", "ConduitCatalogChanged");
+        }
+        // Step 4 — revalidate the projection FLAG and the grant under the
+        // ROW's client and projection. No resolver: the default profile
+        // applies ONLY to a default-profile row (clientId null — D8); a NAMED
+        // row without a resolver has no authority to resume under and fails
+        // closed (D11), without so much as consulting the default profile.
+        // Once per resume, never per call.
+        if (scopeResolver === undefined && execution.clientId !== null) {
+          return terminalize(
+            "no scope resolver for a named client's row — cannot revalidate its grant",
+            "ConduitScopeRevoked",
+          );
+        }
+        const boundScope = bindScope(scopeResolver, execution.clientId);
+        const checkScope = boundScope ?? (() => defaultScopeResolver(deps.store)(null));
+        if (!(await checkScope()).permits(execution.projection, pausedOn.toolName)) {
+          return terminalize(
+            "the client's scope no longer permits this call — re-approve is not possible",
+            "ConduitScopeRevoked",
+          );
+        }
+        // Task 10 owns the direct arm's drive, result states, and latch.
+        if (execution.kind === "direct") {
+          return terminalize("direct resume not yet implemented", "ConduitInternalError");
         }
 
         // Load the durable prefix and stage the decision bound to the pending
@@ -1048,13 +1172,21 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             upstreamSession,
             // The row's OWN persisted attribution (§4.3), not a default: a row
             // started under a named client keeps that client id on resume.
-            // Task 9 adds the §5.4 scope re-check this drive runs under; until
-            // then a resumed drive takes the unscoped path, as the shipped
-            // build does.
+            // Step 4 above used the default profile once, for the mandatory
+            // check; the drive itself stays unscoped when no resolver exists
+            // (D8) — absent must stay absent under exactOptionalPropertyTypes.
             projection: running.projection,
             clientId: running.clientId,
+            ...(boundScope !== undefined ? { scope: boundScope } : {}),
           });
-          const outcome = await drive(running, invoke, prefix, undefined, undefined);
+          const outcome = await drive(
+            running,
+            invoke,
+            prefix,
+            undefined,
+            undefined,
+            boundScope !== undefined ? { scope: boundScope, projection: "code" } : undefined,
+          );
           // Read AFTER the drive settles: `consumed` is host-side truth that
           // the staged decision was taken by the pending call (design D6) —
           // the CLI's verb reporting keys on this, never on error names.
@@ -1077,8 +1209,16 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // `running`, then re-throw the original fault. `failClaimedResume` only
         // fires on a still-`running` row, so if drive already finalized it to a
         // terminal state this is a harmless no-op.
+        //
+        // The stored reason is OPAQUE. The guard's reads (`tools.get`,
+        // `getGeneration`, the scope resolver) flow through here, and a store
+        // rejection carries host-only detail — a database path — into a row
+        // `check_execution` hands back to the agent. The cause goes to the
+        // daemon log under a fresh reference; only the reference is persisted.
+        const ref = crypto.randomUUID();
+        console.error(`[ExecutionManager] resume preparation failed ${ref}: ${String(cause)}`);
         await deps.store.executions
-          .failClaimedResume(executionId, `resume preparation failed: ${String(cause)}`)
+          .failClaimedResume(executionId, `resume preparation failed. Reference: ${ref}`)
           .catch(() => {
             // The store is genuinely faulting; nothing more can persist. Surface
             // the original fault regardless.
