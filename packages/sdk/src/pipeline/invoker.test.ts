@@ -892,7 +892,7 @@ describe("§5.5 scope check", () => {
     expect(onAllowPath.message).toBe(onPolicyPath.message);
   });
 
-  it("INVARIANT §9.2: the out-of-scope HOST log sanitizes the guest-supplied path — no forged line, bounded length", async () => {
+  it("the out-of-scope HOST log sanitizes the guest-supplied path — no forged line, bounded length", async () => {
     // The path is guest-supplied and untrusted. A raw newline in it would
     // forge a second host log line; an unbounded one would flood the daemon
     // log. `printableName` strips control characters and caps at 120.
