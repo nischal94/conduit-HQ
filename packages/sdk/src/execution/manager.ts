@@ -77,8 +77,15 @@ export interface ExecutionManager {
 export type ExecutionOutcome =
   | { status: "completed"; executionId: string; value: unknown }
   | { status: "failed"; executionId: string; error: SandboxError }
-  | { status: "paused"; executionId: string; pending: PendingApproval }
-  | { status: "expired"; executionId: string; pending: PendingApproval }
+  /**
+   * The UNION, never bare `PendingApproval`: until Task 8 captures
+   * provenance at pause time this build writes the LEGACY pause shape, so a
+   * consumer reading `pending.namespace` would compile and get `undefined`.
+   * Readers narrow through `hasProvenance` (§4.1). Task 8 may narrow this
+   * back once every pause carries the pair.
+   */
+  | { status: "paused"; executionId: string; pending: StoredPendingApproval }
+  | { status: "expired"; executionId: string; pending: StoredPendingApproval }
   | { status: "conflict"; executionId: string };
 
 /**
@@ -611,9 +618,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             pausedOn: pending,
           }),
         );
-        // Task 8 makes the captured pause a real `PendingApproval`; until
-        // then the outcome reports the legacy shape this build writes.
-        return { status: "paused", executionId: execution.id, pending: pending as PendingApproval };
+        return { status: "paused", executionId: execution.id, pending };
       }
     }
   }
@@ -830,7 +835,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // Task 9 adds the §5.4 generation check, which narrows this by
         // `hasProvenance`; until then a legacy pause flows on as it does
         // in the shipped build.
-        const pausedOn = stored as PendingApproval;
+        const pausedOn = stored;
 
         // TTL (design D8): lazily expire on resume. `claimForResume` already
         // flipped status to running, so persist the terminal `expired` state.

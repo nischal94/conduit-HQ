@@ -8,7 +8,6 @@ import type { ToolHost } from "../sandbox/sandbox.js";
 import { SecretBox } from "../secrets.js";
 import { codeRow, directRow, pause } from "../test/fixtures.js";
 import type {
-  Execution,
   ExecutionStatus,
   PolicyAction,
   RiskClass,
@@ -64,6 +63,26 @@ describe("SqliteStore", () => {
       const loaded = await store.sources.getByNamespace("petstore");
       expect(loaded?.id).toBe("src_1");
       expect(loaded && "baseUrl" in loaded).toBe(false);
+    });
+
+    it("PENDING Task 4: a hydrated source reports generation 0 until the generation column lands", async () => {
+      // `rowToSource` hardcodes `generation: 0` — there is no `generation`
+      // column yet (§4.1a, Task 4 adds it with the three SQLite triggers).
+      // This pins the PLACEHOLDER, not the behaviour: §5.4's authorization
+      // check compares a pause's `sourceGeneration` against this value, so
+      // Task 4 must consciously replace both the column read and this test.
+      // Until then, every hydrated Source reports 0 regardless of what a
+      // caller passed on write.
+      await store.sources.upsert({
+        id: "src_gen",
+        type: "openapi",
+        namespace: "gen",
+        location: "https://example.com/openapi.json",
+        generation: 7,
+      });
+      expect((await store.sources.get("src_gen"))?.generation).toBe(0);
+      expect((await store.sources.getByNamespace("gen"))?.generation).toBe(0);
+      expect((await store.sources.list()).every((s) => s.generation === 0)).toBe(true);
     });
 
     it("upserts on conflict and removes", async () => {
@@ -731,11 +750,7 @@ describe("SqliteStore", () => {
 
     it("put never changes resume_attempt", async () => {
       await store.executions.create(codeRow({ id: "p_k" }), { attempt: "att" });
-      await store.executions.put({
-        ...codeRow({ id: "p_k" }),
-        status: "completed",
-        result: 1,
-      } as Execution);
+      await store.executions.put(codeRow({ id: "p_k", status: "completed", result: 1 }));
       const raw = await client.execute({
         sql: "SELECT resume_attempt FROM executions WHERE id = ?",
         args: ["p_k"],

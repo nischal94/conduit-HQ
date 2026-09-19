@@ -29,7 +29,7 @@ const base = {
 } as const;
 
 async function seed(store: ConduitStore, rows: Array<Pick<Execution, "id" | "status">>) {
-  for (const row of rows) await store.executions.put({ ...base, ...row } as Execution);
+  for (const row of rows) await store.executions.put({ ...base, ...row });
 }
 
 describe("sweepOrphanedExecutions", () => {
@@ -123,6 +123,47 @@ describe("sweepOrphanedExecutions", () => {
       expect(row.rows[0]?.status).toBe("failed");
       expect(row.rows[0]?.ended_at).not.toBeNull();
     }
+  });
+
+  it("INVARIANT §17: a running DIRECT row is swept exactly like a code row, and a paused direct row is untouched", async () => {
+    // The sweep terminalizes by STATUS, never by kind (§7): a direct row
+    // stranded by a killed daemon has the same unknown outcome as a code
+    // row — its upstream call may well have landed. This pins that a
+    // future kind-aware change cannot silently skip direct rows and leave
+    // them `running` forever.
+    const store = await newStore();
+    const directBase = {
+      kind: "direct",
+      clientId: null,
+      projection: "direct",
+      call: { toolName: "github.issues.list", namespace: "github", request: "{}" },
+      startedAt: 1000,
+    } as const;
+    await store.executions.create({ ...directBase, id: "exec_direct_running", status: "running" });
+    await store.executions.create({
+      ...directBase,
+      id: "exec_direct_paused",
+      status: "paused",
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.issues.list",
+        namespace: "github",
+        sourceGeneration: 1,
+        input: {},
+        reason: "policy requires approval",
+        expiresAt: 9e12,
+      },
+    });
+
+    expect(await sweepOrphanedExecutions(store)).toBe(1);
+
+    const running = await store.executions.get("exec_direct_running");
+    expect(running?.status).toBe("failed");
+    expect(running?.error?.name).toBe("ConduitOutcomeAmbiguous");
+    // No invented outcome: the sweep never replays, so nothing is delivered.
+    expect(running?.result).toBeUndefined();
+    // The paused direct row is awaiting a human, not stranded — untouched.
+    expect((await store.executions.get("exec_direct_paused"))?.status).toBe("paused");
   });
 
   it("returns 0 and writes nothing on a clean database", async () => {
