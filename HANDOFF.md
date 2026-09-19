@@ -108,10 +108,36 @@ amendment are committed. Post-PR gauntlet state:
   store-call coverage table showed that was false, so the sentence was
   reworded before it was written. An adversarial finding against those
   Code Mode writes is now out of scope by documented decision.
-- NEXT: ONE confirming codex pass (same model and effort; list the fixed
-  findings and the §18 scope sentence in the prompt; ask for an explicit
-  CONVERGED / NOT CONVERGED). If it returns the SAME class again, stop and
-  bring the design question to the founder — do not patch a ninth site.
+- Codex confirming pass, attempt 1 (head `d86d3ee`): DIED ON THE USAGE
+  LIMIT after ~220K tokens ("try again at 7:50 AM"). The same run is
+  QUEUED behind a `sleep` and fires 07:53 IST 2026-09-20; it reads the
+  working tree at run time, so do not switch branches while it runs. Its
+  prompt and output live in the session scratchpad; if this section still
+  says QUEUED in a later session, the session ended first — re-run it per
+  `~/.claude/rules/codex-one-path.md` with the prompt shape of pass #1
+  plus: the fixed-findings list, the §18 scope sentence as documented
+  out-of-scope, and a request for an explicit CONVERGED / NOT CONVERGED.
+  Record model, effort, trigger and counts in the PR.
+- The killed run's stderr held ONE lead, which the controller verified by
+  reading the code: the code-row guard timer added by the post-PR fix was
+  UNLATCHED — its callback started a "did not run" write, a guard read
+  returning meanwhile won `Promise.race`, and the drive could start the
+  guest program on a row being written as "did not run" (ninth instance of
+  the class; introduced by the fix meant to close it). FIXED in `dcc9e39`
+  as a shape fix: the latch check lives INSIDE `raceGuard` for both kinds,
+  guard refusals take-the-latch-or-defer, and the handover re-checks.
+  Controller-verified: sdk 657/657, mcp 440/440, cli 118/118, `tsc -p`
+  ×3 exit 0. Honest limit, from the fix agent: the three protections
+  overlap, so removing any ONE leaves every test green; removing any PAIR
+  goes red. No single guard is individually pinned.
+- DONE: Aikido scan — 23/23 changed product files, no issues. Caveat: the
+  scan agent stripped comment blocks to fit the payload size, so a secret
+  inside a COMMENT would not have been seen (the pre-PR code reviewer read
+  comments and found none); `dcc9e39` was committed after the scan.
+- **If the queued codex pass reports the SAME class a tenth time, STOP.
+  Do not patch. Bring the founder the design question: should Lane A bound
+  the code-row guard phase at all, or revert that bound and scope it out in
+  the §18 sentence (as the first mutation already is)?**
 - Follow-up found by a whole-file ledger scan: 129 `INVARIANT §` tests
   uncited and 70 truncated citations in `INVARIANTS.md`, all OUTSIDE the R1
   section (§9.3/§16/§17/§18-C4) and predating this branch. Every
