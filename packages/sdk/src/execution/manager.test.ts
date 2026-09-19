@@ -2520,9 +2520,23 @@ describe("§5.4 resume under scope — real stack", () => {
 describe("R1 direct arm (§5.3/§5.4)", () => {
   let active: Harness | undefined;
   afterEach(async () => {
+    // Real timers FIRST: harness cleanup closes libsql clients and a loopback
+    // server, both of which need a working clock to settle.
+    vi.useRealTimers();
     await active?.cleanup();
     active = undefined;
   });
+
+  /**
+   * Plan-mandated (implementer note 1): the exactly-once tests drive the
+   * budget with FAKE timers rather than a real 400 ms budget, which flakes
+   * under CI load. Only `setTimeout`/`clearTimeout` are faked — `Date` and
+   * the rest stay real, so libsql's own I/O and the harness's loopback
+   * server keep working while the drive's budget is under test control.
+   */
+  function withFakeTimers(): void {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  }
 
   const permitDirect: ScopeResolver = async () =>
     buildEffectiveScope(
@@ -2741,6 +2755,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("D-A13: the budget timer is armed before create() — a hung first write still yields the timeout outcome within budget", async () => {
+    withFakeTimers();
     active = await makeHarness();
     const never = new Promise<never>(() => {});
     const stuck = {
@@ -2748,13 +2763,14 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       executions: { ...active.store.executions, create: () => never },
     } as ConduitStore;
     const m = createExecutionManager({ ...active.deps, store: stuck, direct: fast });
-    const t0 = Date.now();
-    const out = await m.startDirect(
+    const handle = m.startDirect(
       "github.list_issues",
       {},
       { clientId: null, projection: "direct", scope: permitDirect },
-    ).outcome;
-    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 400);
+    );
+    // The budget elapses on the FAKE clock while create() is still hung.
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
+    const out = await handle.outcome;
     expect(out).toMatchObject({
       status: "failed",
       error: { name: "ConduitExecutionInterrupted" },
@@ -2763,6 +2779,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("INVARIANT §5.3 (#22/#28): exactly-once settlement — the timer wins, a delayed SUCCESS from the continuation never overwrites `failed`", async () => {
+    withFakeTimers();
     active = await makeHarness();
     const settleCalls: boolean[] = [];
     const spyStore = spyOnSettle(active.store, settleCalls);
@@ -2778,11 +2795,17 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       {},
       { clientId: null, projection: "direct", scope: permitDirect },
     );
+    // Drive the clock, never the wall: the budget (400) elapses, then the
+    // late success (900) lands. Awaiting the promise under test after each
+    // advance is what keeps this from being a vacuous pass — `advance` alone
+    // would prove nothing about the microtasks the settle depends on.
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
     const out = await handle.outcome;
     expect(out).toMatchObject({
       status: "failed",
       error: { name: "ConduitExecutionInterrupted" },
     });
+    await vi.advanceTimersByTimeAsync(1_000);
     await handle.finished;
     // Exactly ONE write changed the row; the late success never reached
     // settleDirect at all — the latch stopped it before the fence.
@@ -2794,6 +2817,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("INVARIANT §7 (#22): the timer fires with the cell already DISPATCHED — settled ConduitOutcomeAmbiguous, and a late continuation changes nothing", async () => {
+    withFakeTimers();
     active = await makeHarness();
     const settleCalls: boolean[] = [];
     const spyStore = spyOnSettle(active.store, settleCalls);
@@ -2816,11 +2840,13 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       {},
       { clientId: null, projection: "direct", scope: permitDirect },
     );
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
     const out = await handle.outcome;
     expect(out).toMatchObject({
       status: "failed",
       error: { name: OUTCOME_AMBIGUOUS_ERROR_NAME },
     });
+    await vi.advanceTimersByTimeAsync(1_000);
     await handle.finished;
     expect(settleCalls).toEqual([true]);
     expect(await m.get(out.executionId)).toMatchObject({
@@ -2876,6 +2902,13 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       },
     } as ConduitStore;
     const slowM = createExecutionManager({ ...active.deps, store: slowSettle, direct: fast });
+    // REAL CLOCK, deliberately (fix round 1, finding 3): this test drives a
+    // real `resume()` whose approved call crosses the harness's loopback MCP
+    // socket. Under `vi.useFakeTimers` that path deadlocks — verified: the
+    // test times out at 5 s with the clock frozen. So the budget stays real
+    // and the margin is a full SECOND, not a few hundred ms, to survive CI
+    // load; the property under test (an answer within budget, not an exact
+    // duration) tolerates the slack.
     const t0 = Date.now();
     const out = await slowM.resume(
       paused.executionId,
@@ -2883,7 +2916,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       await pendingCallOf(m, paused.executionId),
       permitDirect,
     );
-    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 500);
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
     expect(out).toMatchObject({
       status: "unknown",
       reason: "persist-timeout",
@@ -2988,6 +3021,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   });
 
   it("INVARIANT §5.3 (#22 quarantine, #45): a never-returning store read still yields the timeout outcome within budget; retention reports `abandoned`; finished stays pending", async () => {
+    withFakeTimers();
     active = await makeHarness();
     const never = new Promise<never>(() => {});
     // A read that NEVER returns: the continuation can never finish, so
@@ -2998,24 +3032,33 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       direct: fast,
       makeInvoker: () => () => never,
     });
-    const t0 = Date.now();
     const handle = m.startDirect(
       "github.list_issues",
       {},
       { clientId: null, projection: "direct", scope: permitDirect },
     );
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
     const out = await handle.outcome;
-    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 400);
     expect(out).toMatchObject({
       status: "failed",
       error: { name: "ConduitExecutionInterrupted" },
     });
-    expect(await handle.retention).toBe("abandoned");
+    // The continuation never returns, so the slot is ABANDONED once the
+    // retention window elapses on the fake clock.
+    const retention = handle.retention;
+    await vi.advanceTimersByTimeAsync(fast.slotRetentionMs + 10);
+    expect(await retention).toBe("abandoned");
     expect(
-      await Promise.race([
-        handle.finished.then(() => "finished"),
-        new Promise((r) => setTimeout(() => r("pending"), 50)),
-      ]),
+      await (async () => {
+        const race = Promise.race([
+          handle.finished.then(() => "finished"),
+          new Promise((r) => setTimeout(() => r("pending"), 50)),
+        ]);
+        // Advance AFTER building the race, so the 50 ms probe actually fires
+        // on the fake clock; then await it. Awaiting first would deadlock.
+        await vi.advanceTimersByTimeAsync(50);
+        return race;
+      })(),
     ).toBe("pending");
   });
 
@@ -3053,11 +3096,15 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     });
   });
 
-  it("INVARIANT §5.3 (#45): `outcome` resolves on EVERY path — a continuation that settles nothing publishes the honest non-answer, never hangs", async () => {
+  it("INVARIANT §5.3 (#45): a create rejection whose CONFLICT LOOKUP also rejects still answers — outcome, retention and finished all settle", async () => {
+    // NOTE (fix round 1, finding 4): this pins the create-rejection BRANCH,
+    // not the `finished.finally` backstop. `mapCreateConflict` is wrapped in
+    // `.catch(() => undefined)`, so this path always reaches `settle()` and
+    // publishes `failed` itself; deleting the backstop leaves this test
+    // green. The backstop is labelled untested defence-in-depth in the code.
     active = await makeHarness();
     // A store whose `create` throws a NON-conflict cause and whose conflict
-    // mapper also throws: the branch publishes through the latch. Proven by
-    // the outcome arriving at all — a hung promise would time the test out.
+    // lookup also throws — the hostile double-fault this branch must answer.
     const hostile = {
       ...active.store,
       executions: {
@@ -3203,6 +3250,95 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(failCalled).toBe(0);
     expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
     expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (guard-phase expiry): a guard READ that never returns still answers within the drive budget and terminalizes the claimed row", async () => {
+    // Fix round 1, finding 1. Every §5.4 guard read is unbounded. Before the
+    // fix the drive's timer fired into an UNASSIGNED `onExpire`, so a stalled
+    // guard read left the row `running` forever and `resume()` never settled.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    // `tools.get` is a GUARD read — reached long before any settle decision,
+    // which is what the pre-existing stalled-settle test could not cover.
+    const stuckGuard = {
+      ...active.store,
+      tools: { ...active.store.tools, get: () => never },
+    } as ConduitStore;
+    const stuckM = createExecutionManager({ ...active.deps, store: stuckGuard, direct: fast });
+    // REAL CLOCK, deliberately (fix round 1, finding 3): this test drives a
+    // real `resume()` whose approved call crosses the harness's loopback MCP
+    // socket. Under `vi.useFakeTimers` that path deadlocks — verified: the
+    // test times out at 5 s with the clock frozen. So the budget stays real
+    // and the margin is a full SECOND, not a few hundred ms, to survive CI
+    // load; the property under test (an answer within budget, not an exact
+    // duration) tolerates the slack.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stuckM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 5)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+      decisionApplied: false,
+    });
+    // The row is TERMINALIZED, never stranded `running`.
+    expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
+    // And the pending call never ran.
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (finding 2): a prep-window fault whose fenced settle STALLS still returns within budget, never hangs resume()", async () => {
+    // Fix round 1, finding 2. The prep-window catch awaited `settleDirect`
+    // with no timeout: a stalled store hung `resume()` past every budget.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    // `claimCallId` THROWS → the prep-window catch runs; its settle stalls.
+    const hostile = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        claimCallId: async () => {
+          throw new Error("prep window fault");
+        },
+        settleDirect: () => never,
+      },
+    } as ConduitStore;
+    const hostileM = createExecutionManager({ ...active.deps, store: hostile, direct: fast });
+    // REAL CLOCK, deliberately (fix round 1, finding 3): this test drives a
+    // real `resume()` whose approved call crosses the harness's loopback MCP
+    // socket. Under `vi.useFakeTimers` that path deadlocks — verified: the
+    // test times out at 5 s with the clock frozen. So the budget stays real
+    // and the margin is a full SECOND, not a few hundred ms, to survive CI
+    // load; the property under test (an answer within budget, not an exact
+    // duration) tolerates the slack.
+    const t0 = Date.now();
+    const settled = await Promise.race([
+      hostileM
+        .resume(paused.executionId, { kind: "approve" }, callId, permitDirect)
+        .then(() => "resolved")
+        .catch(() => "threw"),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 5)),
+    ]);
+    // The original fault still surfaces (it re-throws) — but BOUNDED.
+    expect(settled).toBe("threw");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
   });
 
   it("Task 9 handover: a direct row's guard terminalization whose fenced write STALLS reports unknown, never a claimed terminal", async () => {

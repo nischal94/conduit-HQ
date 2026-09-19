@@ -1,4 +1,5 @@
 import { createDispatchCell, type DispatchCell } from "../pipeline/dispatch.js";
+import type { ConduitStore, DirectSettle } from "../store/store.js";
 import type { ExecutionOutcome } from "./manager.js";
 
 /**
@@ -146,4 +147,52 @@ export function createDirectDrive(args: {
  */
 export function deliverableBytes(deliverable: unknown): number {
   return Buffer.byteLength(JSON.stringify(deliverable) ?? "null", "utf8");
+}
+
+/**
+ * How the ONE fenced settle write ended (§5.3). `written` is the only arm
+ * that licenses publishing the intended outcome; every other arm means "the
+ * effect may have landed and the row may not yet say so".
+ */
+export type SettleResult = "written" | "fenced" | "failed" | "timeout";
+
+/**
+ * THE bounded, fenced settle — the single implementation every direct settle
+ * path uses (the drive's own settle, the §5.4 guard terminalizations, the
+ * guard-phase expiry, the TTL `expired` arm, and the prep-window catch).
+ *
+ * It was three hand-rolled copies of this race, and the copy in the
+ * prep-window catch was missing its timeout entirely — a stalled store there
+ * hung `resume()` past every budget. Keeping ONE implementation makes that
+ * class of omission unrepresentable rather than merely fixed.
+ *
+ * Never throws: a rejected write is `failed`, a write still pending after
+ * `budgetMs` is `timeout`. The write itself is NOT cancelled on timeout — it
+ * may still land — so callers that need to observe its completion push the
+ * returned `write` promise onto their tracked list.
+ */
+export function boundedFencedSettle(
+  store: Pick<ConduitStore, "executions">,
+  id: string,
+  attempt: string,
+  settle: DirectSettle,
+  budgetMs: number,
+): { result: Promise<SettleResult>; write: Promise<unknown> } {
+  const write: Promise<"written" | "fenced" | "failed"> = store.executions
+    .settleDirect(id, attempt, settle)
+    .then(
+      (changed) => (changed ? "written" : "fenced"),
+      () => "failed",
+    );
+  const result = (async (): Promise<SettleResult> => {
+    let timerHandle: NodeJS.Timeout | undefined;
+    const timer = new Promise<"timeout">((r) => {
+      timerHandle = setTimeout(() => r("timeout"), budgetMs);
+      timerHandle.unref?.();
+    });
+    const winner = await Promise.race([write, timer]);
+    clearTimeout(timerHandle);
+    return winner;
+  })();
+  return { result, write };
 }
