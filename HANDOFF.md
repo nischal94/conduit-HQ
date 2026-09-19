@@ -43,11 +43,12 @@ pre-commit typecheck cannot pass on Task 1 alone). Task 3 DONE
 items below are closed), Task 5 DONE (`22a5d89`), Task 6 DONE
 (`a03bc8d`), Task 7 DONE (`b56a2bb`), Task 8 DONE (`b7049e4`; it closed
 the Task 8 carried items below), Task 9 DONE (`c25a97e`) — all
-task-reviewed. **Task 10 committed `36d0fc3`; its review returned four
-Important findings; fix round 1 committed `2cc4852`; the scoped re-review
-is pending** (see the Task 10 bullet below — confirm each finding reads
-ADDRESSED before closing the task). NEXT: close Task 10's fix loop →
-Task 11 → the final whole-branch
+task-reviewed. Task 10 DONE (`36d0fc3` + fixes `2cc4852`, `cbc14cc`;
+two fix rounds, the Task 10 findings below are CLOSED). **Task 11
+committed `06be1a5`; its review found three ledger-truthfulness findings;
+fix round 1 committed `d33fb5d`; the scoped re-review is pending** (see
+the Task 11 bullet below). NEXT: close Task 11's fix loop → the final
+whole-branch
 review → the PR gauntlet. Run `packages/mcp` `integration.test.ts` and
 `packages/cli` `key.test.ts` from their package directory (from the repo
 root they fail `MODULE_NOT_FOUND` — a harness artifact). The recovery map is the git-ignored
@@ -87,7 +88,27 @@ from `git log` on the branch. Carried items a fresh session must not lose:
   `vi.useFakeTimers()` (this file's own implementer note); (4) the
   `outcome` backstop in `finished.finally` has no test that fails without
   it. A task is closed only after a scoped re-review says ADDRESSED.
-- **Task 11 dispatch:** replace the 7 `active!` non-null warnings in
+- **Task 10 round 2 (closed, recorded for LEARNINGS):** arming the
+  guard-phase `onExpire` made a dead race live — the guard's own
+  terminalizations cleared the timer without taking the latch, so expiry
+  and guard could both settle and `resume()` could publish a false
+  `unknown/persist-failed`. Fixed by one `terminalizeDirect` helper
+  (latch-or-defer + `finishEarly`). The implementer's first two versions
+  of the pinning test passed while proving nothing (one measured the SQL
+  fence, not the latch). For the final review to weigh: `finished`
+  resolves BEFORE the guard-phase settle write completes, while D-A2 says
+  it means writes have stopped — inert until Lane B consumes `resume`'s
+  lifecycle handle.
+- **Task 11 findings (fix round 1 `d33fb5d`, re-review pending):** the
+  ledger's claim column had been CONDENSED from spec §9.1, which produced
+  a false pinned status on row #22 (the `DIRECT_ADMISSION_MAX`/`busy`
+  clause has no Lane A test → split #22a/#22b) and an unasserted "retry"
+  half on row #11; rows #50 and #28 cited suites lacking the
+  `INVARIANT §` prefix, invisible to a prefix-based sweep. The fix
+  re-derives every claim from the spec and adds a clause-level audit
+  (row → clause → pinning test). Rule for the ledger from now on: never
+  condense a spec claim; a clause without a pin splits the row.
+- **Task 11 dispatch (done in `06be1a5`):** replace the 7 `active!` non-null warnings in
   `manager.test.ts` with a throwing harness accessor; consider collapsing
   the three hand-rolled bounded-fenced-settle races into one helper in
   `direct.ts` if Task 10's fix did not.
