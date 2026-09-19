@@ -25,6 +25,20 @@ const PAIRS: Pair[] = [
   { kind: "direct", projection: "discovery" },
 ];
 
+/**
+ * A `describe.each` over an empty or shrunken list reports success while
+ * asserting nothing — the classic false green. This pins the parameter list
+ * itself, so dropping a pair fails here rather than silently halving coverage.
+ */
+it("INVARIANT §9.2: the D5 harness runs over all THREE valid (kind, projection) pairs — never zero cases", () => {
+  expect(PAIRS).toHaveLength(3);
+  expect(PAIRS.map((p) => `${p.kind}/${p.projection}`)).toEqual([
+    "code/code",
+    "direct/direct",
+    "direct/discovery",
+  ]);
+});
+
 /** Every projection on, every tool allowed: the pair under test is the only variable. */
 const permitAll =
   (h: Harness): ScopeResolver =>

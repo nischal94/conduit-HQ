@@ -2107,7 +2107,7 @@ describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
  * before any drive, so a sandbox rejection means the guard let something
  * through.
  */
-describe("§5.4 step 2 — post-claim read-side guard (row #50), one test per disposition row", () => {
+describe("INVARIANT §5.4 (#50): post-claim read-side guard, one test per disposition row", () => {
   let store: ConduitStore;
   let client: ReturnType<typeof createClient>;
   let manager: ExecutionManager;
