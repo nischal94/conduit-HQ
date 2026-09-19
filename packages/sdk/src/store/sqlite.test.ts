@@ -214,7 +214,7 @@ describe("SqliteStore", () => {
   });
 
   describe("executions", () => {
-    it("claimForResume: exactly one caller wins the paused→running transition", async () => {
+    it("INVARIANT §5.5: claimForResume is an exactly-one-winner CAS — one caller wins the paused→running transition", async () => {
       await store.executions.put({
         kind: "code",
         clientId: null,
@@ -234,7 +234,7 @@ describe("SqliteStore", () => {
       expect((await store.executions.get("e"))?.status).toBe("running");
     });
 
-    it("claimForResume: returns false when not paused", async () => {
+    it("INVARIANT §5.5: claimForResume returns false when the row is not paused", async () => {
       await store.executions.put({
         kind: "code",
         clientId: null,

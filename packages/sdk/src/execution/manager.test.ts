@@ -94,6 +94,20 @@ async function seedProvenance(
 }
 
 /**
+ * Read the live harness from inside a deferred closure (a store override, a
+ * scope resolver) that runs only after `active` is assigned. A runtime
+ * guarantee rather than a non-null assertion: if a refactor ever runs such a
+ * closure before setup, the test names the fault instead of throwing on
+ * `undefined` somewhere deeper.
+ */
+function requireActive(harness: Harness | undefined): Harness {
+  if (harness === undefined) {
+    throw new Error("[manager.test] the harness was read before setup assigned it");
+  }
+  return harness;
+}
+
+/**
  * Manager deps wired to a stub Sandbox. The invoker/host/decisions seams are
  * present but never exercised in the I-1 tests, because the stub sandbox throws
  * before it performs any tool call. `overrides` lets a test pin `newId` so the
@@ -2541,7 +2555,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
   const permitDirect: ScopeResolver = async () =>
     buildEffectiveScope(
       { projections: { code: true, direct: true, discovery: true }, allow: ALL_TOOLS },
-      await active!.store.tools.list(),
+      await requireActive(active).store.tools.list(),
     );
 
   const fast = {
@@ -2897,7 +2911,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
         ...active.store.executions,
         settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
           await gate;
-          return active!.store.executions.settleDirect(...a);
+          return requireActive(active).store.executions.settleDirect(...a);
         },
       },
     } as ConduitStore;
@@ -2970,7 +2984,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
         ...active.store.executions,
         create: async (...a: Parameters<ConduitStore["executions"]["create"]>) => {
           await gate;
-          return active!.store.executions.create(...a);
+          return requireActive(active).store.executions.create(...a);
         },
       },
     } as ConduitStore;
@@ -3074,7 +3088,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
         ...active.store.executions,
         settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
           await gate;
-          return active!.store.executions.settleDirect(...a);
+          return requireActive(active).store.executions.settleDirect(...a);
         },
       },
     } as ConduitStore;
@@ -3226,11 +3240,11 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
           ...a: Parameters<ConduitStore["executions"]["failClaimedResume"]>
         ) => {
           failCalled += 1;
-          return active!.store.executions.failClaimedResume(...a);
+          return requireActive(active).store.executions.failClaimedResume(...a);
         },
         settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
           settleCalled += 1;
-          return active!.store.executions.settleDirect(...a);
+          return requireActive(active).store.executions.settleDirect(...a);
         },
       },
     } as ConduitStore;
@@ -3297,7 +3311,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
         ...active.store.tools,
         get: async (n: string) => {
           await guardReadGate;
-          return active!.store.tools.get(n);
+          return requireActive(active).store.tools.get(n);
         },
       },
       executions: {
@@ -3310,7 +3324,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
             expiryWriteStarted();
             await expiryWriteGate;
           }
-          return active!.store.executions.settleDirect(...a);
+          return requireActive(active).store.executions.settleDirect(...a);
         },
       },
     } as ConduitStore;
@@ -3477,7 +3491,7 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       seen.push(clientId);
       return buildEffectiveScope(
         { projections: { code: true, direct: true, discovery: false }, allow: ALL_TOOLS },
-        await active!.store.tools.list(),
+        await requireActive(active).store.tools.list(),
       );
     };
     const m = createExecutionManager({ ...active.deps, direct: fast });
