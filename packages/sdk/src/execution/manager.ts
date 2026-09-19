@@ -1055,18 +1055,24 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         });
       } catch (cause) {
         if (!drive.settle()) return;
-        const stored: ExecutionError = {
+        // M2: the STORED reason is opaque too. A prep-window fault here can
+        // carry host-only detail (a database path, an upstream body) and the
+        // stored row is handed back to the agent by `check_execution`. The
+        // cause goes to the daemon log under a fresh reference; only the
+        // reference is persisted — the same pattern the resume prep-window
+        // catch uses.
+        const ref = crypto.randomUUID();
+        console.error(
+          `[ExecutionManager] direct drive preparation failed ${ref}: ${String(cause)}`,
+        );
+        const error: ExecutionError = {
           name: "ConduitInternalError",
-          message: `[ExecutionManager] Direct drive preparation failed. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
-        };
-        const visible: ExecutionError = {
-          name: "ConduitInternalError",
-          message: `[ExecutionManager] Direct drive preparation failed. Context: { executionId: ${execution.id} }`,
+          message: `[ExecutionManager] Direct drive preparation failed. Reference: ${ref}`,
         };
         await settleBounded(
           run,
-          { status: "failed", error: stored },
-          { status: "failed", executionId: execution.id, error: visible },
+          { status: "failed", error },
+          { status: "failed", executionId: execution.id, error },
         );
         return;
       }
@@ -1474,7 +1480,43 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // (D-A13) covers the guard phase too: a guard read that never returns
       // still settles the claimed row within the drive budget rather than
       // stranding it `running`.
-      const kind = await deps.store.executions.kindOf(executionId).catch(() => undefined);
+      // I4: BOUNDED. This read runs after the claim already flipped the row to
+      // `running` and before any drive exists — so it is the one post-claim
+      // read no timer covers. A store that never answers here stranded the row
+      // `running` forever and hung `resume()` past every budget. Bound it by
+      // the same drive budget the guard phase gets; on timeout the stored kind
+      // is unknown, so the settle cannot be routed: best-effort terminalize the
+      // claimed row and report the honest non-answer.
+      const kindTimeout = Symbol("kindOf-timeout");
+      let kindTimer: NodeJS.Timeout | undefined;
+      const kind = await Promise.race([
+        deps.store.executions.kindOf(executionId).catch(() => undefined),
+        new Promise<typeof kindTimeout>((r) => {
+          kindTimer = setTimeout(() => r(kindTimeout), budgets.driveBudgetMs);
+          kindTimer?.unref?.();
+        }),
+      ]);
+      clearTimeout(kindTimer);
+      if (kind === kindTimeout) {
+        // The reason is OPAQUE: a store rejection here carries host-only
+        // detail (a database path) into a row `check_execution` hands back to
+        // the agent. The cause goes to the daemon log under a fresh reference.
+        const ref = crypto.randomUUID();
+        console.error(
+          `[ExecutionManager] resume kind lookup timed out ${ref}: executionId ${executionId}`,
+        );
+        await deps.store.executions
+          .failClaimedResume(executionId, `resume kind lookup timed out. Reference: ${ref}`)
+          .catch(() => {
+            // The store is genuinely faulting; nothing more can persist.
+          });
+        return {
+          status: "unknown",
+          executionId,
+          reason: "persist-timeout",
+          decisionApplied: false,
+        };
+      }
       /**
        * GUARD-PHASE EXPIRY. Every §5.4 guard read below — `executions.get`,
        * `claimCallId`, `tools.get`, `sources.getGeneration`, `policies.get`,
@@ -1506,12 +1548,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
                 // on THIS path too, so the expiry exit looks like every other
                 // exit rather than leaving `finished`/`settledAt` pending and
                 // the drive undisposed.
-                directDrive.finishEarly();
+                directDrive.settleEarly();
                 const error: ExecutionError = {
                   name: "ConduitExecutionInterrupted",
                   message: `[ExecutionManager] Direct resume budget elapsed during the read-side guard (${budgets.driveBudgetMs}ms); the pending call did not run. Context: { executionId: ${executionId} }`,
                 };
-                void settleDirectBounded({ status: "failed", error }, error).then(
+                void settleDirectBounded({ status: "failed", error }, error, directDrive).then(
                   resolveGuardExpiry,
                   () =>
                     resolveGuardExpiry({
@@ -1561,14 +1603,24 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       async function settleDirectBounded(
         settle: DirectSettle,
         error: ExecutionError,
+        /**
+         * M1 / D-A2: the drive whose `finished` must await this write. The
+         * write is NOT cancelled when `result` times out — it may still land —
+         * so `finished` ("the continuation and any tracked settle write have
+         * actually stopped") only resolves once it does. Lane B holds an
+         * admission slot on `finished`; resolving it over a live store write
+         * would release that slot while the work is still running.
+         */
+        trackOn?: OwnedDirectDrive,
       ): Promise<ResumeOutcome> {
-        const { result } = boundedFencedSettle(
+        const { result, write } = boundedFencedSettle(
           deps.store,
           executionId,
           resumeAttemptId,
           settle,
           budgets.settleWriteBudgetMs,
         );
+        trackOn?.resolveFinished(write.then(() => undefined));
         const winner = await result;
         if (winner === "written") {
           return { status: "failed", executionId, error, decisionApplied: false };
@@ -1610,8 +1662,11 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // written). Publish ITS outcome; never write a second time.
           return guardExpiry;
         }
-        drive.finishEarly();
-        return settleDirectBounded(settle, error);
+        // M1 / D-A2: `settleEarly` (not `finishEarly`) — the row is decided,
+        // so `settledAt` resolves and retention starts, but `finished` waits
+        // on the settle write below, which is still live work.
+        drive.settleEarly();
+        return settleDirectBounded(settle, error, drive);
       }
 
       // The claim just flipped the row to `running`. EVERYTHING from here until
@@ -1708,14 +1763,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             // — the `expired` arm — never an unfenced `put`. Latch first: if
             // the budget already elapsed, the expiry owns the outcome.
             if (!directDrive.settle()) return guardExpiry;
-            directDrive.finishEarly();
-            const { result } = boundedFencedSettle(
+            // M1 / D-A2: same split as `terminalizeDirect` — the row is
+            // decided, but `finished` awaits this write, which is live work.
+            directDrive.settleEarly();
+            const { result, write } = boundedFencedSettle(
               deps.store,
               executionId,
               resumeAttemptId,
               { status: "expired" },
               budgets.settleWriteBudgetMs,
             );
+            directDrive.resolveFinished(write.then(() => undefined));
             const winner = await result;
             if (winner === "written") {
               return { status: "expired", executionId, pending: pausedOn, decisionApplied: false };
@@ -1881,6 +1939,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           );
           const gotPolicy = await raceGuard(deps.store.policies.get(execution.call.toolName));
           if (gotPolicy.expired) return gotPolicy.outcome;
+          // I2: `raceGuard` answers "not expired" whenever the READ wins the
+          // race — including when the budget elapsed during it and the expiry
+          // has already taken the latch with its write still in flight. The
+          // handover below hands the drive to `runDirect`, whose first
+          // `drive.settle()` then LOSES and returns having resolved nothing,
+          // so `await outcome` never resolves and the resume hangs forever,
+          // holding a daemon queue slot. The latch is the authority: if it is
+          // gone, the expiry owns the outcome, so publish ITS answer rather
+          // than driving a dead latch. Re-checked HERE, after the last guard
+          // read, because this is the last point before handover.
+          if (directDrive.settled) return guardExpiry;
           const policyRow = gotPolicy.value;
           let resolveOutcome!: (o: DirectOutcome) => void;
           const outcome = new Promise<DirectOutcome>((r) => {

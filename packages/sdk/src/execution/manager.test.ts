@@ -3404,6 +3404,256 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
+  it("INVARIANT §5.3 (#28, I1): a FROZEN injected clock cannot re-open the budget after the timer settled — zero upstream calls", async () => {
+    // I1, manager half. `deadline()` subtracted an injected `now()` while the
+    // budget timer ran on `setTimeout`. With `now` frozen, the timer still
+    // fires and publishes "elapsed before dispatch" — but an un-latched
+    // `deadline()` kept reporting the FULL budget, so the invoker's pre-write
+    // gate passed and the call dispatched anyway, for a row already settled.
+    // The latch-aware deadline closes it: after the timer takes the latch,
+    // `deadline()` is 0 whatever the clock says, and the upstream sees NOTHING.
+    active = await makeHarness();
+    const frozen = Date.now();
+    // Hold the invoker's scope check (step 1a) open past the drive budget, so
+    // the timer fires while the call is still short of the wire. The deadline
+    // gate (step 5) runs after it — that is the gate under test.
+    const slowScope: ScopeResolver = async (clientId) => {
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs * 2));
+      return permitDirect(clientId);
+    };
+    const m = createExecutionManager({
+      ...active.deps,
+      direct: fast,
+      // Frozen: every `now()` the manager and the drive read returns the same
+      // instant, so elapsed time is invisible to the deadline arithmetic. The
+      // real `setTimeout` behind the drive's timer is unaffected.
+      now: () => frozen,
+    });
+    // `list_issues` is read-only, so policy ALLOWS it and the drive proceeds
+    // to the dispatch gate — which is the gate under test. An
+    // approval-gated tool would pause before ever reaching it.
+    const handle = m.startDirect(
+      "github.list_issues",
+      { owner: "acme", repo: "site" },
+      { clientId: null, projection: "direct", scope: slowScope },
+    );
+    // REAL CLOCK (same reason as the guard-expiry tests above): the setup
+    // path crosses the harness's loopback MCP socket, which deadlocks under
+    // fake timers. The drive budget is real; only the manager's `now` is
+    // frozen, which is precisely the skew under test.
+    const out = await Promise.race([
+      handle.outcome,
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    // Wait for the continuation to actually STOP before reading the upstream
+    // record: `outcome` resolves as soon as the timer's settle publishes,
+    // while the invoker is still mid-flight behind the gated scope read.
+    // Asserting before `finished` would pass for the wrong reason.
+    await handle.finished;
+    // The point of the fix: with the latch taken, the invoker's deadline gate
+    // sees 0 and refuses, so the governed body was NEVER written upstream.
+    // Unfixed, the frozen clock reports the full budget and the call goes out.
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#45, M1): `finished` stays PENDING while the settle write is still open — D-A2 cleanup means the work has actually stopped", async () => {
+    // M1 / D-A2. `finished` is the CLEANUP promise the spec ties the admission
+    // slot to: "the slot is held until the drive SETTLES … resources are held
+    // until the work has actually stopped". A tracked settle write still in
+    // flight IS live work, so resolving `finished` before it lands would let
+    // Lane B release an admission slot over a live store write.
+    //
+    // `outcome` is deliberately NOT affected: the spec's "two promises" rule
+    // keeps the client-visible outcome resolving as soon as the row is
+    // settled, and retention is measured from `settledAt`, not from here.
+    //
+    // The RESUME path is where the gap was: `settleDirectBounded` discarded
+    // the `write` promise and the guard exits call `finishEarly()`, which
+    // resolved `finished` immediately. (`startDirect`'s own path already
+    // awaited `run.tracked` in `runDirect`'s `finally`.)
+    // The observable seam is the DRIVE's own `finished` on the resume path.
+    // `createDirectDrive` is the manager's, so the drive is captured through
+    // the guard terminalization it performs: the settle write is held open,
+    // and `finished` must not resolve until it lands.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // Bump the generation so the §5.4 step-3 guard terminalizes — that is the
+    // path whose settle write `finished` must now await.
+    await active.reprovision();
+
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((r) => {
+      releaseWrite = r;
+    });
+    let writeStarted!: () => void;
+    const writeInFlight = new Promise<void>((r) => {
+      writeStarted = r;
+    });
+    const gated = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          writeStarted();
+          await writeGate;
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const gatedM = createExecutionManager({ ...active.deps, store: gated, direct: fast });
+    const resuming = gatedM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+    await writeInFlight;
+    // The guard's settle write is OPEN. `resume()` is still awaiting it, so
+    // the row is not yet decided on disk — the write is live work, and a
+    // `finished` that resolved here would release Lane B's slot over it.
+    // The guard terminalization awaits its own bounded settle, so `resume()`
+    // cannot have answered yet. (The drive-level property — `finished` waits
+    // on this write while `settledAt` does not — is pinned at the unit seam
+    // in `direct.test.ts`, where the drive is directly observable.)
+    const settledEarly = await Promise.race([
+      resuming.then(() => "resolved"),
+      new Promise((r) => setTimeout(() => r("still-pending"), 120)),
+    ]);
+    expect(settledEarly).toBe("still-pending");
+    releaseWrite();
+    const out = await resuming;
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitCatalogChanged" } });
+  });
+
+  it("INVARIANT §5.3 (#28, I4): a stalled kindOf after the claim still answers within budget — the row is never stranded running", async () => {
+    // I4. `kindOf` runs AFTER `claimForResume` flipped the row to `running`
+    // and BEFORE any drive (and therefore any timer) exists — it is the one
+    // post-claim read nothing bounds. A store that never answers there left
+    // the row `running` forever and hung `resume()` with no budget to save
+    // it. Bounded by `driveBudgetMs`, it now reports the honest non-answer.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    const stuckKind = {
+      ...active.store,
+      executions: { ...active.store.executions, kindOf: () => never },
+    } as ConduitStore;
+    const stuckM = createExecutionManager({ ...active.deps, store: stuckKind, direct: fast });
+    // REAL CLOCK, deliberately: the setup crosses the harness's loopback MCP
+    // socket, which deadlocks under fake timers (see the guard-expiry tests).
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stuckM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // The honest non-answer: the stored kind is unknown, so the settle could
+    // not be routed. The reason is OPAQUE — a reference, never store detail.
+    expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout" });
+    // And the claimed row is terminalized, never stranded `running`.
+    expect(await m.get(paused.executionId)).not.toMatchObject({ status: "running" });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#28, I2): a guard read returning AFTER the expiry took the latch still settles resume() — never hangs", async () => {
+    // I2, REPRODUCED. The `policies.get` race sits between the last
+    // `raceGuard` and `runDirect`. Sequence: the budget elapses during that
+    // read; the expiry takes the latch and its write is in flight; the read
+    // then returns, so `raceGuard` reports NOT expired; handover runs
+    // `runDirect`, whose first `drive.settle()` LOSES and returns having
+    // resolved nothing — and `await outcome` never resolves. The row is
+    // correctly failed with exactly one settle attempt and zero upstream
+    // calls, but `resume()` hangs forever, holding a daemon queue slot.
+    //
+    // Deliberately WITHOUT `reprovision()`: the §5.4 guard must PASS all the
+    // way to the direct-arm handover, which is the only place this defect
+    // lives. The gate is on `policies.get` — the last read before handover.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+
+    let expiryWriteStarted!: () => void;
+    const expiryWriteInFlight = new Promise<void>((r) => {
+      expiryWriteStarted = r;
+    });
+    let releaseExpiryWrite!: () => void;
+    const expiryWriteGate = new Promise<void>((r) => {
+      releaseExpiryWrite = r;
+    });
+    let releasePolicyRead!: () => void;
+    const policyReadGate = new Promise<void>((r) => {
+      releasePolicyRead = r;
+    });
+    const settleAttempts: string[] = [];
+    const raced = {
+      ...active.store,
+      policies: {
+        ...active.store.policies,
+        get: async (n: string) => {
+          await policyReadGate;
+          return requireActive(active).store.policies.get(n);
+        },
+      },
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          settleAttempts.push(a[1]);
+          if (settleAttempts.length === 1) {
+            // The EXPIRY's write: announce it, then hold it open so the
+            // gated policy read resolves while it is still in flight.
+            expiryWriteStarted();
+            await expiryWriteGate;
+          }
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const racedM = createExecutionManager({ ...active.deps, store: raced, direct: fast });
+    const resuming = racedM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+    // The budget elapses while `policies.get` is gated → the expiry takes the
+    // latch and starts its write. Release the read WHILE that write is open:
+    // the handover must now defer to the expiry, not drive a dead latch.
+    await expiryWriteInFlight;
+    releasePolicyRead();
+    await new Promise((r) => setTimeout(r, 30));
+    releaseExpiryWrite();
+
+    // Bounded probe: without the fix this never settles.
+    const out = await Promise.race([
+      resuming,
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+      decisionApplied: false,
+    });
+    // Exactly one settle attempt — the expiry's — and the approved call never
+    // ran, because the handover deferred instead of dispatching.
+    expect(settleAttempts).toHaveLength(1);
+    expect(active.calls).toHaveLength(0);
+    expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
+  });
+
   it("INVARIANT §5.3 (finding 2): a prep-window fault whose fenced settle STALLS still returns within budget, never hangs resume()", async () => {
     // Fix round 1, finding 2. The prep-window catch awaited `settleDirect`
     // with no timeout: a stalled store hung `resume()` past every budget.

@@ -68,6 +68,14 @@ export interface OwnedDirectDrive extends DirectDrive {
   resolveSettledAt(p: Promise<void>): void;
   /** Guard exits: settle both lifecycle promises and cancel the timer. */
   finishEarly(): void;
+  /**
+   * M1 / D-A2: the guard exits that issue a settle WRITE. Resolves
+   * `settledAt` (the row is decided, so retention starts now — the spec
+   * measures it from settle, not from the write's completion) and cancels the
+   * timer, but leaves `finished` for the caller to resolve on the write, so
+   * "the work has actually stopped" stays true.
+   */
+  settleEarly(): void;
   readonly finished: Promise<void>;
   readonly settledAt: Promise<void>;
 }
@@ -110,7 +118,12 @@ export function createDirectDrive(args: {
     attempt: args.attempt,
     dispatch: createDispatchCell(),
     onExpire: args.onExpire,
-    deadline: () => end - args.now(),
+    // LATCH-AWARE (I1). The timer runs on `setTimeout` while this subtracts an
+    // INJECTABLE `now()` — two clocks that can disagree. Once the latch is
+    // taken the outcome is already decided, so no remaining budget can be
+    // truthful: reporting some would let the invoker's pre-write gate pass and
+    // dispatch a call for an execution already published as "did not run".
+    deadline: () => (settled ? 0 : end - args.now()),
     settle() {
       if (settled) return false;
       settled = true;
@@ -129,6 +142,10 @@ export function createDirectDrive(args: {
     finishEarly() {
       resolveSettledAt(Promise.resolve());
       resolveFinished(Promise.resolve());
+      clearTimeout(timer);
+    },
+    settleEarly() {
+      resolveSettledAt(Promise.resolve());
       clearTimeout(timer);
     },
   };

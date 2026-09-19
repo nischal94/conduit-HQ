@@ -107,6 +107,65 @@ describe("DirectDrive (row #28)", () => {
     expect(onExpire).not.toHaveBeenCalled();
   });
 
+  it("INVARIANT §5.3 (#28): deadline() is LATCH-AWARE — once settled it is <= 0 even with a frozen clock", () => {
+    // I1. The budget timer runs on `setTimeout` while `deadline()` subtracts an
+    // INJECTABLE `now()`: two clocks. If the timer fires (or any other settler
+    // takes the latch) before `now()` reaches `end`, an un-latched `deadline()`
+    // still reports budget remaining, and the invoker's pre-write gate
+    // (`remaining <= 0`) passes — so a call can dispatch for an execution the
+    // expiry has already published as "elapsed before dispatch". Under default
+    // clocks that window is ~1 ms; with an injected clock it is the whole skew.
+    // The latch is the authority, so it decides this too.
+    const frozen = 1_000;
+    const drive = createDirectDrive({
+      executionId: "e",
+      attempt: "a",
+      now: () => frozen,
+      budgetMs: 10_000,
+      onExpire: () => {},
+    });
+    expect(drive.deadline()).toBe(10_000);
+    expect(drive.settle()).toBe(true);
+    expect(drive.deadline()).toBeLessThanOrEqual(0);
+    drive.dispose();
+  });
+
+  it("INVARIANT §5.3 (#45, M1): settleEarly() starts RETENTION but leaves `finished` for the settle write", async () => {
+    // M1 / D-A2. The guard exits that issue a settle WRITE must not resolve
+    // `finished` — the write is still live work, and Lane B holds an admission
+    // slot on `finished`. `settledAt` DOES resolve: the spec measures slot
+    // retention from the moment the row is settled, not from the write's
+    // completion, so retention must start here.
+    const onExpire = vi.fn();
+    const drive = createDirectDrive({
+      executionId: "e",
+      attempt: "a",
+      now: Date.now,
+      budgetMs: 10_000,
+      onExpire,
+    });
+    let landWrite!: () => void;
+    const write = new Promise<void>((r) => {
+      landWrite = r;
+    });
+    drive.settle();
+    drive.settleEarly();
+    // Retention starts immediately.
+    await expect(drive.settledAt).resolves.toBeUndefined();
+    // …but the work has not stopped.
+    const pending = await Promise.race([
+      drive.finished.then(() => "resolved"),
+      new Promise((r) => setTimeout(() => r("still-pending"), 50)),
+    ]);
+    expect(pending).toBe("still-pending");
+    // The caller wires `finished` to the write; landing it finishes the drive.
+    drive.resolveFinished(write);
+    landWrite();
+    await expect(drive.finished).resolves.toBeUndefined();
+    // The timer was cancelled, exactly as `finishEarly` does.
+    expect(onExpire).not.toHaveBeenCalled();
+  });
+
   it("resolveFinished absorbs a REJECTED continuation — `finished` never rejects", async () => {
     const drive = createDirectDrive({
       executionId: "e",
