@@ -1,4 +1,5 @@
 import { createDispatchCell, type DispatchCell } from "../pipeline/dispatch.js";
+import { printableName } from "../policy.js";
 import type { ConduitStore, DirectSettle } from "../store/store.js";
 import type { ExecutionOutcome } from "./manager.js";
 
@@ -179,6 +180,101 @@ export function deliverableBytes(deliverable: unknown): number {
  */
 export type SettleResult = "written" | "fenced" | "failed" | "timeout";
 
+/** Host log lines stay readable; a hostile cause cannot flood the daemon log. */
+const CAUSE_MAX_LENGTH = 300;
+
+/**
+ * THE way a thrown value becomes host-log text. Every `console.error` on the
+ * direct and resume paths uses it.
+ *
+ * Converting a thrown value is FALLIBLE, which is the point. `String(cause)`
+ * throws for a value whose `toString` throws, for a revoked Proxy, and for a
+ * bare Symbol — and on these paths the conversion sits AFTER the settle latch
+ * is spent, where a throw leaves the outcome unresolvable and the caller
+ * waiting forever. So the conversion is guarded and falls back to a fixed
+ * placeholder that names nothing.
+ *
+ * The result is also sanitized: a plain cause containing a newline would
+ * forge a host log line, and an unbounded one would flood the log. Both are
+ * handled by `printableName`'s sanitizing core, which strips control
+ * characters and caps length — the same treatment guest-supplied tool names
+ * get, for the same reason.
+ */
+export function formatCause(cause: unknown): string {
+  let text: string;
+  try {
+    text = String(cause);
+  } catch {
+    // Names nothing about the value: reaching here means even asking what it
+    // is was unsafe.
+    return "<unprintable cause>";
+  }
+  return printableName(text, CAUSE_MAX_LENGTH);
+}
+
+/**
+ * How ONE bounded store call ended. A closed union with no error payload:
+ * a store fault's detail is host-only (it can carry a database path or an
+ * upstream body) and must never reach a caller that publishes to the agent.
+ * Callers that need the cause log it themselves, under a reference.
+ */
+export type StoreCallResult<T> =
+  | { kind: "ok"; value: T }
+  | { kind: "rejected"; cause: unknown }
+  | { kind: "timeout" };
+
+/**
+ * THE way to call the store on any path a client waits on — the single
+ * implementation of "call the store safely".
+ *
+ * Three failure modes are handled in ONE place, deliberately, because each
+ * of them has been a separate hang or a separate stranded row when a call
+ * site handled them by hand:
+ *
+ *  - a SYNCHRONOUS throw. A store method may throw rather than return a
+ *    rejected promise, and a synchronous throw happens before any `.catch()`
+ *    attached to its result exists. Calling inside a `try` turns it into a
+ *    rejection like any other.
+ *  - an UNBOUNDED wait. `.catch()` handles a rejection and does nothing at
+ *    all for a promise that never settles, so a stalled store hangs every
+ *    awaiting caller past every budget. The race against the budget is what
+ *    makes the wait finite.
+ *  - an UNHANDLED REJECTION from the loser. When the timer wins, the write
+ *    is still live and may reject later with nobody awaiting it.
+ *
+ * Never throws and never rejects: every outcome is an arm of the returned
+ * union. The call is NOT cancelled on timeout — it may still land — so
+ * callers that must observe its completion keep the returned `call` promise.
+ */
+export function boundedStoreCall<T>(
+  invoke: () => Promise<T>,
+  budgetMs: number,
+): { result: Promise<StoreCallResult<T>>; call: Promise<StoreCallResult<T>> } {
+  let call: Promise<StoreCallResult<T>>;
+  try {
+    call = invoke().then(
+      (value): StoreCallResult<T> => ({ kind: "ok", value }),
+      (cause: unknown): StoreCallResult<T> => ({ kind: "rejected", cause }),
+    );
+  } catch (cause) {
+    call = Promise.resolve({ kind: "rejected", cause });
+  }
+  // The `.then` above already converts BOTH settlements into a fulfilled
+  // value, so the loser of the race below can never be an unhandled
+  // rejection — that is why this is the only promise kept.
+  const result = (async (): Promise<StoreCallResult<T>> => {
+    let timerHandle: NodeJS.Timeout | undefined;
+    const timer = new Promise<StoreCallResult<T>>((r) => {
+      timerHandle = setTimeout(() => r({ kind: "timeout" }), budgetMs);
+      timerHandle.unref?.();
+    });
+    const winner = await Promise.race([call, timer]);
+    clearTimeout(timerHandle);
+    return winner;
+  })();
+  return { result, call };
+}
+
 /**
  * THE bounded, fenced settle — the single implementation every direct settle
  * path uses (the drive's own settle, the §5.4 guard terminalizations, the
@@ -203,29 +299,18 @@ export function boundedFencedSettle(
   settle: DirectSettle,
   budgetMs: number,
 ): { result: Promise<SettleResult>; write: Promise<unknown> } {
-  // `settleDirect` is called inside the try on purpose. A store method may
-  // throw SYNCHRONOUSLY rather than return a rejected promise, and this
-  // function's whole contract — and every caller's hang-freedom — rests on
-  // "never throws". An escaping synchronous throw here would bypass the
-  // `.then` rejection arm below and every settle path in the manager at once.
-  let write: Promise<"written" | "fenced" | "failed">;
-  try {
-    write = store.executions.settleDirect(id, attempt, settle).then(
-      (changed) => (changed ? "written" : "fenced"),
-      () => "failed",
-    );
-  } catch {
-    write = Promise.resolve("failed");
-  }
-  const result = (async (): Promise<SettleResult> => {
-    let timerHandle: NodeJS.Timeout | undefined;
-    const timer = new Promise<"timeout">((r) => {
-      timerHandle = setTimeout(() => r("timeout"), budgetMs);
-      timerHandle.unref?.();
-    });
-    const winner = await Promise.race([write, timer]);
-    clearTimeout(timerHandle);
-    return winner;
-  })();
-  return { result, write };
+  // Built on `boundedStoreCall` so there is ONE implementation of the
+  // synchronous-throw guard, the budget race, and the loser's rejection
+  // handling. This function adds only the FENCE reading: `settleDirect`
+  // returning false means the guarded UPDATE matched no row.
+  const { result: bounded, call } = boundedStoreCall(
+    () => store.executions.settleDirect(id, attempt, settle),
+    budgetMs,
+  );
+  const result = bounded.then((r): SettleResult => {
+    if (r.kind === "timeout") return "timeout";
+    if (r.kind === "rejected") return "failed";
+    return r.value ? "written" : "fenced";
+  });
+  return { result, write: call };
 }

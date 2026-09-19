@@ -4039,4 +4039,233 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(Date.now() - t0).toBeLessThan(fast.settleWriteBudgetMs + 1_000);
     expect(out).toMatchObject({ threw: expect.stringContaining("injected prep-window fault") });
   });
+
+  it("a CODE row whose post-claim GUARD READ never returns still answers within budget and terminalizes", async () => {
+    // The direct arm's drive timer bounded its guard phase; a code row had no
+    // drive and therefore no bound at all, so one guard read that never
+    // returned stranded the claimed row `running` and hung `resume()` past
+    // every budget. Same hang class, the other arm.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const started = await m.start(
+      'return await tools.github.create_issue({ title: "from agent" });',
+    );
+    expect(started.status).toBe("paused");
+    const callId = await pendingCallOf(m, started.executionId);
+    const never = new Promise<never>(() => {});
+    const stalledGuard = {
+      ...active.store,
+      tools: {
+        ...active.store.tools,
+        // A guard read, mid-phase, that simply never answers.
+        get: () => never,
+      },
+    } as unknown as ConduitStore;
+    const stalledM = createExecutionManager({
+      ...active.deps,
+      store: stalledGuard,
+      direct: fast,
+    });
+    // REAL CLOCK: the setup crosses the harness's loopback MCP socket, which
+    // deadlocks under fake timers. A full second of margin for CI load.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stalledM.resume(started.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // A code row dispatches NOTHING during the read-side guard, so the honest
+    // answer is a definite failure — never ambiguous, never `unknown` unless
+    // the terminalizing write itself failed.
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+      decisionApplied: false,
+    });
+    const raw = await active.client.execute({
+      sql: "SELECT status FROM executions WHERE id = ?",
+      args: [started.executionId],
+    });
+    expect(String(raw.rows[0]?.status)).toBe("failed");
+    expect(active.calls).toHaveLength(0);
+  });
+
+  describe("a result that cannot be serialized settles a truthful terminal, never a hang", () => {
+    // `deliverableBytes` calls `JSON.stringify`, which THROWS for these. A
+    // custom invoker can return either. Measured after the latch, the throw
+    // landed in a catch whose own `settle()` failed, so nothing published the
+    // outcome and the caller waited forever.
+    const shapes: Array<[string, () => unknown]> = [
+      ["a BigInt", () => ({ n: 1n })],
+      [
+        "a circular value",
+        () => {
+          const o: Record<string, unknown> = {};
+          o.self = o;
+          return o;
+        },
+      ],
+    ];
+    for (const [label, make] of shapes) {
+      it(`${label} returned by the invoker on startDirect answers within budget with no stored body`, async () => {
+        active = await makeHarness();
+        const m = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => async () => make(),
+        });
+        const handle = m.startDirect(
+          "github.list_issues",
+          {},
+          { clientId: null, projection: "direct", scope: permitDirect },
+        );
+        const out = await Promise.race([
+          handle.outcome,
+          new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+        ]);
+        expect(out).not.toBe("HUNG");
+        expect(out).toMatchObject({ status: "failed" });
+        // The row is terminalized and carries NO partial body.
+        const raw = await active.client.execute({
+          sql: "SELECT status, result, result_state FROM executions WHERE id = ?",
+          args: [handle.executionId],
+        });
+        expect(String(raw.rows[0]?.status)).toBe("failed");
+        expect(raw.rows[0]?.result).toBeNull();
+        expect(raw.rows[0]?.result_state).toBeNull();
+      });
+    }
+
+    it("a BigInt returned on the RESUMED path answers within budget and terminalizes", async () => {
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+      const bigIntM = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => async () => ({ n: 1n }),
+      });
+      const t0 = Date.now();
+      const out = await Promise.race([
+        bigIntM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+      expect(out).toMatchObject({ status: "failed" });
+      const raw = await active.client.execute({
+        sql: "SELECT status, result FROM executions WHERE id = ?",
+        args: [paused.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("failed");
+      expect(raw.rows[0]?.result).toBeNull();
+    });
+  });
+
+  describe("a thrown value whose string conversion THROWS still settles the outcome", () => {
+    /** `String()` on this throws; so does interpolating it. */
+    function hostileCause(): unknown {
+      return {
+        toString() {
+          throw new Error("toString exploded");
+        },
+      };
+    }
+
+    it("on startDirect: the outcome answers within budget and the row is terminalized", async () => {
+      active = await makeHarness();
+      const m = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        // The fault comes from a DEPENDENCY, so it reaches the outer handler
+        // rather than a path some single fix targeted.
+        makeInvoker: () => () => Promise.reject(hostileCause()),
+      });
+      const handle = m.startDirect(
+        "github.list_issues",
+        {},
+        { clientId: null, projection: "direct", scope: permitDirect },
+      );
+      const out = await Promise.race([
+        handle.outcome,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      expect(out).toMatchObject({ status: "failed" });
+      const raw = await active.client.execute({
+        sql: "SELECT status FROM executions WHERE id = ?",
+        args: [handle.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("failed");
+    });
+
+    it("on the RESUME path: resume() answers within budget and the row is terminalized", async () => {
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+      const hostileM = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => {
+          throw hostileCause();
+        },
+      });
+      const t0 = Date.now();
+      const out = await Promise.race([
+        hostileM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect).then(
+          (o) => o,
+          () => ({ threw: true }),
+        ),
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+      const raw = await active.client.execute({
+        sql: "SELECT status FROM executions WHERE id = ?",
+        args: [paused.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("failed");
+    });
+
+    it("a cause carrying newlines cannot forge a host log line, and is length-bounded", async () => {
+      const errors: string[] = [];
+      const spy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+        errors.push(a.map((x) => String(x)).join(" "));
+      });
+      try {
+        active = await makeHarness();
+        const forging = new Error(
+          `boom\n[ExecutionManager] FORGED host log line\n${"z".repeat(2_000)}`,
+        );
+        const m = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => () => Promise.reject(forging),
+        });
+        await m.startDirect(
+          "github.list_issues",
+          {},
+          { clientId: null, projection: "direct", scope: permitDirect },
+        ).outcome;
+      } finally {
+        spy.mockRestore();
+      }
+      const joined = errors.join("\n");
+      expect(joined).not.toContain("FORGED host log line");
+      for (const line of errors) {
+        expect(line.length).toBeLessThan(1_000);
+      }
+    });
+  });
 });

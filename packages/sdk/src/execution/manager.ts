@@ -41,13 +41,16 @@ import type { ApprovalDecision, ApprovalDecisions } from "./decisions.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
 import {
   boundedFencedSettle,
+  boundedStoreCall,
   createDirectDrive,
   DIRECT_DEFAULTS,
   type DirectBudgets,
   type DirectDriveHandle,
   type DirectOutcome,
   deliverableBytes,
+  formatCause,
   type OwnedDirectDrive,
+  type StoreCallResult,
 } from "./direct.js";
 import { toSandboxJournal } from "./journal.js";
 import { scrubCredential } from "./scrub.js";
@@ -504,7 +507,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             // message, which could carry a store path.
             const correlationId = crypto.randomUUID();
             console.error(
-              `[ExecutionManager] Provenance read failed at pause ${correlationId}: ${String(cause)}`,
+              `[ExecutionManager] Provenance read failed at pause ${correlationId}: ${formatCause(cause)}`,
             );
             captured.ambiguous = {
               name: "ConduitInternalError",
@@ -581,7 +584,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // host-generated, not derived from the fault.
         const ref = crypto.randomUUID();
         console.error(
-          `[ExecutionManager] journal append failed after a completed call ${ref}: ${String(cause)}`,
+          `[ExecutionManager] journal append failed after a completed call ${ref}: ${formatCause(cause)}`,
         );
         captured.ambiguous = {
           name: OUTCOME_AMBIGUOUS_ERROR_NAME,
@@ -672,7 +675,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // OPAQUE: a store fault's text carries the database path and SQL, and
       // this row is handed back to the agent by `check_execution`.
       const ref = crypto.randomUUID();
-      console.error(`[ExecutionManager] settle write failed ${ref}: ${String(cause)}`);
+      console.error(`[ExecutionManager] settle write failed ${ref}: ${formatCause(cause)}`);
       const failed: Execution = {
         ...execution,
         status: "failed",
@@ -753,7 +756,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // or bootstrap fault's text carries host-only detail into a row
       // `check_execution` hands back to the agent.
       const ref = crypto.randomUUID();
-      console.error(`[ExecutionManager] sandbox execution threw ${ref}: ${String(cause)}`);
+      console.error(`[ExecutionManager] sandbox execution threw ${ref}: ${formatCause(cause)}`);
       await finish(execution, {
         status: "failed",
         error: {
@@ -986,6 +989,50 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   // `finished` may stay pending, and only for a quarantined continuation (see
   // its own doc in direct.ts).
   //
+  // CODE-ROW GUARD EXPIRY (resume). A code row has no drive and therefore no
+  // latch — nothing races it, because nothing else can settle it. Its guard
+  // phase is bounded by its own timer, and the transition is a straight line
+  // rather than a race:
+  //
+  //        budget elapses during the guard          a guard read resolves
+  //                    │                                       │
+  //                    ▼                                       ▼
+  //     terminalizeCodeRow: bounded                 the guard continues; the
+  //     failClaimedResume                           timer is cleared when the
+  //         │                                       drive takes over, and on
+  //     ┌───┴────┬──────────┐                       every throwing exit too
+  //   ok(write)  rejected   timeout
+  //   publish    publish    publish
+  //   `failed`   unknown/   unknown/
+  //   (definite) persist-   persist-
+  //              failed     timeout
+  //
+  // The CLASSIFICATION here is the dispatch-cell rule, not a second rule: the
+  // §5.4 read-side guard runs before any invoker is built, so nothing can have
+  // dispatched while it runs. A guard exit is therefore a definite "did not
+  // run" — never ambiguous — and the write's own fate decides only whether
+  // that definite failure is DURABLE.
+  //
+  // THE LATE-CREATE RECONCILIATION (startDirect). When the timer fires while
+  // `create()` is in flight and `create()` then succeeds, the latch is ALREADY
+  // spent: the expiry published the outcome against a row that did not yet
+  // exist. The re-issued fenced settle is therefore reconciliation only — it
+  // changes no client-visible answer — but it goes through the ONE bounded
+  // fenced path all the same, because a stall there left `finished` pending
+  // and the new row `running` forever. `finished` tracks the WRITE, not the
+  // bounded result that may give up on it, and a reconciliation that does not
+  // land is logged host-side under a reference rather than swallowed.
+  //
+  // THE STORE-CALL SHAPE, underneath all of the above. Every store call on a
+  // path a client waits on goes through `storeCall` (or the helpers built on
+  // it: `failClaimedBounded`, `terminalizeCodeRow`, `boundedFencedSettle`).
+  // It answers three questions once instead of at every call site: a store
+  // method may THROW synchronously rather than reject, an await with no budget
+  // never returns when the store stalls, and the loser of a budget race can
+  // reject with nobody watching. Two awaits are deliberately outside it — the
+  // two FIRST mutations, each carrying its own comment — because bounding them
+  // needs attempt-fenced late-completion recovery for code rows.
+  //
   // A THROW is an exit path too, and the one that kept being missed.
   // `runDirect` asserts it never throws, but an assertion is not an
   // enforcement, so both call sites treat a rejection as a real exit that must
@@ -1012,6 +1059,94 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     tracked: Promise<unknown>[];
     /** True once create() (startDirect) or the claim (resume) put the row in place. */
     persisted: boolean;
+  }
+
+  /**
+   * THE post-claim store call. Every store call this manager makes on a path
+   * a client is waiting on — after `claimForResume` has flipped the row, and
+   * everywhere in the direct arm — goes through here rather than being
+   * awaited raw.
+   *
+   * It exists because the alternative is a judgement call at every call site
+   * about whether THAT store method can throw synchronously, whether THAT
+   * await needs a budget, and whether THAT loser can reject unobserved. Those
+   * three questions have the same answer everywhere on these paths, so they
+   * are answered once, here, and a call site that forgets to ask them is a
+   * shape the code no longer has.
+   *
+   * `budgetMs` defaults to the settle-write budget because every caller of
+   * this helper is issuing or racing a write a client is waiting on.
+   */
+  function storeCall<T>(
+    invoke: () => Promise<T>,
+    budgetMs: number = budgets.settleWriteBudgetMs,
+  ): { result: Promise<StoreCallResult<T>>; call: Promise<StoreCallResult<T>> } {
+    return boundedStoreCall(invoke, budgetMs);
+  }
+
+  /**
+   * Best-effort terminalization of a row THIS resume claimed, bounded and
+   * safe against a synchronous throw. Used where the stored kind cannot route
+   * a fenced settle — a `kindOf` that did not answer, and the code-row exits.
+   * Returns how the write ended so the caller can decide whether it may claim
+   * a terminal outcome or must answer `unknown`.
+   */
+  async function failClaimedBounded(
+    executionId: string,
+    reason: string,
+    ref: string,
+    errorName?: string,
+  ): Promise<StoreCallResult<void>> {
+    const { result } = storeCall(() =>
+      errorName === undefined
+        ? deps.store.executions.failClaimedResume(executionId, reason)
+        : deps.store.executions.failClaimedResume(executionId, reason, errorName),
+    );
+    const ended = await result;
+    if (ended.kind === "rejected") {
+      // The store is genuinely faulting; nothing more can persist. The cause
+      // still reaches the host log, under the SAME reference the stored
+      // reason carries, so an operator can join the two.
+      console.error(
+        `[ExecutionManager] failClaimedResume also failed ${ref}: ${formatCause(ended.cause)}`,
+      );
+    }
+    return ended;
+  }
+
+  /**
+   * A CODE row's guard-phase terminalization, classified once.
+   *
+   * The dispatch-cell rule (D-A4) decides this exactly as it decides every
+   * other direct failure — and on this path the cell's answer is structural
+   * rather than read: the §5.4 read-side guard runs BEFORE any invoker is
+   * built, so nothing can have dispatched while it runs. A guard exit is
+   * therefore a definite "did not run", never ambiguous.
+   *
+   * What the write's own fate decides is whether that definite failure is
+   * DURABLE. A written row may be published as `failed`. A write that
+   * rejected or timed out means the row may still read `running`, which is
+   * what `unknown` exists to say — the same rule `settleBounded` applies to
+   * the direct arm's fenced settle.
+   */
+  async function terminalizeCodeRow(
+    executionId: string,
+    reason: string,
+    error: ExecutionError,
+    errorName?: string,
+    flag: { corruptPause?: true } = {},
+  ): Promise<ResumeOutcome> {
+    const ref = crypto.randomUUID();
+    const ended = await failClaimedBounded(executionId, reason, ref, errorName);
+    if (ended.kind === "ok") {
+      return { status: "failed", executionId, error, decisionApplied: false, ...flag };
+    }
+    return {
+      status: "unknown",
+      executionId,
+      reason: ended.kind === "timeout" ? "persist-timeout" : "persist-failed",
+      decisionApplied: false,
+    };
   }
 
   /**
@@ -1160,7 +1295,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // catch uses.
         const ref = crypto.randomUUID();
         console.error(
-          `[ExecutionManager] direct drive preparation failed ${ref}: ${String(cause)}`,
+          `[ExecutionManager] direct drive preparation failed ${ref}: ${formatCause(cause)}`,
         );
         const error: ExecutionError = {
           name: "ConduitInternalError",
@@ -1180,8 +1315,43 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // it. Pure computation, so it may run before the latch.
       const deliverable =
         run.redactFields === undefined ? value : redactSensitiveFields(value, run.redactFields);
+      // MEASURED BEFORE THE LATCH, and the number reused below. `JSON.stringify`
+      // THROWS for a `BigInt`, a circular value, or a throwing `toJSON` — and a
+      // custom invoker can return any of them. Measured after the latch, that
+      // throw landed in the catch below, whose own `drive.settle()` then failed
+      // and returned without publishing anything, so `outcome` never resolved
+      // and the caller waited forever.
+      //
+      // `deliverable` is the value that is actually STORED — redacted on the
+      // resume path, raw on the sync path — so this measures the right bytes
+      // (§4.1), exactly as the post-latch call did.
+      let deliverableSize: number | undefined;
+      try {
+        deliverableSize = deliverableBytes(deliverable);
+      } catch {
+        deliverableSize = undefined;
+      }
+      if (deliverableSize === undefined) {
+        if (!drive.settle()) return;
+        // The call DID run: the cell decides, exactly as `classifyDirectFailure`
+        // does everywhere else. A result we cannot serialize is not "did not
+        // run" — the upstream already performed the call. Nothing of the value
+        // is stored, so no partial body can reach the row.
+        const error: ExecutionError = classifyDirectFailure(
+          run,
+          new Error(
+            `[ExecutionManager] Direct call result could not be serialized. Context: { executionId: ${execution.id} }`,
+          ),
+        );
+        await settleBounded(
+          run,
+          { status: "failed", error },
+          { status: "failed", executionId: execution.id, error },
+        );
+        return;
+      }
       if (!drive.settle()) return;
-      if (deliverableBytes(deliverable) > budgets.resultBytesMax) {
+      if (deliverableSize > budgets.resultBytesMax) {
         await settleBounded(
           run,
           { status: "completed", resultState: "discarded" },
@@ -1222,7 +1392,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             if (!drive.settle()) return;
             const ref = crypto.randomUUID();
             console.error(
-              `[ExecutionManager] Provenance read failed at direct pause ${ref}: ${String(readCause)}`,
+              `[ExecutionManager] Provenance read failed at direct pause ${ref}: ${formatCause(readCause)}`,
             );
             const error: ExecutionError = {
               name: "ConduitInternalError",
@@ -1279,7 +1449,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           await upstreamSession.dispose();
         } catch (cause) {
           console.error(
-            `[ExecutionManager] upstream session scope dispose failed after a direct drive. Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+            `[ExecutionManager] upstream session scope dispose failed after a direct drive. Context: { executionId: ${execution.id}, cause: ${formatCause(cause)} }`,
           );
         }
       }
@@ -1311,6 +1481,8 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         ...(opts?.requestKey !== undefined ? { requestKey: opts.requestKey } : {}),
       };
       try {
+        // Unbounded by decision: bounding the FIRST mutation needs
+        // attempt-fenced late-completion recovery for code rows.
         await deps.store.executions.create(execution);
       } catch (cause) {
         // requestKey is persisted BEFORE the sandbox runs, so a
@@ -1338,7 +1510,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // detail, and the row is agent-readable through `check_execution`.
         const ref = crypto.randomUUID();
         console.error(
-          `[ExecutionManager] upstream session scope creation failed at start() ${ref}: ${String(cause)}`,
+          `[ExecutionManager] upstream session scope creation failed at start() ${ref}: ${formatCause(cause)}`,
         );
         await finish(execution, {
           status: "failed",
@@ -1372,7 +1544,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // OPAQUE, same reason as the scope-creation fault above.
           const ref = crypto.randomUUID();
           console.error(
-            `[ExecutionManager] invoker creation failed at start() ${ref}: ${String(cause)}`,
+            `[ExecutionManager] invoker creation failed at start() ${ref}: ${formatCause(cause)}`,
           );
           await finish(execution, {
             status: "failed",
@@ -1400,7 +1572,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // custom injected scope might). Route to the same diagnostics sink
           // the invoker uses (console.error) rather than rethrow.
           console.error(
-            `[ExecutionManager] upstream session scope dispose failed after start(). Context: { executionId: ${execution.id}, cause: ${String(cause)} }`,
+            `[ExecutionManager] upstream session scope dispose failed after start(). Context: { executionId: ${execution.id}, cause: ${formatCause(cause)} }`,
           );
         }
       }
@@ -1501,7 +1673,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             // A failed lookup is not a conflict; the generic persist failure
             // below is the honest answer. The cause is not silently lost.
             console.error(
-              `[ExecutionManager] conflict lookup failed for ${executionId}: ${String(c)}`,
+              `[ExecutionManager] conflict lookup failed for ${executionId}: ${formatCause(c)}`,
             );
             return undefined;
           });
@@ -1528,9 +1700,31 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             name: "ConduitExecutionInterrupted",
             message: `[ExecutionManager] Direct drive budget elapsed before dispatch (${budgets.driveBudgetMs}ms). Context: { executionId: ${executionId} }`,
           };
-          run.tracked.push(
-            deps.store.executions.settleDirect(executionId, attempt, { status: "failed", error }),
+          // Through the ONE bounded fenced path, not a raw `settleDirect`.
+          // The latch is already spent — the expiry published the outcome —
+          // so this write changes no client-visible answer; what it must not
+          // do is STALL, which left `finished` pending and the new row
+          // `running` forever, nor swallow its own failure, which left an
+          // unreconciled row with nothing in the log to find it by.
+          const { result, write } = boundedFencedSettle(
+            deps.store,
+            executionId,
+            attempt,
+            { status: "failed", error },
+            budgets.settleWriteBudgetMs,
           );
+          // `finished` means the tracked write has actually stopped, so keep
+          // tracking the WRITE, not the bounded result that may give up on it.
+          run.tracked.push(write);
+          const reconciled = await result;
+          if (reconciled !== "written") {
+            // Host-side only, under a reference: the row may still read
+            // `running` and an operator needs a handle on it. The reference
+            // names no stored detail and reaches no agent-readable surface.
+            console.error(
+              `[ExecutionManager] direct timeout reconciliation did not land ${crypto.randomUUID()}: executionId ${executionId}, result ${reconciled}`,
+            );
+          }
           await Promise.allSettled(run.tracked);
           return;
         }
@@ -1589,6 +1783,8 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // when the execution is paused again on a LATER call than the one
       // this decision names.
       const resumeAttemptId = newId();
+      // Unbounded by decision: bounding the FIRST mutation needs
+      // attempt-fenced late-completion recovery for code rows.
       const won = await deps.store.executions.claimForResume(executionId, resumeAttemptId, callId);
       if (!won) {
         return { status: "conflict", executionId, decisionApplied: false };
@@ -1611,17 +1807,15 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // the same drive budget the guard phase gets; on timeout the stored kind
       // is unknown, so the settle cannot be routed: best-effort terminalize the
       // claimed row and report the honest non-answer.
-      const kindTimeout = Symbol("kindOf-timeout");
-      let kindTimer: NodeJS.Timeout | undefined;
-      const kind = await Promise.race([
-        deps.store.executions.kindOf(executionId).catch(() => undefined),
-        new Promise<typeof kindTimeout>((r) => {
-          kindTimer = setTimeout(() => r(kindTimeout), budgets.driveBudgetMs);
-          kindTimer?.unref?.();
-        }),
-      ]);
-      clearTimeout(kindTimer);
-      if (kind === kindTimeout) {
+      const kindEnded = await storeCall(
+        () => deps.store.executions.kindOf(executionId),
+        budgets.driveBudgetMs,
+      ).result;
+      // A REJECTED lookup is not a timeout: the store answered, it just could
+      // not say. `undefined` routes the settle the same way an absent kind
+      // does — through the code-row arm, which is the conservative choice.
+      const kind = kindEnded.kind === "ok" ? kindEnded.value : undefined;
+      if (kindEnded.kind === "timeout") {
         // The reason is OPAQUE: a store rejection here carries host-only
         // detail (a database path) into a row `check_execution` hands back to
         // the agent. The cause goes to the daemon log under a fresh reference.
@@ -1629,30 +1823,14 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         console.error(
           `[ExecutionManager] resume kind lookup timed out ${ref}: executionId ${executionId}`,
         );
-        // BOUNDED: this branch fires precisely because the store did not
-        // answer, so its own fallback write cannot be assumed to. `.catch()`
-        // handles a rejection and does nothing for a promise that never
-        // settles — unbounded, a store stalled across the board hung
-        // `resume()` here, the same hang class the `kindOf` bound above
-        // closes. The outcome below stands either way: best-effort.
-        let failTimer: NodeJS.Timeout | undefined;
-        await Promise.race([
-          deps.store.executions
-            .failClaimedResume(executionId, `resume kind lookup timed out. Reference: ${ref}`)
-            .catch((cause: unknown) => {
-              // The store is genuinely faulting; nothing more can persist.
-              // The cause still reaches the host log, under the SAME reference
-              // the stored reason carries, so an operator can join the two.
-              console.error(
-                `[ExecutionManager] failClaimedResume also failed ${ref}: ${String(cause)}`,
-              );
-            }),
-          new Promise<void>((r) => {
-            failTimer = setTimeout(r, budgets.settleWriteBudgetMs);
-            failTimer?.unref?.();
-          }),
-        ]);
-        clearTimeout(failTimer);
+        // This branch fires precisely because the store did not answer, so
+        // its own fallback write cannot be assumed to either. Best-effort:
+        // the outcome below stands whatever the write did.
+        await failClaimedBounded(
+          executionId,
+          `resume kind lookup timed out. Reference: ${ref}`,
+          ref,
+        );
         return {
           status: "unknown",
           executionId,
@@ -1711,10 +1889,50 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           : undefined;
 
       /**
+       * CODE-ROW GUARD EXPIRY. A code row has no drive and therefore no
+       * timer, so every guard read below used to be unbounded for it: one
+       * read that never returned stranded the claimed row `running` and hung
+       * `resume()` past every budget — the same hang the direct arm's drive
+       * timer closes. Bound the code row's guard phase by the SAME drive
+       * budget.
+       *
+       * Its classification is the dispatch-cell rule, not a new one: the
+       * guard runs before any invoker exists, so nothing can have dispatched
+       * while it runs. The expiry is therefore a definite "did not run", and
+       * `terminalizeCodeRow` decides only whether that failure is durable.
+       */
+      let codeGuardTimer: NodeJS.Timeout | undefined;
+      const codeGuardExpiry =
+        directDrive === undefined
+          ? new Promise<ResumeOutcome>((resolve) => {
+              codeGuardTimer = setTimeout(() => {
+                const error: ExecutionError = {
+                  name: "ConduitExecutionInterrupted",
+                  message: `[ExecutionManager] Resume budget elapsed during the read-side guard (${budgets.driveBudgetMs}ms); the pending call did not run. Context: { executionId: ${executionId} }`,
+                };
+                void terminalizeCodeRow(
+                  executionId,
+                  "resume budget elapsed during the read-side guard; the pending call did not run",
+                  error,
+                  "ConduitExecutionInterrupted",
+                ).then(resolve, () =>
+                  resolve({
+                    status: "unknown",
+                    executionId,
+                    reason: "persist-failed",
+                    decisionApplied: false,
+                  }),
+                );
+              }, budgets.driveBudgetMs);
+              codeGuardTimer.unref?.();
+            })
+          : undefined;
+
+      /**
        * Every guard-phase await races the expiry, so a store read that never
-       * returns still yields an answer within the drive budget. Only the
-       * DIRECT path has a drive (and therefore a timer); a code row keeps
-       * today's behavior exactly.
+       * returns still yields an answer within the drive budget. The DIRECT
+       * path races its drive's timer; a CODE row races `codeGuardExpiry`,
+       * which is the same bound without a drive behind it.
        *
        * The result is a DISCRIMINATED UNION rather than `T | ResumeOutcome`:
        * a guard read's own value could itself be object-shaped, so "is this
@@ -1723,11 +1941,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       type Guarded<T> = { expired: false; value: T } | { expired: true; outcome: ResumeOutcome };
       function raceGuard<T>(work: Promise<T>): Promise<Guarded<T>> {
         const wrapped = work.then((value): Guarded<T> => ({ expired: false, value }));
-        return directDrive === undefined
+        const expiry = directDrive === undefined ? codeGuardExpiry : guardExpiry;
+        return expiry === undefined
           ? wrapped
           : Promise.race([
               wrapped,
-              guardExpiry.then((outcome): Guarded<T> => ({ expired: true, outcome })),
+              expiry.then((outcome): Guarded<T> => ({ expired: true, outcome })),
             ]);
       }
 
@@ -1845,14 +2064,9 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             );
             return { ...settled, corruptPause: true };
           }
-          await deps.store.executions.failClaimedResume(executionId, reason);
-          return {
-            status: "failed",
-            executionId,
-            error,
-            decisionApplied: false,
+          return await terminalizeCodeRow(executionId, reason, error, undefined, {
             corruptPause: true,
-          };
+          });
         }
         // The hydrator casts `paused_on` without validating it, and the
         // claim admits any CORRUPT pause on purpose — a stored value that
@@ -1887,14 +2101,9 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             );
             return { ...settled, corruptPause: true };
           }
-          await deps.store.executions.failClaimedResume(executionId, reason);
-          return {
-            status: "failed",
-            executionId,
-            error,
-            decisionApplied: false,
+          return await terminalizeCodeRow(executionId, reason, error, undefined, {
             corruptPause: true,
-          };
+          });
         }
         const pausedOn = stored;
 
@@ -1928,12 +2137,38 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               decisionApplied: false,
             };
           }
-          const expired: Execution = { ...execution, status: "expired", endedAt: now() };
+          // Captured so the bounded closure below keeps the narrowing the
+          // guard above established.
+          const current: Execution = execution;
+          const expired: Execution = { ...current, status: "expired", endedAt: now() };
           // A settled execution carries no pending approval — clear pausedOn so
           // the terminal row is not left with a stale pending call (same
           // discipline as finish()).
           delete expired.pausedOn;
-          await persistOrFinalizeFailed(execution, () => deps.store.executions.put(expired));
+          // BOUNDED: post-claim and client-visible. `persistOrFinalizeFailed`
+          // handles a REJECTED write, but a write that never settles has no
+          // rejection to handle — unbounded, a stalled store held `resume()`
+          // open past every budget here, exactly as it did on the direct arm.
+          const ended = await storeCall(() =>
+            persistOrFinalizeFailed(current, () => deps.store.executions.put(expired)),
+          ).result;
+          if (ended.kind === "timeout") {
+            // The write never settled, so the row may still read `running`:
+            // `unknown` is exactly what that means. Only a TIMEOUT is
+            // converted — a REJECTION keeps its shipped contract below, where
+            // `persistOrFinalizeFailed` has already written the
+            // ConduitPersistError fallback row and the original fault is the
+            // caller's answer.
+            return {
+              status: "unknown",
+              executionId,
+              reason: "persist-timeout",
+              decisionApplied: false,
+            };
+          }
+          if (ended.kind === "rejected") {
+            throw ended.cause;
+          }
           return { status: "expired", executionId, pending: pausedOn, decisionApplied: false };
         }
 
@@ -1962,8 +2197,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             );
             return { ...settled, ...flag };
           }
-          await deps.store.executions.failClaimedResume(executionId, reason, errorName);
-          return { status: "failed", executionId, error, decisionApplied: false, ...flag };
+          return await terminalizeCodeRow(executionId, reason, error, errorName, flag);
         };
         const CORRUPT = { corruptPause: true as const };
 
@@ -2142,10 +2376,16 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // run. No third rule.
           const finishedRun = runDirect(run)
             .catch(async (cause: unknown) => {
-              if (!directDrive.settle()) return;
+              // The reference is minted BEFORE the latch: once the latch is
+              // taken this handler owns the outcome, and any expression that
+              // could throw between taking it and publishing would leave
+              // `outcome` unresolvable with nothing able to settle it. The
+              // diagnosis runs after the latch only because `formatCause` is
+              // total by construction; nothing else fallible may join it.
               const ref = crypto.randomUUID();
+              if (!directDrive.settle()) return;
               console.error(
-                `[ExecutionManager] direct resume continuation threw ${ref}: ${String(cause)}`,
+                `[ExecutionManager] direct resume continuation threw ${ref}: ${formatCause(cause)}`,
               );
               const error: ExecutionError =
                 run.drive.dispatch.state === "dispatched"
@@ -2173,7 +2413,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
                 );
               } catch (settleCause) {
                 console.error(
-                  `[ExecutionManager] direct resume fallback settle failed ${ref}: ${String(settleCause)}`,
+                  `[ExecutionManager] direct resume fallback settle failed ${ref}: ${formatCause(settleCause)}`,
                 );
                 run.resolveOutcome({
                   status: "unknown",
@@ -2194,8 +2434,16 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // call's identity (design D6). Serialization MUST match the invoker's:
         // request = JSON.stringify(pausedOn.input) via the shared identity from
         // journal.ts — so it cannot drift and fail every approved resume closed.
-        const prefixRows = await deps.store.replayJournal.listByExecution(executionId);
-        const prefix = toSandboxJournal(prefixRows);
+        // Still inside the guard phase for a code row: this read is post-claim
+        // and the client is waiting on it, so it races the same expiry every
+        // guard read does.
+        const gotPrefix = await raceGuard(deps.store.replayJournal.listByExecution(executionId));
+        if (gotPrefix.expired) return gotPrefix.outcome;
+        const prefix = toSandboxJournal(gotPrefix.value);
+        // The guard phase is over: the drive owns terminalization from here,
+        // so the guard's timer must stop or it would fire into a row the
+        // drive is legitimately still working on.
+        clearTimeout(codeGuardTimer);
 
         // DEFERRED: process-crash recovery of a `running` execution (design
         // D8/F5). An earlier revision wrote an attempt marker before each live
@@ -2277,7 +2525,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             // Same best-effort discipline as start(): never let a throwing
             // dispose change the resumed drive's own outcome.
             console.error(
-              `[ExecutionManager] upstream session scope dispose failed after resume(). Context: { executionId: ${executionId}, cause: ${String(cause)} }`,
+              `[ExecutionManager] upstream session scope dispose failed after resume(). Context: { executionId: ${executionId}, cause: ${formatCause(cause)} }`,
             );
           }
         }
@@ -2295,7 +2543,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // `check_execution` hands back to the agent. The cause goes to the
         // daemon log under a fresh reference; only the reference is persisted.
         const ref = crypto.randomUUID();
-        console.error(`[ExecutionManager] resume preparation failed ${ref}: ${String(cause)}`);
+        console.error(`[ExecutionManager] resume preparation failed ${ref}: ${formatCause(cause)}`);
         if (directDrive !== undefined) {
           // The prep-window catch for a DIRECT row settles
           // through the ONE bounded fenced write, not `failClaimedResume` and
@@ -2313,30 +2561,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           await terminalizeDirect(directDrive, { status: "failed", error: prepError }, prepError);
           throw cause;
         }
-        // BOUNDED, on the same budget the direct arm's settle write gets.
-        // This is a CLIENT-VISIBLE path: awaited unbounded, a store that
-        // never answers here held `resume()` open past every budget — the
-        // same hang class the `kindOf` bound and the guard-phase timer close
-        // for the direct arm. Best effort either way: the original fault is
-        // re-thrown below whatever the write did.
-        let prepFailTimer: NodeJS.Timeout | undefined;
-        await Promise.race([
-          deps.store.executions
-            .failClaimedResume(executionId, `resume preparation failed. Reference: ${ref}`)
-            .catch((failCause: unknown) => {
-              // The store is genuinely faulting; nothing more can persist.
-              // The cause still reaches the host log under the same reference.
-              console.error(
-                `[ExecutionManager] failClaimedResume also failed ${ref}: ${String(failCause)}`,
-              );
-            }),
-          new Promise<void>((r) => {
-            prepFailTimer = setTimeout(r, budgets.settleWriteBudgetMs);
-            prepFailTimer?.unref?.();
-          }),
-        ]);
-        clearTimeout(prepFailTimer);
+        // This is a CLIENT-VISIBLE path: awaited raw, a store that never
+        // answers here held `resume()` open past every budget. Best effort
+        // either way — this branch re-throws the original fault whatever the
+        // write did, so the write's own fate does not change the answer.
+        await failClaimedBounded(executionId, `resume preparation failed. Reference: ${ref}`, ref);
         throw cause;
+      } finally {
+        // Every exit from the guard phase stops its timer, including the
+        // exits that throw. A surviving timer would terminalize a row this
+        // resume has already answered for.
+        clearTimeout(codeGuardTimer);
       }
     },
 
@@ -2353,10 +2588,19 @@ function neverPauses(op: string): () => Promise<PendingApproval> {
 }
 
 function toSandboxError(error: unknown): SandboxError {
-  if (error instanceof Error) {
-    return { name: error.name, message: error.message };
+  // TOTAL. This runs after the settle latch on the direct paths (through
+  // `classifyDirectFailure`), where a throw leaves the outcome unresolvable.
+  // Reading `name`/`message` off a hostile Error is fallible too — either can
+  // be a getter that throws — so the whole conversion is guarded, and
+  // `formatCause` sanitizes and bounds whatever comes back.
+  try {
+    if (error instanceof Error) {
+      return { name: formatCause(error.name), message: formatCause(error.message) };
+    }
+  } catch {
+    return { name: "Error", message: "<unprintable cause>" };
   }
-  return { name: "Error", message: String(error) };
+  return { name: "Error", message: formatCause(error) };
 }
 
 function toRowOutcome(

@@ -182,9 +182,9 @@ function overrideVerdict(
  * agent-facing pause message, so strip control characters and cap length
  * before interpolating.
  */
-export function printableName(raw: string): string {
+export function printableName(raw: string, maxLength = 120): string {
   const cleaned = [...raw].filter((ch) => ch >= " " && ch !== "\u007f").join("");
-  return cleaned.length > 120 ? `${cleaned.slice(0, 120)}…` : cleaned;
+  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}…` : cleaned;
 }
 
 /**
