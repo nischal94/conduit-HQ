@@ -327,8 +327,8 @@ export async function runDecide(
     deps.stderr(
       `[conduit approvals] The outcome of this ${kind} is UNKNOWN: the execution was driven but ` +
         `its result could not be durably recorded (${outcome.reason ?? "unreported"}), so the ` +
-        `call may or may not have completed. Do NOT retry it — run "conduit approvals list" and ` +
-        `"conduit check" on execution ${executionId} to see what actually landed.\n`,
+        `call may or may not have completed. Do NOT retry it — run "conduit approvals list", or ` +
+        `use the "check_execution" tool on execution ${executionId}, to see what actually landed.\n`,
     );
     return { exitCode: 1 };
   }

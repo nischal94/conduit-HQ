@@ -836,6 +836,11 @@ describe("conduit approvals approve|deny — outcome mapping (payload doubles)",
       expect(stderr).toMatch(/do not retry|don't retry/i);
       expect(stderr).toMatch(/approvals list/);
       expect(stderr).toContain(reason);
+      // I6: the guidance must name things that EXIST. `conduit check` is not
+      // a command (`COMMANDS` is serve|add-mcp|approvals|key|daemon); the
+      // execution lookup is the `check_execution` tool.
+      expect(stderr).not.toMatch(/"conduit check"/);
+      expect(stderr).toContain("check_execution");
     }
   });
 });
