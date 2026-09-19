@@ -200,23 +200,41 @@ async function runCall(
   // (there is nothing to call), and must not surface an allow reason under a
   // denial name — which would also mis-drive §5.5 replay stripping.
   if (tool === undefined) {
+    // The GUEST-VISIBLE refusal for an out-of-scope tool is byte-identical to
+    // the unknown-tool refusal (I3, controller ruling). Search and describe
+    // already make the two indistinguishable; a CALL that said "outside this
+    // client's scope" was an EXISTENCE ORACLE — a probing client learned the
+    // tool exists and only its grant is missing. Both now produce the same
+    // error class and the same message for the same path.
+    // Deliberately NOT special-cased on `outOfScope`: setting `tool =
+    // undefined` above already routed this through the engine's own
+    // unknown-tool evaluation, so `verdict.reason` IS the unknown-tool text
+    // for this path. Re-deriving it here would reintroduce the oracle the
+    // moment the engine's wording and this literal drift apart — which they
+    // already had. The literal remains only for a CUSTOM engine that answers
+    // `allow` for a tool the catalog does not hold.
+    const guestReason =
+      verdict.action === "allow"
+        ? `Unknown tool "${path}": not in the catalog, so it is blocked.`
+        : verdict.reason;
     const blocked: PolicyVerdict = {
       action: "block",
-      // §5.5: an out-of-scope tool reports the SCOPE refusal whatever the
-      // engine said about the (now unknown) target — the built-in engine
-      // answers block/unknown_tool there, and "not in the catalog" would be
-      // a false statement about a tool the catalog does hold. Naming only
-      // the requested tool keeps the refusal free of the profile's contents.
-      reason: outOfScope
-        ? `Tool "${path}" is outside this client's scope.`
-        : verdict.action === "allow"
-          ? `Unknown tool "${path}": not in the catalog, so it is blocked.`
-          : verdict.reason,
+      reason: guestReason,
       source: verdict.source,
       redactFields: verdict.redactFields,
     };
     await appendTrace(deps, options, log, { path, input, verdict: blocked });
-    throw policyError("block", blocked.reason);
+    if (outOfScope) {
+      // The OPERATOR still needs to tell a scope refusal from a catalog miss,
+      // and `TraceEvent` has no reason field to carry it (it stores
+      // `policyVerdict` only), so the distinction goes to the HOST log. The
+      // tool path only: no tool input, no credential material, and nothing
+      // that crosses back to the guest.
+      log(
+        `[ToolInvoker] Call refused: tool is outside this client's scope (reported to the guest as an unknown tool). Context: { tool: ${path}, clientId: ${JSON.stringify(options.clientId)} }`,
+      );
+    }
+    throw policyError("block", guestReason);
   }
   if (verdict.action !== "allow") {
     // Audit the refusal too. Chosen semantic: unauditable is ALWAYS infra —

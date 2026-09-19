@@ -773,17 +773,58 @@ const permitOnly = (names: string[]) => async () =>
 describe("§5.5 scope check", () => {
   it("INVARIANT §5.5: an out-of-scope tool is treated exactly as an unknown tool — blocked, audited, no upstream contact", async () => {
     const { caller, requests } = recordingUpstream();
+    const scopeLog = vi.fn();
     const invoke = createToolInvoker(deps(caller), {
       executionId: "exec_s",
       projection: "code",
       clientId: "acme",
       scope: permitOnly(["github.delete_repo"]),
+      log: scopeLog,
+    });
+    // I3: the guest-visible refusal must be byte-identical to the one an
+    // UNKNOWN tool produces, or the difference is an existence oracle — a
+    // probing client learns the tool exists and only its grant is missing.
+    // Compared against the error the SAME invoker actually produces for a
+    // nonexistent path, never a literal copied into the test, which would
+    // drift the moment the real wording changes.
+    const asError = (e: unknown): Error => {
+      if (!(e instanceof Error)) throw new Error(`expected an Error, got ${String(e)}`);
+      return e;
+    };
+    const outOfScope = await invoke("github.list_issues", {}).then(
+      () => {
+        throw new Error("expected the out-of-scope call to be refused");
+      },
+      (e: unknown) => asError(e),
+    );
+    // The SAME path, now genuinely absent from the catalog: an invoker whose
+    // store holds no such tool. Same path in, so the two messages are
+    // comparable byte for byte with no rewriting.
+    const emptyStore = {
+      ...deps(recordingUpstream().caller),
+      store: {
+        ...store,
+        tools: { ...store.tools, get: async () => undefined },
+      },
+    } as Parameters<typeof createToolInvoker>[0];
+    const unknown = await createToolInvoker(emptyStore, {
+      executionId: "exec_s_unknown",
+      projection: "code",
+      clientId: "acme",
+      scope: permitOnly(["github.delete_repo"]),
       log: vi.fn(),
-    });
-    await expect(invoke("github.list_issues", {})).rejects.toMatchObject({
-      name: GUEST_ERROR_NAMES.policyBlocked,
-      message: 'Tool "github.list_issues" is outside this client\'s scope.',
-    });
+    })("github.list_issues", {}).then(
+      () => {
+        throw new Error("expected the unknown-tool call to be refused");
+      },
+      (e: unknown) => asError(e),
+    );
+    // Same class and the same text — equality, not substring.
+    expect(outOfScope.name).toBe(GUEST_ERROR_NAMES.policyBlocked);
+    expect(outOfScope.name).toBe(unknown.name);
+    expect(outOfScope.message).toBe(unknown.message);
+    // And it never names the real tool as existing.
+    expect(outOfScope.message).not.toContain("scope");
     expect(requests).toHaveLength(0);
     const [row] = await store.trace.listByExecution("exec_s");
     expect(row).toMatchObject({
@@ -792,6 +833,11 @@ describe("§5.5 scope check", () => {
       projection: "code",
       clientId: "acme",
     });
+    // `TraceEvent` carries `policyVerdict` only — it has no reason field — so
+    // the OPERATOR's distinction lives in the HOST log instead. It names the
+    // tool path and never the tool input.
+    expect(scopeLog).toHaveBeenCalledWith(expect.stringContaining("outside this client's scope"));
+    expect(scopeLog.mock.calls.flat().join(" ")).toContain("github.list_issues");
   });
 
   it("the refusal names only the tool, never the profile's other entries", async () => {
