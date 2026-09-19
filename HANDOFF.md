@@ -40,8 +40,13 @@ at session start).** Plan execution is under way via
 (`44f5bd1` + fix `a2cb86c`; one commit for both by plan design — the
 pre-commit typecheck cannot pass on Task 1 alone). Task 3 DONE
 (`c583398` + fix `502fe90`), Task 4 DONE (`e46b20c`, the Task 4 carried
-items below are closed), Task 5 DONE (`22a5d89`) — all task-reviewed.
-NEXT: Task 6, then 7 → 11 in order. The recovery map is the git-ignored
+items below are closed), Task 5 DONE (`22a5d89`), Task 6 DONE
+(`a03bc8d`), Task 7 DONE (`b56a2bb`) — all task-reviewed. Task 8
+committed `b7049e4` (it closes the Task 8 carried items below), task
+review pending. NEXT: Task 9 → 11 in order, then the final whole-branch
+review, then the PR gauntlet. Run `packages/mcp` `integration.test.ts` and
+`packages/cli` `key.test.ts` from their package directory (from the repo
+root they fail `MODULE_NOT_FOUND` — a harness artifact). The recovery map is the git-ignored
 ledger `.superpowers/sdd/2026-09-12-r1-lane-a-store-manager/progress.md`
 (rulings, deferred minors, per-task BASE shas); if it is gone, rebuild
 from `git log` on the branch. Carried items a fresh session must not lose:
@@ -84,9 +89,10 @@ from `git log` on the branch. Carried items a fresh session must not lose:
   stash"; the controller restored with `git stash apply` on the clean tree.
   Nothing lost. The baseline was unnecessary — the failures were
   diagnosable from their own output. Dispatch prompts now carry a git
-  ALLOWLIST plus "need a baseline → stop and report". **The backup stash
-  `stash@{0}` still exists; dropping it awaits the founder's word**
-  (every file in it is in `44f5bd1`/`a2cb86c`, identical or superseded).
+  ALLOWLIST plus "need a baseline → stop and report". The backup stash
+  was dropped on 2026-09-19 on the founder's delegated decision, after
+  verifying every file in it was in `44f5bd1`/`a2cb86c` and its only unique
+  lines were defects those commits fixed. No stash remains.
 
 **Merge record (12:05):** founder said "do it" to the two named open
 items. Greptile reviewed #61 in three rounds (round 1: a P1 lifecycle
