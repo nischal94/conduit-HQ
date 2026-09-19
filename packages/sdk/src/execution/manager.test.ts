@@ -3888,14 +3888,13 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     expect(active.calls).toHaveLength(0);
   });
 
-  it("INVARIANT §5.3: a throw from ANYWHERE inside the resumed continuation still settles the outcome within budget", async () => {
-    // The class, not the one call: three earlier hangs on this path were each
-    // fixed at the single site a reviewer named, and each time another site
-    // stayed open. The guarantee under test is structural — the place that
-    // swallows the continuation's rejection settles the outcome itself — so
-    // the injected throw deliberately comes from a DEPENDENCY the continuation
-    // calls (the invoker factory), at an arbitrary point, not from a path any
-    // specific fix targeted.
+  it("INVARIANT §5.3: a SYNCHRONOUS throw from the settle write is absorbed and the resumed outcome still settles within budget", async () => {
+    // Scope, precisely: the throw injected here comes from `settleDirect` and
+    // is absorbed by `boundedFencedSettle`, which calls the store inside a
+    // try. So this pins the SETTLE-WRITE arm — a store that cannot write at
+    // all still yields the honest non-answer in budget — and it does NOT
+    // reach the outer rejection handler that catches a continuation
+    // rejection. The hostile-thrown-value tests below cover that handler.
     active = await makeHarness();
     const m = createExecutionManager({ ...active.deps, direct: fast });
     const paused = await m.startDirect(
@@ -3904,11 +3903,10 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       { clientId: null, projection: "direct", scope: permitDirect },
     ).outcome;
     const callId = await pendingCallOf(m, paused.executionId);
-    // A SYNCHRONOUS throw from a store method the continuation calls.
-    // `boundedFencedSettle` invokes `settleDirect` outside any try, so this
-    // escapes the settle helper, the continuation's own catch arms, and
-    // `runDirect` itself — an arbitrary point no earlier fix targeted, and
-    // one no prep-window catch covers.
+    // A SYNCHRONOUS throw from the store method every settle path calls.
+    // `boundedFencedSettle` invokes `settleDirect` inside a try precisely so
+    // this cannot escape it: the throw becomes a rejected write, and the
+    // settle reports `failed` rather than propagating.
     const throwingStore = {
       ...active.store,
       executions: {
@@ -4096,19 +4094,9 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
     // custom invoker can return either. Measured after the latch, the throw
     // landed in a catch whose own `settle()` failed, so nothing published the
     // outcome and the caller waited forever.
-    const shapes: Array<[string, () => unknown]> = [
-      ["a BigInt", () => ({ n: 1n })],
-      [
-        "a circular value",
-        () => {
-          const o: Record<string, unknown> = {};
-          o.self = o;
-          return o;
-        },
-      ],
-    ];
-    for (const [label, make] of shapes) {
-      it(`${label} returned by the invoker on startDirect answers within budget with no stored body`, async () => {
+    /** One body, two literal test names, so each is greppable in this file. */
+    async function expectUnserializableRefused(make: () => unknown): Promise<void> {
+      {
         active = await makeHarness();
         const m = createExecutionManager({
           ...active.deps,
@@ -4134,8 +4122,20 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
         expect(String(raw.rows[0]?.status)).toBe("failed");
         expect(raw.rows[0]?.result).toBeNull();
         expect(raw.rows[0]?.result_state).toBeNull();
-      });
+      }
     }
+
+    it("a BigInt returned by the invoker on startDirect answers within budget with no stored body", async () => {
+      await expectUnserializableRefused(() => ({ n: 1n }));
+    });
+
+    it("a circular value returned by the invoker on startDirect answers within budget with no stored body", async () => {
+      await expectUnserializableRefused(() => {
+        const o: Record<string, unknown> = {};
+        o.self = o;
+        return o;
+      });
+    });
 
     it("a BigInt returned on the RESUMED path answers within budget and terminalizes", async () => {
       active = await makeHarness();
