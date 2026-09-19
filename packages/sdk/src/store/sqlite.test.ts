@@ -1038,6 +1038,111 @@ describe("SqliteStore", () => {
       repaired.close();
     });
 
+    it("a duplicate inserted between the check and the batch still leaves an index serving the join", async () => {
+      // The duplicate check is a separate statement from the DROP/CREATE
+      // batch, so a concurrent writer CAN insert between them. What makes
+      // that window harmless is the batch's own transaction: the failing
+      // CREATE UNIQUE rolls the DROP back with it. This pins that — if the
+      // two statements are ever split apart, the database is left with no
+      // index at all and every subsequent open fails identically.
+      const url = tempFileDbUrl();
+      const seed = createClient({ url });
+      await seed.execute(`CREATE TABLE request_keys (
+        client_id TEXT NOT NULL, key TEXT NOT NULL, execution_id TEXT NOT NULL,
+        PRIMARY KEY (client_id, key))`);
+      await seed.execute("CREATE INDEX request_keys_execution ON request_keys (execution_id)");
+      await seed.execute(
+        "INSERT INTO request_keys (client_id, key, execution_id) VALUES ('acme', 'k1', 'e1')",
+      );
+      seed.close();
+
+      // FAULT-INJECT the create: a client whose duplicate check sees a clean
+      // table (the real one) but whose CREATE UNIQUE meets a duplicate. That
+      // is what an older process inserting between the two statements does,
+      // reproduced without depending on thread timing.
+      const racer = createClient({ url });
+      let injected = false;
+      const racingClient = {
+        ...racer,
+        execute: async (stmt: Parameters<typeof racer.execute>[0]) => {
+          // The same window, for a client that issues the DROP on its own
+          // rather than inside the batch: the duplicate lands right after the
+          // drop. Together with the batch hook this covers both shapes, so
+          // the test gates the property rather than one spelling of it.
+          const sql =
+            typeof stmt === "string" ? stmt : String((stmt as { sql?: string }).sql ?? "");
+          if (/DROP\s+INDEX\s+IF\s+EXISTS\s+request_keys_execution/i.test(sql)) {
+            const r = await racer.execute(stmt);
+            await racer
+              .execute(
+                "INSERT OR IGNORE INTO request_keys (client_id, key, execution_id) VALUES ('acme', 'k2', 'e1')",
+              )
+              .catch(() => undefined);
+            injected = true;
+            return r;
+          }
+          return await racer.execute(stmt);
+        },
+        batch: async (...a: Parameters<typeof racer.batch>) => {
+          const sqls = (a[0] as unknown[]).map((st) =>
+            typeof st === "string" ? st : String((st as { sql?: string }).sql ?? ""),
+          );
+          // ONLY the UPGRADE batch — the one that creates the unique index.
+          // The schema batch creates an index of the same name on a fresh
+          // database; injecting there would land the duplicate before the
+          // duplicate check and make this test pass for the wrong reason.
+          const isUpgrade =
+            sqls.some(
+              (sql) => /CREATE\s+UNIQUE\s+INDEX/i.test(sql) && /request_keys_execution/i.test(sql),
+            ) &&
+            sqls.length <= 2 &&
+            sqls.some((sql) => /DROP\s+INDEX/i.test(sql));
+          if (isUpgrade) {
+            // The window: the duplicate lands now, exactly as a concurrent
+            // writer's would between the check and this batch.
+            await racer
+              .execute(
+                "INSERT OR IGNORE INTO request_keys (client_id, key, execution_id) VALUES ('acme', 'k2', 'e1')",
+              )
+              .catch(() => undefined);
+            injected = true;
+          }
+          return await racer.batch(...a);
+        },
+        close: () => racer.close(),
+      } as unknown as ReturnType<typeof createClient>;
+      // Either the open succeeds or it fails — what must NOT happen is a
+      // database left with no index at all.
+      await openSqliteStore({
+        client: racingClient,
+        secretBox: await testSecretBox(),
+      }).catch(() => undefined);
+
+      // The injection really ran: the batch under test was reached.
+      expect(injected).toBe(true);
+
+      const after = createClient({ url });
+      const list = await after.execute("PRAGMA index_list(request_keys)");
+      const onExecutionId: string[] = [];
+      for (const row of list.rows) {
+        const info = await after.execute(`PRAGMA index_info(${String(row.name)})`);
+        if (info.rows.some((c) => String(c.name) === "execution_id")) {
+          onExecutionId.push(String(row.name));
+        }
+      }
+      after.close();
+      racer.close();
+      // AN INDEX SERVING THE JOIN STILL EXISTS. Before the fix this was empty:
+      // the DROP had landed and the CREATE UNIQUE had failed.
+      expect(onExecutionId.length).toBeGreaterThan(0);
+      // And the store reopens afterwards rather than failing identically forever.
+      const reopened = await openTestStore(url).then(
+        () => "opened",
+        (cause: unknown) => String(cause),
+      );
+      expect(reopened).not.toContain("no such index");
+    });
+
     it("round-trips result, error, and requestKey", async () => {
       const store = await openTestStore();
       await store.executions.put({

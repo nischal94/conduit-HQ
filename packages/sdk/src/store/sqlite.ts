@@ -268,16 +268,21 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
   const keyIndexes = await client.execute("PRAGMA index_list(request_keys)");
   const existing = keyIndexes.rows.find((row) => String(row.name) === "request_keys_execution");
   if (existing !== undefined && Number(existing.unique) !== 1) {
-    // CHECK BEFORE DROPPING. The DROP and the CREATE UNIQUE ran as one batch,
-    // so a duplicate in the table failed the CREATE after the DROP had already
-    // landed — leaving NO index of that name at all, and every subsequent open
-    // failing the same way with no path back. Verified by probe.
+    // CHECK BEFORE DROPPING, for the DIAGNOSTIC — not for atomicity.
     //
-    // So: look for the duplicate first. If one exists, touch nothing. The
-    // database is left exactly as it was (the plain index intact) and the
-    // operator can repair the rows and reopen. No automatic de-duplication —
-    // silently deleting idempotency keys would be guessing which one the
-    // caller meant.
+    // Atomicity is the batch's: `client.batch(..., "write")` below runs the
+    // DROP and the CREATE UNIQUE in ONE transaction, so a duplicate that
+    // fails the CREATE rolls the DROP back too and the plain index survives.
+    // That holds for a duplicate already present AND for one a concurrent
+    // writer inserts between this check and the batch — the window is real,
+    // and the transaction is what makes it harmless. The no-index,
+    // cannot-open state is therefore unreachable here; do not split these two
+    // statements apart, because separately they DO produce it.
+    //
+    // What the check adds is the COUNT-ONLY diagnostic: a bare constraint
+    // error names neither the problem nor the repair. If a duplicate exists,
+    // touch nothing and say so. No automatic de-duplication — silently
+    // deleting idempotency keys would be guessing which one the caller meant.
     const dupes = await client.execute(
       `SELECT COUNT(*) AS n FROM (
          SELECT execution_id FROM request_keys GROUP BY execution_id HAVING COUNT(*) > 1
@@ -828,8 +833,18 @@ export async function openSqliteStore(options: SqliteStoreOptions): Promise<Cond
         // Execution is needed (the fault may be corrupt stored JSON), so this
         // writes columns directly. `reason` becomes the stored error payload
         // (mcp design M4) so a caller reading the failed row sees why.
+        //
+        // `result` and `result_state` are CLEARED with the same statement. A
+        // failed row must not carry a result body: a direct row stranded
+        // `running` can genuinely hold one (the settle write lands before the
+        // crash that strands it), and leaving it stored keeps an upstream
+        // payload on a row terminalized as ambiguous, for anything that later
+        // reads that row. Clearing both together is also what the hydration
+        // guard requires — it refuses a `result_state` on a non-completed
+        // direct row, and a `retained` state with no result.
         await client.execute({
-          sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL, error = ?
+          sql: `UPDATE executions SET status = 'failed', ended_at = ?, paused_on = NULL, error = ?,
+                       result = NULL, result_state = NULL
                 WHERE id = ? AND status = 'running'`,
           args: [Date.now(), JSON.stringify({ name: errorName, message: reason }), id],
         });
