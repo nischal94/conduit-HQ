@@ -307,6 +307,7 @@ async function seedStoreAt(targetDb: string): Promise<void> {
     type: "mcp",
     namespace: NAMESPACE,
     location: mcpLocation,
+    generation: 0,
   });
   await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: NAMESPACE });
   await store.connections.upsert({
@@ -737,6 +738,7 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
       type: "mcp",
       namespace: NAMESPACE,
       location: mcpLocation,
+      generation: 0,
     });
     await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: NAMESPACE });
     await store.connections.upsert({

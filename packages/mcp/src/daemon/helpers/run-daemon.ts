@@ -25,7 +25,7 @@ import { writeFileSync } from "node:fs";
 // Explicit .ts extensions: run directly via `process.execPath` under
 // Node's native TypeScript support, never compiled by tsup, so Node's ESM
 // resolver needs the literal on-disk extension.
-import type { PendingApproval } from "@conduithq/sdk";
+import type { ExecutionOutcome, PendingApproval } from "@conduithq/sdk";
 import { createApprovalRuntime } from "../../runtime.ts";
 import { type CrashTerminalSweep, DaemonExit, runDaemon } from "../conduitd.ts";
 import { FRAME_CAP } from "../frames.ts";
@@ -306,11 +306,16 @@ const createRuntime = pauseExecute
             const pausedOn: PendingApproval = {
               callId: `call_${id}`,
               toolName: "github.delete_repo",
+              namespace: "github",
+              sourceGeneration: 0,
               input: {},
               reason: "policy requires approval",
               expiresAt: Date.now() + approvalTtlMs,
             };
-            await runtimeOpts.store.executions.put({
+            await runtimeOpts.store.executions.create({
+              kind: "code",
+              clientId: null,
+              projection: "code",
               id,
               code,
               status: "paused",
@@ -319,7 +324,11 @@ const createRuntime = pauseExecute
               pausedOn,
             });
             console.log("paused execute");
-            return { status: "paused", executionId: id, pending: pausedOn } as never;
+            return {
+              status: "paused",
+              executionId: id,
+              pending: pausedOn,
+            } satisfies ExecutionOutcome;
           },
         },
       };
@@ -397,7 +406,7 @@ const createRuntime = pauseExecute
                     status: "completed",
                     executionId: "exec_huge",
                     value: { oversize: "x".repeat(FRAME_CAP) },
-                  } as never;
+                  } satisfies ExecutionOutcome;
                 },
               },
             };
@@ -429,7 +438,10 @@ const createRuntime = pauseExecute
                     // and the precondition the crash-terminal sweep recovers.
                     // Stalling before the write would leave nothing to sweep.
                     start: async (code: string) => {
-                      await runtimeOpts.store.executions.put({
+                      await runtimeOpts.store.executions.create({
+                        kind: "code",
+                        clientId: null,
+                        projection: "code",
                         id: `exec_stalled_${Date.now()}`,
                         code,
                         status: "running",

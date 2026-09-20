@@ -1,11 +1,11 @@
 import type {
   ConduitStore,
+  DirectOutcome,
   ExecuteToolDefinition,
   Execution,
-  ExecutionOutcome,
   JsonSchema,
-  PendingApproval,
   ResumeOutcome,
+  StoredPendingApproval,
 } from "@conduithq/sdk";
 import { isPendingApproval, NOT_NAMEABLE_CALL_ID } from "@conduithq/sdk";
 import type { ProvisionPayload } from "./daemon/provision.js";
@@ -38,8 +38,30 @@ export interface PendingView {
  * accepted; the `satisfies` bindings on the projection functions below make
  * the reverse — a sender emitting a status NOT in the set — a compile error.
  */
-export const EXECUTE_STATUSES = ["completed", "failed", "paused", "expired", "conflict"] as const;
+export const EXECUTE_STATUSES = [
+  "completed",
+  "failed",
+  "paused",
+  "expired",
+  "conflict",
+  /**
+   * D-A11: the direct arm's truthful non-answer. The call may have
+   * completed and the record may not yet be durable — a caller RE-LISTS, it
+   * never retries. Additive: a client that does not know this member simply
+   * sees a status it cannot act on, which is exactly the intended behavior.
+   */
+  "unknown",
+] as const;
 export type ExecuteStatus = (typeof EXECUTE_STATUSES)[number];
+
+/**
+ * The ONE source of the `unknown` arm's legal reasons. The guard and the
+ * payload type both derive from it, so a new reason cannot be accepted by one
+ * and rejected by the other — which is what repeating the two literals in
+ * both places would eventually produce.
+ */
+export const UNKNOWN_REASONS = ["persist-timeout", "persist-failed"] as const;
+export type UnknownReason = (typeof UNKNOWN_REASONS)[number];
 
 export const CHECK_BODY_STATUSES = ["running", "completed", "failed", "paused", "expired"] as const;
 export type CheckBodyStatus = (typeof CHECK_BODY_STATUSES)[number];
@@ -51,6 +73,8 @@ export interface ExecutePayload {
   error?: ErrorEnvelope;
   pending?: PendingView;
   message?: string;
+  /** Present only on the `unknown` arm: WHY the record is not durable. */
+  reason?: UnknownReason;
 }
 
 /**
@@ -287,6 +311,10 @@ const PAUSE_MESSAGE =
 const EXPIRED_MESSAGE =
   "The approval expired before a human decided (TTL lapsed). You may re-issue execute to retry.";
 
+const UNKNOWN_MESSAGE =
+  "The call may have completed; the record is not yet durable. Re-list before deciding again — do " +
+  "not retry.";
+
 const CONFLICT_MESSAGE =
   "This requestKey was already used by an earlier execute call. Call check_execution with the " +
   "requestKey to retrieve that execution's outcome instead of re-running.";
@@ -348,7 +376,7 @@ export function toErrorEnvelope(error: { name: string; message: string }): Error
   };
 }
 
-function toPendingView(pending: PendingApproval): PendingView {
+function toPendingView(pending: StoredPendingApproval): PendingView {
   return { toolName: pending.toolName, reason: pending.reason, expiresAt: pending.expiresAt };
 }
 
@@ -384,7 +412,13 @@ export function assertProjection<T>(
   return payload;
 }
 
-export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
+/**
+ * D-A11: the parameter is `DirectOutcome` — `ExecutionOutcome` plus the
+ * `unknown` arm — because BOTH direct paths can publish it and `resume` now
+ * returns it. The code-mode `start` path still passes an `ExecutionOutcome`,
+ * which is a subtype, so no caller changes.
+ */
+export function outcomeToPayload(outcome: DirectOutcome): ExecutePayload {
   const payload = ((): ExecutePayload => {
     switch (outcome.status) {
       case "completed":
@@ -410,6 +444,13 @@ export function outcomeToPayload(outcome: ExecutionOutcome): ExecutePayload {
         return { status: "expired", executionId: outcome.executionId, message: EXPIRED_MESSAGE };
       case "conflict":
         return { status: "conflict", executionId: outcome.executionId, message: CONFLICT_MESSAGE };
+      case "unknown":
+        return {
+          status: "unknown",
+          executionId: outcome.executionId,
+          reason: outcome.reason,
+          message: UNKNOWN_MESSAGE,
+        };
     }
   })();
   return assertProjection(payload, isExecutePayloadShape, "outcomeToPayload");
@@ -498,10 +539,25 @@ function isRecord(value: unknown): value is Record<string, unknown> {
  * access can throw on them, and validating them here would be the drifting
  * second copy of the projection the guard's docblock rules out. The status
  * membership + `executionId` are the STRUCTURAL floor a consumer relies on.
+ *
+ * `reason` is the one exception, because the SDK's invariant ties it to a
+ * single status: it is the `unknown` arm's WHY, and the `unknown` arm is
+ * meaningless without it. A guard that accepted `reason` on any status — or
+ * `unknown` without one — would let a payload through that says less than
+ * the type promises. So the correspondence is checked in BOTH directions.
  */
 export function isExecutePayloadShape(payload: unknown): payload is ExecutePayload {
   if (!isRecord(payload)) return false;
   if (!(EXECUTE_STATUSES as readonly string[]).includes(payload.status as string)) return false;
+  // BOTH directions, and the VALUE too: a guard that checked only presence
+  // narrowed `{ status: "unknown", reason: "other" }` — and a numeric or null
+  // reason — to `ExecutePayload`, so a consumer reading `reason` as one of
+  // two known strings could be handed anything at all.
+  if (payload.status === "unknown") {
+    if (!(UNKNOWN_REASONS as readonly unknown[]).includes(payload.reason)) return false;
+  } else if (payload.reason !== undefined) {
+    return false;
+  }
   return typeof payload.executionId === "string";
 }
 

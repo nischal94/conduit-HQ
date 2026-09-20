@@ -1196,6 +1196,15 @@ treat exactly as an unknown tool —
 `block` with reason `Tool "<path>" is outside this client's scope.`,
 audited, guest-safe name `ConduitPolicyBlocked`.
 
+**Amended 2026-09-19 (Lane A PR):** the refusal reason is NOT the distinct
+string above. The out-of-scope path is refused with the policy engine's own
+unknown-tool reason, byte for byte, because a distinct string is an
+existence oracle: search and describe already make an out-of-scope tool
+indistinguishable from an absent one, and the call refusal must not undo
+that. The operator's distinction is a host-only log line carrying the
+sanitized tool path and the client id. Recorded in conduitspec §18
+(2026-09-19).
+
 **One further host-side change, for §7 — dispatch STATE, not an error
 field (rev 6; generalized to BOTH kinds in rev 9, codex #3):** every
 governed call — not only a direct drive — owns a host-side, monotonic
@@ -2032,6 +2041,12 @@ regenerated per commit · agent never installs.
   passes #7, #8, #9 each found only seams of the immediately previous
   fold and nothing outside it; the class map (§3.1) is unchanged since
   rev 11. Merge follows.
+- **2026-09-19 — Lane A PR amendment (no new rev):** §5.5's out-of-scope
+  refusal reason is amended in place — the refusal carries the policy
+  engine's unknown-tool reason, byte for byte, not a distinct string (an
+  existence oracle). The `unknown` wire status (against §10's "No wire
+  change") and the late-`create()` accepted limit are recorded in
+  conduitspec §18 (2026-09-19).
 
 ## GSTACK REVIEW REPORT
 

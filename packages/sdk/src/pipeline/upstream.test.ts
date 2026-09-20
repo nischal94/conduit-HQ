@@ -8,6 +8,7 @@ import { normalizeMcp } from "../normalize/mcp.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { Source, Tool } from "../types.js";
+import { createDispatchCell } from "./dispatch.js";
 import { GUEST_ERROR_NAMES } from "./errors.js";
 import { createMcpUpstreamCaller } from "./upstream.js";
 import { createUpstreamSessionScope } from "./upstream-session.js";
@@ -40,6 +41,7 @@ function sourceAt(port: number): Source {
     type: "mcp",
     namespace: "github",
     location: `http://127.0.0.1:${port}/mcp`,
+    generation: 0,
   };
 }
 
@@ -240,6 +242,7 @@ describe("MCP upstream caller (spec §5.3 step 4)", () => {
       type: "mcp",
       namespace: "github",
       location: `http://rebind.example:${port}/mcp`,
+      generation: 0,
     };
     // Pre-flight resolves public → passes.
     vi.mocked(lookupPromises).mockResolvedValueOnce([
@@ -753,6 +756,7 @@ describe("INVARIANT §18-C5: the stored upstream name is sent on the wire", () =
         type: "mcp",
         namespace: "context7",
         location: `http://127.0.0.1:${port}/mcp`,
+        generation: 0,
       },
       input: {},
       auth: { headers: {} },
@@ -791,6 +795,7 @@ describe("INVARIANT §18-C5: the stored upstream name is sent on the wire", () =
         type: "mcp",
         namespace: "context7",
         location: `http://127.0.0.1:${port}/mcp`,
+        generation: 0,
       },
       input: {},
       auth: { headers: {} },
@@ -828,5 +833,154 @@ describe("INVARIANT F1: handshake + call share request.timeoutMs", () => {
     await expect(attempt).rejects.toThrow(/timed out after 50ms/);
     await expect(attempt).rejects.toMatchObject({ name: GUEST_ERROR_NAMES.upstream });
     expect(toolsCallRequest(requests)).toBeUndefined(); // never reached tools/call
+  });
+});
+
+describe("INVARIANT §5.5: the per-call dispatch cell", () => {
+  it("INVARIANT §5.5: the caller advances the dispatch cell — initializing before the handshake, dispatched before the governed call", async () => {
+    const states: string[] = [];
+    const cell = createDispatchCell();
+    const { port } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+      // Only JSON-RPC posts are recorded; the ephemeral scope's teardown
+      // DELETE carries no body and is not part of the dispatch sequence.
+      if (parsed.method !== undefined) {
+        states.push(`server:${parsed.method}:${cell.state}`);
+      }
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "x", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { content: [] } }));
+    });
+    const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    await caller.call({
+      tool,
+      source: sourceAt(port),
+      input: {},
+      auth: { headers: {} },
+      timeoutMs: 5000,
+      dispatch: cell,
+    });
+    expect(states).toEqual([
+      "server:initialize:initializing",
+      "server:notifications/initialized:initializing",
+      "server:tools/call:dispatched",
+    ]);
+    expect(cell.state).toBe("dispatched");
+  });
+
+  it("INVARIANT §7 (#21): a side-effect-then-404 upstream surfaces as ONE dispatch and an HTTP 404 upstream error with the cell at dispatched", async () => {
+    const { port, requests } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "x", version: "0" },
+            },
+          }),
+        );
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(404);
+      res.end();
+    });
+    const cell = createDispatchCell();
+    const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    await expect(
+      caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: {} },
+        timeoutMs: 5000,
+        dispatch: cell,
+      }),
+    ).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+      message: expect.stringContaining("HTTP 404"),
+    });
+    expect(requests.filter((r) => r.body.includes('"tools/call"'))).toHaveLength(1);
+    expect(requests.filter((r) => r.body.includes('"initialize"'))).toHaveLength(1);
+    expect(cell.state).toBe("dispatched");
+  });
+
+  it("INVARIANT §5.3 pre-write gate: a budget that elapses during the handshake refuses before tools/call is written — the cell stays initializing", async () => {
+    // The governed call's LAST check runs inside beforeSend. The budget is
+    // alive when the request is built and gone once the handshake is served,
+    // so only the in-hook gate can catch it.
+    let remaining = 5_000;
+    const { port, requests } = await serve((request, res) => {
+      const parsed = JSON.parse(request.body || "{}") as { id?: string; method?: string };
+      if (parsed.method === "initialize") {
+        res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: parsed.id,
+            result: {
+              protocolVersion: NEGOTIATED_VERSION,
+              capabilities: { tools: {} },
+              serverInfo: { name: "x", version: "0" },
+            },
+          }),
+        );
+        remaining = 0; // the drive's budget burns during the handshake
+        return;
+      }
+      if (parsed.method === "notifications/initialized") {
+        res.writeHead(202);
+        res.end();
+        return;
+      }
+      res.writeHead(200, { "content-type": "application/json" });
+      res.end(JSON.stringify({ jsonrpc: "2.0", id: parsed.id, result: { ok: true } }));
+    });
+    const cell = createDispatchCell();
+    const caller = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
+    await expect(
+      caller.call({
+        tool,
+        source: sourceAt(port),
+        input: {},
+        auth: { headers: {} },
+        timeoutMs: 5000,
+        dispatch: cell,
+        deadline: () => remaining,
+      }),
+    ).rejects.toMatchObject({
+      name: GUEST_ERROR_NAMES.upstream,
+      message: expect.stringContaining("timed out"),
+    });
+    expect(requests.filter((r) => r.body.includes('"tools/call"'))).toHaveLength(0);
+    expect(cell.state).toBe("initializing");
   });
 });

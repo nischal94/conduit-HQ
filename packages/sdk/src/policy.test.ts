@@ -103,6 +103,29 @@ describe("createStorePolicyEngine", () => {
     expect(long.action).toBe("block");
   });
 
+  it("strips the Unicode line separators a host log line would render as a break", async () => {
+    // NEL, LINE SEPARATOR and PARAGRAPH SEPARATOR each render as a line
+    // break, so a guest-supplied name carrying one forges a second
+    // apparent record in the console and in host logs.
+    const engine = createStorePolicyEngine(memoryPolicies());
+
+    for (const sep of ["\u0085", "\u2028", "\u2029"]) {
+      const verdict = await engine.evaluate(unknown(`evil${sep}FORGED second line`));
+      expect(verdict.reason).not.toContain(sep);
+      expect(verdict.reason).toContain('Unknown tool "evilFORGED second line"');
+    }
+  });
+
+  it("leaves ordinary non-ASCII names intact — it is not a strip of everything outside ASCII", async () => {
+    const engine = createStorePolicyEngine(memoryPolicies());
+
+    const accented = await engine.evaluate(unknown("café.résumé"));
+    expect(accented.reason).toContain('Unknown tool "café.résumé"');
+
+    const cjk = await engine.evaluate(unknown("检索.工具"));
+    expect(cjk.reason).toContain('Unknown tool "检索.工具"');
+  });
+
   it("honors a manual block override on a safe tool, reporting override provenance", async () => {
     const policies = memoryPolicies();
     const tool = makeTool("safe");

@@ -1,7 +1,10 @@
 import type {
   Connection,
   Execution,
+  ExecutionError,
+  ExecutionKind,
   Integration,
+  PendingApproval,
   Policy,
   Source,
   Tool,
@@ -51,7 +54,7 @@ export interface ConduitStore {
      * with `secret`. */
     removeSecretRef?: string;
     tools: readonly Tool[];
-  }): Promise<void>;
+  }): Promise<{ generation: number }>;
 }
 
 export interface SourceRepository {
@@ -60,6 +63,13 @@ export interface SourceRepository {
   getByNamespace(namespace: string): Promise<Source | undefined>;
   list(): Promise<Source[]>;
   remove(id: string): Promise<void>;
+  /**
+   * The namespace's current §4.1a generation, or `undefined` when no source
+   * row exists. SQLite's triggers allocate the value — never the writer — so
+   * this is the authoritative provenance §5.4's resume check compares a
+   * pause's `sourceGeneration` against.
+   */
+  getGeneration(namespace: string): Promise<number | undefined>;
 }
 
 export interface IntegrationRepository {
@@ -93,11 +103,41 @@ export interface PolicyRepository {
   list(): Promise<Policy[]>;
 }
 
+/**
+ * The ONE settle write a direct drive performs (§5.3). Each arm carries
+ * exactly the columns that status permits, so an inconsistent pair — a
+ * `delivered` row with a stored result, a `retained` row without one —
+ * cannot be expressed at the call site.
+ */
+export type DirectSettle =
+  | { status: "completed"; resultState: "delivered" | "discarded" }
+  | { status: "completed"; resultState: "retained"; result: unknown }
+  | { status: "failed"; error: ExecutionError }
+  | { status: "paused"; pausedOn: PendingApproval }
+  /** The direct resume TTL branch: terminal, no result, no pause. */
+  | { status: "expired" };
+
 export interface ExecutionRepository {
+  /**
+   * Persist a NEW execution (start/startDirect). A plain INSERT — a
+   * duplicate id or, for a named client, a duplicate `(client_id, key)` in
+   * `request_keys` throws (the manager maps the UNIQUE failure to
+   * `conflict`). `attempt` seeds `resume_attempt` so a direct drive's settle
+   * writes can be fenced from the first write (§5.3).
+   */
+  create(execution: Execution, opts?: { attempt?: string }): Promise<void>;
+  /** Settle upsert. Never writes `request_keys`; never changes `resume_attempt`. */
   put(execution: Execution): Promise<void>;
   get(id: string): Promise<Execution | undefined>;
-  /** Resolve by the caller-generated correlation key (mcp design M1). */
-  getByRequestKey(key: string): Promise<Execution | undefined>;
+  /**
+   * The stored `kind` alone, with no hydration (§5.4). A corrupt direct row
+   * — unparseable `seeds`, malformed `direct_call` — must still be routable
+   * through the bounded fenced settle, and `get` cannot answer for it.
+   * `undefined` for a missing row or an unrecognized stored value.
+   */
+  kindOf(id: string): Promise<ExecutionKind | undefined>;
+  /** Default profile (`null`): the legacy column. Named client: `request_keys` (§4.1). */
+  getByRequestKey(key: string, clientId: string | null): Promise<Execution | undefined>;
   /**
    * Atomic paused→running for a single resume. Returns true iff THIS caller
    * won (design F4). `callId` names the pending call the human approved: the
@@ -135,6 +175,20 @@ export interface ExecutionRepository {
    * able to tell that apart from an execution that simply threw.
    */
   failClaimedResume(id: string, reason: string, errorName?: string): Promise<void>;
+  /**
+   * The ONE settle write for a direct row (§5.3 exactly-once): fenced
+   * `WHERE status = 'running' AND resume_attempt = ?`. Returns true iff this
+   * write changed the row. A late continuation after the timer, or a
+   * duplicate settle, returns false and changes nothing.
+   */
+  settleDirect(id: string, attempt: string, settle: DirectSettle): Promise<boolean>;
+  /**
+   * D3 housekeeping sweep (§4.1): every `paused` row of EITHER kind whose
+   * `pausedOn.namespace` EQUALS `namespace` becomes `failed` with
+   * `ConduitCatalogChanged`. Returns the count. Not the authority — the
+   * generation check on resume is.
+   */
+  invalidatePaused(namespace: string): Promise<number>;
   /** Paused executions awaiting a human, oldest-first (spec §10.2 approval queue). */
   listPaused(): Promise<Execution[]>;
   /**

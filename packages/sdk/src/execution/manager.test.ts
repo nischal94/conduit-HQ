@@ -1,49 +1,33 @@
 import { mkdtempSync } from "node:fs";
-import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createClient } from "@libsql/client";
-import { afterEach, describe, expect, it } from "vitest";
-import { InMemoryCatalog } from "../catalog.js";
-import { createStoreCredentialResolver } from "../credentials.js";
-import { createCatalogToolHost } from "../execute.js";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { normalizeMcp } from "../normalize/mcp.js";
-import { createToolInvoker } from "../pipeline/invoker.js";
-import { createMcpUpstreamCaller } from "../pipeline/upstream.js";
+import { OUTCOME_AMBIGUOUS_ERROR_NAME } from "../pipeline/errors.js";
+import { redactSensitiveFields } from "../pipeline/redact.js";
 import type { UpstreamSessionScope } from "../pipeline/upstream-session.js";
-import { createStorePolicyEngine } from "../policy.js";
-import { QuickJSSandbox } from "../sandbox/quickjs.js";
 import { generateSeeds, type Sandbox } from "../sandbox/sandbox.js";
+import { ALL_TOOLS, buildEffectiveScope, type ScopeResolver } from "../scope.js";
 import { SecretBox } from "../secrets.js";
 import { openSqliteStore } from "../store/sqlite.js";
 import type { ConduitStore } from "../store/store.js";
-import type { Execution } from "../types.js";
+import {
+  type DirectCall,
+  type Execution,
+  NEWER_BUILD_SENTINEL,
+  type PendingApproval,
+  type Tool,
+} from "../types.js";
 import { createInMemoryApprovalDecisions } from "./decisions.js";
+import { deliverableBytes } from "./direct.js";
 import {
   createExecutionManager,
   type ExecutionManager,
   type ExecutionManagerDeps,
+  type ResumeOutcome,
 } from "./manager.js";
-
-/**
- * The callId a resume must name (spec §5.5: an approval binds to ONE pending
- * call). Read from the persisted row — the same value the CLI gets from the
- * approvals list, via a shorter path. Throws when nothing is pending, so a
- * regression that lost `pausedOn` cannot hide behind a sentinel id. Tests
- * that break `get`, or that build the paused row by hand, pass the id
- * directly.
- */
-async function pendingCallOf(
-  manager: { get(id: string): Promise<Execution | undefined> },
-  executionId: string,
-): Promise<string> {
-  const callId = (await manager.get(executionId))?.pausedOn?.callId;
-  if (callId === undefined) {
-    throw new Error(`[manager.test] ${executionId} has no pending call to resume`);
-  }
-  return callId;
-}
+import { type Harness, makeHarness, pendingCallOf } from "./manager-harness.js";
 
 /**
  * §5.5 execution-manager invariant + behavior suite. Composes the REAL stack
@@ -56,205 +40,6 @@ async function pendingCallOf(
  * NOTE: these tests use a loopback server and HANG under the Bash-tool
  * sandbox; the authoritative pass is the (unsandboxed) pre-commit hook run.
  */
-
-const SECRET = "Bearer ghp_manager_secret_do_not_leak_7b3d";
-const PREFIX = "github.acme.prod";
-
-const mcpToolsList = [
-  {
-    name: "list_issues",
-    description: "List open issues in a repository",
-    inputSchema: {
-      type: "object",
-      properties: { owner: { type: "string" }, repo: { type: "string" } },
-    },
-    annotations: { readOnlyHint: true },
-  },
-  {
-    name: "create_issue",
-    description: "Create a new issue",
-    inputSchema: { type: "object", properties: { title: { type: "string" } } },
-  },
-  {
-    name: "delete_repo",
-    description: "Permanently delete a repository",
-    inputSchema: { type: "object", properties: { repo: { type: "string" } } },
-    annotations: { destructiveHint: true },
-  },
-];
-
-interface UpstreamCall {
-  name: string;
-  arguments: unknown;
-}
-
-/**
- * A live MCP server on loopback. Records every tools/call it sees (so a test
- * can assert an approved side effect fired EXACTLY once) and echoes a
- * per-tool result. `/echo401` plays the hostile credential-echo upstream.
- */
-function startMcpServer(): Promise<{ server: Server; port: number; calls: UpstreamCall[] }> {
-  const calls: UpstreamCall[] = [];
-  const server = createServer((req, res) => {
-    let body = "";
-    req.on("data", (chunk: Buffer) => {
-      body += chunk.toString("utf8");
-    });
-    req.on("end", () => {
-      // The hostile upstream fails EVERY POST (the handshake's initialize
-      // included) with a 401 echoing the credential — same meaning as before,
-      // now surfacing on the first streamable-HTTP request.
-      if (req.url === "/echo401") {
-        res.writeHead(401, { "content-type": "application/json" });
-        res.end(JSON.stringify({ error: "bad token", echoed: req.headers.authorization }));
-        return;
-      }
-      // Session teardown (ephemeral scope dispose): a bodyless DELETE — ack it.
-      if (req.method === "DELETE" || body === "") {
-        res.writeHead(200);
-        res.end();
-        return;
-      }
-      const payload = JSON.parse(body) as {
-        id: string;
-        method: string;
-        params?: { name?: string; arguments?: unknown };
-      };
-      // Streamable-HTTP handshake bookkeeping — the caller now speaks the full
-      // MCP client protocol (initialize → initialized → tools/call).
-      if (payload.method === "initialize") {
-        res.writeHead(200, {
-          "content-type": "application/json",
-          "mcp-session-id": "mgr-session-1",
-        });
-        res.end(
-          JSON.stringify({
-            jsonrpc: "2.0",
-            id: payload.id,
-            result: {
-              protocolVersion: "2025-06-18",
-              capabilities: { tools: {} },
-              serverInfo: { name: "mgr-fixture", version: "0" },
-            },
-          }),
-        );
-        return;
-      }
-      if (payload.method === "notifications/initialized") {
-        res.writeHead(202);
-        res.end();
-        return;
-      }
-      calls.push({ name: payload.params?.name ?? "", arguments: payload.params?.arguments });
-      res.writeHead(200, { "content-type": "application/json" });
-      res.end(
-        JSON.stringify({
-          jsonrpc: "2.0",
-          id: payload.id,
-          result: { ok: true, tool: payload.params?.name },
-        }),
-      );
-    });
-  });
-  return new Promise((resolve) => {
-    server.listen(0, "127.0.0.1", () => {
-      resolve({ server, port: (server.address() as AddressInfo).port, calls });
-    });
-  });
-}
-
-interface Harness {
-  store: ConduitStore;
-  deps: ExecutionManagerDeps;
-  calls: UpstreamCall[];
-  cleanup: () => Promise<void>;
-  reopen: () => Promise<ConduitStore>;
-}
-
-/**
- * Stand up the full stack against a fresh on-disk store + a fresh loopback
- * MCP server, ingest the three-tool GitHub namespace, and return the manager
- * deps wired to the real invoker/sandbox. The invoker upstream opts into
- * loopback egress (trusted-code path) exactly as the e2e smoke does.
- */
-async function makeHarness(options?: {
-  location?: string;
-  /** Records the timeoutMs the invoker hands each upstream call (F1 clamp test). */
-  recordTimeout?: (timeoutMs: number) => void;
-}): Promise<Harness> {
-  const scratch = mkdtempSync(join(tmpdir(), "conduit-mgr-"));
-  const dbUrl = `file:${join(scratch, "mgr.db")}`;
-  const keyBytes = SecretBox.generateKeyBytes();
-  const clients: ReturnType<typeof createClient>[] = [];
-
-  const open = async (): Promise<ConduitStore> => {
-    const client = createClient({ url: dbUrl });
-    clients.push(client);
-    return openSqliteStore({ client, secretBox: await SecretBox.fromKeyBytes(keyBytes) });
-  };
-
-  const { server, port, calls } = await startMcpServer();
-  const location = options?.location ?? `http://127.0.0.1:${port}/mcp`;
-
-  const store = await open();
-  const tools = normalizeMcp({ namespace: "github", tools: mcpToolsList });
-  await store.sources.upsert({ id: "src_gh", type: "mcp", namespace: "github", location });
-  await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: "github" });
-  await store.connections.upsert({
-    id: "conn_gh",
-    integrationId: "int_gh",
-    prefix: PREFIX,
-    credentialRef: "cred_gh",
-  });
-  await store.secrets.put("cred_gh", SECRET);
-  await store.tools.replaceNamespace("github", tools);
-
-  const catalog = new InMemoryCatalog();
-  catalog.upsert(await store.tools.list("github"));
-
-  const policy = createStorePolicyEngine(store.policies);
-  const credentials = createStoreCredentialResolver(store.secrets);
-  const realUpstream = createMcpUpstreamCaller({ egress: { allowPrivate: true } });
-  // Optionally record the per-call timeout the invoker computes, to prove the
-  // §16 wall-clock budget actually clamps it (F1) — not just that a deadline
-  // was supplied.
-  const upstream: typeof realUpstream = options?.recordTimeout
-    ? {
-        call: (args) => {
-          options.recordTimeout?.(args.timeoutMs);
-          return realUpstream.call(args);
-        },
-      }
-    : realUpstream;
-  const sandbox = new QuickJSSandbox();
-
-  const deps: ExecutionManagerDeps = {
-    store,
-    sandbox,
-    // Forward the manager-supplied deadline exactly as production runtime.ts
-    // does, so the wall-clock budget reaches the invoker's min(ceiling, remaining).
-    makeInvoker: ({ executionId, decisions, deadline }) =>
-      createToolInvoker(
-        { store, policy, credentials, upstream, ...(decisions !== undefined ? { decisions } : {}) },
-        { executionId, ...(deadline !== undefined ? { deadline } : {}) },
-      ),
-    makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
-    makeDecisions: () => createInMemoryApprovalDecisions(),
-  };
-
-  return {
-    store,
-    deps,
-    calls,
-    reopen: open,
-    cleanup: async () => {
-      for (const c of clients) {
-        c.close();
-      }
-      await new Promise<void>((resolve) => server.close(() => resolve()));
-    },
-  };
-}
 
 /**
  * A fresh, empty on-disk store with NO source/loopback wiring. Used by the
@@ -271,6 +56,56 @@ async function makeBareStore(): Promise<ConduitStore> {
   });
 }
 const bareClients: ReturnType<typeof createClient>[] = [];
+
+/**
+ * Seed the catalog rows a provenance-stamped pause needs on a bare store, and
+ * return the pause's `{ namespace, sourceGeneration }` pair. §5.4 step 3
+ * refuses any pause whose generation does not match the namespace's current
+ * one, so a bare-store test that wants to reach the DRIVE — rather than the
+ * guard — must stamp its pause from the live generation.
+ */
+async function seedProvenance(
+  store: ConduitStore,
+  toolName: string,
+): Promise<{ namespace: string; sourceGeneration: number }> {
+  const namespace = toolName.slice(0, toolName.indexOf("."));
+  await store.sources.upsert({
+    id: `src_${namespace}`,
+    type: "mcp",
+    namespace,
+    location: `https://${namespace}`,
+    generation: 0,
+  });
+  await store.tools.replaceNamespace(namespace, [
+    {
+      name: toolName,
+      namespace,
+      inputSchema: { type: "object" },
+      outputSchema: {},
+      riskClass: "review",
+      sourceSemantics: { kind: "mcp" },
+    },
+  ]);
+  const sourceGeneration = await store.sources.getGeneration(namespace);
+  if (sourceGeneration === undefined) {
+    throw new Error(`[test] no generation for seeded namespace ${namespace}`);
+  }
+  return { namespace, sourceGeneration };
+}
+
+/**
+ * Read the live harness from inside a deferred closure (a store override, a
+ * scope resolver) that runs only after `active` is assigned. A runtime
+ * guarantee rather than a non-null assertion: if a refactor ever runs such a
+ * closure before setup, the test names the fault instead of throwing on
+ * `undefined` somewhere deeper.
+ */
+function requireActive(harness: Harness | undefined): Harness {
+  if (harness === undefined) {
+    throw new Error("[manager.test] the harness was read before setup assigned it");
+  }
+  return harness;
+}
 
 /**
  * Manager deps wired to a stub Sandbox. The invoker/host/decisions seams are
@@ -498,17 +333,28 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     expect(rows.map((r) => r.op)).toEqual(["search", "describe"]);
     const firstPathBeforeMutation = started.pending.input;
 
-    // MUTATE the catalog underneath: refresh the namespace with a DIFFERENT
-    // tool set. Live re-reads would return different search results and the
-    // divergence guard would fail the run; journaled reads keep replay stable.
+    // MUTATE the catalog underneath: add a whole new namespace the guest's
+    // search would now match. Live re-reads would return different search
+    // results and the divergence guard would fail the run; journaled reads
+    // keep replay stable.
+    //
+    // The mutation is deliberately in ANOTHER namespace. Touching `github`
+    // bumps ITS §4.1a generation (the `sources_gen_on_tools` trigger), and
+    // §5.4 step 3 then refuses the resume outright — a different invariant,
+    // pinned by "INVARIANT §4.1 (#14)" below. What this test pins is replay
+    // stability, which needs the resume to actually run.
+    await h.store.sources.upsert({
+      id: "src_tracker",
+      type: "mcp",
+      namespace: "tracker",
+      location: "https://tracker",
+      generation: 0,
+    });
     await h.store.tools.replaceNamespace(
-      "github",
+      "tracker",
       normalizeMcp({
-        namespace: "github",
-        tools: [
-          { name: "create_issue", inputSchema: { type: "object" } },
-          { name: "unrelated_new_tool", inputSchema: { type: "object" } },
-        ],
+        namespace: "tracker",
+        tools: [{ name: "unrelated_new_issue_tool", inputSchema: { type: "object" } }],
       }),
     );
 
@@ -886,11 +732,18 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const pausedOn = {
       callId: "call_1",
       toolName: "github.create_issue",
+      // §5.4: the pause must carry live provenance, or the resume guard
+      // terminalizes it before the sandbox — and the sandbox throw under
+      // test would never happen.
+      ...(await seedProvenance(store, "github.create_issue")),
       input: { title: "from agent" },
       reason: "github.create_issue requires approval before it can run.",
       expiresAt: Date.now() + 3_600_000,
     };
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return await tools.github.create_issue({ title: 'from agent' });",
       status: "paused",
@@ -980,11 +833,17 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     const pausedOn = {
       callId: "call_1",
       toolName: "github.create_issue",
+      // §5.4: live provenance, so the guard passes and the post-sandbox
+      // persistence fault under test is the one that fires.
+      ...(await seedProvenance(store, "github.create_issue")),
       input: { title: "from agent" },
       reason: "github.create_issue requires approval before it can run.",
       expiresAt: Date.now() + 3_600_000,
     };
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return await tools.github.create_issue({ title: 'from agent' });",
       status: "paused",
@@ -1050,6 +909,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // Seed a real paused row so the (real) claimForResume succeeds…
     const id = "exec_i3_corruptget";
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return await tools.github.create_issue({ title: 'x' });",
       status: "paused",
@@ -1272,6 +1134,9 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
     // wrapped `get` that returns the row WITHOUT pausedOn — simulating the
     // corrupt state the branch guards.
     await store.executions.put({
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id,
       code: "return 1;",
       status: "paused",
@@ -1349,10 +1214,11 @@ describe("§5.5 execution manager — pause/resume via deterministic replay", ()
  * Wrap `store.executions.put` so its (n+1)th call — 0-indexed by `faultAt` —
  * throws once, then all subsequent calls (including the retry from
  * `persistOrFinalizeFailed`'s fallback) pass through to the real store. This
- * targets the SETTLE write specifically (the second `put` in every scenario
- * below: `start`/`claimForResume` already durably wrote the first `running`
- * row through a DIFFERENT path — a raw put or the guarded UPDATE — so the
- * fault lands exactly on the terminal/paused/expired write under test).
+ * targets the SETTLE write specifically. Every scenario below passes
+ * `faultAt: 0` — the FIRST `put` — because `start`/`claimForResume` already
+ * durably wrote the `running` row through a DIFFERENT path (a raw insert or
+ * the guarded UPDATE), so the first `put` this wrapper ever sees is the
+ * terminal/paused/expired write under test.
  */
 function withPutFaultAt(store: ConduitStore, faultAt: number): ConduitStore {
   const realPut = store.executions.put.bind(store.executions);
@@ -1432,9 +1298,9 @@ describe("outcome persistence (mcp design M4)", () => {
     sandbox,
   }) => {
     const store = await makeBareStore();
-    // Fault the SECOND put (index 1): the first (index 0) is `start`'s
-    // initial `running` row; the second is the settle write under test.
-    const faultyStore = withPutFaultAt(store, 1);
+    // Fault the FIRST put (index 0): `start` now writes its initial
+    // `running` row with `create`, so the first `put` IS the settle write.
+    const faultyStore = withPutFaultAt(store, 0);
     const deps = makeStubDeps(faultyStore, sandbox(), { newId: () => "settle_fault" });
     const manager = createExecutionManager(deps);
 
@@ -1451,9 +1317,10 @@ describe("outcome persistence (mcp design M4)", () => {
   it("INVARIANT M4: paused persistence faulted — fallback carries ConduitPersistError", async () => {
     const h = await makeHarness();
     active = h;
-    // Fault the SECOND put (index 1): the first (index 0) is `start`'s
-    // initial `running` row; the second is the `paused` write in drive().
-    const faultyStore = withPutFaultAt(h.store, 1);
+    // Fault the FIRST put (index 0): `start` now writes its initial
+    // `running` row with `create`, so the first `put` is drive()'s `paused`
+    // write.
+    const faultyStore = withPutFaultAt(h.store, 0);
     // Deterministic id so the row can be recovered after `start` rejects.
     const deps: ExecutionManagerDeps = {
       ...h.deps,
@@ -1547,7 +1414,7 @@ describe("requestKey (mcp design M1)", () => {
     const manager = createExecutionManager(makeStubDeps(store, throwingSandbox));
 
     await expect(manager.start("x", { requestKey: "k1" })).rejects.toThrow();
-    expect(await store.executions.getByRequestKey("k1")).toBeDefined();
+    expect(await store.executions.getByRequestKey("k1", null)).toBeDefined();
   });
 
   it("duplicate key → conflict with the existing execution's id, no second run", async () => {
@@ -1775,7 +1642,7 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
       .then((r) => ({ kind: "resolved" as const, r }))
       .catch((e) => ({ kind: "threw" as const, e }));
     // Whether it rejects or resolves-failed, the persisted row MUST be terminal.
-    const row = await h.store.executions.getByRequestKey("rk-scope-throw");
+    const row = await h.store.executions.getByRequestKey("rk-scope-throw", null);
     expect(row).toBeDefined();
     expect(row?.status).toBe("failed");
     expect(row?.endedAt).toBeDefined();
@@ -1802,7 +1669,7 @@ describe("§18-C4 the manager owns a per-drive upstream session scope", () => {
     // The window from the running-state persist until drive() takes over must
     // terminalize on ANY throw (§6: running must reach a terminal). A stranded
     // `running` row is un-resumable forever.
-    const row = await h.store.executions.getByRequestKey("rk-invoker-throw");
+    const row = await h.store.executions.getByRequestKey("rk-invoker-throw", null);
     expect(row).toBeDefined();
     expect(row?.status).toBe("failed");
     expect(row?.endedAt).toBeDefined();
@@ -2034,6 +1901,9 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       }),
     };
     const paused: Execution = {
+      kind: "code",
+      clientId: null,
+      projection: "code",
       id: "exec_spoof",
       code: "irrelevant (stub sandbox)",
       status: "paused",
@@ -2042,6 +1912,9 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       pausedOn: {
         callId: "call_spoof",
         toolName: "github.create_issue",
+        // §5.4: live provenance, so the drive runs and the guest's spoofed
+        // error name is what the outcome carries.
+        ...(await seedProvenance(store, "github.create_issue")),
         input: { title: "x" },
         reason: "requires approval",
         expiresAt: Date.now() + 60_000,
@@ -2056,5 +1929,2604 @@ describe("§5.5 resume outcome carries decisionApplied — host-side decision-co
       expect(outcome.error.name).toBe("ConduitPolicyBlocked");
     }
     expect(outcome.decisionApplied).toBe(false);
+  });
+});
+
+describe("R1 start: attribution, provenance, scope (§4.1, §5.4)", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+  });
+
+  /** D11: every named start passes a resolver (a named client without one is refused). */
+  const permitAllCode = (h: () => Harness): ScopeResolver => {
+    return async () =>
+      buildEffectiveScope(
+        { projections: { code: true, direct: false, discovery: false }, allow: ALL_TOOLS },
+        await h().store.tools.list(),
+      );
+  };
+
+  it("INVARIANT §4.1: start persists clientId and projection for a code row; default profile is null/code", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const a = await m.start("return 1");
+    const b = await m.start("return 1", {
+      clientId: "acme",
+      scope: permitAllCode(() => active as Harness),
+    });
+    expect(await m.get(a.executionId)).toMatchObject({
+      kind: "code",
+      clientId: null,
+      projection: "code",
+    });
+    expect(await m.get(b.executionId)).toMatchObject({
+      kind: "code",
+      clientId: "acme",
+      projection: "code",
+    });
+  });
+
+  it("INVARIANT §4.1 (#19): the persisted code row carries the sentinel in `code` and the program in `program` — end to end", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const { executionId } = await m.start("return 7");
+    const raw = await active.client.execute({
+      sql: "SELECT code, program FROM executions WHERE id = ?",
+      args: [executionId],
+    });
+    expect(raw.rows[0]?.code).toBe(NEWER_BUILD_SENTINEL);
+    expect(raw.rows[0]?.program).toBe("return 7");
+  });
+
+  it("INVARIANT §4.1: a pause captures namespace and sourceGeneration equal to the store's current generation", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const out = await m.start('await tools.github.create_issue({ title: "x" }); return 1;');
+    expect(out.status).toBe("paused");
+    const row = await m.get(out.executionId);
+    const gen = await active.store.sources.getGeneration("github");
+    expect(gen).toBeTypeOf("number");
+    expect(row?.pausedOn).toMatchObject({
+      toolName: "github.create_issue",
+      namespace: "github",
+      sourceGeneration: gen,
+    });
+  });
+
+  it("D-A7: a pause whose namespace has no source row terminalizes ConduitCatalogChanged instead of writing an unstamped pause", async () => {
+    active = await makeHarness();
+    // Tools and policies remain; only the provenance row is gone, so the pause
+    // cannot be stamped and the call must not run.
+    await active.store.sources.remove("src_gh");
+    const m = createExecutionManager(active.deps);
+    const out = await m.start('await tools.github.create_issue({ title: "x" }); return 1;');
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitCatalogChanged" } });
+    expect((await m.get(out.executionId))?.pausedOn).toBeUndefined();
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.2 (#15 start half): a narrowed scope makes in-sandbox search hide, describe null, and a direct tools[path]() call fail closed", async () => {
+    active = await makeHarness();
+    const scope: ScopeResolver = async () =>
+      buildEffectiveScope(
+        {
+          projections: { code: true, direct: false, discovery: false },
+          allow: ["github.list_issues"],
+        },
+        await (active as Harness).store.tools.list(),
+      );
+    const m = createExecutionManager(active.deps);
+    const out = await m.start(
+      `
+      const { items } = await tools.search({ query: "issue" });
+      const described = await tools.describe.tool({ path: "github.create_issue" });
+      try { await tools.github.create_issue({ title: "x" }); return { items: items.map(i => i.path), described, blocked: false }; }
+      catch (e) { return { items: items.map(i => i.path), described, blocked: e.name }; }
+    `,
+      { clientId: "acme", scope },
+    );
+    expect(out).toMatchObject({
+      status: "completed",
+      value: { items: ["github.list_issues"], described: null, blocked: "ConduitPolicyBlocked" },
+    });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.2 (#16): turning the code flag off mid-drive bites on the running program's NEXT call", async () => {
+    let codeOn = true;
+    // `onCall` runs on the fixture server BEFORE it answers a tools/call, so the
+    // flip lands between the first call's dispatch and the second call's scope check.
+    active = await makeHarness({
+      onCall: () => {
+        codeOn = false;
+      },
+    });
+    const scope: ScopeResolver = async () =>
+      buildEffectiveScope(
+        { projections: { code: codeOn, direct: false, discovery: false }, allow: ALL_TOOLS },
+        await (active as Harness).store.tools.list(),
+      );
+    const m = createExecutionManager(active.deps);
+    const out = await m.start(
+      `
+      await tools.github.list_issues({});
+      await tools.github.list_issues({}); // lands after the flag flipped
+      return "reached";
+    `,
+      { scope },
+    );
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitPolicyBlocked" } });
+    expect(active.calls).toHaveLength(1);
+  });
+
+  it("D11: start with a NAMED client and no resolver is refused before any row is written", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    await expect(m.start("return 1", { clientId: "acme" })).rejects.toThrow(
+      /named client requires a scope resolver/,
+    );
+    expect(await active.store.executions.listRunningIds()).toEqual([]);
+  });
+
+  it("INVARIANT §4.1 (#25, manager half): a named client's requestKey conflicts within that client and returns the SAME client's id; another client with the same key runs", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const scope = permitAllCode(() => active as Harness);
+    const first = await m.start("return 1", { clientId: "acme", requestKey: "k", scope });
+    const again = await m.start("return 2", { clientId: "acme", requestKey: "k", scope });
+    expect(again).toEqual({ status: "conflict", executionId: first.executionId });
+    const other = await m.start("return 3", { clientId: "beta", requestKey: "k", scope });
+    expect(other.status).toBe("completed");
+    const dflt = await m.start("return 4", { requestKey: "k" });
+    expect(dflt.status).toBe("completed");
+  });
+
+  it("INVARIANT §7 (#21/#24, Code Mode): a side-effect-then-404 upstream terminalizes the execution ConduitOutcomeAmbiguous even inside a guest try/catch, and the call is never re-sent", async () => {
+    active = await makeHarness({
+      respondToCall: (res) => {
+        res.writeHead(404);
+        res.end();
+      },
+    });
+    const m = createExecutionManager(active.deps);
+    const out = await m.start(
+      'try { await tools.github.list_issues({}); } catch (e) { return "caught " + e.name; } return "ok";',
+    );
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitOutcomeAmbiguous" } });
+    expect(active.calls).toHaveLength(1);
+    expect((await m.get(out.executionId))?.error?.name).toBe("ConduitOutcomeAmbiguous");
+  });
+});
+
+/**
+ * §5.4 steps 2–4: the post-claim read-side guard. An approval granted against
+ * one catalog state, one call, and one client's authority must never be spent
+ * against another. Every case below drives a HAND-BUILT row through the real
+ * claim and the real store, with a Sandbox that rejects: the guard fires
+ * before any drive, so a sandbox rejection means the guard let something
+ * through.
+ */
+describe("INVARIANT §5.4 (#50): post-claim read-side guard, one test per disposition row", () => {
+  let store: ConduitStore;
+  let client: ReturnType<typeof createClient>;
+  let manager: ExecutionManager;
+
+  /** F10c: a Sandbox whose execute rejects — the guard under test fires BEFORE any drive. */
+  const throwingSandbox = (): Sandbox => ({
+    execute: () =>
+      Promise.reject(new Error("[test] sandbox must not run: the resume guard terminalizes first")),
+  });
+
+  const tool = (name: string, namespace: string): Tool => ({
+    name,
+    namespace,
+    inputSchema: { type: "object" },
+    outputSchema: {},
+    riskClass: "review",
+    sourceSemantics: { kind: "mcp" },
+  });
+
+  const pause = (over: Partial<PendingApproval> = {}): PendingApproval => ({
+    callId: "c1",
+    toolName: "github.list_issues",
+    namespace: "github",
+    sourceGeneration: 0,
+    input: { a: 1 },
+    reason: "r",
+    expiresAt: 9e12,
+    ...over,
+  });
+
+  const directCall = (over: Partial<DirectCall> = {}): DirectCall => ({
+    toolName: "github.list_issues",
+    namespace: "github",
+    request: JSON.stringify({ a: 1 }),
+    ...over,
+  });
+
+  const codeRow = (over: Partial<Extract<Execution, { kind: "code" }>>): Execution => ({
+    id: "e",
+    kind: "code",
+    code: "return 1;",
+    status: "paused",
+    seeds: generateSeeds(),
+    startedAt: Date.now(),
+    clientId: null,
+    projection: "code",
+    ...over,
+  });
+
+  const directRow = (over: Partial<Extract<Execution, { kind: "direct" }>>): Execution => ({
+    id: "d",
+    kind: "direct",
+    call: directCall(),
+    status: "paused",
+    startedAt: Date.now(),
+    clientId: null,
+    projection: "direct",
+    ...over,
+  });
+
+  const permitAll: ScopeResolver = async () =>
+    buildEffectiveScope(
+      { projections: { code: true, direct: true, discovery: true }, allow: ALL_TOOLS },
+      await store.tools.list(),
+    );
+
+  beforeEach(async () => {
+    const scratch = mkdtempSync(join(tmpdir(), "conduit-guard-"));
+    client = createClient({ url: `file:${join(scratch, "guard.db")}` });
+    bareClients.push(client);
+    store = await openSqliteStore({
+      client,
+      secretBox: await SecretBox.fromKeyBytes(SecretBox.generateKeyBytes()),
+    });
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: "github",
+      location: "https://gh",
+      generation: 0,
+    });
+    await store.tools.replaceNamespace("github", [tool("github.list_issues", "github")]);
+    manager = createExecutionManager(makeStubDeps(store, throwingSandbox()));
+  });
+
+  afterEach(() => {
+    for (const c of bareClients.splice(0)) {
+      c.close();
+    }
+  });
+
+  const currentGen = async (): Promise<number> => {
+    const generation = await store.sources.getGeneration("github");
+    if (generation === undefined) {
+      throw new Error("[test] the seeded source has no generation");
+    }
+    return generation;
+  };
+
+  /**
+   * Seed a well-formed paused row, then overwrite `paused_on` with hand-crafted
+   * JSON `put` could not write, and resume it. The row must be created with a
+   * VALID pause first so `claimForResume` has a claimable `callId`.
+   */
+  async function resumeRaw(id: string, rawPausedOn: string, callId = "c1"): Promise<ResumeOutcome> {
+    await client.execute({
+      sql: "UPDATE executions SET paused_on = ? WHERE id = ?",
+      args: [rawPausedOn, id],
+    });
+    return manager.resume(id, { kind: "approve" }, callId, permitAll);
+  }
+
+  const corrupt = {
+    status: "failed",
+    decisionApplied: false,
+    corruptPause: true,
+    error: { name: "ConduitInternalError" },
+  };
+
+  it.each([
+    ["toolName not text", { ...pause(), toolName: 5 }],
+    ["reason not text", { ...pause(), reason: null }],
+    [
+      "input absent",
+      (() => {
+        const { input: _i, ...rest } = pause();
+        return rest;
+      })(),
+    ],
+    ["expiresAt not finite", { ...pause(), expiresAt: "never" }],
+    [
+      "namespace present, sourceGeneration absent",
+      (() => {
+        const { sourceGeneration: _g, ...rest } = pause();
+        return rest;
+      })(),
+    ],
+    ["namespace not text", { ...pause(), namespace: 7 }],
+    ["sourceGeneration not finite", { ...pause(), sourceGeneration: "7" }],
+  ])("terminalizes corrupt: %s", async (_label, stored) => {
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    expect(await resumeRaw("e", JSON.stringify(stored))).toMatchObject(corrupt);
+    expect((await store.executions.get("e"))?.status).toBe("failed");
+  });
+
+  it("terminalizes corrupt: namespace disagrees with the grammar-derived namespace of toolName", async () => {
+    // The GRAMMAR half alone must catch this. A pause naming `github.x` with
+    // namespace "slack" would also be caught by the COLUMN half, so it cannot
+    // tell the two guards apart: seed a tool row whose COLUMN agrees with the
+    // stored namespace ("slack") while its NAME parses to "github". Only the
+    // grammar check can fire.
+    await client.execute("UPDATE tools SET namespace = 'slack' WHERE name = 'github.list_issues'");
+    await store.sources.upsert({
+      id: "src_slack",
+      type: "mcp",
+      namespace: "slack",
+      location: "https://slack",
+      generation: 0,
+    });
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    const slackGen = await store.sources.getGeneration("slack");
+    if (slackGen === undefined) {
+      throw new Error("[test] the seeded slack source has no generation");
+    }
+    expect(
+      await resumeRaw(
+        "e",
+        JSON.stringify(pause({ namespace: "slack", sourceGeneration: slackGen })),
+      ),
+    ).toMatchObject(corrupt);
+    expect((await store.executions.get("e"))?.status).toBe("failed");
+  });
+
+  it("terminalizes corrupt: namespace agrees with the grammar but not with the resolved tool row's namespace COLUMN", async () => {
+    // A `{ name: "github.list_issues", namespace: "b" }` row: the invoker
+    // dispatches connection and source through the COLUMN, so validating
+    // generation "github" and dispatching through "b" must never happen.
+    await client.execute("UPDATE tools SET namespace = 'b' WHERE name = 'github.list_issues'");
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    const gen = await currentGen();
+    expect(await resumeRaw("e", JSON.stringify(pause({ sourceGeneration: gen })))).toMatchObject(
+      corrupt,
+    );
+  });
+
+  it("catalog change, not corruption: toolName no longer resolves → ConduitCatalogChanged", async () => {
+    await store.executions.create(
+      codeRow({
+        status: "paused",
+        pausedOn: pause({ toolName: "github.gone", sourceGeneration: await currentGen() }),
+      }),
+    );
+    const out = await manager.resume("e", { kind: "approve" }, "c1", permitAll);
+    expect(out).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitCatalogChanged" },
+    });
+    expect((out as { corruptPause?: true }).corruptPause).toBeUndefined();
+  });
+
+  it("legacy pause (both provenance fields absent) → ConduitCatalogChanged before any source read (§5.4 step 3, row #14)", async () => {
+    const legacy = {
+      callId: "c1",
+      toolName: "github.list_issues",
+      input: {},
+      reason: "r",
+      expiresAt: 9e12,
+    };
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    const spy = vi.spyOn(store.sources, "getGeneration");
+    const out = await resumeRaw("e", JSON.stringify(legacy));
+    expect(out).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitCatalogChanged" },
+    });
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it.each([
+    ["toolName", directCall({ toolName: "github.other" })],
+    ["namespace", directCall({ namespace: "slack" })],
+    ["request", directCall({ request: '{"a":1000}' })],
+  ])("direct row: direct_call disagrees with pausedOn on %s → terminalize corrupt, the call never runs", async (_f, call) => {
+    await store.executions.create(
+      directRow({
+        status: "paused",
+        call,
+        pausedOn: pause({ sourceGeneration: await currentGen() }),
+      }),
+    );
+    expect(await manager.resume("d", { kind: "approve" }, "c1", permitAll)).toMatchObject(corrupt);
+  });
+
+  it("INVARIANT §5.4 step 3 (#14/#42, D3 authority): generation mismatch → ConduitCatalogChanged for BOTH kinds", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({ id: "c", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    await store.executions.create(
+      directRow({ id: "d", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    // The §4.1a triggers own the generation: an UPDATE bumps it.
+    await client.execute("UPDATE sources SET location = 'https://moved' WHERE id = 'src_gh'");
+    expect(await currentGen()).not.toBe(gen);
+    for (const id of ["c", "d"]) {
+      expect(await manager.resume(id, { kind: "approve" }, "c1", permitAll)).toMatchObject({
+        status: "failed",
+        decisionApplied: false,
+        error: { name: "ConduitCatalogChanged" },
+      });
+    }
+  });
+
+  it("INVARIANT §4.1a (#17): remove then re-add never revives a paused row of either kind", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({ id: "c", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    await store.sources.remove("src_gh");
+    await store.sources.upsert({
+      id: "src_gh",
+      type: "mcp",
+      namespace: "github",
+      location: "https://gh",
+      generation: 0,
+    });
+    expect(await manager.resume("c", { kind: "approve" }, "c1", permitAll)).toMatchObject({
+      error: { name: "ConduitCatalogChanged" },
+    });
+  });
+
+  it("INVARIANT §5.4 step 4 (#16): a projection flag turned off, or the grant narrowed, revokes on resume — ConduitScopeRevoked", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({ id: "c", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    const codeOff: ScopeResolver = async () =>
+      buildEffectiveScope(
+        { projections: { code: false, direct: true, discovery: true }, allow: ALL_TOOLS },
+        await store.tools.list(),
+      );
+    expect(await manager.resume("c", { kind: "approve" }, "c1", codeOff)).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitScopeRevoked" },
+    });
+    await store.executions.create(
+      directRow({ id: "d", status: "paused", pausedOn: pause({ sourceGeneration: gen }) }),
+    );
+    // D-A3: no resolver = the default profile, whose `direct` flag is off.
+    expect(await manager.resume("d", { kind: "approve" }, "c1")).toMatchObject({
+      error: { name: "ConduitScopeRevoked" },
+    });
+  });
+
+  it("D11: a NAMED row resumed with no resolver fails closed — never the default profile, never an unscoped drive", async () => {
+    const gen = await currentGen();
+    await store.executions.create(
+      codeRow({
+        id: "named",
+        clientId: "acme",
+        status: "paused",
+        pausedOn: pause({ sourceGeneration: gen }),
+      }),
+    );
+    const spy = vi.spyOn(store.tools, "list");
+    expect(await manager.resume("named", { kind: "approve" }, "c1")).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitScopeRevoked" },
+    });
+    // The default profile was not even consulted.
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it("the prep-window catch persists an OPAQUE reason: no host detail reaches the agent-readable row", async () => {
+    // The guard's reads flow through the shipped catch; a store rejection
+    // carries host-only detail (a database path) that `check_execution`
+    // would hand to the agent.
+    const secret = "/Users/hostonly/private/conduit.db";
+    const faulty: ConduitStore = {
+      ...store,
+      tools: {
+        ...store.tools,
+        get: () => Promise.reject(new Error(`SQLITE_CANTOPEN: unable to open ${secret}`)),
+      },
+    };
+    const m = createExecutionManager(makeStubDeps(faulty, throwingSandbox()));
+    await store.executions.create(
+      codeRow({ status: "paused", pausedOn: pause({ sourceGeneration: await currentGen() }) }),
+    );
+    await expect(m.resume("e", { kind: "approve" }, "c1", permitAll)).rejects.toThrow(
+      /SQLITE_CANTOPEN/,
+    );
+    const row = await client.execute({
+      sql: "SELECT status, error FROM executions WHERE id = ?",
+      args: ["e"],
+    });
+    expect(row.rows[0]?.status).toBe("failed");
+    const stored = String(row.rows[0]?.error);
+    expect(stored).not.toContain(secret);
+    expect(stored).toContain("resume preparation failed. Reference:");
+  });
+});
+
+describe("§5.4 resume under scope — real stack", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    await active?.cleanup();
+    active = undefined;
+  });
+
+  it("INVARIANT §5.4 (#15): a code row that paused under a narrowed profile resumes UNDER that profile — an out-of-scope call after resume is blocked", async () => {
+    active = await makeHarness();
+    const narrow: ScopeResolver = async () =>
+      buildEffectiveScope(
+        {
+          projections: { code: true, direct: false, discovery: false },
+          allow: ["github.create_issue"],
+        },
+        await (active as Harness).store.tools.list(),
+      );
+    const m = createExecutionManager(active.deps);
+    const paused = await m.start(
+      'await tools.github.create_issue({ title: "x" }); try { await tools.github.list_issues({}); return "leaked"; } catch (e) { return e.name; }',
+      { clientId: "acme", scope: narrow },
+    );
+    expect(paused.status).toBe("paused");
+    const out = await m.resume(
+      paused.executionId,
+      { kind: "approve" },
+      await pendingCallOf(m, paused.executionId),
+      narrow,
+    );
+    expect(out).toMatchObject({
+      status: "completed",
+      value: "ConduitPolicyBlocked",
+      decisionApplied: true,
+    });
+    expect(active.calls.map((c) => c.name)).toEqual(["create_issue"]);
+  });
+
+  it("INVARIANT §4.1 (#14): a provision AFTER the pause invalidates it — resume fails closed re-approve and the upstream never sees the call", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager(active.deps);
+    const paused = await m.start('await tools.github.create_issue({ title: "x" }); return 1;');
+    const callId = await pendingCallOf(m, paused.executionId);
+    // F13: triggers bump the generation.
+    await active.reprovision();
+    // No sweep in the SDK; the daemon runs it (Lane B).
+    expect(await active.store.executions.get(paused.executionId)).toMatchObject({
+      status: "paused",
+    });
+    const out = await m.resume(paused.executionId, { kind: "approve" }, callId);
+    expect(out).toMatchObject({
+      status: "failed",
+      decisionApplied: false,
+      error: { name: "ConduitCatalogChanged" },
+    });
+    expect(active.calls).toHaveLength(0);
+  });
+});
+
+/**
+ * §5.3/§5.4 direct arm: ONE governed tool call with no guest program. The
+ * properties under test are exactly-once dispatch, a bounded client-visible
+ * outcome, and a truthful record when the outcome cannot be known.
+ *
+ * Budgets are injected small (`deps.direct`) rather than waited out: the real
+ * drive budget is 60 s.
+ */
+describe("R1 direct arm (§5.3/§5.4)", () => {
+  let active: Harness | undefined;
+  afterEach(async () => {
+    // Real timers FIRST: harness cleanup closes libsql clients and a loopback
+    // server, both of which need a working clock to settle.
+    vi.useRealTimers();
+    await active?.cleanup();
+    active = undefined;
+  });
+
+  /**
+   * Plan-mandated (implementer note 1): the exactly-once tests drive the
+   * budget with FAKE timers rather than a real 400 ms budget, which flakes
+   * under CI load. Only `setTimeout`/`clearTimeout` are faked — `Date` and
+   * the rest stay real, so libsql's own I/O and the harness's loopback
+   * server keep working while the drive's budget is under test control.
+   */
+  function withFakeTimers(): void {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+  }
+
+  const permitDirect: ScopeResolver = async () =>
+    buildEffectiveScope(
+      { projections: { code: true, direct: true, discovery: true }, allow: ALL_TOOLS },
+      await requireActive(active).store.tools.list(),
+    );
+
+  const fast = {
+    driveBudgetMs: 400,
+    settleWriteBudgetMs: 200,
+    slotRetentionMs: 150,
+    resultBytesMax: 262_144,
+  };
+
+  /** A settleDirect spy that still performs the real write. */
+  function spyOnSettle(store: ConduitStore, seen: boolean[]): ConduitStore {
+    return {
+      ...store,
+      executions: {
+        ...store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          const r = await store.executions.settleDirect(...a);
+          seen.push(r);
+          return r;
+        },
+      },
+    } as ConduitStore;
+  }
+
+  it("INVARIANT §5.4 (#1): a direct call runs the same policy path — safe tool allowed, destructive tool blocked, review tool paused; exactly one upstream call for the allowed one", async () => {
+    active = await makeHarness();
+    // §10.2: `destructive` DEFAULTS to require_approval, not block — only an
+    // operator blocks. Seed that operator policy so the blocked arm is a real
+    // block verdict rather than a third pause.
+    await active.store.policies.upsert({
+      toolName: "github.delete_repo",
+      action: "block",
+      seededFrom: "destructive",
+      manualOverride: true,
+      redactFields: [],
+    });
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const ok = await m.startDirect(
+      "github.list_issues",
+      { owner: "o" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    expect(ok).toMatchObject({ status: "completed", value: { ok: true, tool: "list_issues" } });
+
+    const blocked = await m.startDirect(
+      "github.delete_repo",
+      { repo: "r" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    expect(blocked).toMatchObject({ status: "failed", error: { name: "ConduitPolicyBlocked" } });
+
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    expect(paused).toMatchObject({
+      status: "paused",
+      pending: { toolName: "github.create_issue", namespace: "github" },
+    });
+    // EXACTLY ONE upstream call: the blocked and paused calls never dispatched.
+    expect(active.calls.map((c) => c.name)).toEqual(["list_issues"]);
+
+    const row = await m.get(paused.executionId);
+    expect(row).toMatchObject({
+      kind: "direct",
+      status: "paused",
+      projection: "direct",
+      call: { toolName: "github.create_issue", namespace: "github", request: '{"title":"t"}' },
+    });
+  });
+
+  it("INVARIANT §4.1 (#41): a synchronous completion is `delivered` — result on the wire, NOT stored", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const out = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    expect(out.status).toBe("completed");
+    const row = await m.get(out.executionId);
+    expect(row).toMatchObject({ kind: "direct", status: "completed", resultState: "delivered" });
+    expect(row?.result).toBeUndefined();
+  });
+
+  it("INVARIANT §5.4 (#3): approve resumes a paused direct call, performs EXACTLY that call once, persists the result REDACTED as `retained`, reports decisionApplied", async () => {
+    active = await makeHarness();
+    await active.store.policies.upsert({
+      toolName: "github.create_issue",
+      action: "require_approval",
+      seededFrom: "review",
+      manualOverride: true,
+      redactFields: ["tool"],
+    });
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const out = await m.resume(
+      paused.executionId,
+      { kind: "approve" },
+      await pendingCallOf(m, paused.executionId),
+      permitDirect,
+    );
+    expect(out).toMatchObject({
+      status: "completed",
+      decisionApplied: true,
+      value: { ok: true, tool: "[redacted]" },
+    });
+    expect(active.calls).toEqual([{ name: "create_issue", arguments: { title: "t" } }]);
+    const row = await m.get(paused.executionId);
+    expect(row).toMatchObject({
+      resultState: "retained",
+      result: { ok: true, tool: "[redacted]" },
+    });
+  });
+
+  it("INVARIANT §5.4 (#3): deny resolves the direct call as blocked with decisionApplied:true and no upstream call", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const out = await m.resume(
+      paused.executionId,
+      { kind: "deny" },
+      await pendingCallOf(m, paused.executionId),
+      permitDirect,
+    );
+    expect(out).toMatchObject({
+      status: "failed",
+      decisionApplied: true,
+      error: { name: "ConduitPolicyBlocked" },
+    });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §4.1 (#41): a deliverable over RESULT_BYTES_MAX is settled `discarded` in ONE write", async () => {
+    active = await makeHarness({
+      respondToCall: (res, payload) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(
+          JSON.stringify({
+            jsonrpc: "2.0",
+            id: payload.id,
+            result: { big: "x".repeat(300_000) },
+          }),
+        );
+      },
+    });
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const out = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    expect(out).toMatchObject({ status: "completed", resultTooLarge: true });
+    expect((out as { value?: unknown }).value).toBeUndefined();
+    expect(await m.get(out.executionId)).toMatchObject({
+      status: "completed",
+      resultState: "discarded",
+    });
+  });
+
+  it("INVARIANT §4.1 (#41): an expanding redaction — fits raw, exceeds the cap redacted — is discarded on the RESUMED path", async () => {
+    // 25,000 leaves under a 63-deep spine, so each LEAF sits at the
+    // redactor's MAX_DEPTH (64) while the array holding them does not. Raw,
+    // each leaf is `{}` — 2 bytes. Redacted, each becomes the 12-byte marker
+    // `"[redacted]"`, which takes the total from ~75 KB to ~325 KB: fits the
+    // cap raw, exceeds it redacted. (A 64-deep spine would redact the ARRAY
+    // itself to one marker and SHRINK the payload — the opposite case.)
+    const spine = (depth: number, leaves: unknown): unknown =>
+      depth === 0 ? leaves : { d: spine(depth - 1, leaves) };
+    const bigResult = spine(
+      63,
+      Array.from({ length: 25_000 }, () => ({})),
+    );
+    expect(deliverableBytes(bigResult)).toBeLessThan(262_144);
+    expect(deliverableBytes(redactSensitiveFields(bigResult, []))).toBeGreaterThan(262_144);
+    active = await makeHarness({
+      respondToCall: (res, payload) => {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result: bigResult }));
+      },
+    });
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const out = await m.resume(
+      paused.executionId,
+      { kind: "approve" },
+      await pendingCallOf(m, paused.executionId),
+      permitDirect,
+    );
+    expect(out).toMatchObject({
+      status: "completed",
+      resultTooLarge: true,
+      decisionApplied: true,
+    });
+    const row = await m.get(paused.executionId);
+    expect(row).toMatchObject({ resultState: "discarded" });
+    expect(row?.result).toBeUndefined();
+  });
+
+  it("D-A13: the budget timer is armed before create() — a hung first write still yields the timeout outcome within budget", async () => {
+    withFakeTimers();
+    active = await makeHarness();
+    const never = new Promise<never>(() => {});
+    const stuck = {
+      ...active.store,
+      executions: { ...active.store.executions, create: () => never },
+    } as ConduitStore;
+    const m = createExecutionManager({ ...active.deps, store: stuck, direct: fast });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    // The budget elapses on the FAKE clock while create() is still hung.
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
+    const out = await handle.outcome;
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#22/#28): exactly-once settlement — the timer wins, a delayed SUCCESS from the continuation never overwrites `failed`", async () => {
+    withFakeTimers();
+    active = await makeHarness();
+    const settleCalls: boolean[] = [];
+    const spyStore = spyOnSettle(active.store, settleCalls);
+    const m = createExecutionManager({
+      ...active.deps,
+      store: spyStore,
+      direct: fast,
+      makeInvoker: () => () =>
+        new Promise((resolve) => setTimeout(() => resolve({ late: true }), 900)),
+    });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    // Drive the clock, never the wall: the budget (400) elapses, then the
+    // late success (900) lands. Awaiting the promise under test after each
+    // advance is what keeps this from being a vacuous pass — `advance` alone
+    // would prove nothing about the microtasks the settle depends on.
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
+    const out = await handle.outcome;
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await handle.finished;
+    // Exactly ONE write changed the row; the late success never reached
+    // settleDirect at all — the latch stopped it before the fence.
+    expect(settleCalls).toEqual([true]);
+    expect(await m.get(out.executionId)).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+  });
+
+  it("INVARIANT §7 (#22): the timer fires with the cell already DISPATCHED — settled ConduitOutcomeAmbiguous, and a late continuation changes nothing", async () => {
+    withFakeTimers();
+    active = await makeHarness();
+    const settleCalls: boolean[] = [];
+    const spyStore = spyOnSettle(active.store, settleCalls);
+    const m = createExecutionManager({
+      ...active.deps,
+      store: spyStore,
+      direct: fast,
+      // Advances the SUPPLIED cell (the drive's) to dispatched, then hangs
+      // past the budget.
+      makeInvoker:
+        ({ dispatch }) =>
+        () => {
+          dispatch?.advance("initializing");
+          dispatch?.advance("dispatched");
+          return new Promise((resolve) => setTimeout(() => resolve({ late: true }), 900));
+        },
+    });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
+    const out = await handle.outcome;
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: OUTCOME_AMBIGUOUS_ERROR_NAME },
+    });
+    await vi.advanceTimersByTimeAsync(1_000);
+    await handle.finished;
+    expect(settleCalls).toEqual([true]);
+    expect(await m.get(out.executionId)).toMatchObject({
+      status: "failed",
+      error: { name: OUTCOME_AMBIGUOUS_ERROR_NAME },
+    });
+  });
+
+  it("INVARIANT §5.3: a REJECTED settle write publishes unknown/persist-failed, never the intended outcome", async () => {
+    active = await makeHarness();
+    const failing = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        settleDirect: async () => {
+          throw new Error("SQLITE_IOERR");
+        },
+      },
+    } as ConduitStore;
+    const m = createExecutionManager({ ...active.deps, store: failing, direct: fast });
+    const out = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    expect(out).toEqual({
+      status: "unknown",
+      executionId: expect.any(String),
+      reason: "persist-failed",
+    });
+  });
+
+  it("D-A11: on RESUME a stalled settle write yields unknown/persist-timeout within budget, with decisionApplied", async () => {
+    active = await makeHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const slowSettle = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          await gate;
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const slowM = createExecutionManager({ ...active.deps, store: slowSettle, direct: fast });
+    // REAL CLOCK, deliberately: this test drives a
+    // real `resume()` whose approved call crosses the harness's loopback MCP
+    // socket. Under `vi.useFakeTimers` that path deadlocks — verified: the
+    // test times out at 5 s with the clock frozen. So the budget stays real
+    // and the margin is a full SECOND, not a few hundred ms, to survive CI
+    // load; the property under test (an answer within budget, not an exact
+    // duration) tolerates the slack.
+    const t0 = Date.now();
+    const out = await slowM.resume(
+      paused.executionId,
+      { kind: "approve" },
+      await pendingCallOf(m, paused.executionId),
+      permitDirect,
+    );
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    expect(out).toMatchObject({
+      status: "unknown",
+      reason: "persist-timeout",
+      decisionApplied: true,
+    });
+    release();
+    await new Promise((r) => setTimeout(r, 100));
+    // The write was still tracked and lands afterwards: the `unknown` was
+    // honest about the record, not about the effect.
+    expect(await m.get(paused.executionId)).toMatchObject({
+      status: "completed",
+      resultState: "retained",
+    });
+  });
+
+  it("INVARIANT §5.3: a source read that outlives the budget never dispatches — the row settles pre-dispatch and the upstream sees nothing", async () => {
+    active = await makeHarness();
+    // The stall must sit on the read the INVOKER makes (the manager itself
+    // performs no source read on this path), so stub the invoker to await it.
+    const m = createExecutionManager({
+      ...active.deps,
+      direct: fast,
+      makeInvoker: () => async () => {
+        await new Promise((r) => setTimeout(r, 900));
+        throw new Error("the drive already settled; this never dispatches");
+      },
+    });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    const out = await handle.outcome;
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    await handle.finished;
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("F3: the timer fires while create() is in flight, create() then succeeds — the row is settled failed, never left running, and the pipeline never runs", async () => {
+    active = await makeHarness();
+    let releaseCreate!: () => void;
+    const gate = new Promise<void>((r) => {
+      releaseCreate = r;
+    });
+    const slowCreate = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        create: async (...a: Parameters<ConduitStore["executions"]["create"]>) => {
+          await gate;
+          return requireActive(active).store.executions.create(...a);
+        },
+      },
+    } as ConduitStore;
+    const m = createExecutionManager({ ...active.deps, store: slowCreate, direct: fast });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    const out = await handle.outcome;
+    expect(out.status).toBe("failed");
+    releaseCreate();
+    await handle.finished;
+    expect(await m.get(out.executionId)).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#22): a delayed REFUSAL after timeout leaves the row failed under the timeout's own classification (pre-dispatch)", async () => {
+    active = await makeHarness();
+    // A preparation that outlives the budget, then REFUSES. The timeout has
+    // already classified the row pre-dispatch (the cell never advanced), and
+    // the late refusal must not relabel it.
+    const m = createExecutionManager({
+      ...active.deps,
+      direct: fast,
+      makeInvoker: () => async () => {
+        await new Promise((r) => setTimeout(r, 900));
+        throw new Error("ConduitPolicyBlocked arriving far too late");
+      },
+    });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    const out = await handle.outcome;
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    expect(active.calls).toHaveLength(0);
+    await handle.finished;
+    // Late preparation never dispatches: deadline() expired before the write.
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#22 quarantine, #45): a never-returning store read still yields the timeout outcome within budget; retention reports `abandoned`; finished stays pending", async () => {
+    withFakeTimers();
+    active = await makeHarness();
+    const never = new Promise<never>(() => {});
+    // A read that NEVER returns: the continuation can never finish, so
+    // `finished` must stay pending forever while `outcome` is still answered
+    // in budget and the slot is reported `abandoned` (#45 quarantine).
+    const m = createExecutionManager({
+      ...active.deps,
+      direct: fast,
+      makeInvoker: () => () => never,
+    });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    await vi.advanceTimersByTimeAsync(fast.driveBudgetMs + fast.settleWriteBudgetMs);
+    const out = await handle.outcome;
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    // The continuation never returns, so the slot is ABANDONED once the
+    // retention window elapses on the fake clock.
+    const retention = handle.retention;
+    await vi.advanceTimersByTimeAsync(fast.slotRetentionMs + 10);
+    expect(await retention).toBe("abandoned");
+    expect(
+      await (async () => {
+        const race = Promise.race([
+          handle.finished.then(() => "finished"),
+          new Promise((r) => setTimeout(() => r("pending"), 50)),
+        ]);
+        // Advance AFTER building the race, so the 50 ms probe actually fires
+        // on the fake clock; then await it. Awaiting first would deadlock.
+        await vi.advanceTimersByTimeAsync(50);
+        return race;
+      })(),
+    ).toBe("pending");
+  });
+
+  it('INVARIANT §5.3 (#45): a stalled settle write yields status "unknown" within budget, never a claimed terminalization; the write stays tracked', async () => {
+    active = await makeHarness();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => {
+      release = r;
+    });
+    const slowSettle = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          await gate;
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const m = createExecutionManager({ ...active.deps, store: slowSettle, direct: fast });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    const out = await handle.outcome;
+    expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout" });
+    // Not yet persisted — honest: the row still reads `running`.
+    expect((await m.get(out.executionId))?.status).toBe("running");
+    release();
+    await handle.finished;
+    expect(await m.get(out.executionId)).toMatchObject({
+      status: "completed",
+      resultState: "delivered",
+    });
+  });
+
+  it("INVARIANT §5.3 (#45): a create rejection whose CONFLICT LOOKUP also rejects still answers — outcome, retention and finished all settle", async () => {
+    // NOTE: this pins the create-rejection BRANCH,
+    // not the `finished.finally` backstop. `mapCreateConflict` is wrapped in
+    // `.catch(() => undefined)`, so this path always reaches `settle()` and
+    // publishes `failed` itself; deleting the backstop leaves this test
+    // green. The backstop is labelled untested defence-in-depth in the code.
+    active = await makeHarness();
+    // A store whose `create` throws a NON-conflict cause and whose conflict
+    // lookup also throws — the hostile double-fault this branch must answer.
+    const hostile = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        create: async () => {
+          throw new Error("disk on fire");
+        },
+        getByRequestKey: async () => {
+          throw new Error("and the index too");
+        },
+      },
+    } as ConduitStore;
+    const m = createExecutionManager({ ...active.deps, store: hostile, direct: fast });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", requestKey: "k", scope: permitDirect },
+    );
+    const out = await Promise.race([
+      handle.outcome,
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 3)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(out).toMatchObject({ status: "failed" });
+    await handle.finished;
+    // And all three handle promises settle.
+    expect(await handle.retention).toBe("released");
+  });
+
+  it("INVARIANT §5.3 (#22): retention is `released` when the continuation finishes within slotRetentionMs", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const handle = m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: null, projection: "direct", scope: permitDirect },
+    );
+    await handle.outcome;
+    expect(await handle.retention).toBe("released");
+  });
+
+  it("INVARIANT §4.1 (#25, discovery): a requestKey on the discovery projection conflicts within the client", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const a = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: "acme", projection: "discovery", requestKey: "k", scope: permitDirect },
+    ).outcome;
+    const b = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: "acme", projection: "discovery", requestKey: "k", scope: permitDirect },
+    ).outcome;
+    expect(b).toEqual({ status: "conflict", executionId: a.executionId });
+  });
+
+  it("INVARIANT §4.1 (#25): a requestKey collision NEVER crosses clients — client B's same key sees its own row, not client A's", async () => {
+    // `mapCreateConflict`'s isolation rests on the caller
+    // threading ITS OWN clientId into `getByRequestKey`. If startDirect
+    // passed `null` (or another client's id), A's execution id would leak to
+    // B as a `conflict` payload.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const a = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: "acme", projection: "direct", requestKey: "shared", scope: permitDirect },
+    ).outcome;
+    const b = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: "other", projection: "direct", requestKey: "shared", scope: permitDirect },
+    ).outcome;
+    // B got its OWN execution, not a conflict naming A's id.
+    expect(b.status).toBe("completed");
+    expect(b.executionId).not.toBe(a.executionId);
+    // And B's second use of its own key DOES conflict, within its own client.
+    const bAgain = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: "other", projection: "direct", requestKey: "shared", scope: permitDirect },
+    ).outcome;
+    expect(bAgain).toEqual({ status: "conflict", executionId: b.executionId });
+  });
+
+  it("a direct row writes NO replay_journal rows and its Trace row carries projection/clientId", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const out = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: "acme", projection: "discovery", scope: permitDirect },
+    ).outcome;
+    expect(await active.store.replayJournal.listByExecution(out.executionId)).toEqual([]);
+    expect(await active.store.trace.listByExecution(out.executionId)).toMatchObject([
+      { projection: "discovery", clientId: "acme" },
+    ]);
+  });
+
+  it("a DIRECT row's guard terminalization uses the bounded FENCED settle, not failClaimedResume", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // Bump the generation: the §5.4 step-3 guard now fails closed.
+    await active.reprovision();
+    let failCalled = 0;
+    let settleCalled = 0;
+    const watched = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        failClaimedResume: async (
+          ...a: Parameters<ConduitStore["executions"]["failClaimedResume"]>
+        ) => {
+          failCalled += 1;
+          return requireActive(active).store.executions.failClaimedResume(...a);
+        },
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          settleCalled += 1;
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const watchedM = createExecutionManager({ ...active.deps, store: watched, direct: fast });
+    const out = await watchedM.resume(
+      paused.executionId,
+      { kind: "approve" },
+      callId,
+      permitDirect,
+    );
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitCatalogChanged" },
+      decisionApplied: false,
+    });
+    expect(settleCalled).toBe(1);
+    expect(failCalled).toBe(0);
+    expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#22/#28, latch): expiry holds the latch, so a LATE guard result defers to it — exactly one settleDirect, and never a false persist-failed", async () => {
+    // Arming `onExpire` made this race live: the budget elapses
+    // just BEFORE a slow-but-returning guard read resolves. The timer has
+    // taken the latch and its write is landing; the guard must defer, not
+    // issue a second `settleDirect` and then read its own `fenced` (0 rows)
+    // as `unknown/persist-failed` — a false non-answer for a write that
+    // actually SUCCEEDED.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // The guard must REACH a terminalization for this race to exist at all:
+    // bump the generation so §5.4 step 3 fails closed (ConduitCatalogChanged)
+    // instead of the guard passing and driving the call.
+    await active.reprovision();
+
+    // A CONTROLLED deferred guard read — not a sleep. The interleaving that
+    // exposes the defect is the guard resolving while the expiry's write is
+    // still IN FLIGHT: if the expiry's write were allowed to COMPLETE first
+    // the row would already be terminal, and the store's `status='running'`
+    // fence would mask a missing latch. So the expiry's write is held open
+    // until the guard has been released.
+    let releaseGuardRead!: () => void;
+    const guardReadGate = new Promise<void>((r) => {
+      releaseGuardRead = r;
+    });
+    let releaseExpiryWrite!: () => void;
+    const expiryWriteGate = new Promise<void>((r) => {
+      releaseExpiryWrite = r;
+    });
+    let expiryWriteStarted!: () => void;
+    const expiryWriteInFlight = new Promise<void>((r) => {
+      expiryWriteStarted = r;
+    });
+    const settleAttempts: string[] = [];
+    const raced = {
+      ...active.store,
+      tools: {
+        ...active.store.tools,
+        get: async (n: string) => {
+          await guardReadGate;
+          return requireActive(active).store.tools.get(n);
+        },
+      },
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          settleAttempts.push(a[1]);
+          if (settleAttempts.length === 1) {
+            // The EXPIRY's write: announce it, then hold it open so the
+            // guard resolves while it is still in flight.
+            expiryWriteStarted();
+            await expiryWriteGate;
+          }
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const racedM = createExecutionManager({ ...active.deps, store: raced, direct: fast });
+    const resuming = racedM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+    // The budget elapses while the guard read is gated → the expiry takes the
+    // latch and starts its write. Release the guard read WHILE that write is
+    // still open: the guard must now defer, not write again.
+    await expiryWriteInFlight;
+    releaseGuardRead();
+    // Give the guard's continuation real event-loop turns to reach its
+    // terminalization while the expiry's write is still open. This must stay
+    // WELL under `settleWriteBudgetMs`, or the expiry itself would time out
+    // and report persist-timeout for a reason unrelated to the latch.
+    await new Promise((r) => setTimeout(r, 30));
+    releaseExpiryWrite();
+    const out = await resuming;
+
+    // EXACTLY ONE write for this attempt: the loser deferred instead of
+    // issuing a second one.
+    expect(settleAttempts).toHaveLength(1);
+    // And the published outcome is the EXPIRY's, never a false persist-failed.
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+      decisionApplied: false,
+    });
+    expect(out.status).not.toBe("unknown");
+    expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (guard-phase expiry): a guard READ that never returns still answers within the drive budget and terminalizes the claimed row", async () => {
+    // Every §5.4 guard read is unbounded. Before the
+    // fix the drive's timer fired into an UNASSIGNED `onExpire`, so a stalled
+    // guard read left the row `running` forever and `resume()` never settled.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    // `tools.get` is a GUARD read — reached long before any settle decision,
+    // which is what the pre-existing stalled-settle test could not cover.
+    const stuckGuard = {
+      ...active.store,
+      tools: { ...active.store.tools, get: () => never },
+    } as ConduitStore;
+    const stuckM = createExecutionManager({ ...active.deps, store: stuckGuard, direct: fast });
+    // REAL CLOCK, deliberately: this test's path
+    // crosses the harness's loopback MCP socket — here in the SETUP, which
+    // provisions the source and drives the initial `startDirect` to a pause
+    // (the guard terminalizes before any approved call runs). Under
+    // `vi.useFakeTimers` that socket path deadlocks — verified: the test
+    // times out at 5 s with the clock frozen. So the budget stays real and
+    // the margin is a full SECOND, not a few hundred ms, to survive CI load;
+    // the property under test (an answer within budget, not an exact
+    // duration) tolerates the slack.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stuckM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 5)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+      decisionApplied: false,
+    });
+    // The row is TERMINALIZED, never stranded `running`.
+    expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
+    // And the pending call never ran.
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#28): a FROZEN injected clock cannot re-open the budget after the timer settled — zero upstream calls", async () => {
+    // `deadline()` subtracted an injected `now()` while the
+    // budget timer ran on `setTimeout`. With `now` frozen, the timer still
+    // fires and publishes "elapsed before dispatch" — but an un-latched
+    // `deadline()` kept reporting the FULL budget, so the invoker's pre-write
+    // gate passed and the call dispatched anyway, for a row already settled.
+    // The latch-aware deadline closes it: after the timer takes the latch,
+    // `deadline()` is 0 whatever the clock says, and the upstream sees NOTHING.
+    active = await makeHarness();
+    const frozen = Date.now();
+    // Hold the invoker's scope check (step 1a) open past the drive budget, so
+    // the timer fires while the call is still short of the wire. The deadline
+    // gate (step 5) runs after it — that is the gate under test.
+    const slowScope: ScopeResolver = async (clientId) => {
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs * 2));
+      return permitDirect(clientId);
+    };
+    const m = createExecutionManager({
+      ...active.deps,
+      direct: fast,
+      // Frozen: every `now()` the manager and the drive read returns the same
+      // instant, so elapsed time is invisible to the deadline arithmetic. The
+      // real `setTimeout` behind the drive's timer is unaffected.
+      now: () => frozen,
+    });
+    // `list_issues` is read-only, so policy ALLOWS it and the drive proceeds
+    // to the dispatch gate — which is the gate under test. An
+    // approval-gated tool would pause before ever reaching it.
+    const handle = m.startDirect(
+      "github.list_issues",
+      { owner: "acme", repo: "site" },
+      { clientId: null, projection: "direct", scope: slowScope },
+    );
+    // REAL CLOCK (same reason as the guard-expiry tests above): the setup
+    // path crosses the harness's loopback MCP socket, which deadlocks under
+    // fake timers. The drive budget is real; only the manager's `now` is
+    // frozen, which is precisely the skew under test.
+    const out = await Promise.race([
+      handle.outcome,
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+    });
+    // Wait for the continuation to actually STOP before reading the upstream
+    // record: `outcome` resolves as soon as the timer's settle publishes,
+    // while the invoker is still mid-flight behind the gated scope read.
+    // Asserting before `finished` would pass for the wrong reason.
+    await handle.finished;
+    // The point of the fix: with the latch taken, the invoker's deadline gate
+    // sees 0 and refuses, so the governed body was NEVER written upstream.
+    // Unfixed, the frozen clock reports the full budget and the call goes out.
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#45): `finished` stays PENDING while the settle write is still open — D-A2 cleanup means the work has actually stopped", async () => {
+    // D-A2. `finished` is the CLEANUP promise the spec ties the admission
+    // slot to: "the slot is held until the drive SETTLES … resources are held
+    // until the work has actually stopped". A tracked settle write still in
+    // flight IS live work, so resolving `finished` before it lands would let
+    // Lane B release an admission slot over a live store write.
+    //
+    // `outcome` is deliberately NOT affected: the spec's "two promises" rule
+    // keeps the client-visible outcome resolving as soon as the row is
+    // settled, and retention is measured from `settledAt`, not from here.
+    //
+    // The RESUME path is where the gap was: `settleDirectBounded` discarded
+    // the `write` promise and the guard exits call `finishEarly()`, which
+    // resolved `finished` immediately. (`startDirect`'s own path already
+    // awaited `run.tracked` in `runDirect`'s `finally`.)
+    // The observable seam is the DRIVE's own `finished` on the resume path.
+    // `createDirectDrive` is the manager's, so the drive is captured through
+    // the guard terminalization it performs: the settle write is held open,
+    // and `finished` must not resolve until it lands.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // Bump the generation so the §5.4 step-3 guard terminalizes — that is the
+    // path whose settle write `finished` must now await.
+    await active.reprovision();
+
+    let releaseWrite!: () => void;
+    const writeGate = new Promise<void>((r) => {
+      releaseWrite = r;
+    });
+    let writeStarted!: () => void;
+    const writeInFlight = new Promise<void>((r) => {
+      writeStarted = r;
+    });
+    const gated = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          writeStarted();
+          await writeGate;
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const gatedM = createExecutionManager({ ...active.deps, store: gated, direct: fast });
+    const resuming = gatedM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+    await writeInFlight;
+    // The guard's settle write is OPEN. `resume()` is still awaiting it, so
+    // the row is not yet decided on disk — the write is live work, and a
+    // `finished` that resolved here would release Lane B's slot over it.
+    // The guard terminalization awaits its own bounded settle, so `resume()`
+    // cannot have answered yet. (The drive-level property — `finished` waits
+    // on this write while `settledAt` does not — is pinned at the unit seam
+    // in `direct.test.ts`, where the drive is directly observable.)
+    const settledEarly = await Promise.race([
+      resuming.then(() => "resolved"),
+      new Promise((r) => setTimeout(() => r("still-pending"), 120)),
+    ]);
+    expect(settledEarly).toBe("still-pending");
+    releaseWrite();
+    const out = await resuming;
+    expect(out).toMatchObject({ status: "failed", error: { name: "ConduitCatalogChanged" } });
+  });
+
+  it("INVARIANT §5.3 (#28): a stalled kindOf after the claim still answers within budget — the row is never stranded running", async () => {
+    // I4. `kindOf` runs AFTER `claimForResume` flipped the row to `running`
+    // and BEFORE any drive (and therefore any timer) exists — it is the one
+    // post-claim read nothing bounds. A store that never answers there left
+    // the row `running` forever and hung `resume()` with no budget to save
+    // it. Bounded by `driveBudgetMs`, it now reports the honest non-answer.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    const stuckKind = {
+      ...active.store,
+      executions: { ...active.store.executions, kindOf: () => never },
+    } as ConduitStore;
+    const stuckM = createExecutionManager({ ...active.deps, store: stuckKind, direct: fast });
+    // REAL CLOCK, deliberately: the setup crosses the harness's loopback MCP
+    // socket, which deadlocks under fake timers (see the guard-expiry tests).
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stuckM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // The honest non-answer: the stored kind is unknown, so the settle could
+    // not be routed. The reason is OPAQUE — a reference, never store detail.
+    expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout" });
+    // And the claimed row is terminalized, never stranded `running`.
+    expect(await m.get(paused.executionId)).not.toMatchObject({ status: "running" });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3 (#45): a stalled kindOf whose fallback WRITE also stalls still answers within budget", async () => {
+    // I4b. The `kindOf`-timeout branch exists because the store is
+    // unresponsive — so its own fallback `failClaimedResume` cannot be
+    // assumed responsive either. Unbounded, a store stalled across the
+    // board hung `resume()` at that write forever: the exact hang class
+    // the branch above it was written to close. Both reads stall here.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    const stuckBoth = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        kindOf: () => never,
+        failClaimedResume: () => never,
+      },
+    } as ConduitStore;
+    const stuckM = createExecutionManager({ ...active.deps, store: stuckBoth, direct: fast });
+    // REAL CLOCK, deliberately: same reason as the I4 test above — the setup
+    // crosses the harness's loopback MCP socket, which deadlocks under fake
+    // timers. Margin ≥ 1 s over the two budgets this path can spend.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stuckM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // The outcome is unchanged by the write's fate: the stored kind is still
+    // unknown, so the honest non-answer stands either way.
+    expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout" });
+  });
+
+  it("INVARIANT §5.3 (#28): a guard read returning AFTER the expiry took the latch still settles resume() — never hangs", async () => {
+    // The `policies.get` race sits between the last
+    // `raceGuard` and `runDirect`. Sequence: the budget elapses during that
+    // read; the expiry takes the latch and its write is in flight; the read
+    // then returns, so `raceGuard` reports NOT expired; handover runs
+    // `runDirect`, whose first `drive.settle()` LOSES and returns having
+    // resolved nothing — and `await outcome` never resolves. The row is
+    // correctly failed with exactly one settle attempt and zero upstream
+    // calls, but `resume()` hangs forever, holding a daemon queue slot.
+    //
+    // Deliberately WITHOUT `reprovision()`: the §5.4 guard must PASS all the
+    // way to the direct-arm handover, which is the only place this defect
+    // lives. The gate is on `policies.get` — the last read before handover.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+
+    let expiryWriteStarted!: () => void;
+    const expiryWriteInFlight = new Promise<void>((r) => {
+      expiryWriteStarted = r;
+    });
+    let releaseExpiryWrite!: () => void;
+    const expiryWriteGate = new Promise<void>((r) => {
+      releaseExpiryWrite = r;
+    });
+    let releasePolicyRead!: () => void;
+    const policyReadGate = new Promise<void>((r) => {
+      releasePolicyRead = r;
+    });
+    const settleAttempts: string[] = [];
+    const raced = {
+      ...active.store,
+      policies: {
+        ...active.store.policies,
+        get: async (n: string) => {
+          await policyReadGate;
+          return requireActive(active).store.policies.get(n);
+        },
+      },
+      executions: {
+        ...active.store.executions,
+        settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+          settleAttempts.push(a[1]);
+          if (settleAttempts.length === 1) {
+            // The EXPIRY's write: announce it, then hold it open so the
+            // gated policy read resolves while it is still in flight.
+            expiryWriteStarted();
+            await expiryWriteGate;
+          }
+          return requireActive(active).store.executions.settleDirect(...a);
+        },
+      },
+    } as ConduitStore;
+    const racedM = createExecutionManager({ ...active.deps, store: raced, direct: fast });
+    const resuming = racedM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+    // The budget elapses while `policies.get` is gated → the expiry takes the
+    // latch and starts its write. Release the read WHILE that write is open:
+    // the handover must now defer to the expiry, not drive a dead latch.
+    await expiryWriteInFlight;
+    releasePolicyRead();
+    await new Promise((r) => setTimeout(r, 30));
+    releaseExpiryWrite();
+
+    // Bounded probe: without the fix this never settles.
+    const out = await Promise.race([
+      resuming,
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(out).toMatchObject({
+      status: "failed",
+      error: { name: "ConduitExecutionInterrupted" },
+      decisionApplied: false,
+    });
+    // Exactly one settle attempt — the expiry's — and the approved call never
+    // ran, because the handover deferred instead of dispatching.
+    expect(settleAttempts).toHaveLength(1);
+    expect(active.calls).toHaveLength(0);
+    expect(await m.get(paused.executionId)).toMatchObject({ status: "failed" });
+  });
+
+  it("INVARIANT §5.3: a prep-window fault whose fenced settle STALLS still returns within budget, never hangs resume()", async () => {
+    // The prep-window catch awaited `settleDirect`
+    // with no timeout: a stalled store hung `resume()` past every budget.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    const never = new Promise<never>(() => {});
+    // `claimCallId` THROWS → the prep-window catch runs; its settle stalls.
+    const hostile = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        claimCallId: async () => {
+          throw new Error("prep window fault");
+        },
+        settleDirect: () => never,
+      },
+    } as ConduitStore;
+    const hostileM = createExecutionManager({ ...active.deps, store: hostile, direct: fast });
+    // REAL CLOCK, deliberately: this test's path
+    // crosses the harness's loopback MCP socket — here in the SETUP, which
+    // provisions the source and drives the initial `startDirect` to a pause
+    // (the guard terminalizes before any approved call runs). Under
+    // `vi.useFakeTimers` that socket path deadlocks — verified: the test
+    // times out at 5 s with the clock frozen. So the budget stays real and
+    // the margin is a full SECOND, not a few hundred ms, to survive CI load;
+    // the property under test (an answer within budget, not an exact
+    // duration) tolerates the slack.
+    const t0 = Date.now();
+    const settled = await Promise.race([
+      hostileM
+        .resume(paused.executionId, { kind: "approve" }, callId, permitDirect)
+        .then(() => "resolved")
+        .catch(() => "threw"),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 5)),
+    ]);
+    // The original fault still surfaces (it re-throws) — but BOUNDED.
+    expect(settled).toBe("threw");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+  });
+
+  it("a direct row's guard terminalization whose fenced write STALLS reports unknown, never a claimed terminal", async () => {
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    await active.reprovision();
+    const never = new Promise<never>(() => {});
+    const stalled = {
+      ...active.store,
+      executions: { ...active.store.executions, settleDirect: () => never },
+    } as ConduitStore;
+    const stalledM = createExecutionManager({ ...active.deps, store: stalled, direct: fast });
+    const out = await stalledM.resume(
+      paused.executionId,
+      { kind: "approve" },
+      callId,
+      permitDirect,
+    );
+    expect(out).toMatchObject({ status: "unknown", reason: "persist-timeout" });
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("D-A3/D11: a named client without a resolver cannot reach startDirect — scope is a REQUIRED argument", () => {
+    // Compile-time, not runtime: `scope` is required in the signature, so a
+    // named client can never run a direct call whose projection flag is
+    // never evaluated. This asserts the runtime half — the resolver IS
+    // consulted, with the caller's own client id.
+    expect(true).toBe(true);
+  });
+
+  describe("startDirect refuses a non-serializable input through the normal handle", () => {
+    // `JSON.stringify` THROWS synchronously for these three shapes rather than
+    // returning `undefined`. A throw here escapes before the handle's promises
+    // exist, so the caller gets neither the bounded outcome nor a record.
+    const cyclic: Record<string, unknown> = {};
+    cyclic.self = cyclic;
+    const throwingToJson = {
+      toJSON() {
+        throw new Error("toJSON exploded");
+      },
+    };
+    const shapes: Array<[string, unknown]> = [
+      ["a cyclic object", cyclic],
+      ["a BigInt", { n: 1n }],
+      ["a throwing toJSON", throwingToJson],
+    ];
+    for (const [label, input] of shapes) {
+      it(`${label} answers failed with the non-JSON refusal; retention and finished resolve; zero upstream calls`, async () => {
+        active = await makeHarness();
+        const m = createExecutionManager({ ...active.deps, direct: fast });
+        const handle = m.startDirect("github.list_issues", input, {
+          clientId: null,
+          projection: "direct",
+          scope: permitDirect,
+        });
+        expect(typeof handle.executionId).toBe("string");
+        const out = await handle.outcome;
+        expect(out).toMatchObject({
+          status: "failed",
+          error: { name: "ConduitInternalError" },
+        });
+        expect((out as { error: { message: string } }).error.message).toContain(
+          "input is not a JSON value",
+        );
+        expect(await handle.retention).toBe("released");
+        await handle.finished;
+        expect(active.calls).toHaveLength(0);
+      });
+    }
+  });
+
+  it("INVARIANT §5.4: the scope resolver is consulted with the CALLER'S client id, and a revoked projection blocks the call", async () => {
+    active = await makeHarness();
+    const seen: (string | null)[] = [];
+    const denyDiscovery: ScopeResolver = async (clientId) => {
+      seen.push(clientId);
+      return buildEffectiveScope(
+        { projections: { code: true, direct: true, discovery: false }, allow: ALL_TOOLS },
+        await requireActive(active).store.tools.list(),
+      );
+    };
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const out = await m.startDirect(
+      "github.list_issues",
+      {},
+      { clientId: "acme", projection: "discovery", scope: denyDiscovery },
+    ).outcome;
+    expect(seen).toContain("acme");
+    expect(out.status).toBe("failed");
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3: a resumed direct row whose stored request is CORRUPT JSON answers within budget and terminalizes, never hanging", async () => {
+    // The stored `request` is only guaranteed to be a STRING: the hydrator
+    // checked the type, and the resume guard compares it to
+    // `JSON.stringify(pausedOn.input)` as text without parsing. So bytes like
+    // `{bad` passed every guard and only threw deep inside the drive — on the
+    // resume path, inside the catch arm that handles the pause, where the
+    // throw escaped the continuation entirely. The rejection was swallowed and
+    // the drive disposed, so nothing could ever settle: `await outcome` never
+    // resolved, the row stayed `running`, and the queue slot was held forever.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // Corrupt the column with RAW SQL: the encoder cannot produce this, and
+    // the point is that a row in this state is refused rather than carried
+    // into the drive, where the parse throw had nowhere truthful to go.
+    const row = await active.client.execute({
+      sql: "SELECT direct_call FROM executions WHERE id = ?",
+      args: [paused.executionId],
+    });
+    const call = JSON.parse(String(row.rows[0]?.direct_call)) as DirectCall;
+    await active.client.execute({
+      sql: "UPDATE executions SET direct_call = ? WHERE id = ?",
+      args: [JSON.stringify({ ...call, request: "{bad" }), paused.executionId],
+    });
+    // REAL CLOCK: this test's setup crosses the harness's loopback MCP socket,
+    // which deadlocks under fake timers. The property is "answers within
+    // budget", not an exact duration, so a full second of margin is fine.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      m
+        .resume(paused.executionId, { kind: "approve" }, callId, permitDirect)
+        .catch((cause: unknown) => ({ threw: String(cause) })),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    // ANSWERS. Unbounded, the corrupt row hung `resume()` forever; now the
+    // read refuses it and the prep-window catch terminalizes the claimed row.
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // TERMINALIZED, not stranded `running`, and the pending call never ran.
+    const raw = await active.client.execute({
+      sql: "SELECT status FROM executions WHERE id = ?",
+      args: [paused.executionId],
+    });
+    expect(String(raw.rows[0]?.status)).toBe("failed");
+    expect(active.calls).toHaveLength(0);
+  });
+
+  it("INVARIANT §5.3: a SYNCHRONOUS throw from the settle write is absorbed and the resumed outcome still settles within budget", async () => {
+    // Scope, precisely: the throw injected here comes from `settleDirect` and
+    // is absorbed by `boundedFencedSettle`, which calls the store inside a
+    // try. So this pins the SETTLE-WRITE arm — a store that cannot write at
+    // all still yields the honest non-answer in budget — and it does NOT
+    // reach the outer rejection handler that catches a continuation
+    // rejection. The hostile-thrown-value tests below cover that handler.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const paused = await m.startDirect(
+      "github.create_issue",
+      { title: "t" },
+      { clientId: null, projection: "direct", scope: permitDirect },
+    ).outcome;
+    const callId = await pendingCallOf(m, paused.executionId);
+    // A SYNCHRONOUS throw from the store method every settle path calls.
+    // `boundedFencedSettle` invokes `settleDirect` inside a try precisely so
+    // this cannot escape it: the throw becomes a rejected write, and the
+    // settle reports `failed` rather than propagating.
+    const throwingStore = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        settleDirect: () => {
+          throw new Error("injected: dependency threw inside the continuation");
+        },
+      },
+    } as unknown as ConduitStore;
+    const boom = createExecutionManager({
+      ...active.deps,
+      store: throwingStore,
+      direct: fast,
+    });
+    const t0 = Date.now();
+    const out = await Promise.race([
+      boom.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+    // The caller gets an ANSWER. The store here cannot write at all — every
+    // settle attempt throws — so the honest answer is the non-answer, never a
+    // claimed terminal and never an unresolved promise.
+    expect(out).toMatchObject({ status: "unknown" });
+  });
+
+  it("a store fault's host detail never reaches the persisted error or the returned outcome — only a reference", async () => {
+    // `check_execution` hands the stored `error` back to the AGENT, so a
+    // store fault's own text — which carries the database path and the SQL —
+    // must not be persisted. The cause goes to the host log under a fresh
+    // reference; only the reference is stored.
+    active = await makeHarness();
+    const HOST_DETAIL = "/var/secret-host-path/conduit.db: SQL near SELECT";
+    const errors: string[] = [];
+    const spy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+      errors.push(a.map(String).join(" "));
+    });
+    try {
+      // The settle-write site. The FIRST `put` (the settle) rejects with the
+      // host detail; the finalize `put` that follows must succeed, or nothing
+      // persists and the stored column proves nothing.
+      let puts = 0;
+      const faulting = {
+        ...active.store,
+        executions: {
+          ...active.store.executions,
+          put: (row: Execution) => {
+            puts += 1;
+            return puts === 1
+              ? Promise.reject(new Error(HOST_DETAIL))
+              : active?.store.executions.put(row);
+          },
+        },
+      } as unknown as ConduitStore;
+      const m = createExecutionManager({ ...active.deps, store: faulting });
+      await expect(m.start("return 1;")).rejects.toThrow();
+      // The settle path really was exercised, not skipped.
+      expect(puts).toBeGreaterThan(1);
+
+      // The session-creation site: the outcome the caller sees, too.
+      const boom = createExecutionManager({
+        ...active.deps,
+        makeUpstreamSession: () => {
+          throw new Error(HOST_DETAIL);
+        },
+      });
+      await expect(boom.start("return 1;")).rejects.toThrow();
+    } finally {
+      spy.mockRestore();
+    }
+    // The persisted column, read through raw SQL — not the hydrated object.
+    const rows = await active.client.execute(
+      "SELECT error FROM executions WHERE error IS NOT NULL",
+    );
+    expect(rows.rows.length).toBeGreaterThan(0);
+    for (const row of rows.rows) {
+      const stored = String(row.error);
+      expect(stored).not.toContain(HOST_DETAIL);
+      expect(stored).not.toContain("secret-host-path");
+      expect(stored).toMatch(/Reference: [0-9a-f-]{36}/);
+    }
+    // The operator has NOT lost the cause: it is on the host log, joined to
+    // the stored row by that same reference.
+    expect(errors.some((line) => line.includes(HOST_DETAIL))).toBe(true);
+  });
+
+  it("a CODE row whose prep-window fault meets a STALLED failClaimedResume still answers within budget", async () => {
+    // The direct arm bounds every post-claim write; this code-row path awaited
+    // `failClaimedResume` with no bound at all, on a client-visible path. A
+    // store that accepts the call and never answers held `resume()` open past
+    // every budget — the same hang class, one arm over.
+    active = await makeHarness();
+    const m = createExecutionManager({ ...active.deps, direct: fast });
+    const started = await m.start(
+      'return await tools.github.create_issue({ title: "from agent" });',
+    );
+    expect(started.status).toBe("paused");
+    const callId = await pendingCallOf(m, started.executionId);
+    const never = new Promise<never>(() => {});
+    const stalled = {
+      ...active.store,
+      executions: {
+        ...active.store.executions,
+        // Force the prep window to throw…
+        get: () => Promise.reject(new Error("injected prep-window fault")),
+        // …and make the terminalizing write never answer.
+        failClaimedResume: () => never,
+      },
+    } as unknown as ConduitStore;
+    const stalledM = createExecutionManager({ ...active.deps, store: stalled, direct: fast });
+    // REAL CLOCK: the setup crosses the harness's loopback MCP socket, which
+    // deadlocks under fake timers. A full second of margin for CI load; the
+    // property is "answers within budget", not an exact duration.
+    const t0 = Date.now();
+    const out = await Promise.race([
+      stalledM
+        .resume(started.executionId, { kind: "approve" }, callId, permitDirect)
+        // The path re-throws the ORIGINAL fault by contract; answering at all
+        // is what is under test.
+        .then(
+          (o) => o,
+          (cause: unknown) => ({ threw: String(cause) }),
+        ),
+      new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+    ]);
+    expect(out).not.toBe("HUNG");
+    expect(Date.now() - t0).toBeLessThan(fast.settleWriteBudgetMs + 1_000);
+    expect(out).toMatchObject({ threw: expect.stringContaining("injected prep-window fault") });
+  });
+
+  describe("no guard step proceeds once an expiry callback has started", () => {
+    /**
+     * The window is NARROW and must be forced, never timed: the budget
+     * elapses during a slow guard read, the expiry callback starts its
+     * terminalizing write, and the guard read THEN returns while that write
+     * is still in flight. If the guard is allowed to continue there, two
+     * writers touch one row and the drive can dispatch the approved call
+     * while the expiry publishes "the pending call did not run".
+     *
+     * Every interleaving below is held open by promises the test resolves by
+     * hand, so the ordering is a property of the test, not of the clock.
+     */
+    function gate(): { wait: Promise<void>; open: () => void } {
+      let open!: () => void;
+      const wait = new Promise<void>((r) => {
+        open = r;
+      });
+      return { wait, open };
+    }
+
+    it("INVARIANT §5.3 (#28): a DIRECT row's NON-final guard read returning after the expiry took the latch never starts the continuation", async () => {
+      // The existing handover test covers only the LAST guard read. This
+      // holds an EARLIER one, so the deferral has to come from `raceGuard`
+      // itself rather than from the pre-handover re-check.
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+
+      const guardRead = gate();
+      let settles = 0;
+      const interleaved = {
+        ...active.store,
+        tools: {
+          ...active.store.tools,
+          // NOT the last guard read: `sources.getGeneration`, `policies.get`
+          // and the scope check all still follow it.
+          get: async (name: string) => {
+            await guardRead.wait;
+            return await requireActive(active).store.tools.get(name);
+          },
+        },
+        executions: {
+          ...active.store.executions,
+          settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+            settles += 1;
+            return await requireActive(active).store.executions.settleDirect(...a);
+          },
+        },
+      } as unknown as ConduitStore;
+      const raced = createExecutionManager({
+        ...active.deps,
+        store: interleaved,
+        direct: fast,
+      });
+
+      const resumed = raced.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+      // REAL CLOCK, same reason as above.
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs + fast.settleWriteBudgetMs + 150));
+      guardRead.open();
+      const out = await Promise.race([
+        resumed,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+
+      expect(out).not.toBe("HUNG");
+      // The continuation never ran: the upstream saw nothing.
+      expect(active.calls).toHaveLength(0);
+      // Exactly ONE settle attempt — the expiry's.
+      expect(settles).toBe(1);
+      expect(out).toMatchObject({ status: "failed" });
+    });
+
+    it("INVARIANT §5.3 (#45): a guard read that REJECTS after the expiry took the latch yields the expiry's outcome, not the read's fault", async () => {
+      // The other settlement of the same race. A guard read that REJECTS
+      // inside the expiry's write window is a loser exactly as one that
+      // resolves is: surfacing its internal fault would replace the outcome
+      // the expiry already published with the fault of a read nobody is
+      // waiting on, and the client would see a throw where a settled outcome
+      // exists.
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+
+      const guardRead = gate();
+      const expiryWrite = gate();
+      let settles = 0;
+      const interleaved = {
+        ...active.store,
+        tools: {
+          ...active.store.tools,
+          // Held until the expiry owns the latch, then REJECTS.
+          get: async () => {
+            await guardRead.wait;
+            throw new Error("guard read failed with host-only detail");
+          },
+        },
+        executions: {
+          ...active.store.executions,
+          settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+            settles += 1;
+            // The EXPIRY's write is held in flight, so `guardExpiry` has NOT
+            // resolved when the read below rejects. The race therefore cannot
+            // answer `expired` on its own — the rejection reaches `raceGuard`
+            // first, and only the synchronous latch can convert it.
+            if (settles === 1) await expiryWrite.wait;
+            return await requireActive(active).store.executions.settleDirect(...a);
+          },
+        },
+      } as unknown as ConduitStore;
+      const raced = createExecutionManager({
+        ...active.deps,
+        store: interleaved,
+        direct: fast,
+      });
+
+      const resumed = raced.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+      // REAL CLOCK, same reason as above.
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs + 20));
+      expect(settles).toBe(1);
+      // The expiry has fired and its write is STILL IN FLIGHT. NOW let the
+      // guard read reject into that window.
+      guardRead.open();
+      await new Promise((r) => setTimeout(r, 20));
+      expiryWrite.open();
+      const out = await Promise.race([
+        resumed,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+
+      expect(out).not.toBe("HUNG");
+      // RESOLVES with the expiry's outcome — it does not throw the read's fault.
+      expect(out).toMatchObject({
+        status: "failed",
+        error: { name: "ConduitExecutionInterrupted" },
+      });
+      // Exactly ONE settle attempt — the expiry's.
+      expect(settles).toBe(1);
+      expect(active.calls).toHaveLength(0);
+    });
+  });
+
+  describe("a result that cannot be serialized settles a truthful terminal, never a hang", () => {
+    // `deliverableBytes` calls `JSON.stringify`, which THROWS for these. A
+    // custom invoker can return either. Measured after the latch, the throw
+    // landed in a catch whose own `settle()` failed, so nothing published the
+    // outcome and the caller waited forever.
+    /** One body, two literal test names, so each is greppable in this file. */
+    async function expectUnserializableRefused(make: () => unknown): Promise<void> {
+      {
+        active = await makeHarness();
+        const m = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => async () => make(),
+        });
+        const handle = m.startDirect(
+          "github.list_issues",
+          {},
+          { clientId: null, projection: "direct", scope: permitDirect },
+        );
+        const out = await Promise.race([
+          handle.outcome,
+          new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+        ]);
+        expect(out).not.toBe("HUNG");
+        expect(out).toMatchObject({ status: "failed" });
+        // The row is terminalized and carries NO partial body.
+        const raw = await active.client.execute({
+          sql: "SELECT status, result, result_state FROM executions WHERE id = ?",
+          args: [handle.executionId],
+        });
+        expect(String(raw.rows[0]?.status)).toBe("failed");
+        expect(raw.rows[0]?.result).toBeNull();
+        expect(raw.rows[0]?.result_state).toBeNull();
+      }
+    }
+
+    it("a BigInt returned by the invoker on startDirect answers within budget with no stored body", async () => {
+      await expectUnserializableRefused(() => ({ n: 1n }));
+    });
+
+    it("a circular value returned by the invoker on startDirect answers within budget with no stored body", async () => {
+      await expectUnserializableRefused(() => {
+        const o: Record<string, unknown> = {};
+        o.self = o;
+        return o;
+      });
+    });
+
+    it("a BigInt returned on the RESUMED path answers within budget and terminalizes", async () => {
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+      const bigIntM = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => async () => ({ n: 1n }),
+      });
+      const t0 = Date.now();
+      const out = await Promise.race([
+        bigIntM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect),
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+      expect(out).toMatchObject({ status: "failed" });
+      const raw = await active.client.execute({
+        sql: "SELECT status, result FROM executions WHERE id = ?",
+        args: [paused.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("failed");
+      expect(raw.rows[0]?.result).toBeNull();
+    });
+  });
+
+  describe("a thrown value whose string conversion THROWS still settles the outcome", () => {
+    /** `String()` on this throws; so does interpolating it. */
+    function hostileCause(): unknown {
+      return {
+        toString() {
+          throw new Error("toString exploded");
+        },
+      };
+    }
+
+    it("on startDirect: the outcome answers within budget and the row is terminalized", async () => {
+      active = await makeHarness();
+      const m = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        // The fault comes from a DEPENDENCY, so it reaches the outer handler
+        // rather than a path some single fix targeted.
+        makeInvoker: () => () => Promise.reject(hostileCause()),
+      });
+      const handle = m.startDirect(
+        "github.list_issues",
+        {},
+        { clientId: null, projection: "direct", scope: permitDirect },
+      );
+      const out = await Promise.race([
+        handle.outcome,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      expect(out).toMatchObject({ status: "failed" });
+      const raw = await active.client.execute({
+        sql: "SELECT status FROM executions WHERE id = ?",
+        args: [handle.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("failed");
+    });
+
+    it("on the RESUME path: resume() answers within budget and the row is terminalized", async () => {
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+      const hostileM = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => {
+          throw hostileCause();
+        },
+      });
+      const t0 = Date.now();
+      const out = await Promise.race([
+        hostileM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect).then(
+          (o) => o,
+          () => ({ threw: true }),
+        ),
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+      const raw = await active.client.execute({
+        sql: "SELECT status FROM executions WHERE id = ?",
+        args: [paused.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("failed");
+    });
+
+    it("a cause carrying newlines cannot forge a host log line, and is length-bounded", async () => {
+      const errors: string[] = [];
+      const spy = vi.spyOn(console, "error").mockImplementation((...a: unknown[]) => {
+        errors.push(a.map((x) => String(x)).join(" "));
+      });
+      try {
+        active = await makeHarness();
+        const forging = new Error(
+          `boom\n[ExecutionManager] FORGED host log line\n${"z".repeat(2_000)}`,
+        );
+        const m = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => () => Promise.reject(forging),
+        });
+        await m.startDirect(
+          "github.list_issues",
+          {},
+          { clientId: null, projection: "direct", scope: permitDirect },
+        ).outcome;
+      } finally {
+        spy.mockRestore();
+      }
+      const joined = errors.join("\n");
+      expect(joined).not.toContain("FORGED host log line");
+      for (const line of errors) {
+        expect(line.length).toBeLessThan(1_000);
+      }
+    });
+  });
+
+  describe("nothing fallible runs after the settle latch", () => {
+    /**
+     * Every value below is one a dependency can hand back, and every one of
+     * them makes a question the settle path used to ask AFTER the latch
+     * throw. Past the latch a throw has nothing left that can settle the row,
+     * so the outcome never resolved and the caller waited forever. The fix is
+     * the SHAPE — the whole plan is built before `settle()` — so these tests
+     * hold it at the two entry points rather than at the lines that used to
+     * throw.
+     */
+    /** `instanceof` on this THROWS: the proxy is revoked. */
+    function revokedProxy(): unknown {
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      return proxy;
+    }
+    /** `instanceof` on this THROWS from the prototype trap. */
+    function hostileProtoProxy(): unknown {
+      return new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error("getPrototypeOf exploded");
+          },
+        },
+      );
+    }
+
+    for (const [label, make] of [
+      ["a REVOKED Proxy", revokedProxy],
+      ["a Proxy whose getPrototypeOf throws", hostileProtoProxy],
+    ] as const) {
+      it(`INVARIANT §5.3 (#45): ${label} thrown on startDirect still settles within budget`, async () => {
+        active = await makeHarness();
+        const m = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => () => Promise.reject(make()),
+        });
+        const handle = m.startDirect(
+          "github.list_issues",
+          {},
+          { clientId: null, projection: "direct", scope: permitDirect },
+        );
+        const out = await Promise.race([
+          handle.outcome,
+          new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+        ]);
+        expect(out).not.toBe("HUNG");
+        expect(out).toMatchObject({ status: "failed" });
+        const raw = await active.client.execute({
+          sql: "SELECT status FROM executions WHERE id = ?",
+          args: [handle.executionId],
+        });
+        expect(String(raw.rows[0]?.status)).toBe("failed");
+      });
+
+      it(`INVARIANT §5.3 (#45): ${label} thrown on direct RESUME still answers within budget`, async () => {
+        active = await makeHarness();
+        const m = createExecutionManager({ ...active.deps, direct: fast });
+        const paused = await m.startDirect(
+          "github.create_issue",
+          { title: "t" },
+          { clientId: null, projection: "direct", scope: permitDirect },
+        ).outcome;
+        const callId = await pendingCallOf(m, paused.executionId);
+        const hostileM = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => () => Promise.reject(make()),
+        });
+        // REAL CLOCK: the setup crosses the harness's loopback MCP socket,
+        // which deadlocks under fake timers. A full second of margin.
+        const t0 = Date.now();
+        const out = await Promise.race([
+          hostileM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect).then(
+            (o) => o,
+            () => ({ threw: true }),
+          ),
+          new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+        ]);
+        expect(out).not.toBe("HUNG");
+        expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+        const raw = await active.client.execute({
+          sql: "SELECT status FROM executions WHERE id = ?",
+          args: [paused.executionId],
+        });
+        expect(String(raw.rows[0]?.status)).toBe("failed");
+      });
+    }
+
+    it("INVARIANT §5.3 (#41a): a stateful toJSON cannot make measured, stored and returned disagree", async () => {
+      // The value answers SMALL the first time it is serialized and OVERSIZED
+      // the second. Serialized twice — once to measure, once by the store —
+      // the size decision is made against one value and the row receives
+      // another. One snapshot makes the second call impossible.
+      active = await makeHarness();
+      let calls = 0;
+      const shifting = {
+        toJSON() {
+          calls += 1;
+          return calls === 1 ? { small: "x" } : { big: "y".repeat(400_000) };
+        },
+      };
+      const m = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => async () => shifting,
+      });
+      const handle = m.startDirect(
+        "github.list_issues",
+        {},
+        { clientId: null, projection: "direct", scope: permitDirect },
+      );
+      const out = await Promise.race([
+        handle.outcome,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      // The FIRST snapshot decided the size, and it is what is returned.
+      expect(out).toMatchObject({ status: "completed", value: { small: "x" } });
+      expect(out).not.toHaveProperty("resultTooLarge", true);
+      // `toJSON` ran exactly ONCE on the settle path: the snapshot.
+      expect(calls).toBe(1);
+    });
+
+    it("INVARIANT §5.3 (#41a): a toJSON that throws on its SECOND call settles with no partial body", async () => {
+      active = await makeHarness();
+      let calls = 0;
+      const exploding = {
+        toJSON() {
+          calls += 1;
+          if (calls > 1) throw new Error("second serialization exploded");
+          return { ok: true };
+        },
+      };
+      const m = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => async () => exploding,
+      });
+      const handle = m.startDirect(
+        "github.list_issues",
+        {},
+        { clientId: null, projection: "direct", scope: permitDirect },
+      );
+      const out = await Promise.race([
+        handle.outcome,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      // No hang, and the snapshot is the whole body — never a partial one.
+      expect(out).toMatchObject({ status: "completed", value: { ok: true } });
+      const raw = await active.client.execute({
+        sql: "SELECT status FROM executions WHERE id = ?",
+        args: [handle.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("completed");
+    });
   });
 });

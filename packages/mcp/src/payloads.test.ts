@@ -1,4 +1,4 @@
-import { buildExecuteTool, type Execution, type ExecutionOutcome } from "@conduithq/sdk";
+import { buildExecuteTool, type DirectOutcome, type Execution } from "@conduithq/sdk";
 import { describe, expect, it } from "vitest";
 import {
   CHECK_BODY_STATUSES,
@@ -16,6 +16,7 @@ import {
   outcomeToPayload,
   pausedToListRow,
   resumeToPayload,
+  UNKNOWN_REASONS,
 } from "./payloads.js";
 
 const seeds = { now: 1, random: 0.5 };
@@ -56,6 +57,8 @@ describe("outcomeToPayload (execute)", () => {
       pending: {
         callId: "c",
         toolName: "github.delete_repo",
+        namespace: "github",
+        sourceGeneration: 0,
         input: {},
         reason: "destructive",
         expiresAt: 99,
@@ -124,6 +127,8 @@ describe("resumeToPayload (approvals.resume)", () => {
       pending: {
         callId: "c1",
         toolName: "github.push",
+        namespace: "github",
+        sourceGeneration: 0,
         input: { token: "should-never-cross-the-socket" },
         reason: "review",
         expiresAt: 9,
@@ -144,7 +149,15 @@ describe("resumeToPayload (approvals.resume)", () => {
       resumeToPayload({
         status: "expired",
         executionId: "e4",
-        pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 1 },
+        pending: {
+          callId: "c",
+          toolName: "t",
+          namespace: "n",
+          sourceGeneration: 0,
+          input: {},
+          reason: "r",
+          expiresAt: 1,
+        },
         decisionApplied: false,
       }).status,
     ).toBe("expired");
@@ -160,7 +173,15 @@ describe("resumeToPayload (approvals.resume)", () => {
 });
 
 describe("executionToCheckPayload (check_execution)", () => {
-  const base = { id: "e", code: "1", seeds, startedAt: 1 } as const;
+  const base = {
+    kind: "code",
+    clientId: null,
+    projection: "code",
+    id: "e",
+    code: "1",
+    seeds,
+    startedAt: 1,
+  } as const;
   it("not_found for unknown executions", () => {
     expect(executionToCheckPayload(undefined, 10)).toEqual({ status: "not_found" });
   });
@@ -186,7 +207,18 @@ describe("executionToCheckPayload (check_execution)", () => {
       {
         ...base,
         status: "paused",
-        pausedOn: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 50 },
+        // The R1 pause shape, provenance fields included: every other
+        // fixture here is the LEGACY shape, so without this one the
+        // projection was never exercised against a real stored pause.
+        pausedOn: {
+          callId: "c",
+          toolName: "t",
+          namespace: "t",
+          sourceGeneration: 3,
+          input: {},
+          reason: "r",
+          expiresAt: 50,
+        },
       },
       10,
     );
@@ -220,7 +252,15 @@ describe("executionToCheckPayload (check_execution)", () => {
 });
 
 describe("pausedToListRow (the approvals.list projection)", () => {
-  const base = { id: "e", code: "1", seeds, startedAt: 1_000 } as const;
+  const base = {
+    kind: "code",
+    clientId: null,
+    projection: "code",
+    id: "e",
+    code: "1",
+    seeds,
+    startedAt: 1_000,
+  } as const;
 
   it("INVARIANT §17: the paused call's ARGUMENTS never cross the socket on approvals.list", () => {
     // The stored `pausedOn` is a raw `PendingApproval` whose `input` is the
@@ -234,6 +274,8 @@ describe("pausedToListRow (the approvals.list projection)", () => {
       pausedOn: {
         callId: "c1",
         toolName: "github.delete_repo",
+        namespace: "github",
+        sourceGeneration: 0,
         input: { token: "should-never-cross-the-socket" },
         reason: "requires approval",
         expiresAt: 9,
@@ -290,6 +332,8 @@ describe("pausedToListRow (the approvals.list projection)", () => {
       pausedOn: {
         callId: "call_A",
         toolName: "t",
+        namespace: "github",
+        sourceGeneration: 0,
         input: {},
         reason: "r",
         expiresAt: "bogus",
@@ -313,14 +357,23 @@ describe("pausedToListRow (the approvals.list projection)", () => {
  * The point of these tests is not that a given arm renders some fields —
  * that is covered above — but that EVERY status arm a sender can produce
  * passes the SAME shape predicate the client (`client.ts`) refuses on. If a
- * projection ever emitted an arm the guard would reject, this fails; that is
- * what makes "single source of truth" a checked property rather than a
- * claim. The status-set exhaustiveness (each legal member is exercised) is
- * asserted alongside, so an added union member with no covering arm is
- * caught here too.
+ * projection ever emitted an arm the guard would reject, this fails.
+ *
+ * What is pinned here is STATUS-SET COVERAGE: every legal status member is
+ * exercised by some arm, and every arm passes the predicate. It is not a
+ * claim that each arm's payload fields are themselves validated — the
+ * predicate checks a structural floor, by design (see its docblock).
  */
 describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the client guard uses", () => {
-  const base = { id: "e", code: "1", seeds, startedAt: 1 } as const;
+  const base = {
+    kind: "code",
+    clientId: null,
+    projection: "code",
+    id: "e",
+    code: "1",
+    seeds,
+    startedAt: 1,
+  } as const;
 
   // One representative outcome per execute status. Every member of
   // EXECUTE_STATUSES must appear as a key, or the set-coverage check fails.
@@ -330,15 +383,33 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     paused: {
       status: "paused",
       executionId: "e",
-      pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
+      pending: {
+        callId: "c",
+        toolName: "t",
+        namespace: "n",
+        sourceGeneration: 0,
+        input: {},
+        reason: "r",
+        expiresAt: 9,
+      },
     },
     expired: {
       status: "expired",
       executionId: "e",
-      pending: { callId: "c", toolName: "t", input: {}, reason: "r", expiresAt: 9 },
+      pending: {
+        callId: "c",
+        toolName: "t",
+        namespace: "n",
+        sourceGeneration: 0,
+        input: {},
+        reason: "r",
+        expiresAt: 9,
+      },
     },
     conflict: { status: "conflict", executionId: "e" },
-  } satisfies Record<ExecuteStatus, ExecutionOutcome>;
+    // D-A11: the direct arm's truthful non-answer, on the wire.
+    unknown: { status: "unknown", executionId: "e", reason: "persist-timeout" },
+  } satisfies Record<ExecuteStatus, DirectOutcome>;
 
   it("every EXECUTE_STATUSES arm of outcomeToPayload passes isExecutePayloadShape", () => {
     // Set coverage: the fixtures name exactly the legal members.
@@ -346,6 +417,19 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     for (const status of EXECUTE_STATUSES) {
       const payload = outcomeToPayload(executeOutcomes[status]);
       expect(payload.status).toBe(status);
+      expect(isExecutePayloadShape(payload)).toBe(true);
+    }
+  });
+
+  it("INVARIANT §5.3 (D-A11): the `unknown` arm round-trips its reason and never claims a terminal", () => {
+    for (const reason of ["persist-timeout", "persist-failed"] as const) {
+      const payload = outcomeToPayload({ status: "unknown", executionId: "e", reason });
+      expect(payload.status).toBe("unknown");
+      expect(payload.reason).toBe(reason);
+      // No terminal payload fields: nothing here may read as a landed result.
+      expect(payload.result).toBeUndefined();
+      expect(payload.error).toBeUndefined();
+      expect(payload.message).toContain("do not retry");
       expect(isExecutePayloadShape(payload)).toBe(true);
     }
   });
@@ -397,6 +481,38 @@ describe("INVARIANT §17 (F6): sender projections pass the SAME predicate the cl
     expect(isCheckPayloadShape({ status: "conflict", executionId: "e" })).toBe(false);
     // And a legal status missing the mandatory executionId is rejected.
     expect(isExecutePayloadShape({ status: "completed" })).toBe(false);
+  });
+
+  it("`reason` and the `unknown` status imply each other — the SDK's invariant, checked both ways", () => {
+    // `reason` is the `unknown` arm's WHY, and `unknown` says nothing useful
+    // without it. Accepting either half alone would pass a payload that
+    // promises less than the type does.
+    expect(isExecutePayloadShape({ status: "unknown", executionId: "e" })).toBe(false);
+    expect(
+      isExecutePayloadShape({ status: "completed", executionId: "e", reason: "persist-failed" }),
+    ).toBe(false);
+    // Both halves together are accepted, as is neither.
+    expect(
+      isExecutePayloadShape({ status: "unknown", executionId: "e", reason: "persist-timeout" }),
+    ).toBe(true);
+    expect(isExecutePayloadShape({ status: "completed", executionId: "e" })).toBe(true);
+  });
+
+  it("`reason` on the `unknown` arm must be one of the two legal VALUES, not merely present", () => {
+    // Presence alone let `{ status: "unknown", reason: "other" }` — and a
+    // numeric or null reason — narrow to `ExecutePayload`, so a consumer
+    // reading `reason` as one of two known strings could be handed anything.
+    for (const bogus of ["other", "", 42, null, true, {}]) {
+      expect(isExecutePayloadShape({ status: "unknown", executionId: "e", reason: bogus })).toBe(
+        false,
+      );
+    }
+    // Both legal values are accepted, and they come from the one constant.
+    for (const legal of UNKNOWN_REASONS) {
+      expect(isExecutePayloadShape({ status: "unknown", executionId: "e", reason: legal })).toBe(
+        true,
+      );
+    }
   });
 });
 

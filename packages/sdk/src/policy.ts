@@ -177,14 +177,38 @@ function overrideVerdict(
 }
 
 /**
+ * U+0085 (NEL), U+2028 (LINE SEPARATOR) and U+2029 (PARAGRAPH SEPARATOR)
+ * render as a line break in a host log line and in the console, so a name
+ * carrying one forges a second apparent record exactly as a raw newline
+ * would. NEL is stripped with the whole C1 range that holds it.
+ */
+const LINE_BREAKING = /[\u0080-\u009f\u2028\u2029]/u;
+
+/**
  * Unknown-tool names originate from the sandboxed agent's call — untrusted
  * (§9.2 posture). Reasons are product surface shown in the console and the
  * agent-facing pause message, so strip control characters and cap length
  * before interpolating.
+ *
+ * "Control character" is not the ASCII range alone: the line separators
+ * above go too. Ordinary non-ASCII text stays intact — this is not a strip
+ * of everything outside ASCII.
  */
-function printableName(raw: string): string {
-  const cleaned = [...raw].filter((ch) => ch >= " " && ch !== "\u007f").join("");
-  return cleaned.length > 120 ? `${cleaned.slice(0, 120)}…` : cleaned;
+export function printableName(raw: string, maxLength = 120): string {
+  const cleaned = [...raw]
+    .filter((ch) => ch >= " " && ch !== "\u007f" && !LINE_BREAKING.test(ch))
+    .join("");
+  return cleaned.length > maxLength ? `${cleaned.slice(0, maxLength)}…` : cleaned;
+}
+
+/**
+ * The ONE source of the unknown-tool refusal text. The invoker refuses an
+ * out-of-scope call with the same message the engine emits for a catalog
+ * miss: the two must stay byte-identical, or the difference becomes an
+ * existence oracle the moment the two wordings drift apart.
+ */
+export function unknownToolReason(toolName: string): string {
+  return `Unknown tool "${printableName(toolName)}": not in the catalog, so it is blocked. Check the tool name or re-sync the source.`;
 }
 
 export function createStorePolicyEngine(policies: PolicyRepository): PolicyEngine {
@@ -198,7 +222,7 @@ export function createStorePolicyEngine(policies: PolicyRepository): PolicyEngin
         const stale = await policies.get(target.toolName);
         return {
           action: "block",
-          reason: `Unknown tool "${printableName(target.toolName)}": not in the catalog, so it is blocked. Check the tool name or re-sync the source.`,
+          reason: unknownToolReason(target.toolName),
           source: "unknown_tool",
           redactFields: stale?.redactFields ?? [],
         };

@@ -12,6 +12,20 @@ export type JsonSchema = Record<string, unknown>;
 
 export type SourceType = "openapi" | "graphql" | "mcp" | "custom_js";
 
+export type Projection = "code" | "direct" | "discovery";
+export const PROJECTIONS: readonly Projection[] = ["code", "direct", "discovery"];
+export type ExecutionKind = "code" | "direct";
+export type ResultState = "delivered" | "retained" | "discarded";
+
+/**
+ * §4.1: every row written by this build stores this program in `code`
+ * (the real program moves to `program`). An OLDER build ignores the new
+ * columns, reads `code`, and fails the row closed instead of resuming a
+ * direct row as an empty program or a narrowed code row under the
+ * unscoped invoker. Verbatim; the string is part of the downgrade contract.
+ */
+export const NEWER_BUILD_SENTINEL = 'throw new Error("conduit: row written by a newer build")';
+
 /** Raw input to ingestion: where a catalog of tools comes from. */
 export interface Source {
   id: string;
@@ -22,6 +36,14 @@ export interface Source {
   location: string;
   /** Required when an OpenAPI document has relative `servers` entries (spec §7). */
   baseUrl?: string;
+  /**
+   * §4.1a provenance, allocated by SQLite triggers. Present on every
+   * hydrated row; `sources.upsert` and `provisionSource` IGNORE it on write
+   * (the database owns it). Required, per the spec: callers that
+   * construct a Source for a write pass `generation: 0` — the value is
+   * never written.
+   */
+  generation: number;
 }
 
 /** What a Source defines. Describes the tool catalog; not live or authenticated on its own. */
@@ -102,31 +124,95 @@ export interface ExecutionError {
  * replay (spec §5.5): the journal of tool-call results is the resume state —
  * on resume the code re-runs from the top against memoized results.
  */
-export interface Execution {
+export interface ExecutionBase {
   /** `exec_...` */
   id: string;
-  code: string;
   status: ExecutionStatus;
-  /** Recorded non-determinism, replayed verbatim on resume (spec §5.5). */
-  seeds: { now: number; random: number };
-  pausedOn?: PendingApproval;
+  /**
+   * The UNION, never bare `PendingApproval`: the hydrator casts parsed JSON
+   * without validating; readers narrow through `isPendingApproval`, then
+   * `hasProvenance` for the legacy arm (§4.1, rev 13).
+   */
+  pausedOn?: StoredPendingApproval;
   startedAt: number;
   endedAt?: number;
-  /** Caller-generated correlation key (mcp design M1); unique, persisted before the sandbox runs. */
+  /** Caller-generated correlation key (mcp design M1). Default profile: the
+   * legacy column. Named client: the `request_keys` row (§4.1). */
   requestKey?: string;
+  /** null = default profile (§4.1). Written for BOTH kinds at start. */
+  clientId: string | null;
+  /** Which profile FLAG this execution runs under; re-checked on every call. */
+  projection: Projection;
   /** Persisted settle-state (mcp design M4): completed → result. undefined normalized to null at the surface. */
   result?: unknown;
   /** Persisted settle-state (mcp design M4): failed → error, ALWAYS present on a stored failed row. */
   error?: ExecutionError;
 }
 
-/** A call waiting on a human (spec §10.2). Expires per CONDUIT_APPROVAL_TTL (spec §5.5). */
+/** A direct row's stored canonical call. Provenance does NOT live here. */
+export interface DirectCall {
+  toolName: string;
+  namespace: string;
+  /** `JSON.stringify(input)` as the invoker computes it — the decisions-seam identity. */
+  request: string;
+}
+
+// The valid (kind, projection) pairs are exactly three (design §4.1): ("code","code"),
+// ("direct","direct"), ("direct","discovery"). The pair is enforced in the TYPE
+// (below), in fresh DDL (a CHECK), and read-side in hydration: independent
+// guards would let {kind:"direct", projection:"code"} be authorized under the
+// Code flag and dispatched through the direct arm.
+export type Execution =
+  | (Omit<ExecutionBase, "projection"> & {
+      kind: "code";
+      projection: "code";
+      code: string;
+      /** Recorded non-determinism, replayed verbatim on resume (spec §5.5). */
+      seeds: { now: number; random: number };
+    })
+  | (Omit<ExecutionBase, "projection"> & {
+      kind: "direct";
+      projection: "direct" | "discovery";
+      call: DirectCall;
+      /** Set iff status is `completed` (§4.1 status table, rev 16). */
+      resultState?: ResultState;
+    });
+
+export function isValidProjectionForKind(kind: ExecutionKind, projection: Projection): boolean {
+  return kind === "code" ? projection === "code" : projection !== "code";
+}
+
+/**
+ * A call waiting on a human (spec §10.2), as written by R1: provenance
+ * included (§4.1). Expires per CONDUIT_APPROVAL_TTL (spec §5.5).
+ */
 export interface PendingApproval {
   callId: string;
   toolName: string;
+  namespace: string;
+  sourceGeneration: number;
   input: unknown;
   reason: string;
   expiresAt: number;
+}
+
+/** A pause written before R1: NO provenance. Resume fails it closed (§5.4 step 3). */
+export type LegacyPendingApproval = Omit<PendingApproval, "namespace" | "sourceGeneration">;
+
+export type StoredPendingApproval = PendingApproval | LegacyPendingApproval;
+
+/**
+ * SOUND STANDALONE. This is exported, and its result feeds an authorization
+ * comparison (§5.4 step 3 matches `sourceGeneration` against the namespace's
+ * current generation), so it must not assume a caller validated the shape
+ * first: a presence check alone would accept `sourceGeneration: "7"`, which
+ * compares unequal to every number and fails closed only by accident. Check
+ * the TYPES of both provenance fields.
+ */
+export function hasProvenance(pause: StoredPendingApproval): pause is PendingApproval {
+  if (!("sourceGeneration" in pause) || !("namespace" in pause)) return false;
+  const { sourceGeneration, namespace } = pause;
+  return typeof sourceGeneration === "number" && typeof namespace === "string";
 }
 
 /**
@@ -147,17 +233,27 @@ export const NOT_NAMEABLE_CALL_ID = /^[ \t\n\v\f\r]*$/;
  * row can be listed as decidable and then refused, or the reverse. A
  * corrupt pause is terminalized on resume and listed as a recovery row.
  */
-export function isPendingApproval(value: unknown): value is PendingApproval {
+export function isPendingApproval(value: unknown): value is StoredPendingApproval {
   if (typeof value !== "object" || value === null) return false;
   const v = value as Record<string, unknown>;
-  return (
+  const baseOk =
     typeof v.callId === "string" &&
     !NOT_NAMEABLE_CALL_ID.test(v.callId) &&
     typeof v.toolName === "string" &&
     "input" in v &&
     typeof v.reason === "string" &&
     typeof v.expiresAt === "number" &&
-    Number.isFinite(v.expiresAt)
+    Number.isFinite(v.expiresAt);
+  if (!baseOk) return false;
+  const hasNamespace = "namespace" in v;
+  const hasGeneration = "sourceGeneration" in v;
+  if (!hasNamespace && !hasGeneration) return true; // legacy arm
+  return (
+    hasNamespace &&
+    hasGeneration &&
+    typeof v.namespace === "string" &&
+    typeof v.sourceGeneration === "number" &&
+    Number.isFinite(v.sourceGeneration)
   );
 }
 
@@ -169,6 +265,9 @@ export interface TraceEvent {
   /** `namespace.tool` */
   toolName: string;
   connectionPrefix: string;
+  /** §4.3 (D4): attribution lands at append time; audit rows are write-once. */
+  projection: Projection;
+  clientId: string | null;
   /** Redacted at append time (§11): builtin sensitive keys + the tool
    * policy's redactFields are masked before the row is written. */
   input: unknown;

@@ -1,7 +1,12 @@
 import { createServer, type IncomingMessage, type Server } from "node:http";
 import { createServer as createNetServer, type Server as NetServer, type Socket } from "node:net";
 import { afterEach, describe, expect, it } from "vitest";
-import { createMcpClient, type McpSession, SUPPORTED_PROTOCOL_VERSIONS } from "./mcp-client.js";
+import {
+  createMcpClient,
+  McpClientError,
+  type McpSession,
+  SUPPORTED_PROTOCOL_VERSIONS,
+} from "./mcp-client.js";
 
 let server: Server | undefined;
 afterEach(() => new Promise<void>((r) => (server ? server.close(() => r()) : r())));
@@ -907,7 +912,7 @@ describe("INVARIANT §18-C4: callTool", () => {
 });
 
 describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
-  it("INVARIANT §18-C4: 404 retry fires ONLY when the request carried a session id, at most once", async () => {
+  it("INVARIANT §18-C4: the 404 retry fires ONLY for side-effect-free operations (tools/list), only when the request carried a session id, at most once", async () => {
     let initializeCount = 0;
     let callCount = 0;
     const callSessionHeaders: (string | string[] | undefined)[] = [];
@@ -929,7 +934,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
           res.end();
           return;
         }
-        if (parsed.method === "tools/call") {
+        if (parsed.method === "tools/list") {
           callCount++;
           callSessionHeaders.push(req.headers["mcp-session-id"]);
           if (callCount === 1) {
@@ -938,7 +943,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
             return;
           }
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+          res.end(jsonRpcResponse(parsed.id as string, { result: { tools: [] } }));
           return;
         }
         res.writeHead(404);
@@ -947,10 +952,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     });
     const client = createMcpClient({ target: url, headers: {} }, budget());
     const session = await client.initialize();
-    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
-      result: { content: [] },
-      status: 200,
-    });
+    await expect(client.listTools(session, 1024)).resolves.toEqual([]);
     expect(initializeCount).toBe(2);
     // The retried request must carry the FRESH session's id on the wire —
     // pinning that the retry uses the re-initialized local session, not the
@@ -978,7 +980,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
           res.end();
           return;
         }
-        if (parsed.method === "tools/call") {
+        if (parsed.method === "tools/list") {
           res.writeHead(404);
           res.end();
           return;
@@ -989,7 +991,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     });
     const client = createMcpClient({ target: url, headers: {} }, budget());
     const session = await client.initialize();
-    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+    await expect(client.listTools(session, 1024)).rejects.toMatchObject({
       kind: "http_status",
       status: 404,
     });
@@ -1014,7 +1016,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
           res.end();
           return;
         }
-        if (parsed.method === "tools/call") {
+        if (parsed.method === "tools/list") {
           res.writeHead(404);
           res.end();
           return;
@@ -1026,11 +1028,183 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     const client = createMcpClient({ target: url, headers: {} }, budget());
     const session = await client.initialize();
     expect(session.sessionId).toBeUndefined();
-    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+    await expect(client.listTools(session, 1024)).rejects.toMatchObject({
       kind: "http_status",
       status: 404,
     });
     expect(initializeCount).toBe(1);
+  });
+
+  it("INVARIANT §7 (#21): a governed tools/call is dispatched at most once — a 404 after dispatch is NOT retried and the session is NOT re-initialized", async () => {
+    let initializeCount = 0;
+    const sideEffects: string[] = [];
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initializeCount++;
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": `sess-${initializeCount}`,
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        if (parsed.method === "tools/call") {
+          // The upstream DID the work, then answered 404.
+          sideEffects.push("performed");
+          res.writeHead(404);
+          res.end();
+          return;
+        }
+        res.writeHead(404);
+        res.end();
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    await expect(client.callTool(session, "demo", {})).rejects.toMatchObject({
+      kind: "http_status",
+      status: 404,
+    });
+    expect(sideEffects).toEqual(["performed"]);
+    expect(initializeCount).toBe(1);
+  });
+
+  it("INVARIANT §5.5 (#24): beforeSend fires exactly once per tools/call and never for handshake posts", async () => {
+    const order: string[] = [];
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        order.push(`server:${String(parsed.method)}`);
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    expect(order.filter((o) => o.startsWith("client:"))).toEqual([]);
+    await client.callTool(
+      session,
+      "demo",
+      {},
+      { beforeSend: () => order.push("client:beforeSend") },
+    );
+    const sendIndex = order.indexOf("client:beforeSend");
+    const callIndex = order.indexOf("server:tools/call");
+    expect(sendIndex).toBeGreaterThan(-1);
+    expect(sendIndex).toBeLessThan(callIndex);
+    expect(order.filter((o) => o === "client:beforeSend")).toHaveLength(1);
+  });
+
+  it("INVARIANT §5.3: a THROWING beforeSend aborts the post — callTool rejects with the hook's error and the server records no tools/call", async () => {
+    const methods: string[] = [];
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        methods.push(String(parsed.method));
+        if (parsed.method === "initialize") {
+          res.writeHead(200, { "content-type": "application/json", "mcp-session-id": "s" });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          res.writeHead(202);
+          res.end();
+          return;
+        }
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+      });
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    const gate = new McpClientError("timeout", "drive budget elapsed before the write");
+    await expect(
+      client.callTool(
+        session,
+        "demo",
+        {},
+        {
+          beforeSend: () => {
+            throw gate;
+          },
+        },
+      ),
+    ).rejects.toBe(gate);
+    expect(methods).not.toContain("tools/call");
+  });
+
+  it("INVARIANT §5.5 (#24): connection loss at the write — zero bytes delivered — still fires beforeSend first, so the failure classifies post-dispatch", async () => {
+    let initialized = false;
+    // Once the handshake is done, destroy every NEW connection before any byte
+    // of it is read, so the tools/call write fails with zero bytes delivered.
+    let handshakeDone = false;
+    const url = await serve((req, res) => {
+      readBody(req).then(({ parsed }) => {
+        if (parsed.method === "initialize") {
+          initialized = true;
+          // `connection: close` on both handshake replies so the tools/call
+          // POST must open a NEW socket, which the handler below destroys.
+          res.writeHead(200, {
+            "content-type": "application/json",
+            "mcp-session-id": "s",
+            connection: "close",
+          });
+          res.end(
+            jsonRpcResponse(parsed.id as string, { result: initializeResult("2025-06-18").result }),
+          );
+          return;
+        }
+        if (parsed.method === "notifications/initialized") {
+          handshakeDone = true;
+          res.writeHead(202, { connection: "close" });
+          res.end();
+          return;
+        }
+        // unreachable for tools/call: the socket is destroyed on connect.
+        res.writeHead(500);
+        res.end();
+      });
+    });
+    server?.on("connection", (socket) => {
+      if (handshakeDone) socket.destroy();
+    });
+    const client = createMcpClient({ target: url, headers: {} }, budget());
+    const session = await client.initialize();
+    expect(initialized).toBe(true);
+    let fired = false;
+    await expect(
+      client.callTool(
+        session,
+        "demo",
+        {},
+        {
+          beforeSend: () => {
+            fired = true;
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ kind: "network" });
+    expect(fired).toBe(true);
   });
 
   it("INVARIANT §18-C4: a 404 mid-pagination restarts from page one, discarding the stale cursor, keeping the cumulative budget", async () => {
@@ -1187,7 +1361,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
           res.end();
           return;
         }
-        if (parsed.method === "tools/call") {
+        if (parsed.method === "tools/list") {
           callCount++;
           if (callCount === 1) {
             // A session-expiry 404 DRESSED IN an SSE content-type: must still
@@ -1198,7 +1372,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
             return;
           }
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+          res.end(jsonRpcResponse(parsed.id as string, { result: { tools: [] } }));
           return;
         }
         res.writeHead(404);
@@ -1207,10 +1381,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     });
     const client = createMcpClient({ target: url, headers: {} }, budget());
     const session = await client.initialize();
-    await expect(client.callTool(session, "demo", {})).resolves.toEqual({
-      result: { content: [] },
-      status: 200,
-    });
+    await expect(client.listTools(session, 1024)).resolves.toEqual([]);
     expect(initializeCount).toBe(2);
   });
 
@@ -1305,7 +1476,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
           res.end();
           return;
         }
-        if (parsed.method === "tools/call") {
+        if (parsed.method === "tools/list") {
           callCount++;
           if (callCount === 1) {
             res.writeHead(404);
@@ -1313,7 +1484,7 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
             return;
           }
           res.writeHead(200, { "content-type": "application/json" });
-          res.end(jsonRpcResponse(parsed.id as string, { result: { content: [] } }));
+          res.end(jsonRpcResponse(parsed.id as string, { result: { tools: [] } }));
           return;
         }
         res.writeHead(404);
@@ -1325,9 +1496,9 @@ describe("INVARIANT §18-C4: scoped 404-session-expiry retry", () => {
     const originalSessionId = session.sessionId;
     // Simulate a concurrent renewal: someone else already moved the shared
     // session object to a new id before this operation's retry would publish.
-    const inFlight = client.callTool(session, "demo", {});
+    const inFlight = client.listTools(session, 1024);
     session.sessionId = "sess-renewed-by-someone-else";
-    await expect(inFlight).resolves.toEqual({ result: { content: [] }, status: 200 });
+    await expect(inFlight).resolves.toEqual([]);
     // The retry's local re-initialize must NOT have clobbered the caller's
     // session, because by the time it would publish, session.sessionId no
     // longer equals the id that 404'd.

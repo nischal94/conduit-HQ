@@ -1,18 +1,20 @@
 #!/usr/bin/env node
 
-// Interim demo approver (task 9). Opens the store from the same env contract
-// as the bin, composes a manager EXACTLY as packages/mcp/src/server.ts does
+// Interim demo approver. Opens the store from the same env contract as the
+// bin, composes a manager EXACTLY as packages/mcp/src/server.ts does
 // (per-call: fresh catalog snapshot, fresh invoker factory wired to the
 // decisions seam), and resumes one paused execution with an approve
-// decision. Task 10's ring-2 suite execs this file as its cross-process
-// approver — the argv/exit/stdio contract below is load-bearing, not
-// incidental.
+// decision. The ring-2 suite execs this file as its cross-process approver —
+// the argv/exit/stdio contract below is load-bearing, not incidental.
 //
 // Usage: node scripts/approve-demo.mjs <executionId> <callId>
 // stdout: NOTHING, ever.
 // stderr: the outcome status line (or the failure reason).
-// exit 0: resume settled (completed / paused / expired).
-// exit 1: resume could not settle as approved (conflict / failed) or threw.
+// exit 0: the approve decision was APPLIED — the pending call ran.
+// exit 1: anything else. `conflict`, `failed`, `unknown`, and a resume that
+//         settled without applying the decision (`paused` on a later call,
+//         `expired`) all mean the call this run was asked to approve did not
+//         run, so none of them is a success.
 
 import { createRequire } from "node:module";
 import { ensureDbDir, resolveEnv } from "../packages/mcp/dist/index.js";
@@ -82,7 +84,12 @@ async function main() {
           upstream,
           ...(decisions !== undefined ? { decisions } : {}),
         },
-        { executionId: execId, log: (line) => console.error(line) },
+        {
+          executionId: execId,
+          projection: "code",
+          clientId: null,
+          log: (line) => console.error(line),
+        },
       ),
     makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
   });
@@ -94,14 +101,40 @@ async function main() {
   const outcome = await manager.resume(executionId, { kind: "approve" }, callId);
   console.error(`[ApproveDemo] outcome: ${outcome.status}`);
 
-  if (outcome.status === "conflict" || outcome.status === "failed") {
-    if (outcome.status === "failed") {
-      console.error(`[ApproveDemo] error: ${outcome.error.name}: ${outcome.error.message}`);
-    } else {
-      console.error(
-        `[ApproveDemo] conflict: execution ${executionId} was not paused (race or not found).`,
-      );
-    }
+  // D-A11: `unknown` is NOT success. The resume drove the call but its
+  // settle write is not durable, so the call may or may not have landed — the
+  // one thing that must never happen is a retry. Mirrors the CLI's unknown
+  // arm: no landed verb, a non-zero exit, and an instruction to re-list.
+  if (outcome.status === "unknown") {
+    console.error(
+      `[ApproveDemo] The outcome of this approval is UNKNOWN: the execution was driven but ` +
+        `its result could not be durably recorded (${outcome.reason}), so the ` +
+        `call may or may not have completed. Do NOT retry it — re-list the approvals, or use ` +
+        `the "check_execution" tool on execution ${executionId}, to see what actually landed.`,
+    );
+    process.exit(1);
+  }
+  if (outcome.status === "failed") {
+    console.error(`[ApproveDemo] error: ${outcome.error.name}: ${outcome.error.message}`);
+    process.exit(1);
+  }
+  if (outcome.status === "conflict") {
+    console.error(
+      `[ApproveDemo] conflict: execution ${executionId} was not paused (race or not found).`,
+    );
+    process.exit(1);
+  }
+  // The ONLY success is a decision that was actually applied — the same test
+  // the CLI uses. A resume can end `paused` (the execution paused again on a
+  // LATER call, which this decision did not authorize) or `expired` (the
+  // approval window closed before the decision was staged); in both the
+  // pending call this run was asked to approve did not run, so exiting 0
+  // would report success for work that never happened.
+  if (outcome.decisionApplied !== true) {
+    console.error(
+      `[ApproveDemo] outcome: ${outcome.status} — the pending call did not run. ` +
+        `Re-list the approvals to see the current state of execution ${executionId}.`,
+    );
     process.exit(1);
   }
   process.exit(0);

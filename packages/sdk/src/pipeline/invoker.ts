@@ -1,11 +1,19 @@
 import type { CredentialResolver } from "../credentials.js";
 import type { ToolInvoker } from "../execute.js";
 import type { ApprovalDecisions } from "../execution/decisions.js";
-import type { PolicyEngine, PolicyVerdict } from "../policy.js";
+import {
+  type PolicyEngine,
+  type PolicyVerdict,
+  printableName,
+  unknownToolReason,
+} from "../policy.js";
+import type { EffectiveScope } from "../scope.js";
 import type { ConduitStore } from "../store/store.js";
-import type { Connection, TraceEvent } from "../types.js";
+import type { Connection, Projection, TraceEvent } from "../types.js";
+import { createDispatchCell, type DispatchCell } from "./dispatch.js";
 import {
   ConduitCallError,
+  ConduitOutcomeAmbiguous,
   ConduitReplayDivergence,
   GUEST_ERROR_NAMES,
   infraError,
@@ -17,14 +25,19 @@ import type { UpstreamCaller, UpstreamOutcome } from "./upstream.js";
 import type { UpstreamSessionScope } from "./upstream-session.js";
 
 /**
- * The §5.3 per-call pipeline: resolve tool → enforce policy → resolve
- * connection → attach credentials host-side → call upstream → append Trace
- * → return. Mounts at the ToolInvoker seam the sandbox's ToolHost calls
- * through; everything here runs host-side, outside the sandbox (spec §9.2).
+ * The §5.3 per-call pipeline: resolve tool → check scope → enforce policy →
+ * resolve connection → read the source → gate on the deadline → attach
+ * credentials host-side → call upstream → append Trace → return. Mounts at
+ * the ToolInvoker seam the sandbox's ToolHost calls through; everything here
+ * runs host-side, outside the sandbox (spec §9.2).
  *
- * Policy is deliberately evaluated BEFORE connection resolution (spec §5.3
- * lists them in the other order) so a denied or unknown tool never engages
- * the connection or credential machinery.
+ * The ORDER is the security property. Scope and policy are evaluated BEFORE
+ * connection resolution (spec §5.3 lists them in the other order) so a denied,
+ * unknown, or out-of-scope tool never engages the connection or credential
+ * machinery. The deadline gate sits after the last unbounded store read and
+ * before credentials, so a continuation stalled on a read never holds live
+ * credential material; a final gate inside the caller's
+ * `beforeSend` covers the awaits that follow.
  *
  * Every failure is classified at this boundary (pipeline/errors.ts): only
  * the four guest-safe names cross into the sandbox. An outermost catch
@@ -66,6 +79,18 @@ export interface CreateToolInvokerOptions {
    * to `upstream.ts`'s own ephemeral per-call scope.
    */
   upstreamSession?: UpstreamSessionScope;
+  /** §4.3: recorded on every Trace row this invoker appends. */
+  projection: Projection;
+  clientId: string | null;
+  /**
+   * §5.2/§5.5: the scope resolver already bound to this drive's client id,
+   * awaited per call so a revocation lands on the very next call. OPTIONAL —
+   * absent (the shipped Code Mode path) NO scope is consulted and the call
+   * behaves exactly as it does today; never a default scope built per call.
+   */
+  scope?: () => Promise<EffectiveScope>;
+  /** §5.5: a direct drive's one dispatch cell. Absent → one fresh cell per call. */
+  dispatch?: DispatchCell;
 }
 
 const DEFAULT_UPSTREAM_TIMEOUT_MS = 30_000;
@@ -78,9 +103,23 @@ export function createToolInvoker(
   const ceiling = options.upstreamTimeoutMs ?? DEFAULT_UPSTREAM_TIMEOUT_MS;
 
   return async (path: string, input: unknown): Promise<unknown> => {
+    // One cell per call (D-A4). A direct drive supplies its own; every other
+    // caller gets a fresh one here — a cell shared across calls would let an
+    // earlier call's dispatch misclassify a later one.
+    const dispatch = options.dispatch ?? createDispatchCell();
     try {
-      return await runCall(deps, options, log, ceiling, path, input);
+      return await runCall(deps, options, log, ceiling, path, input, dispatch);
     } catch (cause) {
+      // §7: whatever error reaches here, the CELL decides — not an error
+      // field, which any wrapping or replacement would drop. Once the body
+      // write was attempted the upstream effect is unknowable, so classify
+      // ambiguous BEFORE any pass-through below can hide it.
+      if (dispatch.state === "dispatched") {
+        throw new ConduitOutcomeAmbiguous(
+          `[ToolInvoker] Upstream call failed after dispatch: the upstream may have performed the call. Context: { tool: ${path} }`,
+          { cause },
+        );
+      }
       // Outermost classification: anything a step already threw as a
       // ConduitCallError passes through; anything else (a bug, a custom
       // caller's non-serializable result, a throwing deadline()) becomes an
@@ -106,11 +145,39 @@ async function runCall(
   ceiling: number,
   path: string,
   input: unknown,
+  dispatch: DispatchCell,
 ): Promise<unknown> {
   // 1. Look up the tool (catalog-of-record: the store, not the in-memory catalog).
-  const tool = await deps.store.tools.get(path).catch((cause) => {
+  let tool = await deps.store.tools.get(path).catch((cause) => {
     throw infraError(cause, log);
   });
+  // §5.5: scope is authority recomputed per call. Out of scope ≡ unknown —
+  // the same block, the same audit row, and no upstream contact, so the
+  // refusal cannot be used to probe what the profile grants.
+  //
+  // The resolver runs on the scoped path whether or not the catalog holds the
+  // name, and BEFORE the outcome depends on catalog presence. Gating it on
+  // `tool !== undefined` made the SCHEDULE itself an existence oracle even
+  // though the refusal text was identical: an unknown name returned without
+  // ever awaiting the resolver, so a guest read existence off the latency, off
+  // a resolver rejection that surfaced as `infraError` for existing names
+  // only, and off a resolver that hung for one case and not the other. The
+  // number and order of awaited resolver and store calls must not depend on
+  // catalog membership. The UNSCOPED path is untouched — no resolver exists
+  // there, so it keeps its one `tools.get` per call.
+  let outOfScope = false;
+  if (options.scope !== undefined) {
+    const scope = await options.scope().catch((cause) => {
+      throw infraError(cause, log);
+    });
+    // An absent tool is already refused below; recording `outOfScope` only
+    // when the catalog HELD it keeps the host log's operator distinction
+    // truthful, and it never reaches the guest.
+    if (tool !== undefined && !scope.permits(options.projection, path)) {
+      tool = undefined;
+      outOfScope = true;
+    }
+  }
 
   // 1b. §5.5 design D6 — request-bound operator decision, checked BEFORE
   //     policy (a human approval/denial on the paused call overrides the
@@ -152,17 +219,63 @@ async function runCall(
   // (there is nothing to call), and must not surface an allow reason under a
   // denial name — which would also mis-drive §5.5 replay stripping.
   if (tool === undefined) {
+    // The GUEST-VISIBLE refusal for an out-of-scope tool is byte-identical to
+    // the unknown-tool refusal (controller ruling). Search and describe
+    // already make the two indistinguishable; a CALL that said "outside this
+    // client's scope" was an EXISTENCE ORACLE — a probing client learned the
+    // tool exists and only its grant is missing. Both now produce the same
+    // error class and the same message for the same path.
+    // Deliberately NOT special-cased on `outOfScope`: setting `tool =
+    // undefined` above already routed this through the engine's own
+    // unknown-tool evaluation, so `verdict.reason` IS the unknown-tool text
+    // for this path. Re-deriving it here would reintroduce the oracle the
+    // moment the engine's wording and this fallback drift apart — which they
+    // already had. The fallback remains only for a CUSTOM engine that answers
+    // `allow` for a tool the catalog does not hold, and it is built from the
+    // SAME `unknownToolReason` helper the engine uses, so the two texts are
+    // byte-identical by construction rather than by matching literals.
+    const guestReason = verdict.action === "allow" ? unknownToolReason(path) : verdict.reason;
     const blocked: PolicyVerdict = {
       action: "block",
-      reason:
-        verdict.action === "allow"
-          ? `Unknown tool "${path}": not in the catalog, so it is blocked.`
-          : verdict.reason,
+      reason: guestReason,
       source: verdict.source,
       redactFields: verdict.redactFields,
     };
     await appendTrace(deps, options, log, { path, input, verdict: blocked });
-    throw policyError("block", blocked.reason);
+    if (options.scope !== undefined) {
+      // ONE logging path, taken for BOTH refusals on the scoped path. The
+      // guest-visible text was already identical; the SCHEDULE was not. Only
+      // the out-of-scope case logged, so a synchronous sink's latency, or a
+      // sink that threw or stalled for one case and not the other, told a
+      // probing client which of the two had happened — the existence oracle
+      // the identical text exists to close. Same call count, same position,
+      // either way; the operator's distinction is a FIELD on the line.
+      //
+      // The tool path only: no tool input, no credential material, and
+      // nothing that crosses back to the guest. The path is GUEST-SUPPLIED,
+      // so it is sanitized before interpolation: a raw newline in it would
+      // forge a host log line, and an unbounded one would flood the daemon
+      // log.
+      //
+      // The sink is CALLED and never AWAITED, and its faults are swallowed: a
+      // throwing sink must not change the error the guest sees, and a sink
+      // returning a promise that never settles must not hold the call open.
+      // A host log line is a diagnostic, never part of the refusal.
+      try {
+        const logged: unknown = log(
+          `[ToolInvoker] Call refused: reported to the guest as an unknown tool. Context: { tool: ${printableName(path)}, clientId: ${JSON.stringify(options.clientId)}, inCatalog: ${outOfScope} }`,
+        );
+        // Duck-typed, not `instanceof`: a sink may return a thenable from
+        // another realm. An unobserved rejection would surface as an
+        // unhandled rejection and take the process down.
+        if (typeof logged === "object" && logged !== null && "then" in logged) {
+          void Promise.resolve(logged).catch(() => {});
+        }
+      } catch {
+        // Deliberately empty: see above.
+      }
+    }
+    throw policyError("block", guestReason);
   }
   if (verdict.action !== "allow") {
     // Audit the refusal too. Chosen semantic: unauditable is ALWAYS infra —
@@ -179,14 +292,9 @@ async function runCall(
     throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
   });
 
-  // 4. Credentials — host-side, fresh per call (spec §9.2). Resolver
-  //    failures carry the prefix and credentialRef in their message;
-  //    they cross the boundary only as opaque infra errors.
-  const auth = await deps.credentials.resolve(connection).catch((cause) => {
-    throw infraError(cause, log);
-  });
-
-  // 5. Upstream, time-bounded by the remaining §16 budget.
+  // 4. Source read — the LAST unbounded store read before the wire
+  //    F2). It comes before the deadline gate so a continuation that stalls
+  //    here has its budget re-read afterwards, not before.
   const source = await deps.store.sources.getByNamespace(tool.namespace).catch((cause) => {
     throw infraError(cause, log);
   });
@@ -198,16 +306,28 @@ async function runCall(
       `Source type "${tool.sourceSemantics.kind}" is not yet callable; MCP only in v1. Context: { tool: ${tool.name} }`,
     );
   }
+
+  // 5. Deadline gate — re-read AFTER every unbounded read has returned, and
+  //    BEFORE credentials. A burnt §16 budget refuses while no credential
+  //    material has been resolved at all, so a stalled continuation never
+  //    holds live credentials and never dispatches after the row was settled.
+  //    Traced per decision A3 (an allowed call that produced no result).
   const remaining = options.deadline?.() ?? Number.POSITIVE_INFINITY;
   if (remaining <= 0) {
-    // A burnt §16 budget refuses BEFORE any credentialed bytes leave the
-    // host — never a 1ms token request. Traced per decision A3 (an
-    // allowed call that produced no result).
     await appendTrace(deps, options, log, { path, input, verdict, connection });
     throw upstreamError(
       `Upstream call refused: the execution's wall-clock budget is exhausted (spec §16). Context: { tool: ${tool.name} }`,
     );
   }
+
+  // 6. Credentials — host-side, fresh per call (spec §9.2). Resolver
+  //    failures carry the prefix and credentialRef in their message;
+  //    they cross the boundary only as opaque infra errors.
+  const auth = await deps.credentials.resolve(connection).catch((cause) => {
+    throw infraError(cause, log);
+  });
+
+  // 7. Upstream, time-bounded by the post-read remaining §16 budget.
   const timeoutMs = Math.max(1, Math.min(ceiling, remaining));
   let outcome: UpstreamOutcome;
   try {
@@ -217,6 +337,11 @@ async function runCall(
       input,
       auth,
       timeoutMs,
+      dispatch,
+      // The pre-write gate: the checks above still precede egress
+      // pre-flight and the session handshake, both of which await. The caller
+      // re-reads this immediately before the body write.
+      ...(options.deadline !== undefined ? { deadline: options.deadline } : {}),
       ...(options.upstreamSession !== undefined ? { session: options.upstreamSession } : {}),
     });
   } catch (cause) {
@@ -237,7 +362,7 @@ async function runCall(
     throw error;
   }
 
-  // 6. Trace, then return. Fail closed if the audit row can't be written
+  // 8. Trace, then return. Fail closed if the audit row can't be written
   //    (decision A3): an unauditable call must not silently succeed.
   await appendTrace(deps, options, log, { path, input, verdict, connection, outcome });
   return outcome.result;
@@ -367,6 +492,9 @@ async function appendTrace(
     // Refusals are traced before any connection is engaged: empty prefix
     // records exactly that.
     connectionPrefix: details.connection?.prefix ?? "",
+    // §4.3: which projection raised the call, and for which client.
+    projection: options.projection,
+    clientId: options.clientId,
     // §11: the audit row is redacted at append time (builtins + the
     // verdict's per-tool additions). Non-mutating by contract (redact.ts)
     // — the caller's `input` reference is journaled for replay later.

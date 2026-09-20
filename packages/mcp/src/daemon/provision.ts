@@ -835,7 +835,7 @@ async function fetchAndProvision(args: {
   }
 
   await store.provisionSource({
-    source: { id: ids.sourceId, type: "mcp" as const, namespace, location: url },
+    source: { id: ids.sourceId, type: "mcp" as const, namespace, location: url, generation: 0 },
     integration: { id: ids.integrationId, sourceId: ids.sourceId, namespace },
     connection: {
       id: ids.connectionId,

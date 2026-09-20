@@ -31,7 +31,140 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-13 ~12:10 (**Lane A plan WRITTEN, REVIEWED, and MERGED — PR #61 `1022b2e`**, founder-named merge; branches = main only; NEXT: execute the plan on `feat/r1-lane-a`)
+## Current handoff — updated 2026-09-20 (**R1 Lane A EXECUTED — PR #62 open, every gate passed, founder authorized the merge on green**; NEXT after the merge: R3a preview packaging)
+
+**State.** The Lane A plan
+(`docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md`) was
+executed on `feat/r1-lane-a` and is PR #62. If this section still says
+"open", the merge did not complete: check `gh pr view 62` first. What it
+lands: `Execution` as a discriminated union (`kind`, `clientId`,
+`projection`) with a throwing sentinel in `code` for every new row;
+client-namespaced request keys (one key per execution, unique);
+writer-independent source generation (a ledger table plus three
+triggers); a per-call dispatch cell; no automatic retry of a governed
+`tools/call`; scope and the deadline gate before credential resolution;
+a scoped catalog tool host; provenance-stamped pauses and a post-claim
+read-side guard on `resume`; the direct arm (`startDirect` returns
+`{ executionId, outcome, retention, finished }`); the `unknown` outcome
+on the wire; a projection-parameterized harness; and an R1 section in
+`INVARIANTS.md` (68 rows: 37 pinned, 31 entered as not yet enforced —
+the Lane B/C halves).
+
+**Decisions recorded this session (all in conduitspec §18, entry dated
+2026-09-19, and the design spec's §5.5 amendment):** the `unknown` status
+travels on the wire (a deviation from the design's "no wire change"); an
+out-of-scope call is refused exactly as an unknown tool — same text,
+same error class, same schedule of awaited and logged calls — with
+wall-clock timing labelled best-effort; the late-`create()` accepted
+limit; `resultTooLarge` is not yet projected onto the wire (Lane B
+decides the form); which store calls stay un-time-bounded (Code Mode's
+first mutation, its drive writes, a code row's guard reads, and the
+`claimForResume` await for both kinds) and what Lane A does bound (the
+kind lookup after the claim, the direct path, a code row's terminalizing
+writes); a timer on the code-row guard was tried and removed — a second
+writer without a latch; host dependencies are trusted.
+
+**Review record.** Eleven tasks, each by a separate implementer with a
+task-scoped review; a whole-branch review; a five-reviewer pre-PR pass;
+then on the PR: `/security-review` (nothing met the bar), an Aikido scan
+(no issues; comment blocks were stripped from its payloads), `code-review`
+with five reviewers, Greptile, CodeRabbit, and three `codex exec` passes
+(`gpt-5.6-sol`, `high`; P0/P1/P2 = 1/6/0, 1/4/0, 0/5/1). The loop stopped
+after pass 3 by adjudication (LEARNINGS #16/#26): the last three passes
+found only seams of the previous fix and inaccuracies in the decision
+record. The founder passed the explainer quiz ("Lane A Walkthrough",
+published 2026-09-20, seven questions) and named the merge. Lessons are
+LEARNINGS #29–#37.
+
+**The recurring defect, for whoever touches the direct arm next.**
+Twelve instances of one class: something that could fail ran after the
+settle latch was spent, or a second settler did not honour the first.
+It was closed structurally — one bounded store-call helper
+(`boundedStoreCall` / `boundedFencedSettle` in
+`packages/sdk/src/execution/direct.ts`), a closed union from the resume
+guard's `raceGuard`, and a prepare-then-commit rule at every `settle()`.
+Before changing a latch, a timer, or a handover, re-walk EVERY exit of
+the state machine drawn in the comment above the direct arm in
+`manager.ts`, not only the one you changed.
+
+### NEXT
+
+1. **R3a preview packaging** (§18, 2026-09-11 — unchanged): a versioned
+   packed artifact, alpha install notes, and ONE governance property
+   demonstrable in the first-run path (approve → the exact approved call
+   runs once; deny → nothing ran). Plan it with
+   `superpowers:writing-plans`. Then the three-week alpha window and the
+   profiles decision (the default and its reversal trigger are in §18).
+2. **Lane B is NOT next** unless an adopter needs profiles. When it is
+   built it must: add the profiles table and repository; authorize every
+   read by execution id against the caller's client id (the daemon does
+   not filter `executions.get` by client today — harmless while every row
+   has `clientId: null`); cap the size of `startDirect`'s `input`; decide
+   the wire form of `resultTooLarge`; consume `resume`'s lifecycle handle
+   for direct admission; and flip the 31 ⏳ rows.
+
+**Follow-ups this work named (none blocks R3a):** bound Code Mode's
+first mutation and resume guard with attempt-fenced late-completion
+recovery; brand `ExecutionId` / `CallId` / `AttemptId` / `Namespace`
+(`claimForResume` takes three bare strings, and swapping `settleDirect`'s
+two defeats the fence silently); have the manager apply `dispatch` /
+`projection` / `clientId` / `scope` itself so a custom `makeInvoker`
+cannot drop them; a structural check that every store call on a
+client-visible manager path goes through the bounded helper;
+`request_keys` and `source_generations` retention; extraction seams in
+`manager.ts` and `sqlite.ts` (both well past 1,000 lines); a `design §x.y`
+prefix for design-spec section references in code and test names (bare
+`§4.1` / `§5.4` there mean the R1 design spec, whose numbers collide with
+`conduitspec.md`'s); a sweep of the task-number comments that predate
+this branch; a whole-file ledger scan found 129 `INVARIANT §` tests
+uncited and 70 truncated citations, all OUTSIDE the R1 section and
+predating this branch; replace the three literal NUL bytes in the Lane A
+plan document (lines 1242, 1248, 1249) with the escape — the brief
+extractor truncates at them.
+
+**Session quirks worth inheriting (2026-09-19/20):** the pre-commit hook
+does NOT typecheck `packages/mcp` tests the way CI's `pnpm typecheck`
+does — run `tsc --noEmit -p` on each of `packages/sdk`, `packages/mcp`,
+`packages/cli` by hand before trusting "tsc clean" · run `packages/mcp`
+`integration.test.ts` and `packages/cli` `key.test.ts` from their package
+directory; from the repo root they fail `MODULE_NOT_FOUND` · the
+spec-drift gate refuses EVERY commit while `conduitspec.html` and
+`conduitspec.md` disagree in the working tree, so never leave the spec
+pair half-edited while another committer is active · the
+`--doctor --offline performs ZERO writes` fixture race is wider now (a
+larger schema lengthens the seeding write); fix the fixture — fingerprint
+after setup settles, or assert content rather than mtime · a new flake:
+a full `packages/mcp` run can fail once with "Bind refused: existing
+entry is not a socket" on a temp socket path · every dispatch to a
+subagent carries a git ALLOWLIST and "if you think you need a baseline,
+stop and report" (LEARNINGS #36) · control characters in source are
+written as escapes and checked at byte level (LEARNINGS #37) · an agent's
+completion claim is verified against the artifact before it is repeated
+(LEARNINGS #32).
+
+**DEFERRED (live list, updated 2026-09-20):** carry the 2026-09-13 and
+earlier lists, plus the follow-ups above, plus: Dependabot reports 15
+alerts on main (14 moderate, 1 low) against the 6 medium / 1 low last
+recorded here — audit triage is due before R3a ships.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — confirm
+> #62, R1 Lane A, is MERGED; if it is still open, the merge did not
+> complete: CI must be green and the founder has already named it).
+> **Do NOT re-review #62 or reopen its §18 decisions.** NEXT: plan R3a
+> preview packaging with `superpowers:writing-plans` per HANDOFF NEXT
+> item 1. Carry the DEFERRED list and the follow-ups.
+
+---
+
+**Superseded (2026-09-13 ~12:10) — kept for the record:**
+
+### Previous handoff — 2026-09-13 ~12:10 (**Lane A plan WRITTEN, REVIEWED, and MERGED — PR #61 `1022b2e`**, founder-named merge; NEXT was: execute the plan on `feat/r1-lane-a` — DONE by the section above)
+
 
 **Merge record (12:05):** founder said "do it" to the two named open
 items. Greptile reviewed #61 in three rounds (round 1: a P1 lifecycle

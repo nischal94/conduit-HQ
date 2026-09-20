@@ -51,6 +51,38 @@ export class ConduitReplayDivergence extends Error {
   }
 }
 
+/**
+ * §7: a governed call failed AFTER its body write was attempted, so the
+ * upstream may have performed it. Host-side and terminal, like
+ * ConduitReplayDivergence: the invoker's outermost catch lets it through
+ * unchanged, the journaling wrapper turns it into a guest-uncatchable
+ * terminal signal, and the manager settles `failed` under this name — the
+ * SAME name the crash-terminal sweep uses, so every reader keys on one string.
+ */
+export const OUTCOME_AMBIGUOUS_ERROR_NAME = "ConduitOutcomeAmbiguous";
+
+export class ConduitOutcomeAmbiguous extends Error {
+  constructor(message: string, options?: { cause?: unknown }) {
+    super(message, options);
+    this.name = OUTCOME_AMBIGUOUS_ERROR_NAME;
+  }
+}
+
+/**
+ * The HOST-terminal error names as a closed set — the mirror of
+ * `GUEST_ERROR_NAMES`. These two never cross into the sandbox: each
+ * terminates the execution instead. Naming the set gives a reader one place
+ * to see that it is exactly two, and gives a caller a type to switch on
+ * rather than two loose string constants.
+ */
+export const HOST_TERMINAL_ERROR_NAMES = {
+  replayDivergence: REPLAY_DIVERGENCE_ERROR_NAME,
+  outcomeAmbiguous: OUTCOME_AMBIGUOUS_ERROR_NAME,
+} as const;
+
+export type HostTerminalErrorName =
+  (typeof HOST_TERMINAL_ERROR_NAMES)[keyof typeof HOST_TERMINAL_ERROR_NAMES];
+
 export class ConduitCallError extends Error {
   readonly kind: CallErrorKind;
   readonly correlationId: string | undefined;

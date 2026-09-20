@@ -1,5 +1,6 @@
 import type { UpstreamAuth } from "../credentials.js";
 import type { Source, Tool } from "../types.js";
+import type { DispatchCell } from "./dispatch.js";
 import {
   assertEgressAllowed,
   createPinnedLookup,
@@ -37,6 +38,16 @@ export interface UpstreamRequest {
    * handshake still happens but nothing is cached.
    */
   session?: UpstreamSessionScope;
+  /** §5.5 per-call dispatch cell; advanced by this caller. */
+  dispatch?: DispatchCell;
+  /**
+   * §5.3 pre-write gate: the drive's remaining wall-clock budget, re-read
+   * inside `beforeSend` immediately before the governed body write. The
+   * invoker's own gate runs before egress pre-flight and the session
+   * handshake, both of which await — this is the LAST check, so a budget
+   * that elapses during those awaits still refuses before any byte is sent.
+   */
+  deadline?: () => number;
 }
 
 export interface UpstreamOutcome {
@@ -90,7 +101,8 @@ export function createMcpUpstreamCaller(
           ? request.tool.sourceSemantics.upstreamName
           : stripNamespacePrefix(request.tool);
       const startedAt = Date.now();
-      // The WHOLE logical operation — handshake + call + one 404-retry — shares
+      // The WHOLE logical operation — handshake (whose `tools/list` keeps the
+      // one 404-retry) + the governed call (which has none, §7) — shares
       // this single deadline (preserving F1's per-call budget semantics). The
       // client decrements against `deadline()` at every phase; the byte cap is
       // cumulative across every response in the operation.
@@ -126,6 +138,7 @@ export function createMcpUpstreamCaller(
         // could wait seconds for a peer's (or a hostile upstream's stalled)
         // handshake before its own deadline is ever checked. On a cache hit
         // the acquire promise is already resolved and wins immediately.
+        request.dispatch?.advance("initializing");
         const { session } = await withinDeadline(
           scope.acquire({
             url: request.source.location,
@@ -145,9 +158,9 @@ export function createMcpUpstreamCaller(
         // (deadline + a fresh cumulative byte allowance), not the cached
         // handshake client — otherwise call #2+ to a reused session would run
         // under call #1's stale deadline/byte budget (F1 per-call semantics).
-        // The 404-expiry retry inside `callTool` mutates the CACHED `session`
-        // object in place (same reference the scope holds; see
-        // `withSessionExpiryRetry`), so a renewal is visible to later calls.
+        // §7: `callTool` carries NO 404-expiry retry — a governed call is
+        // dispatched at most once. Only the handshake's `tools/list` renews a
+        // session in place (see `withSessionExpiryRetry`).
         const freshClient = createMcpClient(
           { target, headers: { ...request.auth.headers }, lookup: pinnedLookup },
           budget,
@@ -156,6 +169,19 @@ export function createMcpUpstreamCaller(
           session,
           upstreamName,
           request.input ?? {},
+          {
+            beforeSend: () => {
+              // The gate fires BEFORE the cell advances, so a refusal here
+              // classifies pre-dispatch: nothing of the body was written.
+              if (request.deadline !== undefined && request.deadline() <= 0) {
+                throw new McpClientError(
+                  "timeout",
+                  "drive budget elapsed before the governed call was written",
+                );
+              }
+              request.dispatch?.advance("dispatched");
+            },
+          },
         );
         assertNoCredentialEcho(result, request);
         return { result: result ?? null, status, latencyMs: Date.now() - startedAt };

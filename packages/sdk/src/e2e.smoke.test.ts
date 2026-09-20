@@ -11,7 +11,7 @@ import { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execu
 import { createInMemoryApprovalDecisions } from "./execution/decisions.js";
 import { createExecutionManager, type ExecutionManagerDeps } from "./execution/manager.js";
 import { normalizeMcp } from "./normalize/mcp.js";
-import { GUEST_ERROR_NAMES } from "./pipeline/errors.js";
+import { GUEST_ERROR_NAMES, OUTCOME_AMBIGUOUS_ERROR_NAME } from "./pipeline/errors.js";
 import { createToolInvoker } from "./pipeline/invoker.js";
 import { createMcpUpstreamCaller } from "./pipeline/upstream.js";
 import { createStorePolicyEngine } from "./policy.js";
@@ -136,7 +136,7 @@ function startMcpServer(): Promise<{
       if (req.url === "/echoInBody") {
         // A hostile-but-200 upstream: instead of rejecting auth (like
         // /echo401), it ACCEPTS the tools/call and echoes the credential back
-        // inside a successful JSON-RPC *result* body (Task 12 — the M4
+        // inside a successful JSON-RPC *result* body (the M4
         // falsification probe). Any 200 result still passes through the
         // §9.2 containsCredential tripwire (upstream.ts), so this exercises
         // the same defense-in-depth on the success path, one step earlier
@@ -237,6 +237,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       type: "mcp",
       namespace: "github",
       location: mcpLocation,
+      generation: 0,
     });
     await first.store.integrations.upsert({
       id: "int_gh",
@@ -297,7 +298,12 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
         // applies here; Phase 9 proves the default blocks it.
         upstream: createMcpUpstreamCaller({ egress: { allowPrivate: true } }),
       },
-      { executionId: "exec_smoke", log: (message) => hostLog.push(message) },
+      {
+        executionId: "exec_smoke",
+        projection: "code",
+        clientId: null,
+        log: (message) => hostLog.push(message),
+      },
     );
 
     const host = createCatalogToolHost(catalog, invoke);
@@ -366,7 +372,12 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
             upstream: createMcpUpstreamCaller({ egress: { allowPrivate: true } }),
             ...(decisions !== undefined ? { decisions } : {}),
           },
-          { executionId, log: (message) => hostLog.push(message) },
+          {
+            executionId,
+            projection: "code",
+            clientId: null,
+            log: (message) => hostLog.push(message),
+          },
         ),
       makeToolHost: (invoke) => createCatalogToolHost(catalog, invoke),
       makeDecisions: () => createInMemoryApprovalDecisions(),
@@ -543,7 +554,12 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
         credentials: resolver,
         upstream: createMcpUpstreamCaller(), // §9.3 defaults: no allowPrivate
       },
-      { executionId: "exec_egress", log: (message) => hostLog.push(message) },
+      {
+        executionId: "exec_egress",
+        projection: "code",
+        clientId: null,
+        log: (message) => hostLog.push(message),
+      },
     );
     const guardedHost = createCatalogToolHost(catalog, guardedInvoke);
     const egressBlocked = await sandbox.execute({
@@ -574,6 +590,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       type: "mcp",
       namespace: "github",
       location: `http://127.0.0.1:${port}/echo401`,
+      generation: 0,
     });
     const rejected = await sandbox.execute({
       code: `
@@ -623,6 +640,7 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
       type: "mcp",
       namespace: "github",
       location: `http://127.0.0.1:${port}/echoInBody`,
+      generation: 0,
     });
     const echoOutcome = await manager.start(`
       try {
@@ -632,15 +650,18 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
         return { name: error.name, message: String(error.message ?? error) };
       }
     `);
-    expect(echoOutcome.status).toBe("completed");
-    if (echoOutcome.status === "completed") {
-      const value = echoOutcome.value as { name: string; message: string };
-      // The §9.2 best-effort tripwire (upstream.ts containsCredential) fires
-      // on the echoed credential in the 200 result body, refusing to deliver
-      // it — the call surfaces as an upstream error, not a completed value
-      // carrying the secret.
-      expect(value.name).toBe(GUEST_ERROR_NAMES.upstream);
-      expect(value.message).toContain("echoed the connection's credential");
+    // The §9.2 best-effort tripwire (upstream.ts containsCredential) fires on
+    // the echoed credential in the 200 result body, refusing to deliver it —
+    // the call never yields a completed value carrying the secret.
+    //
+    // One-way door #3 (eng review D4): the refusal arrives AFTER the governed
+    // body was written, so §7 classifies it ambiguous. The journaling wrapper
+    // terminalizes it HOST-SIDE — the guest's `catch` never runs and the
+    // execution settles `failed`, exactly as a replay-divergence does.
+    expect(echoOutcome.status).toBe("failed");
+    if (echoOutcome.status === "failed") {
+      expect(echoOutcome.error.name).toBe(OUTCOME_AMBIGUOUS_ERROR_NAME);
+      expect(echoOutcome.error.message).toContain("after dispatch");
     }
     expect(JSON.stringify(echoOutcome)).not.toContain(SECRET);
     expect(JSON.stringify(echoOutcome)).not.toContain("ghp_smoke");
@@ -648,7 +669,8 @@ describe("e2e smoke: ingest → persist → reopen → policy → sandbox → in
     // The persisted `executions` row for this run — whichever settle path
     // fired — must not carry the secret in its `result` or `error` column.
     const echoRow = await manager.get(echoOutcome.executionId);
-    expect(echoRow?.status).toBe("completed");
+    expect(echoRow?.status).toBe("failed");
+    expect(echoRow?.error?.name).toBe(OUTCOME_AMBIGUOUS_ERROR_NAME);
     expect(JSON.stringify(echoRow)).not.toContain(SECRET);
     expect(JSON.stringify(echoRow)).not.toContain("ghp_smoke");
 

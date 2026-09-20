@@ -1,7 +1,13 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { InMemoryCatalog } from "./catalog.js";
-import { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execute.js";
+import {
+  buildExecuteTool,
+  createCatalogToolHost,
+  createScopedCatalogToolHost,
+  estimateTokens,
+} from "./execute.js";
 import { QuickJSSandbox } from "./sandbox/quickjs.js";
+import { ALL_TOOLS, buildEffectiveScope, DEFAULT_PROFILE_GRANT } from "./scope.js";
 import type { Tool } from "./types.js";
 
 /** The §4.2 demo configuration: the connections the spec prices at ~1,044 tokens. */
@@ -110,5 +116,114 @@ describe("createCatalogToolHost", () => {
         issues: [{ number: 7, title: "bug" }],
       },
     });
+  });
+});
+
+describe("createScopedCatalogToolHost (§5.2, #43)", () => {
+  const mk = (name: string, description: string): Tool => ({
+    name,
+    namespace: name.split(".")[0] as string,
+    description,
+    inputSchema: { type: "object" },
+    outputSchema: {},
+    riskClass: "safe",
+    sourceSemantics: { kind: "mcp" },
+  });
+  const disallowed = Array.from({ length: 10 }, (_, i) => mk(`ops.deploy_${i}`, ""));
+  const catalog = new InMemoryCatalog();
+  // ten disallowed tools that out-rank the one allowed tool on the query "deploy"
+  catalog.upsert(
+    Array.from({ length: 10 }, (_, i) => mk(`ops.deploy_${i}`, "deploy deploy deploy")),
+  );
+  catalog.upsert([mk("allowed.thing", "deploy")]);
+  const scope = async () =>
+    buildEffectiveScope(
+      { projections: { code: true, direct: false, discovery: false }, allow: ["allowed"] },
+      [...disallowed, mk("allowed.thing", "")],
+    );
+  const invoke = vi.fn(async () => ({}));
+
+  it("INVARIANT §5.3 (#43): eligibility is applied BEFORE ranking and the limit — an allowed tool ranked below ten disallowed ones is still returned", async () => {
+    const host = createScopedCatalogToolHost(catalog, invoke, scope, "code");
+    const hits = await host.search({ query: "deploy" });
+    expect(hits.map((h) => h.path)).toEqual(["allowed.thing"]);
+  });
+
+  it("describe of an out-of-scope tool is undefined, indistinguishable from nonexistent", async () => {
+    const host = createScopedCatalogToolHost(catalog, invoke, scope, "code");
+    expect(await host.describe("ops.deploy_1")).toBeUndefined();
+    expect(await host.describe("nope.tool")).toBeUndefined();
+    expect((await host.describe("allowed.thing"))?.path).toBe("allowed.thing");
+  });
+
+  it("a flag turned off empties search and describe for that projection", async () => {
+    const off = async () =>
+      buildEffectiveScope(
+        { projections: { code: false, direct: false, discovery: false }, allow: ALL_TOOLS },
+        [mk("allowed.thing", "")],
+      );
+    const host = createScopedCatalogToolHost(catalog, invoke, off, "code");
+    expect(await host.search({ query: "deploy" })).toEqual([]);
+    expect(await host.describe("allowed.thing")).toBeUndefined();
+  });
+
+  it("the limit still applies after filtering", async () => {
+    const wide = async () => buildEffectiveScope(DEFAULT_PROFILE_GRANT, disallowed);
+    const host = createScopedCatalogToolHost(catalog, invoke, wide, "code");
+    expect(await host.search({ query: "deploy", limit: 3 })).toHaveLength(3);
+  });
+
+  it("call passes through to the invoker untouched — scope is the invoker's job at call time", async () => {
+    const host = createScopedCatalogToolHost(catalog, invoke, scope, "code");
+    await host.call("ops.deploy_1", { x: 1 });
+    expect(invoke).toHaveBeenCalledWith("ops.deploy_1", { x: 1 });
+  });
+
+  it("a resolver failure crosses as the opaque infra error, raw detail only in the host log", async () => {
+    const log = vi.fn();
+    const failing = async (): Promise<never> => {
+      throw new Error("[SqliteStore] disk full at ~/.conduit/conduit.db");
+    };
+    const host = createScopedCatalogToolHost(catalog, invoke, failing, "code", log);
+    let thrown: Error | undefined;
+    try {
+      await host.search({ query: "deploy" });
+    } catch (error) {
+      if (error instanceof Error) thrown = error;
+    }
+    expect(thrown?.name).toBe("ConduitInternalError");
+    expect(thrown?.message).not.toContain("SqliteStore");
+    expect(thrown?.message).not.toContain(".conduit");
+    expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("SqliteStore");
+  });
+
+  it("a resolver that RESOLVES with a malformed snapshot is as opaque as one that rejects", async () => {
+    // The boundary must cover the whole body, not just the resolver call. A
+    // snapshot whose `permits` throws is the same class of host fault as a
+    // rejecting resolver; if it escaped raw, the guest could tell the two
+    // apart by the error it gets back.
+    const log = vi.fn();
+    const malformed = async () =>
+      ({
+        permits: () => {
+          throw new TypeError("[SqliteStore] cannot read properties of undefined at ~/.conduit");
+        },
+      }) as unknown as Awaited<ReturnType<typeof scope>>;
+    const host = createScopedCatalogToolHost(catalog, invoke, malformed, "code", log);
+    for (const body of [
+      () => host.search({ query: "deploy" }),
+      () => host.describe("github.deploy"),
+    ]) {
+      let thrown: Error | undefined;
+      try {
+        await body();
+      } catch (error) {
+        if (error instanceof Error) thrown = error;
+      }
+      expect(thrown?.name).toBe("ConduitInternalError");
+      expect(thrown?.message).not.toContain("SqliteStore");
+      expect(thrown?.message).not.toContain(".conduit");
+    }
+    expect(log.mock.calls.map((c) => String(c[0])).join("\n")).toContain("SqliteStore");
   });
 });

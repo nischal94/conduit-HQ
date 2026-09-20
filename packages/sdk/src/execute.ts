@@ -1,6 +1,8 @@
 import type { Catalog } from "./catalog.js";
+import { ConduitCallError, infraError } from "./pipeline/errors.js";
 import type { ToolHost } from "./sandbox/sandbox.js";
-import type { JsonSchema } from "./types.js";
+import type { EffectiveScope } from "./scope.js";
+import type { JsonSchema, Projection } from "./types.js";
 
 /**
  * The `execute` tool (spec §6): the only tool any client ever sees.
@@ -107,6 +109,61 @@ export function createCatalogToolHost(catalog: Catalog, invoke: ToolInvoker): To
   return {
     search: async (options) => catalog.search(options),
     describe: async (path, options) => catalog.describe(path, options),
+    call: (path, input) => invoke(path, input),
+  };
+}
+
+/**
+ * §5.2/§5.4: a live filtered view of the catalog for one drive. `search`
+ * applies eligibility to the WHOLE ranked candidate set, then the limit —
+ * filtering the top ten would hide an allowed tool that ranks below ten
+ * disallowed ones (§5.3, row #43). `describe` of an out-of-scope tool is
+ * `undefined`, indistinguishable from a nonexistent one. One snapshot is
+ * awaited per op; the Catalog interface gains nothing.
+ */
+export function createScopedCatalogToolHost(
+  catalog: Catalog,
+  invoke: ToolInvoker,
+  scope: () => Promise<EffectiveScope>,
+  projection: Projection,
+  log: (message: string) => void = (m) => console.error(m),
+): ToolHost {
+  const DEFAULT_LIMIT = 10;
+  // A resolver failure is a host fault. It must cross into the guest as the
+  // opaque infra error (correlation id in the host log), never as the store's
+  // raw message — the same boundary the invoker applies.
+  const resolve = () =>
+    scope().catch((cause) => {
+      throw infraError(cause, log);
+    });
+  /**
+   * The whole body, not just the resolver call. `resolve()` above converts a
+   * REJECTING resolver into the opaque infra error, but a resolver that
+   * RESOLVES with a malformed snapshot is just as much a host fault — and its
+   * `permits` would throw raw into the guest (a TypeError carrying host
+   * internals), making the two failure modes distinguishable from inside the
+   * sandbox. Same boundary, same opacity, whichever way the fault arrives.
+   */
+  const guard = async <T>(body: () => Promise<T>): Promise<T> => {
+    try {
+      return await body();
+    } catch (cause) {
+      throw cause instanceof ConduitCallError ? cause : infraError(cause, log);
+    }
+  };
+  return {
+    search: (options) =>
+      guard(async () => {
+        const snapshot = await resolve();
+        const ranked = catalog.search({ query: options.query, limit: Number.MAX_SAFE_INTEGER });
+        return ranked
+          .filter((hit) => snapshot.permits(projection, hit.path))
+          .slice(0, options.limit ?? DEFAULT_LIMIT);
+      }),
+    describe: (path, options) =>
+      guard(async () =>
+        (await resolve()).permits(projection, path) ? catalog.describe(path, options) : undefined,
+      ),
     call: (path, input) => invoke(path, input),
   };
 }

@@ -13,17 +13,30 @@ import { sweepOrphanedExecutions } from "./sweep.js";
  */
 
 async function newStore(): Promise<ConduitStore> {
-  return openSqliteStore({
-    client: createClient({ url: ":memory:" }),
-    secretBox: await SecretBox.fromKeyBytes(Buffer.alloc(32, 7)),
-  });
+  return (await newStoreWithClient()).store;
 }
 
-const base: Omit<Execution, "id" | "status"> = {
+/** Same store, with the raw client kept so a test can read COLUMNS. */
+async function newStoreWithClient(): Promise<{
+  store: ConduitStore;
+  client: ReturnType<typeof createClient>;
+}> {
+  const client = createClient({ url: ":memory:" });
+  const store = await openSqliteStore({
+    client,
+    secretBox: await SecretBox.fromKeyBytes(Buffer.alloc(32, 7)),
+  });
+  return { store, client };
+}
+
+const base = {
+  kind: "code",
+  clientId: null,
+  projection: "code",
   code: "return 1",
   seeds: { now: 1000, random: 0.5 },
   startedAt: 1000,
-};
+} as const;
 
 async function seed(store: ConduitStore, rows: Array<Pick<Execution, "id" | "status">>) {
   for (const row of rows) await store.executions.put({ ...base, ...row });
@@ -120,6 +133,75 @@ describe("sweepOrphanedExecutions", () => {
       expect(row.rows[0]?.status).toBe("failed");
       expect(row.rows[0]?.ended_at).not.toBeNull();
     }
+  });
+
+  it("INVARIANT §17: a running DIRECT row is swept exactly like a code row, and a paused direct row is untouched", async () => {
+    // The sweep terminalizes by STATUS, never by kind (§7): a direct row
+    // stranded by a killed daemon has the same unknown outcome as a code
+    // row — its upstream call may well have landed. This pins that a
+    // future kind-aware change cannot silently skip direct rows and leave
+    // them `running` forever.
+    const { store, client } = await newStoreWithClient();
+    const directBase = {
+      kind: "direct",
+      clientId: null,
+      projection: "direct",
+      call: { toolName: "github.issues.list", namespace: "github", request: "{}" },
+      startedAt: 1000,
+    } as const;
+    // Seeded WITH a result. Without one the "nothing is delivered" assertion
+    // below could not fail: the row had no result to keep or drop, so it
+    // passed whatever the sweep did. A stranded direct row can genuinely
+    // carry a stored result — the settle write lands in one statement, but a
+    // crash between a write and its status flip is the state this sweep
+    // exists for — and the sweep must terminalize it WITHOUT delivering it.
+    await store.executions.create({
+      ...directBase,
+      id: "exec_direct_running",
+      status: "running",
+      result: { delivered: "must not be handed back" },
+    });
+    await store.executions.create({
+      ...directBase,
+      id: "exec_direct_paused",
+      status: "paused",
+      pausedOn: {
+        callId: "c1",
+        toolName: "github.issues.list",
+        namespace: "github",
+        sourceGeneration: 1,
+        input: {},
+        reason: "policy requires approval",
+        expiresAt: 9e12,
+      },
+    });
+
+    expect(await sweepOrphanedExecutions(store)).toBe(1);
+
+    const running = await store.executions.get("exec_direct_running");
+    expect(running?.status).toBe("failed");
+    expect(running?.error?.name).toBe("ConduitOutcomeAmbiguous");
+    // The row is terminalized as ambiguous and the stored result is NOT
+    // promoted into a delivered outcome: the sweep never replays and never
+    // decides that an unfinished call succeeded.
+    expect(running?.kind).toBe("direct");
+    // ABSENCE, not "not delivered". A failed row must not CARRY the body at
+    // all: a terminalized-ambiguous row that still holds the upstream's
+    // result keeps that payload stored for anything that later reads the row,
+    // and "resultState is not delivered" passes while it sits there.
+    expect(running?.kind === "direct" ? running.result : undefined).toBeUndefined();
+    expect(running?.kind === "direct" ? running.resultState : undefined).toBeUndefined();
+    expect(running?.status).toBe("failed");
+    // The RAW columns, not the hydrated view: the hydrator could mask a
+    // stored body by declining to surface it on a failed row.
+    const rawDirect = await client.execute({
+      sql: "SELECT result, result_state FROM executions WHERE id = ?",
+      args: ["exec_direct_running"],
+    });
+    expect(rawDirect.rows[0]?.result).toBeNull();
+    expect(rawDirect.rows[0]?.result_state).toBeNull();
+    // The paused direct row is awaiting a human, not stranded — untouched.
+    expect((await store.executions.get("exec_direct_paused"))?.status).toBe("paused");
   });
 
   it("returns 0 and writes nothing on a clean database", async () => {

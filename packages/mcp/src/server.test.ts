@@ -76,6 +76,7 @@ async function seedStore(): Promise<ConduitStore> {
     type: "mcp",
     namespace: "github",
     location: "http://127.0.0.1:1/mcp",
+    generation: 0,
   });
   await store.integrations.upsert({ id: "int_gh", sourceId: "src_gh", namespace: "github" });
   await store.connections.upsert({
@@ -139,7 +140,7 @@ function fakeDaemon(
           kind: "result",
           requestId,
           payload: executionToCheckPayload(
-            await store.executions.getByRequestKey(request.requestKey),
+            await store.executions.getByRequestKey(request.requestKey, null),
             Date.now(),
           ),
         };
@@ -182,7 +183,7 @@ describe("createConduitMcpServer", () => {
   // `createConduitMcpServer` could never fire — asserting on it here would
   // have been a test that passes while pinning nothing.
 
-  it("tools/list exposes exactly execute + check_execution, with fresh connections", async () => {
+  it("INVARIANT §4.2: the Code Mode projection advertises exactly two tools — execute + check_execution — with fresh connections", async () => {
     const client = await connect(server);
     const { tools } = await client.listTools();
     expect(tools.map((t) => t.name).sort()).toEqual(["check_execution", "execute"]);
@@ -265,6 +266,7 @@ describe("createConduitMcpServer", () => {
       type: "mcp",
       namespace: "stripe",
       location: "http://127.0.0.1:1/mcp",
+      generation: 0,
     });
     await store.connections.upsert({
       id: "conn2",

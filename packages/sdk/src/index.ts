@@ -14,13 +14,26 @@ export type {
   ExecuteToolDefinition,
   ToolInvoker,
 } from "./execute.js";
-export { buildExecuteTool, createCatalogToolHost, estimateTokens } from "./execute.js";
+export {
+  buildExecuteTool,
+  createCatalogToolHost,
+  createScopedCatalogToolHost,
+  estimateTokens,
+} from "./execute.js";
 export type {
   ApprovalDecision,
   ApprovalDecisions,
   PendingCallIdentity,
 } from "./execution/decisions.js";
 export { createInMemoryApprovalDecisions, identitiesMatch } from "./execution/decisions.js";
+export type {
+  DirectBudgets,
+  DirectDrive,
+  DirectDriveHandle,
+  DirectOutcome,
+  UnknownOutcome,
+} from "./execution/direct.js";
+export { createDirectDrive, DIRECT_DEFAULTS, deliverableBytes } from "./execution/direct.js";
 export { matchesPending, toSandboxJournal } from "./execution/journal.js";
 export type {
   ExecutionManager,
@@ -37,14 +50,18 @@ export type {
   NormalizeOpenApiOptions,
 } from "./normalize/openapi.js";
 export { normalizeOpenApi } from "./normalize/openapi.js";
+export type { DispatchCell, DispatchState } from "./pipeline/dispatch.js";
+export { createDispatchCell } from "./pipeline/dispatch.js";
 export type { EgressOptions } from "./pipeline/egress.js";
 export { assertEgressAllowed, createPinnedLookup, isPrivateAddress } from "./pipeline/egress.js";
 export type { CallErrorKind, GuestErrorName } from "./pipeline/errors.js";
 export {
   ConduitCallError,
+  ConduitOutcomeAmbiguous,
   GUEST_ERROR_NAMES,
   infraError,
   NON_MEMOIZABLE_ERROR_NAMES,
+  OUTCOME_AMBIGUOUS_ERROR_NAME,
   policyError,
   upstreamError,
 } from "./pipeline/errors.js";
@@ -91,6 +108,14 @@ export type {
   ToolHost,
 } from "./sandbox/sandbox.js";
 export { DEFAULT_SANDBOX_LIMITS, generateSeeds } from "./sandbox/sandbox.js";
+export type { EffectiveScope, ScopeGrant, ScopeResolver } from "./scope.js";
+export {
+  ALL_TOOLS,
+  buildEffectiveScope,
+  DEFAULT_PROFILE_GRANT,
+  defaultScopeResolver,
+  namespaceOf,
+} from "./scope.js";
 export { SecretBox } from "./secrets.js";
 export {
   CANARY_REF,
@@ -105,6 +130,7 @@ export { openSqliteStore } from "./store/sqlite.js";
 export type {
   ConduitStore,
   ConnectionRepository,
+  DirectSettle,
   ExecutionRepository,
   IntegrationRepository,
   PolicyRepository,
@@ -115,18 +141,33 @@ export type {
 } from "./store/store.js";
 export type {
   Connection,
+  DirectCall,
   Execution,
+  ExecutionBase,
+  ExecutionError,
+  ExecutionKind,
   ExecutionStatus,
   Integration,
   JsonSchema,
+  LegacyPendingApproval,
   PendingApproval,
   Policy,
   PolicyAction,
+  Projection,
+  ResultState,
   RiskClass,
   Source,
   SourceSemantics,
   SourceType,
+  StoredPendingApproval,
   Tool,
   TraceEvent,
 } from "./types.js";
-export { isPendingApproval, NOT_NAMEABLE_CALL_ID } from "./types.js";
+export {
+  hasProvenance,
+  isPendingApproval,
+  isValidProjectionForKind,
+  NEWER_BUILD_SENTINEL,
+  NOT_NAMEABLE_CALL_ID,
+  PROJECTIONS,
+} from "./types.js";
