@@ -242,17 +242,38 @@ async function runCall(
       redactFields: verdict.redactFields,
     };
     await appendTrace(deps, options, log, { path, input, verdict: blocked });
-    if (outOfScope) {
-      // The OPERATOR still needs to tell a scope refusal from a catalog miss,
-      // and `TraceEvent` has no reason field to carry it (it stores
-      // `policyVerdict` only), so the distinction goes to the HOST log. The
-      // tool path only: no tool input, no credential material, and nothing
-      // that crosses back to the guest. The path is GUEST-SUPPLIED, so it is
-      // sanitized before interpolation: a raw newline in it would forge a
-      // host log line, and an unbounded one would flood the daemon log.
-      log(
-        `[ToolInvoker] Call refused: tool is outside this client's scope (reported to the guest as an unknown tool). Context: { tool: ${printableName(path)}, clientId: ${JSON.stringify(options.clientId)} }`,
-      );
+    if (options.scope !== undefined) {
+      // ONE logging path, taken for BOTH refusals on the scoped path. The
+      // guest-visible text was already identical; the SCHEDULE was not. Only
+      // the out-of-scope case logged, so a synchronous sink's latency, or a
+      // sink that threw or stalled for one case and not the other, told a
+      // probing client which of the two had happened — the existence oracle
+      // the identical text exists to close. Same call count, same position,
+      // either way; the operator's distinction is a FIELD on the line.
+      //
+      // The tool path only: no tool input, no credential material, and
+      // nothing that crosses back to the guest. The path is GUEST-SUPPLIED,
+      // so it is sanitized before interpolation: a raw newline in it would
+      // forge a host log line, and an unbounded one would flood the daemon
+      // log.
+      //
+      // The sink is CALLED and never AWAITED, and its faults are swallowed: a
+      // throwing sink must not change the error the guest sees, and a sink
+      // returning a promise that never settles must not hold the call open.
+      // A host log line is a diagnostic, never part of the refusal.
+      try {
+        const logged: unknown = log(
+          `[ToolInvoker] Call refused: reported to the guest as an unknown tool. Context: { tool: ${printableName(path)}, clientId: ${JSON.stringify(options.clientId)}, inCatalog: ${outOfScope} }`,
+        );
+        // Duck-typed, not `instanceof`: a sink may return a thenable from
+        // another realm. An unobserved rejection would surface as an
+        // unhandled rejection and take the process down.
+        if (typeof logged === "object" && logged !== null && "then" in logged) {
+          void Promise.resolve(logged).catch(() => {});
+        }
+      } catch {
+        // Deliberately empty: see above.
+      }
     }
     throw policyError("block", guestReason);
   }

@@ -834,10 +834,118 @@ describe("§5.5 scope check", () => {
       clientId: "acme",
     });
     // `TraceEvent` carries `policyVerdict` only — it has no reason field — so
-    // the OPERATOR's distinction lives in the HOST log instead. It names the
-    // tool path and never the tool input.
-    expect(scopeLog).toHaveBeenCalledWith(expect.stringContaining("outside this client's scope"));
+    // the OPERATOR's distinction lives in the HOST log instead, as a field on
+    // a line taken for BOTH refusals. It names the tool path and never the
+    // tool input.
+    expect(scopeLog).toHaveBeenCalledWith(expect.stringContaining("inCatalog: true"));
     expect(scopeLog.mock.calls.flat().join(" ")).toContain("github.list_issues");
+    expect(scopeLog.mock.calls.flat().join(" ")).not.toContain("title");
+  });
+
+  describe("INVARIANT §5.5: the log SCHEDULE cannot tell an absent name from an out-of-scope one", () => {
+    // The guest-visible text was already identical. The schedule was not:
+    // only the out-of-scope case called `log`, so a synchronous sink's
+    // latency, or a sink that threw or stalled for one case and not the
+    // other, restored the existence oracle the identical text closes.
+    //
+    // Each case below runs BOTH paths through the same sink and compares
+    // what the guest saw and how many times the sink was called.
+    const asError = (e: unknown): Error => {
+      if (!(e instanceof Error)) throw new Error(`expected an Error, got ${String(e)}`);
+      return e;
+    };
+    /** The same call, once against a catalog that holds the name and once against one that does not. */
+    async function bothRefusals(
+      log: () => unknown,
+    ): Promise<{ outOfScope: Error; absent: Error; calls: number }> {
+      let calls = 0;
+      const counting = () => {
+        calls += 1;
+        return log();
+      };
+      const outOfScope = await createToolInvoker(deps(recordingUpstream().caller), {
+        executionId: "exec_sched_scope",
+        projection: "code",
+        clientId: "acme",
+        // The catalog HOLDS github.list_issues; the grant does not.
+        scope: permitOnly(["github.delete_repo"]),
+        log: counting,
+      })("github.list_issues", {}).then(() => {
+        throw new Error("expected the out-of-scope call to be refused");
+      }, asError);
+      const afterScoped = calls;
+      const emptyStore = {
+        ...deps(recordingUpstream().caller),
+        store: { ...store, tools: { ...store.tools, get: async () => undefined } },
+      } as Parameters<typeof createToolInvoker>[0];
+      const absent = await createToolInvoker(emptyStore, {
+        executionId: "exec_sched_absent",
+        projection: "code",
+        clientId: "acme",
+        scope: permitOnly(["github.delete_repo"]),
+        log: counting,
+      })("github.list_issues", {}).then(() => {
+        throw new Error("expected the absent call to be refused");
+      }, asError);
+      // The SAME number of sink calls on each path — that is the invariant.
+      expect(afterScoped).toBe(calls - afterScoped);
+      return { outOfScope, absent, calls };
+    }
+
+    it("INVARIANT §5.5: an absent and an out-of-scope name call the log sink the same number of times", async () => {
+      const { outOfScope, absent } = await bothRefusals(() => undefined);
+      expect(outOfScope.name).toBe(absent.name);
+      expect(outOfScope.message).toBe(absent.message);
+    });
+
+    it("INVARIANT §5.5: a THROWING log sink produces the same error class and message for both", async () => {
+      const { outOfScope, absent } = await bothRefusals(() => {
+        throw new Error("sink exploded");
+      });
+      expect(outOfScope.name).toBe(GUEST_ERROR_NAMES.policyBlocked);
+      expect(outOfScope.name).toBe(absent.name);
+      expect(outOfScope.message).toBe(absent.message);
+      // The sink's own fault never reaches the guest.
+      expect(outOfScope.message).not.toContain("exploded");
+    });
+
+    it("INVARIANT §5.5: a log sink returning a never-settling promise still returns on both paths", async () => {
+      // The sink is CALLED, never AWAITED. If it were awaited, this hangs.
+      const { outOfScope, absent } = await bothRefusals(() => new Promise<void>(() => {}));
+      expect(outOfScope.message).toBe(absent.message);
+    });
+
+    it("the UNSCOPED path gains no log call and no extra store call", async () => {
+      // No resolver, so there is nothing to be an oracle about: the unscoped
+      // path keeps its one `tools.get` per call and stays silent.
+      let gets = 0;
+      const log = vi.fn();
+      const counted = {
+        ...deps(recordingUpstream().caller),
+        store: {
+          ...store,
+          tools: {
+            ...store.tools,
+            get: async (name: string) => {
+              gets += 1;
+              return await store.tools.get(name);
+            },
+          },
+        },
+      } as Parameters<typeof createToolInvoker>[0];
+      await createToolInvoker(counted, {
+        executionId: "exec_unscoped_sched",
+        projection: "code",
+        clientId: null,
+      })("github.nope", {}).then(
+        () => {
+          throw new Error("expected the call to be refused");
+        },
+        () => undefined,
+      );
+      expect(gets).toBe(1);
+      expect(log).not.toHaveBeenCalled();
+    });
   });
 
   it("INVARIANT §5.5: the out-of-scope refusal is identical on the APPROVED-decision path too — one source of the unknown-tool text", async () => {
@@ -1075,7 +1183,8 @@ describe("§5.5 scope check", () => {
       log: scopeLog,
     })(hostile, {}).catch(() => {});
     const line = scopeLog.mock.calls.flat().join(" ");
-    expect(line).toContain("outside this client's scope");
+    // One line for both refusals; the operator's distinction is a field.
+    expect(line).toContain("inCatalog: true");
     // The interpolated name carries no newline, so the forged tail cannot
     // start a line of its own, and the whole entry stays bounded.
     expect(line).not.toContain("\n");
