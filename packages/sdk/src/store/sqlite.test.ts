@@ -992,11 +992,13 @@ describe("SqliteStore", () => {
     });
 
     it("INVARIANT §4.1: a DUPLICATED key blocks the unique upgrade with a diagnostic and leaves the plain index intact", async () => {
-      // The ladder used to DROP and CREATE UNIQUE in one batch. With two key
-      // rows for one execution the CREATE failed AFTER the DROP had landed,
-      // so the database was left with no index of that name and every
-      // subsequent open failed identically — a bricked store with no repair
-      // path. Checking first means the failure is diagnosable and reversible.
+      // The ladder used to DROP and CREATE UNIQUE in one batch. That batch is
+      // ATOMIC: with two key rows for one execution the CREATE fails and
+      // rolls the DROP back with it, so the plain index survives and the
+      // store is repairable, never bricked. What the batch alone could not do
+      // is SAY WHY — every subsequent open failed the same opaque way.
+      // Checking first makes the failure diagnosable: the next open reaches
+      // the count-only diagnostic instead of re-running the doomed upgrade.
       const url = tempFileDbUrl();
       const seed = createClient({ url });
       await seed.execute(`CREATE TABLE request_keys (
