@@ -1292,18 +1292,22 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
     try {
       request = JSON.parse(execution.call.request);
     } catch {
-      if (!drive.settle()) return;
+      // PREPARED BEFORE THE LATCH, as everywhere else in the direct arm: the
+      // error, the settle and the outcome are complete before `settle()` is
+      // called, so nothing that could throw sits between the latch returning
+      // true and the outcome being published. A throw there would leave
+      // `outcome` unresolvable with nothing left able to settle it.
+      //
       // No stored bytes and no parse position in the message: the row is
       // handed back to the agent by `check_execution`.
       const error: ExecutionError = {
         name: "ConduitInternalError",
         message: `[ExecutionManager] Stored direct_call request is not valid JSON (corrupt state); the call did not run. Context: { executionId: ${execution.id} }`,
       };
-      await settleBounded(
-        run,
-        { status: "failed", error },
-        { status: "failed", executionId: execution.id, error },
-      );
+      const settle: DirectSettle = { status: "failed", error };
+      const outcome: DirectOutcome = { status: "failed", executionId: execution.id, error };
+      if (!drive.settle()) return;
+      await settleBounded(run, settle, outcome);
       return;
     }
     let upstreamSession: UpstreamSessionScope | undefined;
@@ -1951,6 +1955,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
               now,
               budgetMs: budgets.driveBudgetMs,
               onExpire: () => {
+                // Prepared before the latch: a plain object built from values
+                // already in hand, so nothing fallible sits between the latch
+                // and the publish.
+                const error: ExecutionError = {
+                  name: "ConduitExecutionInterrupted",
+                  message: `[ExecutionManager] Direct resume budget elapsed during the read-side guard (${budgets.driveBudgetMs}ms); the pending call did not run. Context: { executionId: ${executionId} }`,
+                };
                 // The latch: if the guard already decided, it owns the settle.
                 if (!directDrive?.settle()) return;
                 // Resolve the drive's lifecycle promises and clear its timer
@@ -1958,10 +1969,6 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
                 // exit rather than leaving `finished`/`settledAt` pending and
                 // the drive undisposed.
                 directDrive.settleEarly();
-                const error: ExecutionError = {
-                  name: "ConduitExecutionInterrupted",
-                  message: `[ExecutionManager] Direct resume budget elapsed during the read-side guard (${budgets.driveBudgetMs}ms); the pending call did not run. Context: { executionId: ${executionId} }`,
-                };
                 void settleDirectBounded({ status: "failed", error }, error, directDrive).then(
                   resolveGuardExpiry,
                   () =>
