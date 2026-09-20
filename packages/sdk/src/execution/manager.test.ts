@@ -4114,6 +4114,79 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       expect(settles).toBe(1);
       expect(out).toMatchObject({ status: "failed" });
     });
+
+    it("INVARIANT §5.3 (#45): a guard read that REJECTS after the expiry took the latch yields the expiry's outcome, not the read's fault", async () => {
+      // The other settlement of the same race. A guard read that REJECTS
+      // inside the expiry's write window is a loser exactly as one that
+      // resolves is: surfacing its internal fault would replace the outcome
+      // the expiry already published with the fault of a read nobody is
+      // waiting on, and the client would see a throw where a settled outcome
+      // exists.
+      active = await makeHarness();
+      const m = createExecutionManager({ ...active.deps, direct: fast });
+      const paused = await m.startDirect(
+        "github.create_issue",
+        { title: "t" },
+        { clientId: null, projection: "direct", scope: permitDirect },
+      ).outcome;
+      const callId = await pendingCallOf(m, paused.executionId);
+
+      const guardRead = gate();
+      const expiryWrite = gate();
+      let settles = 0;
+      const interleaved = {
+        ...active.store,
+        tools: {
+          ...active.store.tools,
+          // Held until the expiry owns the latch, then REJECTS.
+          get: async () => {
+            await guardRead.wait;
+            throw new Error("guard read failed with host-only detail");
+          },
+        },
+        executions: {
+          ...active.store.executions,
+          settleDirect: async (...a: Parameters<ConduitStore["executions"]["settleDirect"]>) => {
+            settles += 1;
+            // The EXPIRY's write is held in flight, so `guardExpiry` has NOT
+            // resolved when the read below rejects. The race therefore cannot
+            // answer `expired` on its own — the rejection reaches `raceGuard`
+            // first, and only the synchronous latch can convert it.
+            if (settles === 1) await expiryWrite.wait;
+            return await requireActive(active).store.executions.settleDirect(...a);
+          },
+        },
+      } as unknown as ConduitStore;
+      const raced = createExecutionManager({
+        ...active.deps,
+        store: interleaved,
+        direct: fast,
+      });
+
+      const resumed = raced.resume(paused.executionId, { kind: "approve" }, callId, permitDirect);
+      // REAL CLOCK, same reason as above.
+      await new Promise((r) => setTimeout(r, fast.driveBudgetMs + 20));
+      expect(settles).toBe(1);
+      // The expiry has fired and its write is STILL IN FLIGHT. NOW let the
+      // guard read reject into that window.
+      guardRead.open();
+      await new Promise((r) => setTimeout(r, 20));
+      expiryWrite.open();
+      const out = await Promise.race([
+        resumed,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+      ]);
+
+      expect(out).not.toBe("HUNG");
+      // RESOLVES with the expiry's outcome — it does not throw the read's fault.
+      expect(out).toMatchObject({
+        status: "failed",
+        error: { name: "ConduitExecutionInterrupted" },
+      });
+      // Exactly ONE settle attempt — the expiry's.
+      expect(settles).toBe(1);
+      expect(active.calls).toHaveLength(0);
+    });
   });
 
   describe("a result that cannot be serialized settles a truthful terminal, never a hang", () => {
