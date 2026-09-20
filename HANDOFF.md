@@ -161,6 +161,58 @@ amendment are committed. Post-PR gauntlet state:
   changes shipped Code Mode behaviour), keep every direct-path bound, and
   reword the §18 sentence to say Lane A bounds the DIRECT path and the
   direct-row resume guard only.
+- **FOUNDER DECISION 2026-09-20: Option A — REVERT the code-row resume
+  guard bound.** A code row goes back to one writer and no timer on its
+  guard path, as on main; every direct-path bound stays.
+- DONE: codex confirming pass #2 (`gpt-5.6-sol`, `high`, head `6335cf3`;
+  it completed before the controller's attempt to stop it) — **P0 1 / P1 4
+  / P2 0, NOT CONVERGED.** It marked FIXED: late-create reconciliation; the
+  unique-index upgrade (the batch IS atomic — "repairable, not bricked";
+  this settles the earlier contradiction against the pre-PR reviewer's
+  probe); sweep result retention; `startDirect` input serialization;
+  `unknown.reason` validation; harness `credentialRef`. Remaining: (P0) the
+  existence oracle survives through the LOG schedule — `log` fires only for
+  an out-of-scope name, an absent name skips it; (P1) a REJECTING guard
+  read bypasses `raceGuard`'s latch check (the code half disappears with
+  Option A; the direct half needs a closed union); (P1) `cause instanceof
+  Error` runs AFTER the latch and throws on a revoked Proxy → hang; (P1,
+  new class) the deliverable is serialized twice, so a stateful `toJSON`
+  breaks "measured = stored = returned"; (P1) ledger rows #41a, #45 and the
+  §5.5 equivalence row do not pin those cases. Classification: the last two
+  code findings are reachable only from HOST code (a custom invoker or
+  store), which the threat model trusts — fixed anyway because one SHAPE
+  change closes the class: PREPARE-THEN-COMMIT (everything fallible is
+  computed before `settle()`; after the latch the code only publishes
+  prebuilt values). A fresh fix agent is working
+  `final-shape-fixlist.md` (git-ignored workspace) from `e84ae85`.
+- **FINAL SHAPE PASS DONE** — `8c98ace` (code-row guard timer and latch
+  removed; four tests that pinned it deleted), `28aca06` (`raceGuard`
+  returns a closed union incl. rejection and consults the latch after
+  either settlement), `92c740a` (PREPARE-THEN-COMMIT: every fallible step
+  — classification, formatting, snapshotting and measuring the deliverable
+  — happens before `settle()`; the deliverable is snapshotted ONCE so
+  measured = stored = returned), `5f79ca6` (one logging path for both
+  scoped refusals; the sink is never awaited), `b06d094` (ledger repinned;
+  stale index-upgrade comment corrected). Controller-verified by hand: sdk
+  664/664, mcp 440/440, cli 118/118, `tsc -p` ×3 exit 0; none of the
+  removed timer's identifiers survives. The fix agent's tests found a
+  TWELFTH instance not on the list — the `catch` at the head of
+  `runDirect` asked `cause instanceof Error` unguarded, one frame further
+  out than the two named sites — fixed in `92c740a`. For a code row the
+  guard's READS are unbounded (as on main) and its terminalizing WRITES are
+  bounded; the follow-up is named in a code comment at the first read.
+- **§18 WRITTEN (founder delegated the wording):** the 2026-09-19 entry now
+  says which Code Mode store calls stay un-time-bounded (first mutation,
+  drive writes, code-row guard reads), that a code-row guard timer was tried
+  and removed and why, what Lane A does bound (the direct path incl. the
+  direct-row resume guard, and a code row's terminalizing writes), that
+  host dependencies are trusted, and that out-of-scope/absent
+  indistinguishability covers text, error class and the call/log schedule
+  while wall-clock timing is best-effort.
+- After that: ONE more codex pass when the usage limit allows, then STOP
+  whatever it says — classify each finding as fix / out of scope by the §18
+  text / best-effort, record the run in the PR, and bring any remaining
+  in-scope break to the founder rather than opening another fix loop.
 - **If the queued codex pass reports the SAME class a tenth time, STOP.
   Do not patch. Bring the founder the design question: should Lane A bound
   the code-row guard phase at all, or revert that bound and scope it out in

@@ -804,10 +804,17 @@ id and nothing was dispatched; the next re-issue with the same key answers `conf
 completion reaches a client as `result: null` while the stored row says `discarded`; Lane B
 decides the wire form. **Also out of scope for Lane A:** Code Mode's own store calls are not
 time-bounded, as on main today — the first mutation (`start`'s `create()`, the
-`claimForResume` await) and the drive's journal, pause and settle writes; a store that commits and
-never answers hangs that call. Bounding them needs attempt-fenced late-completion recovery for code rows and is a
-follow-up. What Lane A bounds: every store call in `resume`'s read-side guard phase, for both kinds,
-and every store call on the direct path.
+`claimForResume` await), the drive's journal, pause and settle writes, and the reads of
+`resume`'s read-side guard for a code row; a store that commits, or accepts a read, and never answers
+hangs that call. Bounding them needs attempt-fenced late-completion recovery for code rows and is a follow-up. A
+timer on the code-row guard was tried and removed: a code row has no drive, so the timer was a second writer
+beside the guard, and a second writer needs a latch the code path does not otherwise have. What Lane A bounds:
+every store call on the direct path, including the direct-row resume guard, and the terminalizing writes of a code
+row's resume guard. **Threat-model notes:** host dependencies — a custom invoker, store, or log
+sink — are trusted, so hostile values thrown or returned by them are outside the threat model; the direct arm is
+nevertheless total about them, because nothing that can throw runs after its settle latch is taken. An
+out-of-scope tool is indistinguishable from an absent one in refusal text, error class, and the schedule of
+awaited and logged calls; wall-clock timing is best-effort, not a boundary.
 - **R1 sequencing amended — Lane A, then preview packaging, then decide profiles (decided 2026-09-11):** ✅
 The R1 build shape stays Lane A → B → C (R1 design spec §10), but publication moves between A and B.
 **Lane A first, while nothing is published:** it changes pause-path storage (the `code`
