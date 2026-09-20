@@ -152,7 +152,14 @@ completion claim is verified against the artifact before it is repeated
 **DEFERRED (live list, updated 2026-09-20):** carry the 2026-09-13 and
 earlier lists, plus the follow-ups above, plus: Dependabot reports 15
 alerts on main (14 moderate, 1 low) against the 6 medium / 1 low last
-recorded here — audit triage is due before R3a ships.
+recorded here — audit triage is due before R3a ships · the
+`--doctor --offline performs ZERO writes` fixture race
+(`packages/mcp/src/integration.test.ts`) — also due before R3a ships: it
+failed CI once on PR #62 and the larger R1 schema widens the window, so a
+required check now fails on timing; fix the fixture (fingerprint after
+the seeding write settles, or assert content rather than mtime), and
+prove the repaired test can still fail by making `--doctor --offline`
+write once.
 
 **SHELVED (unchanged):** the project-jail plan.
 
