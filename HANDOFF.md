@@ -209,10 +209,30 @@ amendment are committed. Post-PR gauntlet state:
   host dependencies are trusted, and that out-of-scope/absent
   indistinguishability covers text, error class and the call/log schedule
   while wall-clock timing is best-effort.
-- After that: ONE more codex pass when the usage limit allows, then STOP
-  whatever it says — classify each finding as fix / out of scope by the §18
-  text / best-effort, record the run in the PR, and bring any remaining
-  in-scope break to the founder rather than opening another fix loop.
+- **The founder PASSED the explainer quiz (2026-09-20, all seven).** The
+  explainer "Lane A Walkthrough" was published 2026-09-20. The second merge
+  gate — the founder's explicit word naming PR #62 — is still open.
+- DONE: codex pass #3, the FINAL one (`gpt-5.6-sol`, `high`, head
+  `6036a18`) — **P0 0 / P1 5 / P2 1; no boundary break.** It confirmed
+  FIXED: the rejecting guard read, the double serialization, the
+  log-schedule oracle, and the removal of the code-row timer (no dangling
+  expiry await). **STOP LINE REACHED — adjudicated, no further pass**
+  (LEARNINGS #16/#26: the last three passes found only seams of the
+  previous fold and inaccuracies in the decision record, no new boundary
+  class). Findings and their disposition: (1) `printableName` left U+0085 /
+  U+2028 / U+2029, so a tool name could forge a host log record → FIXED;
+  (2) `claimForResume` is awaited before kind routing, so a stalled claim
+  hangs a DIRECT resume too → the §18 sentence was wrong, not the code;
+  corrected; (3) the bounded `kindOf` lookup precedes kind routing, so code
+  rows pass through one timeout (one writer) → the §18 sentence was wrong;
+  corrected; (4) one settle site built its error after the latch — trigger
+  is a hostile custom store, outside the threat model, but §18 claimed
+  "nothing throwable after the latch" → construction moved before the latch
+  AND the sentence softened to a design rule, not a totality proof; (5) the
+  §5.5 ledger row's tests did not assert the log call's POSITION → test
+  fixed; (6) the unscoped no-log test never passed its spy → fixed. A small
+  fix agent is working items 1, 4, 5, 6 from `6036a18`; the §18 text is
+  corrected on disk and lands with it. Record all three codex runs on the PR.
 - **If the queued codex pass reports the SAME class a tenth time, STOP.
   Do not patch. Bring the founder the design question: should Lane A bound
   the code-row guard phase at all, or revert that bound and scope it out in
