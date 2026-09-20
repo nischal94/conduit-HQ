@@ -31,12 +31,19 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-20 (**R1 Lane A EXECUTED — PR #62 open, every gate passed, founder authorized the merge on green**; NEXT after the merge: R3a preview packaging)
+## Current handoff — updated 2026-09-20 (**R1 Lane A LANDED — PR #62 MERGED `240bfb9`**, founder-named merge after a full quiz pass; branches = main only; NEXT: R3a preview packaging)
+
+**Merge record.** The founder passed the explainer quiz and said "merge
+#62 once CI is green". All nine checks were green on the final head
+`33606e7`; every inline review comment was read first (the last one, from
+Greptile, found run-schedule and scratch details in this file's
+mid-session checkpoints — a real public-safe violation, fixed before the
+merge). Squash `240bfb9`; its tree is byte-identical to the branch tip's;
+the branch is deleted locally and on the remote.
 
 **State.** The Lane A plan
 (`docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md`) was
-executed on `feat/r1-lane-a` and is PR #62. If this section still says
-"open", the merge did not complete: check `gh pr view 62` first. What it
+executed on `feat/r1-lane-a` and landed as PR #62. What it
 lands: `Execution` as a discriminated union (`kind`, `clientId`,
 `projection`) with a throwing sentinel in `code` for every new row;
 client-namespaced request keys (one key per execution, unique);
@@ -74,7 +81,7 @@ after pass 3 by adjudication (LEARNINGS #16/#26): the last three passes
 found only seams of the previous fix and inaccuracies in the decision
 record. The founder passed the explainer quiz ("Lane A Walkthrough",
 published 2026-09-20, seven questions) and named the merge. Lessons are
-LEARNINGS #29–#37.
+LEARNINGS #29–#37; the session debrief was published 2026-09-20.
 
 **The recurring defect, for whoever touches the direct arm next.**
 Twelve instances of one class: something that could fail ran after the
@@ -152,9 +159,8 @@ recorded here — audit triage is due before R3a ships.
 ### KICKOFF PROMPT for the next session
 
 > Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
-> follow its protocol (incl. `gh pr list --state all --limit 5` — confirm
-> #62, R1 Lane A, is MERGED; if it is still open, the merge did not
-> complete: CI must be green and the founder has already named it).
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #62, R1
+> Lane A, is MERGED `240bfb9`; branches = main only).
 > **Do NOT re-review #62 or reopen its §18 decisions.** NEXT: plan R3a
 > preview packaging with `superpowers:writing-plans` per HANDOFF NEXT
 > item 1. Carry the DEFERRED list and the follow-ups.
