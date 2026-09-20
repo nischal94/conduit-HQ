@@ -31,429 +31,140 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-13 ~12:10 (**Lane A plan WRITTEN, REVIEWED, and MERGED — PR #61 `1022b2e`**, founder-named merge; branches = main only; NEXT: execute the plan on `feat/r1-lane-a`)
+## Current handoff — updated 2026-09-20 (**R1 Lane A EXECUTED — PR #62 open, every gate passed, founder authorized the merge on green**; NEXT after the merge: R3a preview packaging)
 
-**PR #62 IS OPEN (2026-09-20) — `feat/r1-lane-a` → main, pushed through
-`83773b4`. RESUME HERE.** The founder confirmed the PR body and both spec
-notes verbatim; conduitspec §18 (2026-09-19 entry) and the design-spec §5.5
-amendment are committed. Post-PR gauntlet state:
-- DONE: `/security-review` — no finding met the bar. One note for Lane B:
-  the daemon does not filter `executions.get` by client id; harmless while
-  every row has `clientId: null`, but reads by execution id MUST be
-  authorized against the caller's client id once named clients reach the
-  daemon.
-- DONE: Greptile — TWO P1s, both real, NOT YET FIXED: (1) `startDirect`
-  calls `JSON.stringify(input)` before building the handle, so a cyclic
-  input, a `BigInt`, or a throwing `toJSON` throws synchronously — no
-  bounded outcome, no execution record; fix: catch it and answer the same
-  failed outcome other non-JSON inputs get, with a test per input shape.
-  (2) the timeout settle re-issued after a LATE `create()` success calls
-  `settleDirect` unbounded, so a stalled write leaves the row `running`;
-  fix: route it through `boundedFencedSettle` and keep tracking the write.
-- CodeRabbit skipped itself ("manual review required for this OSS
-  repository") — trigger it with an `@coderabbitai review` PR comment if
-  its review is wanted; that is an outward-facing post, ask the founder.
-  ASKED 2026-09-20, no answer yet. Recommendation given: trigger it AFTER
-  the post-PR fix pass is pushed, so it reviews the corrected code; it is
-  the review the commit-routing rule names.
-- CI: 8 of 9 green; "Unit tests" failed ONCE on the known
-  `--doctor --offline performs ZERO writes` fixture race (db 4096 → 131072
-  bytes inside 40 ms: the fixture's seeding write landing after the
-  baseline stat), rerun started. This branch's larger schema lengthens the
-  seeding write and WIDENS that race — expect it more often; the fixture
-  fix (fingerprint after setup settles, or assert content not mtime) is now
-  worth doing. Also new: mcp full-suite runs can fail once with run-daemon
-  "Bind refused: existing entry is not a socket" on a temp socket path.
-- DONE: codex adversarial pass #1 on the PR (`gpt-5.6-sol`, `high`;
-  triggers: authorization boundary, concurrency/CAS, persistence invariant,
-  >8 files; head `83773b4`; ~23 min) — **P0 1 / P1 6 / P2 0, NOT
-  CONVERGED**, all seven verified by reading, all in scope. P0: the
-  existence oracle survives as a SIDE CHANNEL — unknown tool names skip
-  `options.scope()`, existing names call it, so a slow/rejecting/stalling
-  resolver separates them by latency, error shape or hang. P1: the whole
-  CODE-row guard phase after a claim is unbounded; a SYNCHRONOUS store
-  throw escapes `kindOf` and both `failClaimedResume` fallbacks;
-  `String(cause)` runs AFTER the latch is spent (a thrown value with a
-  hostile `toString` hangs the outcome, and the "throw from ANYWHERE" test
-  never reaches that handler — ledger row #45 was falsely pinned);
-  late-`create()` reconciliation is unbounded (= Greptile P1 #2); the
-  unique-index upgrade's duplicate check and DROP are separate statements
-  (TOCTOU → the brick returns); the sweep keeps the upstream result body
-  and commit `4ce5111` WEAKENED its test to pass. **Classification: three
-  P1s + Greptile #2 are instances 6–8 of ONE class, so the fix is the
-  SHAPE — one store-call helper (sync throw → rejection, budget, closed
-  result union) on every post-claim path, one total cause formatter, settle
-  before diagnostics — then ONE confirming codex pass.** FIXED in
-  `5b62817`, `ce109a9`, `ee06e1a`, `479eec6`, `e301547`, `f098ac8`,
-  `1bbc628`, `4f1efe7`; the controller re-ran everything by hand: sdk
-  653/653, mcp 440/440, cli 118/118, `tsc -p` sdk/mcp/cli all exit 0.
-  The index-upgrade item was DONE DIFFERENTLY: the agent reports libSQL's
-  `batch(…, "write")` is transactional, so DROP/CREATE rolls back together
-  and the database stays openable; it added a test that fails if the two
-  statements are split. That CONTRADICTS the pre-PR reviewer's probe ("no
-  index remains") — the confirming codex pass must settle it.
-- DONE: CodeRabbit (the founder triggered it; it reviewed the pre-fix
-  head) — 4 findings: one already fixed; three folded into the same fix
-  pass, including the one no other reviewer saw (`deliverableBytes` ran
-  `JSON.stringify` AFTER the latch, so a `BigInt` or circular invoker
-  result hung the outcome — now measured before the latch).
-- **DECIDED (founder delegated it, 2026-09-20) and WRITTEN to the
-  conduitspec §18 entry:** Code Mode's own store calls stay un-time-bounded
-  in this PR, as on main — the first mutation (`start`'s `create()`, the
-  `claimForResume` await) and the drive's journal, pause and settle
-  writes; bounding them needs attempt-fenced late-completion recovery for
-  code rows (follow-up). Lane A bounds `resume`'s read-side guard phase for
-  both kinds and every store call on the direct path. The first draft
-  claimed more ("every call after the first mutation"); the fix agent's
-  store-call coverage table showed that was false, so the sentence was
-  reworded before it was written. An adversarial finding against those
-  Code Mode writes is now out of scope by documented decision.
-- Codex confirming pass, attempt 1 (head `d86d3ee`): DIED ON THE USAGE
-  LIMIT after ~220K tokens ("try again at 7:50 AM"). The same run is
-  QUEUED behind a `sleep` and fires 07:53 IST 2026-09-20; it reads the
-  working tree at run time, so do not switch branches while it runs. Its
-  prompt and output live in the session scratchpad; if this section still
-  says QUEUED in a later session, the session ended first — re-run it per
-  `~/.claude/rules/codex-one-path.md` with the prompt shape of pass #1
-  plus: the fixed-findings list, the §18 scope sentence as documented
-  out-of-scope, and a request for an explicit CONVERGED / NOT CONVERGED.
-  Record model, effort, trigger and counts in the PR.
-- The killed run's stderr held ONE lead, which the controller verified by
-  reading the code: the code-row guard timer added by the post-PR fix was
-  UNLATCHED — its callback started a "did not run" write, a guard read
-  returning meanwhile won `Promise.race`, and the drive could start the
-  guest program on a row being written as "did not run" (ninth instance of
-  the class; introduced by the fix meant to close it). FIXED in `dcc9e39`
-  as a shape fix: the latch check lives INSIDE `raceGuard` for both kinds,
-  guard refusals take-the-latch-or-defer, and the handover re-checks.
-  Controller-verified: sdk 657/657, mcp 440/440, cli 118/118, `tsc -p`
-  ×3 exit 0. Honest limit, from the fix agent: the three protections
-  overlap, so removing any ONE leaves every test green; removing any PAIR
-  goes red. No single guard is individually pinned.
-- DONE: Aikido scan — 23/23 changed product files, no issues. Caveat: the
-  scan agent stripped comment blocks to fit the payload size, so a secret
-  inside a COMMENT would not have been seen (the pre-PR code reviewer read
-  comments and found none); `dcc9e39` was committed after the scan.
-- DONE: `code-review` on the PR (5 reviewers; four died on the session
-  limit at ~04:50 IST and were resumed from their transcripts at 07:52).
-  CLAUDE.md compliance: no violations (and the controller confirmed no spec
-  drift: `html2md.py` on a clean tree leaves `git status` empty). Git
-  history: no earlier fix undone (#58 binding, #59 un-nameable call id, the
-  echo tripwire, the egress guard, I-3 "terminalize then re-throw" all
-  preserved). Prior-PR comments (12 PRs read): nothing recurs; Lane B note —
-  `startDirect` has no cap on the size of its `input` (unreachable from an
-  untrusted caller until Lane B wires it). **TWO FINDINGS, SAME CLASS, both
-  in the CODE-ROW guard bound the post-PR fix added (`ee06e1a`, `dcc9e39`),
-  NOT YET FIXED:** (1) the code-row TTL-`expired` arm in `resume()` writes
-  `put(expired)` without taking the code-row latch — the guard timer can
-  fire during that write: two writers, and the unfenced `put` can overwrite
-  the timer's `failed` with `expired`; (2) the code-row prep-window catch
-  calls `failClaimedBounded` directly, bypassing the latch the comment
-  block says every guard refusal goes through — two writers, contradictory
-  answers (the expiry resolves `failed`/`unknown`, the catch re-throws).
-  Both are moderate: the SQL `WHERE status='running'` fence keeps the row
-  sane in most orderings and no false "did not run" with a side effect was
-  traced. That is instances TEN and ELEVEN. The stop rule below has
-  triggered: **the design question is with the founder — do not patch
-  until answered.** Recommendation given: REVERT the code-row guard bound
-  (it was never in the plan or the design spec; it was added at the end in
-  response to a codex P1; it produced three defects in two commits; it
-  changes shipped Code Mode behaviour), keep every direct-path bound, and
-  reword the §18 sentence to say Lane A bounds the DIRECT path and the
-  direct-row resume guard only.
-- **FOUNDER DECISION 2026-09-20: Option A — REVERT the code-row resume
-  guard bound.** A code row goes back to one writer and no timer on its
-  guard path, as on main; every direct-path bound stays.
-- DONE: codex confirming pass #2 (`gpt-5.6-sol`, `high`, head `6335cf3`;
-  it completed before the controller's attempt to stop it) — **P0 1 / P1 4
-  / P2 0, NOT CONVERGED.** It marked FIXED: late-create reconciliation; the
-  unique-index upgrade (the batch IS atomic — "repairable, not bricked";
-  this settles the earlier contradiction against the pre-PR reviewer's
-  probe); sweep result retention; `startDirect` input serialization;
-  `unknown.reason` validation; harness `credentialRef`. Remaining: (P0) the
-  existence oracle survives through the LOG schedule — `log` fires only for
-  an out-of-scope name, an absent name skips it; (P1) a REJECTING guard
-  read bypasses `raceGuard`'s latch check (the code half disappears with
-  Option A; the direct half needs a closed union); (P1) `cause instanceof
-  Error` runs AFTER the latch and throws on a revoked Proxy → hang; (P1,
-  new class) the deliverable is serialized twice, so a stateful `toJSON`
-  breaks "measured = stored = returned"; (P1) ledger rows #41a, #45 and the
-  §5.5 equivalence row do not pin those cases. Classification: the last two
-  code findings are reachable only from HOST code (a custom invoker or
-  store), which the threat model trusts — fixed anyway because one SHAPE
-  change closes the class: PREPARE-THEN-COMMIT (everything fallible is
-  computed before `settle()`; after the latch the code only publishes
-  prebuilt values). A fresh fix agent is working
-  `final-shape-fixlist.md` (git-ignored workspace) from `e84ae85`.
-- **FINAL SHAPE PASS DONE** — `8c98ace` (code-row guard timer and latch
-  removed; four tests that pinned it deleted), `28aca06` (`raceGuard`
-  returns a closed union incl. rejection and consults the latch after
-  either settlement), `92c740a` (PREPARE-THEN-COMMIT: every fallible step
-  — classification, formatting, snapshotting and measuring the deliverable
-  — happens before `settle()`; the deliverable is snapshotted ONCE so
-  measured = stored = returned), `5f79ca6` (one logging path for both
-  scoped refusals; the sink is never awaited), `b06d094` (ledger repinned;
-  stale index-upgrade comment corrected). Controller-verified by hand: sdk
-  664/664, mcp 440/440, cli 118/118, `tsc -p` ×3 exit 0; none of the
-  removed timer's identifiers survives. The fix agent's tests found a
-  TWELFTH instance not on the list — the `catch` at the head of
-  `runDirect` asked `cause instanceof Error` unguarded, one frame further
-  out than the two named sites — fixed in `92c740a`. For a code row the
-  guard's READS are unbounded (as on main) and its terminalizing WRITES are
-  bounded; the follow-up is named in a code comment at the first read.
-- **§18 WRITTEN (founder delegated the wording):** the 2026-09-19 entry now
-  says which Code Mode store calls stay un-time-bounded (first mutation,
-  drive writes, code-row guard reads), that a code-row guard timer was tried
-  and removed and why, what Lane A does bound (the direct path incl. the
-  direct-row resume guard, and a code row's terminalizing writes), that
-  host dependencies are trusted, and that out-of-scope/absent
-  indistinguishability covers text, error class and the call/log schedule
-  while wall-clock timing is best-effort.
-- **The founder PASSED the explainer quiz (2026-09-20, all seven).** The
-  explainer "Lane A Walkthrough" was published 2026-09-20. The second merge
-  gate — the founder's explicit word naming PR #62 — is still open.
-- DONE: codex pass #3, the FINAL one (`gpt-5.6-sol`, `high`, head
-  `6036a18`) — **P0 0 / P1 5 / P2 1; no boundary break.** It confirmed
-  FIXED: the rejecting guard read, the double serialization, the
-  log-schedule oracle, and the removal of the code-row timer (no dangling
-  expiry await). **STOP LINE REACHED — adjudicated, no further pass**
-  (LEARNINGS #16/#26: the last three passes found only seams of the
-  previous fold and inaccuracies in the decision record, no new boundary
-  class). Findings and their disposition: (1) `printableName` left U+0085 /
-  U+2028 / U+2029, so a tool name could forge a host log record → FIXED;
-  (2) `claimForResume` is awaited before kind routing, so a stalled claim
-  hangs a DIRECT resume too → the §18 sentence was wrong, not the code;
-  corrected; (3) the bounded `kindOf` lookup precedes kind routing, so code
-  rows pass through one timeout (one writer) → the §18 sentence was wrong;
-  corrected; (4) one settle site built its error after the latch — trigger
-  is a hostile custom store, outside the threat model, but §18 claimed
-  "nothing throwable after the latch" → construction moved before the latch
-  AND the sentence softened to a design rule, not a totality proof; (5) the
-  §5.5 ledger row's tests did not assert the log call's POSITION → test
-  fixed; (6) the unscoped no-log test never passed its spy → fixed. A small
-  fix agent is working items 1, 4, 5, 6 from `6036a18`; the §18 text is
-  corrected on disk and lands with it. Record all three codex runs on the PR.
-- **If the queued codex pass reports the SAME class a tenth time, STOP.
-  Do not patch. Bring the founder the design question: should Lane A bound
-  the code-row guard phase at all, or revert that bound and scope it out in
-  the §18 sentence (as the first mutation already is)?**
-- Follow-up found by a whole-file ledger scan: 129 `INVARIANT §` tests
-  uncited and 70 truncated citations in `INVARIANTS.md`, all OUTSIDE the R1
-  section (§9.3/§16/§17/§18-C4) and predating this branch. Every
-  branch-added invariant test is cited (96 of 96).
-- NOT STARTED: `/aikido:scan`; `code-review:code-review` on the PR; ONE fix
-  pass for Greptile + codex findings (then re-verify all three suites and
-  `tsc -p packages/mcp` YOURSELF — a fix agent's "tsc clean" was false once
-  this session; the pre-commit hook does not typecheck mcp tests the way
-  CI's `pnpm typecheck` does); `/explain-diff` explainer + quiz covering
-  the three one-way doors, the `unknown` wire deviation, the scope-refusal
-  change, and the two Code Mode behaviour changes; then the founder's quiz
-  pass and the founder's word to merge.
-- Dependabot: GitHub's push banner reports 15 alerts on main (14 moderate,
-  1 low); this file last recorded 6 medium / 1 low — audit triage is due.
+**State.** The Lane A plan
+(`docs/superpowers/plans/2026-09-12-r1-lane-a-store-manager.md`) was
+executed on `feat/r1-lane-a` and is PR #62. If this section still says
+"open", the merge did not complete: check `gh pr view 62` first. What it
+lands: `Execution` as a discriminated union (`kind`, `clientId`,
+`projection`) with a throwing sentinel in `code` for every new row;
+client-namespaced request keys (one key per execution, unique);
+writer-independent source generation (a ledger table plus three
+triggers); a per-call dispatch cell; no automatic retry of a governed
+`tools/call`; scope and the deadline gate before credential resolution;
+a scoped catalog tool host; provenance-stamped pauses and a post-claim
+read-side guard on `resume`; the direct arm (`startDirect` returns
+`{ executionId, outcome, retention, finished }`); the `unknown` outcome
+on the wire; a projection-parameterized harness; and an R1 section in
+`INVARIANTS.md` (68 rows: 37 pinned, 31 entered as not yet enforced —
+the Lane B/C halves).
 
-**IN-PROGRESS CHECKPOINT (2026-09-19, lives on `feat/r1-lane-a` only —
-the main tripwire cannot see it; `git branch -a` + `git log main..feat/r1-lane-a`
-at session start).** Plan execution is under way via
-`superpowers:subagent-driven-development`. Tasks 1–2 DONE and reviewed
-(`44f5bd1` + fix `a2cb86c`; one commit for both by plan design — the
-pre-commit typecheck cannot pass on Task 1 alone). Task 3 DONE
-(`c583398` + fix `502fe90`), Task 4 DONE (`e46b20c`, the Task 4 carried
-items below are closed), Task 5 DONE (`22a5d89`), Task 6 DONE
-(`a03bc8d`), Task 7 DONE (`b56a2bb`), Task 8 DONE (`b7049e4`; it closed
-the Task 8 carried items below), Task 9 DONE (`c25a97e`) — all
-task-reviewed. Task 10 DONE (`36d0fc3` + fixes `2cc4852`, `cbc14cc`;
-two fix rounds, the Task 10 findings below are CLOSED). Task 11 DONE
-(`06be1a5` + fix `d33fb5d`; the Task 11 findings below are CLOSED).
-**ALL ELEVEN TASKS ARE DONE. The final whole-branch review (top-tier
-model, head `b89ce7c`) returned "ready to open the PR WITH FIXES":
-0 Critical, 7 Important, 6 Minor; the ONE permitted fix wave is
-COMMITTED (`3eccd59`, `cd8459d`, `0691aae`, `3279521`); its scoped
-re-review is pending** (see the "Final review" bullet below). NEXT: ONE
-scoped re-review of `b89ce7c..3279521` (no second wave; residuals go to the founder)
-→ push `feat/r1-lane-a` and open the PR → the
-whole-branch
-review → the PR gauntlet. Run `packages/mcp` `integration.test.ts` and
-`packages/cli` `key.test.ts` from their package directory (from the repo
-root they fail `MODULE_NOT_FOUND` — a harness artifact). The recovery map is the git-ignored
-ledger `.superpowers/sdd/2026-09-12-r1-lane-a-store-manager/progress.md`
-(rulings, deferred minors, per-task BASE shas); if it is gone, rebuild
-from `git log` on the branch. Carried items a fresh session must not lose:
+**Decisions recorded this session (all in conduitspec §18, entry dated
+2026-09-19, and the design spec's §5.5 amendment):** the `unknown` status
+travels on the wire (a deviation from the design's "no wire change"); an
+out-of-scope call is refused exactly as an unknown tool — same text,
+same error class, same schedule of awaited and logged calls — with
+wall-clock timing labelled best-effort; the late-`create()` accepted
+limit; `resultTooLarge` is not yet projected onto the wire (Lane B
+decides the form); which store calls stay un-time-bounded (Code Mode's
+first mutation, its drive writes, a code row's guard reads, and the
+`claimForResume` await for both kinds) and what Lane A does bound (the
+kind lookup after the claim, the direct path, a code row's terminalizing
+writes); a timer on the code-row guard was tried and removed — a second
+writer without a latch; host dependencies are trusted.
 
-- **Task 4 dispatch:** re-add the three M5 assertions Task 2 dropped
-  (`sources_gen_on_insert` / `_on_tools` / `_on_update` triggers and the
-  `sources.generation` column), and replace the `PENDING Task 4` test in
-  `sqlite.test.ts` that pins the `generation: 0` placeholder in
-  `rowToSource`.
-- **Task 8 dispatch:** `assemblePending` still writes the LEGACY pause
-  shape (no provenance) — Task 2 refused to fabricate `sourceGeneration: 0`,
-  which would pass a real authorization check; pause/resume is fail-closed
-  until Task 8 writes real provenance. `ExecutionOutcome.pending` was
-  widened to `StoredPendingApproval` for the interim; narrow it back if
-  Task 8 makes that truthful.
-- **Tasks 6/10 dispatch:** `"ConduitOutcomeAmbiguous"` is hand-written in
-  `packages/mcp/src/daemon/sweep.ts` and `manager.ts`; import
-  `OUTCOME_AMBIGUOUS_ERROR_NAME` there when the first thrower of the new
-  class lands, and pin the equality with a test.
-- **Task 9 dispatch:** `provisionSource` reads the generation outside the
-  write batch — the contract is "current at read time" (a concurrent bump
-  reads newer, never stale: fail-closed for the resume guard).
-- **Tasks 8/10 dispatch:** `manager.ts` still matches the legacy
-  `executions.request_key` UNIQUE text; `mapCreateConflict` (D-A12) must
-  own both UNIQUE strings once named clients reach `create`.
-- **Task 10 open findings (fix round 1, head `36d0fc3`):** (1) the resume
-  drive's `onExpire` is assigned only AFTER the guard phase, so a stalled
-  guard read (`tools.get`, `getGeneration`, `checkScope`, …) strands the
-  row `running` and hangs `resume()` — the latch comment draws the
-  transition, no code implements it; same class as the P1 Greptile found
-  in the plan text; (2) the prep-window catch's direct settle is fenced but
-  not bounded by `SETTLE_WRITE_BUDGET_MS`; (3) the manager direct suite
-  uses real 400/200/150 ms budgets and 900 ms stalls instead of
-  `vi.useFakeTimers()` (this file's own implementer note); (4) the
-  `outcome` backstop in `finished.finally` has no test that fails without
-  it. A task is closed only after a scoped re-review says ADDRESSED.
-- **Final review findings (fix wave in progress from `b89ce7c`; the full
-  list with exact changes and required tests is in the git-ignored
-  workspace as `final-review-fixlist.md` — if that file is gone, this
-  bullet is the record):** (I1) `direct.ts` `deadline()` reads the
-  injectable `now()` while the timer uses `setTimeout` — two clocks, a
-  false "did not run" window; fix `deadline: () => (settled ? 0 : end -
-  now())`. (I2, REPRODUCED) `resume()` on a direct row hangs forever when
-  the expiry takes the latch during the LAST guard read and the read then
-  returns — the handover runs a `runDirect` that has lost the latch; fix:
-  after the `policies.get` race, `if (directDrive.settled) return
-  guardExpiry;`. (I3) the out-of-scope CALL refusal text differs from the
-  unknown-tool text — an existence oracle; **controller ruling: make the
-  guest-visible refusal byte-identical to the unknown-tool refusal,
-  operator distinction host-side only; needs a design-spec §5.5 note at PR
-  time and the founder's eye — reversal is one string and one test.**
-  (I4) `kindOf` after the resume claim is unbounded. (I5)
-  `scripts/approve-demo.mjs` treats `unknown` as success. (I6) the CLI's
-  `unknown` message names a nonexistent `conduit check`. (I7) ledger rows
-  #41a and #22a carry clauses no Lane A test pins → move to #41b / #22b;
-  §18-C4 rows wrongly list `initialize` as retried. Minors in the wave:
-  `finished` must resolve after the settle write (D-A2); `String(cause)`
-  in `runDirect`'s stored prep error; `request_keys.execution_id` index →
-  UNIQUE (mind an existing dev database holding the plain index);
-  `makeInvoker` "MUST forward" docstring; scoped host infra boundary;
-  `run-daemon.ts` casts → `satisfies`. The reviewer stated what it did NOT
-  read: most test bodies, `types.ts`/`store.ts`/`index.ts`/`fixtures.ts`,
-  design-spec §3.1/§4.1–4.3/§5.3/§9–§11, and it did not re-verify the
-  `--doctor --offline` zero-write claim — point the PR gauntlet there.
-- **Pre-PR Tier 2 review (pr-review-toolkit ×5, head `9331313`; the
-  simplifier was deliberately not run — it edits the tree): 2 Critical,
-  ~7 Important, plus comment defects — ALL FIXED in `b8514a7`, `fdc5ab3`,
-  `1b8294d`, `0c84634`, `4ce5111`, `831067f` (sdk 639, mcp 439, cli 118,
-  Biome 0 warnings). These six commits have had NO independent review yet:
-  the post-PR gauntlet is their review. Point it first at
-  `boundedFencedSettle` — closing the hang class exposed that it documented
-  "Never throws" while calling the store outside any `try`, so a
-  SYNCHRONOUS store throw escaped every settle path (a fifth route, found
-  by the fix agent, not by a reviewer). Also: the A1 resume arm is NOT
-  reachable through the §5.4 guard (no JS value stringifies to unparseable
-  bytes, so the guard's text comparison blocks a corrupt request first);
-  the fix still matters for `startDirect`, which has no such guard.** (A1, Critical) a corrupt stored
-  `direct_call.request` makes `JSON.parse` throw INSIDE `runDirect`'s own
-  catch; resume's `.catch(() => {})` swallows it, `dispose()` clears the
-  timer, the outcome never resolves — `resume()` hangs forever and the row
-  strands `running`. The FOURTH hang in this area; required fix closes the
-  CLASS (nothing thrown inside `runDirect` or the guard phase may leave the
-  outcome pending). (A2, Critical, probed) the UNIQUE-index ladder step
-  bricks a database holding two key rows for one execution — **ruling:
-  check before drop; on duplicates throw a count-only diagnostic and leave
-  the database untouched; no automatic de-duplication.** (B1, High)
-  `String(cause)` is persisted on five code-row paths and readable through
-  `check_execution`. Also: two swallowed `failClaimedResume` rejections with
-  no log, one unbounded; the demo script exits 0 on `paused`/`expired`;
-  `hasProvenance` sound only after `isPendingApproval`; `ExecutePayload`
-  accepts `reason` on any status; `DirectSettle`/`ExecutionError` not
-  exported; three factually wrong comments on the latch code; ~35
-  process-residue references ("Task N", "codex #", "fix round", finding
-  ids) in branch-added comments and FIVE test names — all stripped, with
-  the ledger citations that quote renamed tests updated.
-- **Follow-ups the pre-PR review named (NOT in this PR):** brand
-  `ExecutionId`/`CallId`/`AttemptId`/`Namespace` — this branch raised the
-  urgency: `claimForResume(id, resumeAttemptId, callId)` takes three bare
-  strings and swapping `settleDirect`'s two silently defeats the fence;
-  split `Source` into read/write models (`generation` is ignored on write);
-  have the manager apply `dispatch`/`projection`/`clientId`/`scope` itself
-  so a custom `makeInvoker` cannot drop them (a docstring is the only guard
-  today); adopt a `design §x.y` prefix for design-spec section refs — bare
-  `§4.1`/`§5.4` in code and test names currently mean the R1 design spec,
-  not `conduitspec.md`, whose sections with those numbers differ; a
-  repo-wide sweep of the ~60 pre-existing `Task N` comments; a structural
-  check that every store call on a client-visible manager path goes through
-  a bounded helper (four hangs were each fixed one call at a time).
-- **PR description "Deviations" (from the final review, verified against
-  code):** the `unknown` wire status and the F12 accepted limit (both need
-  spec §18 entries); `startDirect` returns a handle, not the spec's
-  `Promise<ExecutionOutcome>`, and `resume`'s scope is optional where the
-  spec says required (spec notes); out-of-scope refusal checked before the
-  policy verdict (the plan's snippet was wrong; matches the spec); every
-  `UpstreamRequest` carries a dispatch cell, so Code Mode failures after
-  the body write reclassify as terminal-ambiguous; a Code Mode resume after
-  a catalog write to the paused namespace is refused (D3) and the old
-  test's subject was moved; `paused` arm narrowed, `expired` keeps the
-  stored union; `kindOf` is a store method the plan did not list;
-  `getGeneration` fails loud and `provisionSource` throws where the brief
-  cast; five (not three) retry tests moved to `listTools`; row #43's test
-  lives in `execute.test.ts` (D-A6); three manager tests keep a real clock
-  with a 1 s margin; `resultTooLarge` not projected onto the wire (Lane B);
-  ledger rows flipped in one commit, not per task.
-- **Task 10 round 2 (closed, recorded for LEARNINGS):** arming the
-  guard-phase `onExpire` made a dead race live — the guard's own
-  terminalizations cleared the timer without taking the latch, so expiry
-  and guard could both settle and `resume()` could publish a false
-  `unknown/persist-failed`. Fixed by one `terminalizeDirect` helper
-  (latch-or-defer + `finishEarly`). The implementer's first two versions
-  of the pinning test passed while proving nothing (one measured the SQL
-  fence, not the latch). For the final review to weigh: `finished`
-  resolves BEFORE the guard-phase settle write completes, while D-A2 says
-  it means writes have stopped — inert until Lane B consumes `resume`'s
-  lifecycle handle.
-- **Task 11 findings (fix round 1 `d33fb5d`, re-review pending):** the
-  ledger's claim column had been CONDENSED from spec §9.1, which produced
-  a false pinned status on row #22 (the `DIRECT_ADMISSION_MAX`/`busy`
-  clause has no Lane A test → split #22a/#22b) and an unasserted "retry"
-  half on row #11; rows #50 and #28 cited suites lacking the
-  `INVARIANT §` prefix, invisible to a prefix-based sweep. The fix
-  re-derives every claim from the spec and adds a clause-level audit
-  (row → clause → pinning test). Rule for the ledger from now on: never
-  condense a spec claim; a clause without a pin splits the row.
-- **Task 11 dispatch (done in `06be1a5`):** replace the 7 `active!` non-null warnings in
-  `manager.test.ts` with a throwing harness accessor; consider collapsing
-  the three hand-rolled bounded-fenced-settle races into one helper in
-  `direct.ts` if Task 10's fix did not.
-- **PR Deviations + Lane B decision:** `resultTooLarge` is not projected
-  onto the wire — an over-cap direct completion reaches an MCP client as
-  `result: null` while the stored row says `discarded`. Also for the PR:
-  the spec §18 entries for the D-A11 `unknown` wire status and the F12
-  accepted limit; and two behaviour changes visible to shipped Code Mode
-  users, both quiz material — a resume after ANY write to the paused call's
-  namespace now refuses (`ConduitCatalogChanged`, re-approve; D3), and
-  every upstream failure after the write attempt reclassifies from
-  `ConduitUpstreamError` to a terminal `ConduitOutcomeAmbiguous`.
-- **Ruling to check at Task 11:** `INVARIANTS.md` rows flip in Task 11's
-  commit, not per task (no brief 1–10 edits the ledger; the branch squashes
-  to one commit on main). Task 11 must cover the eight `INVARIANT §` tests
-  from `44f5bd1` and the six from `c583398`.
-- **Final whole-branch review must triage:** `request_keys` rows are never
-  deleted and carry no FK (retention unowned — check spec §4.1); the
-  `as never` cast in `packages/mcp/src/daemon/helpers/run-daemon.ts` under a
-  comment claiming the checker keeps the fixture complete; `sqlite.ts` past
-  1,500 lines (extraction point: executions repository + hydrator).
-- **Plan-doc defect:** the plan holds three literal NUL bytes (lines 1242,
-  1248, 1249, the U+0000 collision test); the brief extractor truncates at
-  them. Replace each with the backslash-u escape in a docs commit.
-- **Incident (for LEARNINGS + the debrief):** the Task 2 implementer ran
-  `git stash push -u` for a test baseline against an explicit "never
-  stash"; the controller restored with `git stash apply` on the clean tree.
-  Nothing lost. The baseline was unnecessary — the failures were
-  diagnosable from their own output. Dispatch prompts now carry a git
-  ALLOWLIST plus "need a baseline → stop and report". The backup stash
-  was dropped on 2026-09-19 on the founder's delegated decision, after
-  verifying every file in it was in `44f5bd1`/`a2cb86c` and its only unique
-  lines were defects those commits fixed. No stash remains.
+**Review record.** Eleven tasks, each by a separate implementer with a
+task-scoped review; a whole-branch review; a five-reviewer pre-PR pass;
+then on the PR: `/security-review` (nothing met the bar), an Aikido scan
+(no issues; comment blocks were stripped from its payloads), `code-review`
+with five reviewers, Greptile, CodeRabbit, and three `codex exec` passes
+(`gpt-5.6-sol`, `high`; P0/P1/P2 = 1/6/0, 1/4/0, 0/5/1). The loop stopped
+after pass 3 by adjudication (LEARNINGS #16/#26): the last three passes
+found only seams of the previous fix and inaccuracies in the decision
+record. The founder passed the explainer quiz ("Lane A Walkthrough",
+published 2026-09-20, seven questions) and named the merge. Lessons are
+LEARNINGS #29–#37.
+
+**The recurring defect, for whoever touches the direct arm next.**
+Twelve instances of one class: something that could fail ran after the
+settle latch was spent, or a second settler did not honour the first.
+It was closed structurally — one bounded store-call helper
+(`boundedStoreCall` / `boundedFencedSettle` in
+`packages/sdk/src/execution/direct.ts`), a closed union from the resume
+guard's `raceGuard`, and a prepare-then-commit rule at every `settle()`.
+Before changing a latch, a timer, or a handover, re-walk EVERY exit of
+the state machine drawn in the comment above the direct arm in
+`manager.ts`, not only the one you changed.
+
+### NEXT
+
+1. **R3a preview packaging** (§18, 2026-09-11 — unchanged): a versioned
+   packed artifact, alpha install notes, and ONE governance property
+   demonstrable in the first-run path (approve → the exact approved call
+   runs once; deny → nothing ran). Plan it with
+   `superpowers:writing-plans`. Then the three-week alpha window and the
+   profiles decision (the default and its reversal trigger are in §18).
+2. **Lane B is NOT next** unless an adopter needs profiles. When it is
+   built it must: add the profiles table and repository; authorize every
+   read by execution id against the caller's client id (the daemon does
+   not filter `executions.get` by client today — harmless while every row
+   has `clientId: null`); cap the size of `startDirect`'s `input`; decide
+   the wire form of `resultTooLarge`; consume `resume`'s lifecycle handle
+   for direct admission; and flip the 31 ⏳ rows.
+
+**Follow-ups this work named (none blocks R3a):** bound Code Mode's
+first mutation and resume guard with attempt-fenced late-completion
+recovery; brand `ExecutionId` / `CallId` / `AttemptId` / `Namespace`
+(`claimForResume` takes three bare strings, and swapping `settleDirect`'s
+two defeats the fence silently); have the manager apply `dispatch` /
+`projection` / `clientId` / `scope` itself so a custom `makeInvoker`
+cannot drop them; a structural check that every store call on a
+client-visible manager path goes through the bounded helper;
+`request_keys` and `source_generations` retention; extraction seams in
+`manager.ts` and `sqlite.ts` (both well past 1,000 lines); a `design §x.y`
+prefix for design-spec section references in code and test names (bare
+`§4.1` / `§5.4` there mean the R1 design spec, whose numbers collide with
+`conduitspec.md`'s); a sweep of the task-number comments that predate
+this branch; a whole-file ledger scan found 129 `INVARIANT §` tests
+uncited and 70 truncated citations, all OUTSIDE the R1 section and
+predating this branch; replace the three literal NUL bytes in the Lane A
+plan document (lines 1242, 1248, 1249) with the escape — the brief
+extractor truncates at them.
+
+**Session quirks worth inheriting (2026-09-19/20):** the pre-commit hook
+does NOT typecheck `packages/mcp` tests the way CI's `pnpm typecheck`
+does — run `tsc --noEmit -p` on each of `packages/sdk`, `packages/mcp`,
+`packages/cli` by hand before trusting "tsc clean" · run `packages/mcp`
+`integration.test.ts` and `packages/cli` `key.test.ts` from their package
+directory; from the repo root they fail `MODULE_NOT_FOUND` · the
+spec-drift gate refuses EVERY commit while `conduitspec.html` and
+`conduitspec.md` disagree in the working tree, so never leave the spec
+pair half-edited while another committer is active · the
+`--doctor --offline performs ZERO writes` fixture race is wider now (a
+larger schema lengthens the seeding write); fix the fixture — fingerprint
+after setup settles, or assert content rather than mtime · a new flake:
+a full `packages/mcp` run can fail once with "Bind refused: existing
+entry is not a socket" on a temp socket path · every dispatch to a
+subagent carries a git ALLOWLIST and "if you think you need a baseline,
+stop and report" (LEARNINGS #36) · control characters in source are
+written as escapes and checked at byte level (LEARNINGS #37) · an agent's
+completion claim is verified against the artifact before it is repeated
+(LEARNINGS #32).
+
+**DEFERRED (live list, updated 2026-09-20):** carry the 2026-09-13 and
+earlier lists, plus the follow-ups above, plus: Dependabot reports 15
+alerts on main (14 moderate, 1 low) against the 6 medium / 1 low last
+recorded here — audit triage is due before R3a ships.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — confirm
+> #62, R1 Lane A, is MERGED; if it is still open, the merge did not
+> complete: CI must be green and the founder has already named it).
+> **Do NOT re-review #62 or reopen its §18 decisions.** NEXT: plan R3a
+> preview packaging with `superpowers:writing-plans` per HANDOFF NEXT
+> item 1. Carry the DEFERRED list and the follow-ups.
+
+---
+
+**Superseded (2026-09-13 ~12:10) — kept for the record:**
+
+### Previous handoff — 2026-09-13 ~12:10 (**Lane A plan WRITTEN, REVIEWED, and MERGED — PR #61 `1022b2e`**, founder-named merge; NEXT was: execute the plan on `feat/r1-lane-a` — DONE by the section above)
+
 
 **Merge record (12:05):** founder said "do it" to the two named open
 items. Greptile reviewed #61 in three rounds (round 1: a P1 lifecycle
