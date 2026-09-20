@@ -174,6 +174,40 @@ export function deliverableBytes(deliverable: unknown): number {
 }
 
 /**
+ * ONE serialization of the deliverable, taken BEFORE the settle latch.
+ *
+ * The value comes from host code and may serialize differently each time it
+ * is asked: a stateful `toJSON` can return a small object when it is measured
+ * and something larger — or something else entirely — when the store
+ * stringifies it again on the way to the row. Measuring one value and storing
+ * another breaks the §4.1 size decision and makes what is returned disagree
+ * with what is persisted. A `toJSON` that throws only on a later call is
+ * worse: past the latch the throw has nothing left that can settle the row.
+ *
+ * So the value is converted to JSON text ONCE and parsed back into plain
+ * data. From here the deliverable is inert: every later serialization of it
+ * is deterministic, and `bytes` is the exact size of what is stored and
+ * returned. Returns `undefined` when the value cannot be serialized at all
+ * (a BigInt, a circular value, a throwing `toJSON`), which the caller settles
+ * as a truthful failure.
+ */
+export function snapshotDeliverable(
+  deliverable: unknown,
+): { value: unknown; bytes: number } | undefined {
+  try {
+    const text = JSON.stringify(deliverable);
+    if (text === undefined) {
+      // `undefined` has no JSON form; the store normalizes it to `null` and
+      // that is what is measured and delivered.
+      return { value: undefined, bytes: Buffer.byteLength("null", "utf8") };
+    }
+    return { value: JSON.parse(text), bytes: Buffer.byteLength(text, "utf8") };
+  } catch {
+    return undefined;
+  }
+}
+
+/**
  * How the ONE fenced settle write ended (§5.3). `written` is the only arm
  * that licenses publishing the intended outcome; every other arm means "the
  * effect may have landed and the row may not yet say so".

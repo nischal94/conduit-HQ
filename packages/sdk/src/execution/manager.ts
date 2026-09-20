@@ -47,10 +47,10 @@ import {
   type DirectBudgets,
   type DirectDriveHandle,
   type DirectOutcome,
-  deliverableBytes,
   formatCause,
   type OwnedDirectDrive,
   type StoreCallResult,
+  snapshotDeliverable,
 } from "./direct.js";
 import { toSandboxJournal } from "./journal.js";
 import { scrubCredential } from "./scrub.js";
@@ -977,10 +977,28 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   // may have performed the call"); otherwise ConduitExecutionInterrupted
   // ("did not run").
   //
-  // ORDERING RULE: every UNBOUNDED read a settle needs happens
-  // BEFORE `settle()` is taken — the pause path's `getGeneration`, the
-  // create-conflict lookup — so a stalled read cannot hold the latch and
-  // deny the timer its chance to answer.
+  // PREPARE, THEN COMMIT — the ordering rule, in its general form. The latch
+  // is a COMMIT POINT: taking it means this caller now owns the row's answer,
+  // and nothing else can produce one. So everything that can throw or stall
+  // happens BEFORE it, and what follows is only the commit.
+  //
+  // BEFORE `settle()`: every unbounded read a settle needs (the pause path's
+  // `getGeneration`, the create-conflict lookup), so a stalled read cannot
+  // hold the latch and deny the timer its chance to answer; and every
+  // FALLIBLE step — classifying a thrown value, reading a property off it,
+  // converting it to text, minting a reference, measuring or serializing a
+  // result. Each of these is a question asked of a value host code produced,
+  // and any of them can throw. The whole settle plan — the `DirectSettle` to
+  // write, the outcome to publish, the host log line — is built here.
+  //
+  // AFTER `settle()`: publish the prebuilt outcome, start the bounded write
+  // with the prebuilt value, and log the prebuilt string inside a try/catch.
+  // Nothing else. A throw past the latch has nothing left that could settle
+  // the row, so `outcome` never resolves and the caller waits forever — and
+  // the backstops cannot help, because the latch they would need is spent.
+  //
+  // If PREPARING the plan throws, that is handled pre-latch and becomes the
+  // plan for a truthful failure, classified by the dispatch cell.
   //
   // EXIT PATHS: `runDirect`'s `finally` always disposes the drive's timer and
   // awaits the tracked settle writes; `startDirect`'s `finished` disposes
@@ -1209,11 +1227,25 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
    * governed body write was attempted the upstream effect is unknowable, so a
    * failure after `dispatched` is ambiguous — never "did not run".
    */
+  /**
+   * TOTAL. `cause` is an arbitrary thrown value from host code, and asking it
+   * anything is fallible: `instanceof` invokes a `getPrototypeOf` trap that a
+   * Proxy can make throw, and it throws outright for a REVOKED Proxy; reading
+   * `.name` can run a getter that throws. A throw here leaves the outcome
+   * unresolvable with nothing able to settle it, so every question asked of
+   * the value is guarded and an unanswerable one falls to the conservative
+   * class — the cell's own verdict, which needs nothing from the value.
+   */
+  function isAmbiguousCause(cause: unknown): boolean {
+    try {
+      return cause instanceof Error && cause.name === OUTCOME_AMBIGUOUS_ERROR_NAME;
+    } catch {
+      return false;
+    }
+  }
+
   function classifyDirectFailure(run: DirectRun, cause: unknown): ExecutionError {
-    if (
-      run.drive.dispatch.state === "dispatched" ||
-      (cause instanceof Error && cause.name === OUTCOME_AMBIGUOUS_ERROR_NAME)
-    ) {
+    if (run.drive.dispatch.state === "dispatched" || isAmbiguousCause(cause)) {
       return {
         name: OUTCOME_AMBIGUOUS_ERROR_NAME,
         message: `[ExecutionManager] Direct call failed after dispatch; the upstream may have performed the call. Context: { executionId: ${run.execution.id} }`,
@@ -1225,7 +1257,9 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
   /** The timer's settle handler (D-A13): installed via createDirectDrive's onExpire. */
   function expireDirect(run: DirectRun): void {
     const { execution, drive } = run;
-    if (!drive.settle()) return;
+    // PREPARED BEFORE THE LATCH. The cell is read and the error built while
+    // the latch is still free, so the only statements past `settle()` are the
+    // publish and the bounded write.
     const error: ExecutionError =
       drive.dispatch.state === "dispatched"
         ? classifyDirectFailure(run, new Error("budget elapsed after dispatch"))
@@ -1233,6 +1267,7 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             name: "ConduitExecutionInterrupted",
             message: `[ExecutionManager] Direct drive budget elapsed before dispatch (${budgets.driveBudgetMs}ms). Context: { executionId: ${execution.id} }`,
           };
+    if (!drive.settle()) return;
     void settleBounded(
       run,
       { status: "failed", error },
@@ -1289,7 +1324,10 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           ...(run.decisions !== undefined ? { decisions: run.decisions } : {}),
         });
       } catch (cause) {
-        if (!drive.settle()) return;
+        // PREPARED BEFORE THE LATCH: the reference, the log text, and the
+        // error. `formatCause` is total but `crypto.randomUUID` is a host
+        // call, and nothing that can throw belongs after the latch.
+        //
         // The STORED reason is opaque too. A prep-window fault here can
         // carry host-only detail (a database path, an upstream body) and the
         // stored row is handed back to the agent by `check_execution`. The
@@ -1297,13 +1335,17 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         // reference is persisted — the same pattern the resume prep-window
         // catch uses.
         const ref = crypto.randomUUID();
-        console.error(
-          `[ExecutionManager] direct drive preparation failed ${ref}: ${formatCause(cause)}`,
-        );
+        const logLine = `[ExecutionManager] direct drive preparation failed ${ref}: ${formatCause(cause)}`;
         const error: ExecutionError = {
           name: "ConduitInternalError",
           message: `[ExecutionManager] Direct drive preparation failed. Reference: ${ref}`,
         };
+        if (!drive.settle()) return;
+        try {
+          console.error(logLine);
+        } catch {
+          // A throwing log sink never changes the row's answer.
+        }
         await settleBounded(
           run,
           { status: "failed", error },
@@ -1318,34 +1360,32 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
       // it. Pure computation, so it may run before the latch.
       const deliverable =
         run.redactFields === undefined ? value : redactSensitiveFields(value, run.redactFields);
-      // MEASURED BEFORE THE LATCH, and the number reused below. `JSON.stringify`
-      // THROWS for a `BigInt`, a circular value, or a throwing `toJSON` — and a
-      // custom invoker can return any of them. Measured after the latch, that
-      // throw landed in the catch below, whose own `drive.settle()` then failed
-      // and returned without publishing anything, so `outcome` never resolved
-      // and the caller waited forever.
-      //
-      // `deliverable` is the value that is actually STORED — redacted on the
-      // resume path, raw on the sync path — so this measures the right bytes
-      // (§4.1), exactly as the post-latch call did.
-      let deliverableSize: number | undefined;
+      // SNAPSHOT ONCE, before the latch. What is MEASURED must be what is
+      // STORED and what is RETURNED; a value whose `toJSON` answers
+      // differently on a second call would otherwise measure small and store
+      // something else, and one that throws on a second call would throw past
+      // the latch with nothing able to settle the row. After this the
+      // deliverable is plain data and every later serialization of it is
+      // deterministic.
+      let snapshot: { value: unknown; bytes: number } | undefined;
       try {
-        deliverableSize = deliverableBytes(deliverable);
+        snapshot = snapshotDeliverable(deliverable);
       } catch {
-        deliverableSize = undefined;
+        snapshot = undefined;
       }
-      if (deliverableSize === undefined) {
-        if (!drive.settle()) return;
-        // The call DID run: the cell decides, exactly as `classifyDirectFailure`
-        // does everywhere else. A result we cannot serialize is not "did not
-        // run" — the upstream already performed the call. Nothing of the value
-        // is stored, so no partial body can reach the row.
+      if (snapshot === undefined) {
+        // PREPARED BEFORE THE LATCH, like every other fallible step. The call
+        // DID run: the cell decides, exactly as `classifyDirectFailure` does
+        // everywhere else. A result we cannot serialize is not "did not run" —
+        // the upstream already performed it. Nothing of the value is stored,
+        // so no partial body can reach the row.
         const error: ExecutionError = classifyDirectFailure(
           run,
           new Error(
             `[ExecutionManager] Direct call result could not be serialized. Context: { executionId: ${execution.id} }`,
           ),
         );
+        if (!drive.settle()) return;
         await settleBounded(
           run,
           { status: "failed", error },
@@ -1353,33 +1393,51 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
         );
         return;
       }
+      // THE SETTLE PLAN, built entirely before the latch: which arm, the
+      // `DirectSettle` to write, and the outcome to publish. Every value in it
+      // is the ONE snapshot — measured, stored, and returned are the same
+      // bytes by construction rather than by three agreeing serializations.
+      const settlePlan: { settle: DirectSettle; outcome: DirectOutcome } =
+        snapshot.bytes > budgets.resultBytesMax
+          ? {
+              settle: { status: "completed", resultState: "discarded" },
+              outcome: {
+                status: "completed",
+                executionId: execution.id,
+                value: undefined,
+                resultTooLarge: true,
+              },
+            }
+          : run.redactFields === undefined
+            ? {
+                settle: { status: "completed", resultState: "delivered" },
+                outcome: { status: "completed", executionId: execution.id, value: snapshot.value },
+              }
+            : {
+                settle: {
+                  status: "completed",
+                  resultState: "retained",
+                  result: snapshot.value,
+                },
+                outcome: { status: "completed", executionId: execution.id, value: snapshot.value },
+              };
       if (!drive.settle()) return;
-      if (deliverableSize > budgets.resultBytesMax) {
-        await settleBounded(
-          run,
-          { status: "completed", resultState: "discarded" },
-          {
-            status: "completed",
-            executionId: execution.id,
-            value: undefined,
-            resultTooLarge: true,
-          },
-        );
-      } else if (run.redactFields === undefined) {
-        await settleBounded(
-          run,
-          { status: "completed", resultState: "delivered" },
-          { status: "completed", executionId: execution.id, value: deliverable },
-        );
-      } else {
-        await settleBounded(
-          run,
-          { status: "completed", resultState: "retained", result: deliverable },
-          { status: "completed", executionId: execution.id, value: deliverable },
-        );
-      }
+      await settleBounded(run, settlePlan.settle, settlePlan.outcome);
     } catch (cause) {
-      if (cause instanceof Error && cause.name === GUEST_ERROR_NAMES.policyDenied) {
+      // TOTAL, and the FIRST question asked of the thrown value. `instanceof`
+      // runs a `getPrototypeOf` trap that a Proxy can make throw, and throws
+      // outright for a revoked one. Asked unguarded here, the throw escaped
+      // `runDirect` itself — past every backstop inside it — and the row's
+      // only answer came from the caller's defence-in-depth latch, as
+      // `unknown`. A value host code threw can never be trusted to answer a
+      // question; an unanswerable one is simply not the pause case.
+      let isPolicyDenied: boolean;
+      try {
+        isPolicyDenied = cause instanceof Error && cause.name === GUEST_ERROR_NAMES.policyDenied;
+      } catch {
+        isPolicyDenied = false;
+      }
+      if (isPolicyDenied) {
         if (run.decisions === undefined) {
           // §5.4 startDirect step 5: pause. The generation read is UNBOUNDED,
           // so it runs BEFORE the latch — the timer can still
@@ -1392,15 +1450,19 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           } catch (readCause) {
             // A REJECTED read is a store fault, not a catalog change. Opaque
             // to the client; the cause goes to the host log only.
-            if (!drive.settle()) return;
+            // PREPARED BEFORE THE LATCH, as everywhere else.
             const ref = crypto.randomUUID();
-            console.error(
-              `[ExecutionManager] Provenance read failed at direct pause ${ref}: ${formatCause(readCause)}`,
-            );
+            const logLine = `[ExecutionManager] Provenance read failed at direct pause ${ref}: ${formatCause(readCause)}`;
             const error: ExecutionError = {
               name: "ConduitInternalError",
               message: `[ExecutionManager] Approval pause could not be recorded. Reference: ${ref}`,
             };
+            if (!drive.settle()) return;
+            try {
+              console.error(logLine);
+            } catch {
+              // A throwing log sink never changes the row's answer.
+            }
             await settleBounded(
               run,
               { status: "failed", error },
@@ -1408,38 +1470,61 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
             );
             return;
           }
+          // PREPARED BEFORE THE LATCH. `cause.message` is a property read on a
+          // value host code threw: it can be a getter that throws, and past
+          // the latch nothing could settle the row afterwards. `formatCause`
+          // is the one total conversion, and it sanitizes and bounds the text
+          // that is about to be persisted as the pause reason.
+          let pauseReason: string;
+          try {
+            pauseReason =
+              cause instanceof Error ? formatCause(cause.message) : "<unprintable cause>";
+          } catch {
+            pauseReason = "<unprintable cause>";
+          }
+          // THE WHOLE PLAN, built before the latch. `newId`, `now` and the
+          // TTL resolver are all host calls, and the pause record they build
+          // is the value that will be written and published — so it exists in
+          // full before `settle()`, and the only statements past the latch are
+          // the bounded write and the publish.
+          const pausePlan: { settle: DirectSettle; outcome: DirectOutcome } =
+            generation === undefined
+              ? (() => {
+                  const error: ExecutionError = {
+                    name: "ConduitCatalogChanged",
+                    message: `[ExecutionManager] Approval pause refused: no source for namespace. Context: { executionId: ${execution.id} }`,
+                  };
+                  return {
+                    settle: { status: "failed", error },
+                    outcome: { status: "failed", executionId: execution.id, error },
+                  };
+                })()
+              : (() => {
+                  const pending: PendingApproval = {
+                    callId: newId(),
+                    toolName: execution.call.toolName,
+                    namespace,
+                    sourceGeneration: generation,
+                    input: request,
+                    reason: pauseReason,
+                    expiresAt: now() + resolveApprovalTtlMs(),
+                  };
+                  return {
+                    settle: { status: "paused", pausedOn: pending },
+                    outcome: { status: "paused", executionId: execution.id, pending },
+                  };
+                })();
           if (!drive.settle()) return;
-          if (generation === undefined) {
-            const error: ExecutionError = {
-              name: "ConduitCatalogChanged",
-              message: `[ExecutionManager] Approval pause refused: no source for namespace. Context: { executionId: ${execution.id} }`,
-            };
-            await settleBounded(
-              run,
-              { status: "failed", error },
-              { status: "failed", executionId: execution.id, error },
-            );
-            return;
-          }
-          const pending: PendingApproval = {
-            callId: newId(),
-            toolName: execution.call.toolName,
-            namespace,
-            sourceGeneration: generation,
-            input: request,
-            reason: cause.message,
-            expiresAt: now() + resolveApprovalTtlMs(),
-          };
-          await settleBounded(
-            run,
-            { status: "paused", pausedOn: pending },
-            { status: "paused", executionId: execution.id, pending },
-          );
+          await settleBounded(run, pausePlan.settle, pausePlan.outcome);
           return;
         }
       }
-      if (!drive.settle()) return;
+      // PREPARED BEFORE THE LATCH. Classification asks questions of an
+      // arbitrary thrown value; it is total by construction, but it is also
+      // pure, so there is no reason for it to sit after the latch where a
+      // throw would be unrecoverable. Nothing fallible follows `settle()`.
       const error = classifyDirectFailure(run, cause);
+      if (!drive.settle()) return;
       await settleBounded(
         run,
         { status: "failed", error },
@@ -2401,17 +2486,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
           // run. No third rule.
           const finishedRun = runDirect(run)
             .catch(async (cause: unknown) => {
-              // The reference is minted BEFORE the latch: once the latch is
-              // taken this handler owns the outcome, and any expression that
-              // could throw between taking it and publishing would leave
-              // `outcome` unresolvable with nothing able to settle it. The
-              // diagnosis runs after the latch only because `formatCause` is
-              // total by construction; nothing else fallible may join it.
+              // THE WHOLE PLAN, built BEFORE the latch: the reference, the
+              // host log line, and the error. Once the latch is taken this
+              // handler owns the outcome, and any expression that could throw
+              // between taking it and publishing would leave `outcome`
+              // unresolvable with nothing able to settle it.
               const ref = crypto.randomUUID();
-              if (!directDrive.settle()) return;
-              console.error(
-                `[ExecutionManager] direct resume continuation threw ${ref}: ${formatCause(cause)}`,
-              );
+              const logLine = `[ExecutionManager] direct resume continuation threw ${ref}: ${formatCause(cause)}`;
               const error: ExecutionError =
                 run.drive.dispatch.state === "dispatched"
                   ? {
@@ -2422,6 +2503,12 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
                       name: "ConduitInternalError",
                       message: `[ExecutionManager] Direct resume continuation failed; the call did not run. Reference: ${ref}`,
                     };
+              if (!directDrive.settle()) return;
+              try {
+                console.error(logLine);
+              } catch {
+                // A throwing log sink never changes the row's answer.
+              }
               // TOTAL, by construction. The bounded settle is best effort —
               // the very fault that brought us here can be a store that
               // cannot accept a write at all, and `settleDirect` is called
@@ -2437,9 +2524,13 @@ export function createExecutionManager(deps: ExecutionManagerDeps): ExecutionMan
                   { status: "failed", executionId: run.execution.id, error },
                 );
               } catch (settleCause) {
-                console.error(
-                  `[ExecutionManager] direct resume fallback settle failed ${ref}: ${formatCause(settleCause)}`,
-                );
+                try {
+                  console.error(
+                    `[ExecutionManager] direct resume fallback settle failed ${ref}: ${formatCause(settleCause)}`,
+                  );
+                } catch {
+                  // The answer below is the guarantee; the log line is not.
+                }
                 run.resolveOutcome({
                   status: "unknown",
                   executionId: run.execution.id,

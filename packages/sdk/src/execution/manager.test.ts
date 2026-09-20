@@ -4368,4 +4368,165 @@ describe("R1 direct arm (§5.3/§5.4)", () => {
       }
     });
   });
+
+  describe("nothing fallible runs after the settle latch", () => {
+    /**
+     * Every value below is one a dependency can hand back, and every one of
+     * them makes a question the settle path used to ask AFTER the latch
+     * throw. Past the latch a throw has nothing left that can settle the row,
+     * so the outcome never resolved and the caller waited forever. The fix is
+     * the SHAPE — the whole plan is built before `settle()` — so these tests
+     * hold it at the two entry points rather than at the lines that used to
+     * throw.
+     */
+    /** `instanceof` on this THROWS: the proxy is revoked. */
+    function revokedProxy(): unknown {
+      const { proxy, revoke } = Proxy.revocable({}, {});
+      revoke();
+      return proxy;
+    }
+    /** `instanceof` on this THROWS from the prototype trap. */
+    function hostileProtoProxy(): unknown {
+      return new Proxy(
+        {},
+        {
+          getPrototypeOf() {
+            throw new Error("getPrototypeOf exploded");
+          },
+        },
+      );
+    }
+
+    for (const [label, make] of [
+      ["a REVOKED Proxy", revokedProxy],
+      ["a Proxy whose getPrototypeOf throws", hostileProtoProxy],
+    ] as const) {
+      it(`INVARIANT §5.3 (#45): ${label} thrown on startDirect still settles within budget`, async () => {
+        active = await makeHarness();
+        const m = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => () => Promise.reject(make()),
+        });
+        const handle = m.startDirect(
+          "github.list_issues",
+          {},
+          { clientId: null, projection: "direct", scope: permitDirect },
+        );
+        const out = await Promise.race([
+          handle.outcome,
+          new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+        ]);
+        expect(out).not.toBe("HUNG");
+        expect(out).toMatchObject({ status: "failed" });
+        const raw = await active.client.execute({
+          sql: "SELECT status FROM executions WHERE id = ?",
+          args: [handle.executionId],
+        });
+        expect(String(raw.rows[0]?.status)).toBe("failed");
+      });
+
+      it(`INVARIANT §5.3 (#45): ${label} thrown on direct RESUME still answers within budget`, async () => {
+        active = await makeHarness();
+        const m = createExecutionManager({ ...active.deps, direct: fast });
+        const paused = await m.startDirect(
+          "github.create_issue",
+          { title: "t" },
+          { clientId: null, projection: "direct", scope: permitDirect },
+        ).outcome;
+        const callId = await pendingCallOf(m, paused.executionId);
+        const hostileM = createExecutionManager({
+          ...active.deps,
+          direct: fast,
+          makeInvoker: () => () => Promise.reject(make()),
+        });
+        // REAL CLOCK: the setup crosses the harness's loopback MCP socket,
+        // which deadlocks under fake timers. A full second of margin.
+        const t0 = Date.now();
+        const out = await Promise.race([
+          hostileM.resume(paused.executionId, { kind: "approve" }, callId, permitDirect).then(
+            (o) => o,
+            () => ({ threw: true }),
+          ),
+          new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 20)),
+        ]);
+        expect(out).not.toBe("HUNG");
+        expect(Date.now() - t0).toBeLessThan(fast.driveBudgetMs + fast.settleWriteBudgetMs + 1_000);
+        const raw = await active.client.execute({
+          sql: "SELECT status FROM executions WHERE id = ?",
+          args: [paused.executionId],
+        });
+        expect(String(raw.rows[0]?.status)).toBe("failed");
+      });
+    }
+
+    it("INVARIANT §5.3 (#41a): a stateful toJSON cannot make measured, stored and returned disagree", async () => {
+      // The value answers SMALL the first time it is serialized and OVERSIZED
+      // the second. Serialized twice — once to measure, once by the store —
+      // the size decision is made against one value and the row receives
+      // another. One snapshot makes the second call impossible.
+      active = await makeHarness();
+      let calls = 0;
+      const shifting = {
+        toJSON() {
+          calls += 1;
+          return calls === 1 ? { small: "x" } : { big: "y".repeat(400_000) };
+        },
+      };
+      const m = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => async () => shifting,
+      });
+      const handle = m.startDirect(
+        "github.list_issues",
+        {},
+        { clientId: null, projection: "direct", scope: permitDirect },
+      );
+      const out = await Promise.race([
+        handle.outcome,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      // The FIRST snapshot decided the size, and it is what is returned.
+      expect(out).toMatchObject({ status: "completed", value: { small: "x" } });
+      expect(out).not.toHaveProperty("resultTooLarge", true);
+      // `toJSON` ran exactly ONCE on the settle path: the snapshot.
+      expect(calls).toBe(1);
+    });
+
+    it("INVARIANT §5.3 (#41a): a toJSON that throws on its SECOND call settles with no partial body", async () => {
+      active = await makeHarness();
+      let calls = 0;
+      const exploding = {
+        toJSON() {
+          calls += 1;
+          if (calls > 1) throw new Error("second serialization exploded");
+          return { ok: true };
+        },
+      };
+      const m = createExecutionManager({
+        ...active.deps,
+        direct: fast,
+        makeInvoker: () => async () => exploding,
+      });
+      const handle = m.startDirect(
+        "github.list_issues",
+        {},
+        { clientId: null, projection: "direct", scope: permitDirect },
+      );
+      const out = await Promise.race([
+        handle.outcome,
+        new Promise((r) => setTimeout(() => r("HUNG"), fast.driveBudgetMs * 10)),
+      ]);
+      expect(out).not.toBe("HUNG");
+      // No hang, and the snapshot is the whole body — never a partial one.
+      expect(out).toMatchObject({ status: "completed", value: { ok: true } });
+      const raw = await active.client.execute({
+        sql: "SELECT status FROM executions WHERE id = ?",
+        args: [handle.executionId],
+      });
+      expect(String(raw.rows[0]?.status)).toBe("completed");
+    });
+  });
 });
