@@ -134,6 +134,33 @@ amendment are committed. Post-PR gauntlet state:
   scan agent stripped comment blocks to fit the payload size, so a secret
   inside a COMMENT would not have been seen (the pre-PR code reviewer read
   comments and found none); `dcc9e39` was committed after the scan.
+- DONE: `code-review` on the PR (5 reviewers; four died on the session
+  limit at ~04:50 IST and were resumed from their transcripts at 07:52).
+  CLAUDE.md compliance: no violations (and the controller confirmed no spec
+  drift: `html2md.py` on a clean tree leaves `git status` empty). Git
+  history: no earlier fix undone (#58 binding, #59 un-nameable call id, the
+  echo tripwire, the egress guard, I-3 "terminalize then re-throw" all
+  preserved). Prior-PR comments (12 PRs read): nothing recurs; Lane B note —
+  `startDirect` has no cap on the size of its `input` (unreachable from an
+  untrusted caller until Lane B wires it). **TWO FINDINGS, SAME CLASS, both
+  in the CODE-ROW guard bound the post-PR fix added (`ee06e1a`, `dcc9e39`),
+  NOT YET FIXED:** (1) the code-row TTL-`expired` arm in `resume()` writes
+  `put(expired)` without taking the code-row latch — the guard timer can
+  fire during that write: two writers, and the unfenced `put` can overwrite
+  the timer's `failed` with `expired`; (2) the code-row prep-window catch
+  calls `failClaimedBounded` directly, bypassing the latch the comment
+  block says every guard refusal goes through — two writers, contradictory
+  answers (the expiry resolves `failed`/`unknown`, the catch re-throws).
+  Both are moderate: the SQL `WHERE status='running'` fence keeps the row
+  sane in most orderings and no false "did not run" with a side effect was
+  traced. That is instances TEN and ELEVEN. The stop rule below has
+  triggered: **the design question is with the founder — do not patch
+  until answered.** Recommendation given: REVERT the code-row guard bound
+  (it was never in the plan or the design spec; it was added at the end in
+  response to a codex P1; it produced three defects in two commits; it
+  changes shipped Code Mode behaviour), keep every direct-path bound, and
+  reword the §18 sentence to say Lane A bounds the DIRECT path and the
+  direct-row resume guard only.
 - **If the queued codex pass reports the SAME class a tenth time, STOP.
   Do not patch. Bring the founder the design question: should Lane A bound
   the code-row guard phase at all, or revert that bound and scope it out in
