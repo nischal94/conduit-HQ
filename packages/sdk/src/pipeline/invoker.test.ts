@@ -854,52 +854,115 @@ describe("§5.5 scope check", () => {
       if (!(e instanceof Error)) throw new Error(`expected an Error, got ${String(e)}`);
       return e;
     };
-    /** The same call, once against a catalog that holds the name and once against one that does not. */
-    async function bothRefusals(
+    /**
+     * Records every observable step of one refusal, in the order it happens:
+     * the store reads, the scope resolver, and the LOG call. Comparing only
+     * counts left the log call free to move — one path could log before the
+     * trace append and the other after, and every assertion stayed green
+     * while the schedule differed. Position is part of the schedule.
+     */
+    function recordingDeps(
+      present: boolean,
+      seq: string[],
       log: () => unknown,
-    ): Promise<{ outOfScope: Error; absent: Error; calls: number }> {
+    ): {
+      deps: Parameters<typeof createToolInvoker>[0];
+      log: () => unknown;
+      scope: ReturnType<typeof permitOnly>;
+    } {
+      const tracked = {
+        ...store,
+        tools: {
+          ...store.tools,
+          get: async () => {
+            seq.push("tools.get");
+            return present ? await store.tools.get("github.list_issues") : undefined;
+          },
+        },
+        policies: {
+          ...store.policies,
+          get: async (name: string) => {
+            seq.push("policies.get");
+            return await store.policies.get(name);
+          },
+        },
+        trace: {
+          ...store.trace,
+          append: async (...a: Parameters<ConduitStore["trace"]["append"]>) => {
+            seq.push("trace.append");
+            return await store.trace.append(...a);
+          },
+        },
+      } as ConduitStore;
+      return {
+        deps: { ...deps(recordingUpstream().caller), store: tracked } as Parameters<
+          typeof createToolInvoker
+        >[0],
+        log: () => {
+          seq.push("log");
+          return log();
+        },
+        scope: async () => {
+          seq.push("scope");
+          return await permitOnly(["github.delete_repo"])();
+        },
+      };
+    }
+
+    /** The same call, once against a catalog that holds the name and once against one that does not. */
+    async function bothRefusals(log: () => unknown): Promise<{
+      outOfScope: Error;
+      absent: Error;
+      calls: number;
+      outOfScopeSeq: string[];
+      absentSeq: string[];
+    }> {
       let calls = 0;
       const counting = () => {
         calls += 1;
         return log();
       };
-      const outOfScope = await createToolInvoker(deps(recordingUpstream().caller), {
+      const outOfScopeSeq: string[] = [];
+      const scoped = recordingDeps(true, outOfScopeSeq, counting);
+      const outOfScope = await createToolInvoker(scoped.deps, {
         executionId: "exec_sched_scope",
         projection: "code",
         clientId: "acme",
         // The catalog HOLDS github.list_issues; the grant does not.
-        scope: permitOnly(["github.delete_repo"]),
-        log: counting,
+        scope: scoped.scope,
+        log: scoped.log,
       })("github.list_issues", {}).then(() => {
         throw new Error("expected the out-of-scope call to be refused");
       }, asError);
       const afterScoped = calls;
-      const emptyStore = {
-        ...deps(recordingUpstream().caller),
-        store: { ...store, tools: { ...store.tools, get: async () => undefined } },
-      } as Parameters<typeof createToolInvoker>[0];
-      const absent = await createToolInvoker(emptyStore, {
+      const absentSeq: string[] = [];
+      const empty = recordingDeps(false, absentSeq, counting);
+      const absent = await createToolInvoker(empty.deps, {
         executionId: "exec_sched_absent",
         projection: "code",
         clientId: "acme",
-        scope: permitOnly(["github.delete_repo"]),
-        log: counting,
+        scope: empty.scope,
+        log: empty.log,
       })("github.list_issues", {}).then(() => {
         throw new Error("expected the absent call to be refused");
       }, asError);
       // The SAME number of sink calls on each path — that is the invariant.
       expect(afterScoped).toBe(calls - afterScoped);
-      return { outOfScope, absent, calls };
+      return { outOfScope, absent, calls, outOfScopeSeq, absentSeq };
     }
 
-    it("INVARIANT §5.5: an absent and an out-of-scope name call the log sink the same number of times", async () => {
-      const { outOfScope, absent } = await bothRefusals(() => undefined);
+    it("INVARIANT §5.5: an absent and an out-of-scope name produce the same ordered call sequence, log call included", async () => {
+      const { outOfScope, absent, outOfScopeSeq, absentSeq } = await bothRefusals(() => undefined);
       expect(outOfScope.name).toBe(absent.name);
       expect(outOfScope.message).toBe(absent.message);
+      // POSITION, not just count: the whole ordered sequence, compared as a
+      // whole, so moving either path's log call earlier or later fails here.
+      expect(outOfScopeSeq).toEqual(absentSeq);
+      expect(outOfScopeSeq).toContain("log");
     });
 
     it("INVARIANT §5.5: a THROWING log sink produces the same error class and message for both", async () => {
-      const { outOfScope, absent } = await bothRefusals(() => {
+      const { outOfScope, absent, outOfScopeSeq, absentSeq } = await bothRefusals(() => {
         throw new Error("sink exploded");
       });
       expect(outOfScope.name).toBe(GUEST_ERROR_NAMES.policyBlocked);
@@ -907,12 +970,16 @@ describe("§5.5 scope check", () => {
       expect(outOfScope.message).toBe(absent.message);
       // The sink's own fault never reaches the guest.
       expect(outOfScope.message).not.toContain("exploded");
+      expect(outOfScopeSeq).toEqual(absentSeq);
     });
 
     it("INVARIANT §5.5: a log sink returning a never-settling promise still returns on both paths", async () => {
       // The sink is CALLED, never AWAITED. If it were awaited, this hangs.
-      const { outOfScope, absent } = await bothRefusals(() => new Promise<void>(() => {}));
+      const { outOfScope, absent, outOfScopeSeq, absentSeq } = await bothRefusals(
+        () => new Promise<void>(() => {}),
+      );
       expect(outOfScope.message).toBe(absent.message);
+      expect(outOfScopeSeq).toEqual(absentSeq);
     });
 
     it("the UNSCOPED path gains no log call and no extra store call", async () => {
@@ -937,6 +1004,7 @@ describe("§5.5 scope check", () => {
         executionId: "exec_unscoped_sched",
         projection: "code",
         clientId: null,
+        log,
       })("github.nope", {}).then(
         () => {
           throw new Error("expected the call to be refused");
@@ -1164,7 +1232,9 @@ describe("§5.5 scope check", () => {
     // forge a second host log line; an unbounded one would flood the daemon
     // log. `printableName` strips control characters and caps at 120.
     const scopeLog = vi.fn();
-    const hostile = `github.${"a".repeat(300)}\nFORGED host log line`;
+    // U+2028 renders as a line break too, so it forges a host log line
+    // exactly as a raw newline does.
+    const hostile = `github.${"\u2028"}FORGED by separator.${"a".repeat(300)}\nFORGED host log line`;
     // The branch is reached only when the catalog HOLDS the tool and scope
     // then withholds it, so the lookup answers for the hostile path while
     // the profile grants something else entirely.
@@ -1189,6 +1259,8 @@ describe("§5.5 scope check", () => {
     // start a line of its own, and the whole entry stays bounded.
     expect(line).not.toContain("\n");
     expect(line).not.toContain("FORGED host log line");
+    expect(line).not.toContain("\u2028");
+    expect(line).toContain("github.FORGED by separator.");
     expect(line.length).toBeLessThan(400);
   });
 
