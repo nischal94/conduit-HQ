@@ -163,7 +163,7 @@ written as escapes and checked at byte level (LEARNINGS #37) · an agent's
 completion claim is verified against the artifact before it is repeated
 (LEARNINGS #32).
 
-**DEFERRED (live list, updated 2026-09-20):** carry the 2026-09-13 and
+**DEFERRED (live list, updated 2026-09-25):** carry the 2026-09-13 and
 earlier lists, plus the follow-ups above, plus: Dependabot reports 15
 alerts on main (14 moderate, 1 low) against the 6 medium / 1 low last
 recorded here — audit triage is due before R3a ships · the
