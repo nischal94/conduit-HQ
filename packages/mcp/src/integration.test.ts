@@ -15,6 +15,8 @@ import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
+import { setFlagsFromString } from "node:v8";
+import { runInNewContext } from "node:vm";
 import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
@@ -57,6 +59,17 @@ import { AGENT_VERSION } from "./env.js";
  */
 
 const execFileAsync = promisify(execFile);
+
+/**
+ * Runs a full garbage collection in THIS process. `--expose-gc` is set at
+ * runtime, so the suite needs no special Node flag; the fixed literal "gc"
+ * is the only code evaluated. Used to flush connections a closed
+ * @libsql/client leaves alive until collection (see the ZERO-writes case).
+ */
+function forceGc(): void {
+  setFlagsFromString("--expose-gc");
+  (runInNewContext("gc") as () => void)();
+}
 
 /**
  * Runs `--doctor --offline` expecting a NON-ZERO exit, returning its output.
@@ -1170,31 +1183,42 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
   const doctorDaemons: ChildProcess[] = [];
 
   /**
-   * Seeds ONE source under a caller-supplied key, in a caller-supplied db.
+   * Seeds ONE source under a caller-supplied key, in a caller-supplied db,
+   * in a CHILD process that exits before this resolves.
    *
    * Separate from the suite's `seedStoreAt`, which seals under the shared
-   * module-level `masterKey` and seeds a whole policy fixture. These cases
-   * each mint their own key into their own isolated HOME (the offline
-   * doctor reads `${HOME}/.conduit` by construction), and all they need is
-   * a real migrated database with a countable source in it.
+   * module-level `masterKey` and seeds a whole policy fixture. This case
+   * mints its own key into its own isolated state dir, and all it needs is a
+   * real migrated database with a countable source in it. The source's
+   * location is a literal: nothing here contacts the upstream.
+   *
+   * Why a child: a @libsql/client close() leaves the native connection alive
+   * until garbage collection, and that collection checkpoints the WAL into
+   * the db at an arbitrary later moment. Seeding in-process therefore kept a
+   * writer to the fixture alive in the test runner itself (the cause of this
+   * suite's ZERO-writes flake). A child that has exited holds nothing, so the
+   * db and its sidecars are final: the state a real install is in when an
+   * operator runs the offline doctor.
    */
-  async function seedOneSourceAt(targetDb: string, keyBytes: Uint8Array): Promise<void> {
-    const client = createClient({ url: `file:${targetDb}` });
-    const store = await openSqliteStore({
-      client,
-      secretBox: await SecretBox.fromKeyBytes(keyBytes as Uint8Array<ArrayBuffer>),
+  async function seedOneSourceInChild(targetDb: string, keyB64: string): Promise<void> {
+    const script = [
+      'import { createClient } from "@libsql/client";',
+      'import { openSqliteStore, SecretBox } from "@conduithq/sdk";',
+      'const client = createClient({ url: "file:" + process.env.SEED_DB });',
+      "const store = await openSqliteStore({",
+      "  client,",
+      '  secretBox: await SecretBox.fromKeyBytes(new Uint8Array(Buffer.from(process.env.SEED_KEY, "base64"))),',
+      "});",
+      `await store.sources.upsert({ id: "src_doc", type: "mcp", namespace: ${JSON.stringify(NAMESPACE)}, location: "http://127.0.0.1:1/mcp", generation: 0 });`,
+      "client.close();",
+    ].join("\n");
+    // cwd = this package, so the child resolves the same workspace
+    // @conduithq/sdk and @libsql/client this suite does.
+    await execFileAsync(process.execPath, ["--input-type=module", "-e", script], {
+      cwd: process.cwd(),
+      env: { ...process.env, SEED_DB: targetDb, SEED_KEY: keyB64 },
+      timeout: 30_000,
     });
-    await store.sources.upsert({
-      id: "src_doc",
-      type: "mcp",
-      namespace: NAMESPACE,
-      // A literal rather than the suite's `mcpLocation`, which is assigned
-      // in another block's beforeAll: nothing here ever contacts the
-      // upstream, so the row only has to be well-formed and countable.
-      location: "http://127.0.0.1:1/mcp",
-      generation: 0,
-    });
-    client.close();
   }
 
   afterEach(async () => {
@@ -1424,7 +1448,9 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
       // nonexistent db "no writes" would be trivially true; against a live
       // one, an opener would touch journal mode and sidecars.
       const dbPath = join(conduitDir, "conduit.db");
-      await seedOneSourceAt(dbPath, keyBytes);
+      // In a child process: see seedOneSourceInChild for why in-process
+      // seeding left a writer to this fixture alive in the test runner.
+      await seedOneSourceInChild(dbPath, keyB64);
 
       const watched = [dbPath, `${dbPath}-wal`, `${dbPath}-shm`, `${dbPath}-journal`];
       const before = new Map<string, string>();
@@ -1438,6 +1464,15 @@ describe("ring-2: --doctor split (Task 9, design §9.1)", () => {
       // mutation too, and a store open is exactly what checkpoints one away.
       const existedBefore = new Set(watched.filter((p) => existsSync(p)));
       expect(before.size).toBeGreaterThan(0); // non-vacuous: something is being watched
+
+      // Regression guard for the flake this test had (3 of 60 CI runs): the
+      // @libsql/client close() in an IN-PROCESS seeder leaves the native
+      // connection alive until garbage collection, and that collection then
+      // checkpoints the WAL into the db, a write this test blamed on
+      // `--doctor --offline`. Forcing a collection here turns any seeding
+      // that leaves a connection in this process into a failure every run.
+      forceGc();
+      await new Promise((resolve) => setTimeout(resolve, 50));
 
       const env: Record<string, string | undefined> = { ...process.env };
       delete env.CONDUIT_MASTER_KEY;
