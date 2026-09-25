@@ -382,7 +382,7 @@ function isValidHttpUrl(value: string): boolean {
  * The url is rendered origin+path (`sanitizeUrlForOperator`) as a second
  * belt to the intake userinfo rejection.
  */
-function mapFetchError(cause: unknown, url: string, secretSupplied: boolean): string {
+function mapFetchError(cause: unknown, url: string, authSent: "fresh" | "stored" | "none"): string {
   const safeUrl = sanitizeUrlForOperator(url);
   const unreachable = `[conduit add-mcp] upstream unreachable at ${safeUrl}; nothing was written. Re-run when reachable.`;
   if (!(cause instanceof McpClientError)) {
@@ -391,10 +391,16 @@ function mapFetchError(cause: unknown, url: string, secretSupplied: boolean): st
   switch (cause.kind) {
     case "http_status":
       if (cause.status === 401 || cause.status === 403) {
-        // An operator who DID supply a token needs to fix that token, not be
-        // told to set one. The line names neither the token nor any of it.
-        if (secretSupplied) {
-          return `[conduit add-mcp] the upstream rejected the credential you supplied (HTTP ${cause.status}): check the token's permissions for this upstream and that it has not expired; nothing was written.`;
+        // The advice follows what the fetch actually carried: the secret the
+        // operator supplied in this request, the credential stored for the
+        // namespace (a same-url re-run or a revalidate), or nothing. Only the
+        // integer status is interpolated — never the credential, never
+        // upstream text (§9.2).
+        if (authSent === "fresh") {
+          return `[conduit add-mcp] the upstream rejected the credential you supplied (HTTP ${cause.status}): it is sent verbatim as the Authorization header, so include its scheme (e.g. "Bearer <token>"), and check its permissions for this upstream and that it has not expired; nothing was written.`;
+        }
+        if (authSent === "stored") {
+          return `[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP ${cause.status}): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"), or --clear-credential to drop it; nothing was written.`;
         }
         return `[conduit add-mcp] upstream requires authorization (HTTP ${cause.status}): set CONDUIT_ADD_SECRET; nothing was written.`;
       }
@@ -767,10 +773,16 @@ async function fetchAndProvision(args: {
     // (credential-redacted), never to the client; the client gets a fixed
     // category from `mapFetchError`.
     logRedactedDetail(args.log, namespace, url, args.onboardingAuth, cause);
-    // `hasFreshSecret` is the one normalization (`trim() !== ""`) that also
-    // decides whether the supplied secret became `authorization`, so the
-    // advice cannot disagree with what was actually sent.
-    throw new ProvisionRefused(mapFetchError(cause, url, args.hasFreshSecret));
+    // Classify what `authorization` carried, from the same values that built
+    // it: `hasFreshSecret` (the one `trim() !== ""` normalization) means the
+    // operator's secret was sent; otherwise a defined `onboardingAuth` is the
+    // namespace's stored credential; otherwise nothing was sent.
+    const authSent = args.hasFreshSecret
+      ? "fresh"
+      : args.onboardingAuth !== undefined
+        ? "stored"
+        : "none";
+    throw new ProvisionRefused(mapFetchError(cause, url, authSent));
   }
 
   // The third onboarding bound (§2.2), alongside `MAX_RESPONSE_BYTES` and

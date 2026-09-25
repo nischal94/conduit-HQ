@@ -675,6 +675,31 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
     expect(sameUrlFetch.mock.calls[0]?.[1]).toEqual({ authorization: "Bearer tok123" });
   });
 
+  for (const status of [401, 403] as const) {
+    it(`a STORED credential refused with HTTP ${status} on a same-url re-run gets stored-credential guidance, not set-the-secret`, async () => {
+      const store = await openTestStore();
+      await run({}, { store, env: { CONDUIT_ADD_SECRET: "Bearer tok123" } });
+
+      const refusingFetch = vi.fn(async (_url: string, _opts?: { authorization?: string }) => {
+        throw new McpClientError("http_status", `MCP endpoint returned HTTP ${status}`, {
+          status,
+        });
+      });
+      const result = await run({}, { store, env: {}, fetchTools: refusingFetch });
+
+      expect(result.exitCode).toBe(1);
+      // The stored credential WAS sent: the advice must not say nothing was.
+      expect(refusingFetch.mock.calls[0]?.[1]).toEqual({ authorization: "Bearer tok123" });
+      const stderr = result.stderrLines.join("");
+      expect(stderr).toContain(
+        `[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP ${status}): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"), or --clear-credential to drop it; nothing was written.`,
+      );
+      expect(stderr).not.toContain("you supplied");
+      expect(stderr).not.toContain("set CONDUIT_ADD_SECRET;");
+      expect(stderr).not.toContain("tok123");
+    });
+  }
+
   it("does NOT pass the stored credential when no auth is available (fresh add, no env)", async () => {
     const store = await openTestStore();
     const noAuthFetch = vi.fn(async (_url: string, opts?: { authorization?: string }) => {
@@ -805,10 +830,11 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
       expect(result.exitCode).toBe(1);
       const stderr = result.stderrLines.join("");
       expect(stderr).toContain(
-        `[conduit add-mcp] the upstream rejected the credential you supplied (HTTP ${status}): check the token's permissions for this upstream and that it has not expired; nothing was written.`,
+        `[conduit add-mcp] the upstream rejected the credential you supplied (HTTP ${status}): it is sent verbatim as the Authorization header, so include its scheme (e.g. "Bearer <token>"), and check its permissions for this upstream and that it has not expired; nothing was written.`,
       );
       expect(stderr).not.toContain("wrong-scope");
       expect(stderr).not.toContain("set CONDUIT_ADD_SECRET");
+      expect(await store.sources.list()).toEqual([]);
     });
   }
 
@@ -916,6 +942,30 @@ describe("revalidateSourceRequest (the anti-oracle half)", () => {
     });
 
     expect(seen).toEqual([undefined]);
+  });
+
+  it("a STORED credential refused with HTTP 403 on revalidate gets stored-credential guidance and changes nothing", async () => {
+    const store = await openTestStore();
+    await run({}, { store, env: { CONDUIT_ADD_SECRET: "Bearer stored" } });
+    const sourcesBefore = await store.sources.list();
+    const toolsBefore = await store.tools.list();
+
+    await expect(
+      revalidateSourceRequest("github", {
+        store,
+        fetchTools: async () => {
+          throw new McpClientError("http_status", "MCP endpoint returned HTTP 403", {
+            status: 403,
+          });
+        },
+      }),
+    ).rejects.toMatchObject({
+      name: "ProvisionRefused",
+      message:
+        '[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP 403): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"), or --clear-credential to drop it; nothing was written.',
+    });
+    expect(await store.sources.list()).toEqual(sourcesBefore);
+    expect(await store.tools.list()).toEqual(toolsBefore);
   });
 
   it("refuses an unknown namespace rather than implicitly onboarding it, with 0 writes and no fetch", async () => {
