@@ -1,9 +1,9 @@
 import { execFileSync } from "node:child_process";
-import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
+import { mkdirSync, mkdtempSync, realpathSync, rmSync, symlinkSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join, resolve } from "node:path";
+import { join, resolve, sep } from "node:path";
 import type { RpcRequest, RpcResponse } from "@conduithq/mcp";
 import {
   createApprovalRuntime,
@@ -318,7 +318,13 @@ describe("conduit approvals list", () => {
     // string, or it reaches a different daemon than the list did.
     mkdirSync(join(scratch, "elsewhere", "sub"), { recursive: true });
     symlinkSync(join(scratch, "elsewhere", "sub"), join(scratch, "link"));
-    const aliased = join(scratch, "link", "..", "state");
+    // Not `join`: it would collapse `link/..` lexically and the symlink
+    // would never be followed. The kernel resolves `link` first, so the
+    // daemon's directory is `elsewhere/state`, not `<scratch>/state`.
+    const aliased = [scratch, "link", "..", "state"].join(sep);
+    expect(resolveEffectiveStateDir(aliased)).toBe(
+      join(realpathSync(join(scratch, "elsewhere")), "state"),
+    );
     expect(resolveEffectiveStateDir(aliased)).not.toBe(resolve(aliased));
     const viaLink = makeDeps({ store, now: () => 10_000 });
     await runList({ json: false, stateDir: aliased }, viaLink);
