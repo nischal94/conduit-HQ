@@ -382,7 +382,7 @@ function isValidHttpUrl(value: string): boolean {
  * The url is rendered origin+path (`sanitizeUrlForOperator`) as a second
  * belt to the intake userinfo rejection.
  */
-function mapFetchError(cause: unknown, url: string): string {
+function mapFetchError(cause: unknown, url: string, secretSupplied: boolean): string {
   const safeUrl = sanitizeUrlForOperator(url);
   const unreachable = `[conduit add-mcp] upstream unreachable at ${safeUrl}; nothing was written. Re-run when reachable.`;
   if (!(cause instanceof McpClientError)) {
@@ -391,6 +391,11 @@ function mapFetchError(cause: unknown, url: string): string {
   switch (cause.kind) {
     case "http_status":
       if (cause.status === 401 || cause.status === 403) {
+        // An operator who DID supply a token needs to fix that token, not be
+        // told to set one. The line names neither the token nor any of it.
+        if (secretSupplied) {
+          return `[conduit add-mcp] the upstream rejected the credential you supplied (HTTP ${cause.status}): check the token's permissions for this upstream and that it has not expired; nothing was written.`;
+        }
         return `[conduit add-mcp] upstream requires authorization (HTTP ${cause.status}): set CONDUIT_ADD_SECRET; nothing was written.`;
       }
       // Fixed category — the upstream's status is a small integer we chose to
@@ -762,7 +767,10 @@ async function fetchAndProvision(args: {
     // (credential-redacted), never to the client; the client gets a fixed
     // category from `mapFetchError`.
     logRedactedDetail(args.log, namespace, url, args.onboardingAuth, cause);
-    throw new ProvisionRefused(mapFetchError(cause, url));
+    // `hasFreshSecret` is the one normalization (`trim() !== ""`) that also
+    // decides whether the supplied secret became `authorization`, so the
+    // advice cannot disagree with what was actually sent.
+    throw new ProvisionRefused(mapFetchError(cause, url, args.hasFreshSecret));
   }
 
   // The third onboarding bound (§2.2), alongside `MAX_RESPONSE_BYTES` and

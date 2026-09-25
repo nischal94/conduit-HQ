@@ -786,6 +786,52 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
     });
   }
 
+  const suppliedCases: { status: 401 | 403 }[] = [{ status: 401 }, { status: 403 }];
+  for (const { status } of suppliedCases) {
+    it(`error mapping: http_status ${status} WITH a credential supplied → check-the-token guidance, 0 writes`, async () => {
+      const store = await openTestStore();
+      const result = await run(
+        {},
+        {
+          store,
+          env: { CONDUIT_ADD_SECRET: "Bearer wrong-scope" },
+          fetchTools: vi.fn(async () => {
+            throw new McpClientError("http_status", `MCP endpoint returned HTTP ${status}`, {
+              status,
+            });
+          }),
+        },
+      );
+      expect(result.exitCode).toBe(1);
+      const stderr = result.stderrLines.join("");
+      expect(stderr).toContain(
+        `[conduit add-mcp] the upstream rejected the credential you supplied (HTTP ${status}): check the token's permissions for this upstream and that it has not expired; nothing was written.`,
+      );
+      expect(stderr).not.toContain("wrong-scope");
+      expect(stderr).not.toContain("set CONDUIT_ADD_SECRET");
+    });
+  }
+
+  it("error mapping: http_status 403 with a whitespace-only CONDUIT_ADD_SECRET → counts as not supplied, set-the-secret guidance", async () => {
+    const store = await openTestStore();
+    const result = await run(
+      {},
+      {
+        store,
+        env: { CONDUIT_ADD_SECRET: "   " },
+        fetchTools: vi.fn(async () => {
+          throw new McpClientError("http_status", "MCP endpoint returned HTTP 403", {
+            status: 403,
+          });
+        }),
+      },
+    );
+    expect(result.exitCode).toBe(1);
+    expect(result.stderrLines.join("")).toContain(
+      "[conduit add-mcp] upstream requires authorization (HTTP 403): set CONDUIT_ADD_SECRET; nothing was written.",
+    );
+  });
+
   it("a non-McpClientError rejection still fails loud via the network fallback line", async () => {
     const store = await openTestStore();
     const deps = {
