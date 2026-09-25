@@ -359,7 +359,14 @@ describe("conduit approvals list", () => {
     const store = await seedPaused();
     const deps = makeDeps({ store, now: () => 10_000 });
     await runList({ json: true }, deps);
-    expect(deps.stdoutLines.join("")).not.toContain("To decide");
+    const raw = deps.stdoutLines.join("");
+    expect(raw).not.toContain("To deny:");
+    expect(raw).not.toContain("To approve:");
+    // The whole output is one JSON array: one entry per seeded paused row
+    // (exec_old, exec_new), and nothing appended after it.
+    const parsed = JSON.parse(raw) as Array<{ executionId: string }>;
+    expect(Array.isArray(parsed)).toBe(true);
+    expect(parsed.map((row) => row.executionId)).toEqual(["exec_old", "exec_new"]);
   });
 
   it("a row from an OLDER daemon (no callId) renders `-` in the CALL ID column and null-free JSON", async () => {
