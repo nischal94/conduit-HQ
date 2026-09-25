@@ -92,9 +92,10 @@ function prodDeps(stateDir: string): ApprovalsDeps {
  *
  * Structurally FLAT and narrower than a stored `Execution`: the daemon
  * projects the six fields this command renders and drops the raw
- * `pausedOn`, whose `input` is the paused call's arguments. A corrupt row
- * (paused with no `pausedOn`) is omitted and logged daemon-side, so nothing
- * here has to defend against it.
+ * `pausedOn`, whose `input` is the paused call's arguments. A corrupt pause
+ * arrives as a recovery row (`pausedToListRow` in packages/mcp/src/payloads.ts):
+ * tool name "(unreadable pause)", expiry 0, and a call id only when the claim
+ * needs that exact id.
  */
 type PausedRowWire = PausedListRow;
 
@@ -141,7 +142,10 @@ function ask<K extends RpcRequest["kind"]>(
 
 interface PausedRow {
   executionId: string;
-  /** `-` when the daemon predates call-bound approvals (wire skew). */
+  /**
+   * `-` when the daemon predates call-bound approvals (wire skew), or for a
+   * corrupt pause whose stored call id is un-nameable.
+   */
   callId: string;
   tool: string;
   waitingSince: number;
