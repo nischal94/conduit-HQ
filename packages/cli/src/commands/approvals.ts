@@ -1,3 +1,4 @@
+import { resolve } from "node:path";
 import {
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
@@ -185,7 +186,17 @@ function pad(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
 }
 
-function renderTable(rows: PausedRow[], now: number): string {
+/** POSIX single-quote: safe for ANY string, including newlines and control bytes. */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/** Upstream-controlled; shown only when it cannot carry shell or terminal syntax. */
+const SAFE_LABEL = /^[A-Za-z0-9._-]{1,128}$/;
+/** Conduit-generated ids; a copyable line is printed only when both match. */
+const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+
+function renderTable(rows: PausedRow[], now: number, stateDir: string | undefined): string {
   if (rows.length === 0) {
     return "No paused executions awaiting approval.\n";
   }
@@ -197,11 +208,35 @@ function renderTable(rows: PausedRow[], now: number): string {
     return `${pad(row.executionId, idWidth)}  ${pad(row.callId, callWidth)}  ${pad(row.tool, toolWidth)}  ${pad(waiting, 24)}  ${expiryLabel(row, now)}`;
   });
   const header = `${pad("EXEC ID", idWidth)}  ${pad("CALL ID", callWidth)}  ${pad("TOOL", toolWidth)}  ${pad("WAITING SINCE", 24)}  EXPIRY`;
-  return `${[header, ...lines].join("\n")}\n`;
+  // Absolute, so a copied line targets the same database from any directory.
+  const dirFlag = stateDir !== undefined ? ` --state-dir ${shellQuote(resolve(stateDir))}` : "";
+  // A row from an older daemon carries no call id ("-") and cannot be decided by id.
+  const decidable = rows.filter((row) => row.callId !== "-");
+  const decide = decidable.flatMap((row) => {
+    // Quoting stops the shell, not the terminal: an id with a newline or ESC
+    // would still corrupt the screen or a copy. Ids are Conduit-generated,
+    // so anything outside the safe set means something is wrong: say so.
+    if (!SAFE_ID.test(row.executionId) || !SAFE_ID.test(row.callId)) {
+      return [
+        "",
+        "A paused call has ids with unexpected characters; not printing copyable lines for it. Use `conduit approvals list --json`.",
+      ];
+    }
+    const ids = `${shellQuote(row.executionId)} ${shellQuote(row.callId)}${dirFlag}`;
+    const label = SAFE_LABEL.test(row.tool) ? ` (${row.tool})` : "";
+    // Deny first, neutral wording: approving must be a choice, not the default.
+    return [
+      "",
+      `Call ${shellQuote(row.callId)}${label}:`,
+      `  To deny:    conduit approvals deny ${ids}`,
+      `  To approve: conduit approvals approve ${ids}`,
+    ];
+  });
+  return `${[header, ...lines, ...decide].join("\n")}\n`;
 }
 
 export async function runList(
-  args: { json: boolean },
+  args: { json: boolean; stateDir?: string },
   deps: ApprovalsDeps,
 ): Promise<ApprovalsResult> {
   const answer = await ask(deps, { kind: "approvals.list" }, "list");
@@ -229,7 +264,7 @@ export async function runList(
       )}\n`,
     );
   } else {
-    deps.stdout(renderTable(rows, now));
+    deps.stdout(renderTable(rows, now, args.stateDir));
   }
   return { exitCode: 0 };
 }
@@ -415,7 +450,10 @@ export async function approvals(argv: string[], opts: ApprovalsOptions = {}): Pr
   switch (sub) {
     case "list": {
       const json = rest.includes("--json");
-      const result = await runList({ json }, deps);
+      const result = await runList(
+        { json, ...(opts.stateDir === undefined ? {} : { stateDir: opts.stateDir }) },
+        deps,
+      );
       return result.exitCode;
     }
     case "approve":

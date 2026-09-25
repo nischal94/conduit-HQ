@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
 import type { RpcRequest, RpcResponse } from "@conduithq/mcp";
 import {
   createApprovalRuntime,
@@ -15,7 +15,7 @@ import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ApprovalsDeps } from "./commands/approvals.js";
-import { runDecide, runList } from "./commands/approvals.js";
+import { runDecide, runList, shellQuote } from "./commands/approvals.js";
 
 /**
  * Unit suite for `conduit approvals`, driven through the DAEMON seam.
@@ -281,6 +281,85 @@ describe("conduit approvals list", () => {
     const row = await store.executions.get("exec_old");
     expect(row?.status).toBe("paused");
     expect(row?.pausedOn?.expiresAt).toBe(5_000);
+  });
+
+  it("list ends with deny-then-approve lines per decidable row, fully quoted, with an absolute --state-dir", async () => {
+    const store = await seedPaused();
+    const deps = makeDeps({ store, now: () => 10_000 });
+
+    await runList({ json: false }, deps);
+    const plain = deps.stdoutLines.join("");
+    expect(plain).toContain("  To deny:    conduit approvals deny 'exec_new' 'c2'");
+    expect(plain).toContain("  To approve: conduit approvals approve 'exec_new' 'c2'");
+    expect(plain.indexOf("To deny:    conduit approvals deny 'exec_new'")).toBeLessThan(
+      plain.indexOf("To approve: conduit approvals approve 'exec_new'"),
+    );
+    expect(plain).toContain("Call 'c2' (github.create_issue):");
+
+    const withDir = makeDeps({ store, now: () => 10_000 });
+    await runList({ json: false, stateDir: "rel dir/it's" }, withDir);
+    expect(withDir.stdoutLines.join("")).toContain(
+      `conduit approvals approve 'exec_new' 'c2' --state-dir '${resolve("rel dir/it's").replace(/'/g, `'\\''`)}'`,
+    );
+  });
+
+  it("shellQuote survives spaces, quotes, newlines, and ESC; an unsafe tool name never reaches a line", () => {
+    for (const hostile of ["a b", "it's", "x\ny; rm -rf ~", "\u001b[2Jclear"]) {
+      const quoted = shellQuote(hostile);
+      expect(quoted.startsWith("'")).toBe(true);
+      expect(quoted.endsWith("'")).toBe(true);
+      expect(quoted.slice(1, -1).replace(/'\\''/g, "")).not.toContain("'");
+    }
+  });
+
+  it("an upstream tool name carrying a newline or ESC never appears in the decide block", async () => {
+    const store = await seedPaused();
+    await store.executions.put({
+      ...(await store.executions.get("exec_new"))!,
+      id: "exec_evil",
+      pausedOn: {
+        callId: "c9",
+        toolName: "gh.x\n$(touch /tmp/pwned)\u001b[2J",
+        input: {},
+        reason: "requires approval",
+        expiresAt: 999_999_999_999,
+      },
+    });
+    const deps = makeDeps({ store, now: () => 10_000 });
+    await runList({ json: false }, deps);
+    const out = deps.stdoutLines.join("");
+    const decideBlock = out.slice(out.indexOf("\nCall "));
+    expect(decideBlock).toContain("Call 'c9':");
+    expect(decideBlock).not.toContain("touch /tmp/pwned");
+    expect(decideBlock).not.toContain("\u001b");
+  });
+
+  it("a call id or execution id outside the safe set gets no copyable line", async () => {
+    const store = await seedPaused();
+    await store.executions.put({
+      ...(await store.executions.get("exec_new"))!,
+      id: "exec_ok",
+      pausedOn: {
+        callId: "c\n\u001b]52;c;cm0gLXJmIH4=\u0007",
+        toolName: "gh.x",
+        input: {},
+        reason: "requires approval",
+        expiresAt: 999_999_999_999,
+      },
+    });
+    const deps = makeDeps({ store, now: () => 10_000 });
+    await runList({ json: false }, deps);
+    const out = deps.stdoutLines.join("");
+    expect(out).toContain("not printing copyable lines for it");
+    expect(out).not.toContain("approve 'exec_ok'");
+    expect(out.slice(out.indexOf("A paused call has ids"))).not.toContain("\u001b");
+  });
+
+  it("list --json is unchanged by the decide block", async () => {
+    const store = await seedPaused();
+    const deps = makeDeps({ store, now: () => 10_000 });
+    await runList({ json: true }, deps);
+    expect(deps.stdoutLines.join("")).not.toContain("To decide");
   });
 
   it("a row from an OLDER daemon (no callId) renders `-` in the CALL ID column and null-free JSON", async () => {
