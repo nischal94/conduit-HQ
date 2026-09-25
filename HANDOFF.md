@@ -172,7 +172,19 @@ in the section below (its doctor-fixture item is DONE — #64), plus:
 - **Corrupt `-` rows get no operator guidance**: a corrupt pause from the
   current daemon arrives with no call id and the reason "deciding it with
   any call id terminalizes it" (`payloads.ts` `pausedToListRow`), but
-  neither the table nor `--json` shows the reason.
+  neither the table nor `--json` shows the reason. Same family (PR #65
+  code review, 2026-09-26, scored 25): a corrupt row that KEEPS a
+  nameable call id gets the normal "To approve:" line, and approving it
+  terminalizes the row as `failed` (reported truthfully). Mark corrupt
+  rows in the copy block, e.g. keyed on tool `(unreadable pause)`.
+- **Founder decision — same-user-shell agents and the approval seam**
+  (PR #65 code review, 2026-09-26): spec §18 says "an agent must never
+  approve its own paused call" but enforces it only by not exposing
+  approve as an MCP tool. An agent with a shell as the same OS user can
+  run `conduit approvals list` (which the pause message now names) and
+  paste the printed approve line. Not a new hole — the command was
+  already in README and `--help` — but no spec text models this threat.
+  Decide: accept and record in §18, or design a human-presence check.
 - **A pasted invisible character in `CONDUIT_ADD_SECRET`** makes
   `http.request` throw `ERR_INVALID_CHAR` before any I/O, reported as
   "upstream unreachable … re-run" (`provision.ts` `mapFetchError`).
