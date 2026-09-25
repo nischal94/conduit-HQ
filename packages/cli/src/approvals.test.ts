@@ -356,6 +356,23 @@ describe("conduit approvals list", () => {
     });
   });
 
+  it("a state dir with control or format characters gets no copyable lines and is never echoed", async () => {
+    const store = await seedPaused();
+    // OSC 52 (clipboard write), a newline, and a right-to-left override.
+    for (const hostile of ["x\u001b]52;c;dG91Y2g=\u0007", "a\nb", "ab‮cd"]) {
+      const deps = makeDeps({ store, now: () => 10_000 });
+      await runList({ json: false, stateDir: join(scratch, hostile) }, deps);
+      const out = deps.stdoutLines.join("");
+      expect(out).toContain("EXEC ID");
+      expect(out).not.toContain("conduit approvals approve");
+      expect(out).not.toContain("conduit approvals deny");
+      expect(out).not.toContain(hostile);
+      expect(out).toContain(
+        "The state directory's resolved path contains control or format characters; no copyable lines printed. Use `conduit approvals list --json` with the same --state-dir.",
+      );
+    }
+  });
+
   it("shellQuote survives spaces, quotes, newlines, and ESC", () => {
     for (const hostile of ["a b", "it's", "x\ny; rm -rf ~", "\u001b[2Jclear"]) {
       const quoted = shellQuote(hostile);

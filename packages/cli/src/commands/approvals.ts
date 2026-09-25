@@ -212,6 +212,8 @@ const SAFE_LABEL = /^[A-Za-z0-9._-]{1,128}$/;
  * No leading `-`: an id like `--state-dir` would be parsed as a flag.
  */
 const SAFE_ID = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
+/** Unicode control (Cc) and format (Cf) characters: what a terminal acts on. */
+const TERMINAL_UNSAFE = /[\p{Cc}\p{Cf}]/u;
 
 function renderTable(rows: PausedRow[], now: number, stateDir: string | undefined): string {
   if (rows.length === 0) {
@@ -228,8 +230,17 @@ function renderTable(rows: PausedRow[], now: number, stateDir: string | undefine
   // The same resolution `daemonRequest` applies, so a copied line reaches
   // the daemon this list talked to from any directory, symlinked spellings
   // included. Any error it throws propagates to the command's caller.
-  const dirFlag =
-    stateDir !== undefined ? ` --state-dir ${shellQuote(resolveEffectiveStateDir(stateDir))}` : "";
+  const resolvedDir = stateDir !== undefined ? resolveEffectiveStateDir(stateDir) : undefined;
+  // The same terminal concern as the ids below, on the resolved value: a
+  // component reached through a symlink is not what the operator typed. A
+  // control or format character (ESC, newline, bidi override) prints no
+  // copyable line, and the path's bytes are never echoed.
+  if (resolvedDir !== undefined && TERMINAL_UNSAFE.test(resolvedDir)) {
+    const notice =
+      "The state directory's resolved path contains control or format characters; no copyable lines printed. Use `conduit approvals list --json` with the same --state-dir.";
+    return `${[header, ...lines, "", notice].join("\n")}\n`;
+  }
+  const dirFlag = resolvedDir !== undefined ? ` --state-dir ${shellQuote(resolvedDir)}` : "";
   // A `-` call id means the row has no nameable call id: an older daemon, or
   // a corrupt stored pause from the current one (the recovery row
   // `pausedToListRow` in packages/mcp/src/payloads.ts). No call id is shown
