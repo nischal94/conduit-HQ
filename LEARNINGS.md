@@ -2829,3 +2829,71 @@ characters in source are written as escapes and checked at byte level
 (`count(bytes([0]))` on the committed blob), in every dispatch, with the
 output pasted into the report. The three bytes are still in the plan
 document on main; replacing them is a one-commit docs fix.**
+
+### 38. A flaky "zero writes" test was the test process writing, not the product
+
+`--doctor --offline performs ZERO writes` failed 3 of 60 CI runs and
+was logged as a fixture race. The failure signature said more: the db
+was 4096 bytes at the fingerprint (all data still in the WAL) and
+~131 KB tens of ms later, too soon for the doctor subprocess to have
+started. A local probe showed `@libsql/client` 0.14's `close()` leaves
+the native connection alive until garbage collection; the collection
+then checkpoints the WAL into the db. 11 of 12 seedings kept the WAL
+600 ms after `close()`; a forced GC checkpointed it 10 of 10 times.
+The in-process seeder was the writer; the doctor never wrote. Fix
+(#64): seed in a child process that exits, and force a GC between the
+fingerprint and the run so a regression fails every time. **Lesson:
+read the numbers in a flaky assertion before accepting the logged
+hypothesis — timing and size ruled out the accused code. A GC-timing
+bug becomes deterministic by forcing the collection at the moment that
+matters (`v8.setFlagsFromString("--expose-gc")` +
+`vm.runInNewContext("gc")`). Any other test that seeds a WAL database
+in-process and then inspects its files has the same exposure.**
+
+### 39. The agent reversed a founder decision on convenience, then withdrew it
+
+After two plan reviews the agent proposed dropping D-R10 (ship only
+pnpm-resolved versions) as "fragile", having recommended it days
+earlier; asked for a final answer, it withdrew the reversal. The
+founder had noticed the answers moving. **Lesson: re-weighing an
+earlier recommendation is legitimate only on new evidence, and the
+test is written down before answering: CLAUDE.md non-negotiables beat
+implementation convenience; a founder decision changes only on new
+evidence; a check may fail loudly but never silently. D-R10's failure
+mode is a loud pack refusal, which is the acceptable kind.**
+
+### 40. Every fold of review findings spawned defects of its own — five review loops confirmed it
+
+Across the eng review, the DX review, and their five codex passes, the
+agent's own folds introduced real defects: a hostile-env check set the
+egress flag to `1` (hiding the regression it targeted), a fixture that
+would fail its "expected pass" case, a shrinkwrap check that would
+refuse the first pack, a copy-paste block that injected a token into
+shell history, and an absolute-path check that verified nothing. Each
+was caught by the next pass. **Lesson (reinforces #26-shape): budget a
+confirming pass per fold and stop by the written stop line when a pass
+returns only seams or repeat classes. A plan also doubled in size
+(~1,400 → ~2,700 lines) under review; the reviews earned their keep on
+roughly eight findings, and the long tail added complexity faster than
+safety.**
+
+### 41. The same false-green shape appeared four times in one session
+
+A "HOME stays empty" test that could not see the passwd-anchored state
+dir; a `--version` check that mcp's entry also answers with the same
+string; a `--json` guard asserting the absence of a string nothing
+prints; a `node -e` "YAML check" that only read the file. All four were
+drafted by the agent or specified by the plan. **Lesson: for every new
+check, write down what would have to break for it to go red, then make
+it go red once before trusting it (the rule exists; this session shows
+the drafting reflex does not follow it unprompted).**
+
+### 42. The stored add-mcp secret is the full Authorization header value
+
+`packages/sdk/src/credentials.ts` defines the secret as the complete
+header value (`Bearer ghp_x`), sent verbatim. No README said so; the
+examples said `YOUR_TOKEN`, and PR A's first cut prompted for a
+`Token:`, which would send a bare token and get a 401 the new advice
+misdiagnosed. A silent-failure review caught it. **Lesson: before
+writing operator-facing guidance about a credential, read how the
+credential is consumed, not how it is named.**
