@@ -99,9 +99,23 @@ the state machine drawn in the comment above the direct arm in
 1. **R3a preview packaging** (§18, 2026-09-11 — unchanged): a versioned
    packed artifact, alpha install notes, and ONE governance property
    demonstrable in the first-run path (approve → the exact approved call
-   runs once; deny → nothing ran). Plan it with
-   `superpowers:writing-plans`. Then the three-week alpha window and the
-   profiles decision (the default and its reversal trigger are in §18).
+   runs once; deny → nothing ran). **2026-09-25: PLANNED + REVIEWED** —
+   `docs/superpowers/plans/2026-09-25-r3a-preview-packaging.md` (untracked
+   on main until the plan PR; `/plan-eng-review` CLEAR + three `codex exec`
+   passes, converged by adjudication; founder decisions D-R1, D-R2,
+   D-R6–D-R12 in its header). (a) `/plan-devex-review` DONE 2026-09-25
+   (DX POLISH, 4 → 7.5/10; two more codex passes, converged; added Task
+   3B). Final audit 2026-09-25: plan kept as reviewed incl. D-R10; ONE
+   change, D-R5 → two PRs (plan D-R5, D-R13). Remaining, in order:
+   (b) plan PR on `docs/r3a-plan`; (c) the `--doctor --offline` fixture
+   fix (pre-ship gate 1, moved first on CI evidence — see DEFERRED);
+   (d) PR A `fix/approval-guidance` = Task 3B + README shell-history fix;
+   (e) PR B `feat/r3a-preview-packaging` = Tasks 1–6, from main after A
+   merges — each via `superpowers:subagent-driven-development`, Tier 2
+   gauntlet + `/explain-diff` quiz; (f) Dependabot triage; (g) Task 7
+   release on the founder's word. Then the
+   three-week alpha window and the profiles decision (the default and its
+   reversal trigger are in §18).
 2. **Lane B is NOT next** unless an adopter needs profiles. When it is
    built it must: add the profiles table and repository; authorize every
    read by execution id against the caller's client id (the daemon does
@@ -149,7 +163,7 @@ written as escapes and checked at byte level (LEARNINGS #37) · an agent's
 completion claim is verified against the artifact before it is repeated
 (LEARNINGS #32).
 
-**DEFERRED (live list, updated 2026-09-20):** carry the 2026-09-13 and
+**DEFERRED (live list, updated 2026-09-25):** carry the 2026-09-13 and
 earlier lists, plus the follow-ups above, plus: Dependabot reports 15
 alerts on main (14 moderate, 1 low) against the 6 medium / 1 low last
 recorded here — audit triage is due before R3a ships · the
@@ -159,7 +173,27 @@ failed CI once on PR #62 and the larger R1 schema widens the window, so a
 required check now fails on timing; fix the fixture (fingerprint after
 the seeding write settles, or assert content rather than mtime), and
 prove the repaired test can still fail by making `--doctor --offline`
-write once.
+write once. · signed build provenance (GitHub artifact attestation) for
+the release tarball — due before PUBLIC R3, not R3a: the R3a `.sha256`
+proves integrity only, and attestation needs a separate privileged,
+tag-triggered workflow (`id-token: write`) with its own threat-model
+review (decided in the R3a plan's eng review, 2026-09-25). · `conduit
+approvals list` prints the upstream-controlled tool name raw in its table
+row (`packages/cli/src/commands/approvals.ts` `renderTable`): a name with
+terminal control bytes (ESC) or a newline reaches the operator's terminal
+unfiltered. Pre-existing; R3a hardens only its new decide block. Fix:
+render non-`[A-Za-z0-9._-]` names escaped (found by the R3a DX review's
+codex pass, 2026-09-25). · CI flake evidence (measured 2026-09-25 over the last 60 `ci.yml`
+runs): 7 needed a rerun, every one in "Unit tests", `packages/mcp`: 3× the
+`--doctor --offline performs ZERO writes` fixture (`integration.test.ts`),
+4× daemon auto-start timing tests in `daemon/client.test.ts` (§3.5
+decision table: transient-exclusive hold, auto-start into a missing state
+dir, autoStart default; §17 leaf-swap). The doctor fixture fix is due
+first (R3a plan order); the `client.test.ts` family is a separate,
+unscheduled fix · `conduit add-mcp` native secret input (a hidden
+TTY prompt or `--secret-stdin`), so onboarding needs no shell variable at
+all; R3a documents `read -rs` + `unset` as the interim (R3a DX review,
+2026-09-25).
 
 **SHELVED (unchanged):** the project-jail plan.
 
