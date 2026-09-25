@@ -73,10 +73,11 @@ included (for example `Bearer <token>`). It travels via env var — never a
 flag, so it stays out of argv — and is SecretBox-encrypted at rest. Type it
 at a hidden prompt so it stays out of your shell history too. The subshell
 keeps the value out of your shell afterwards and stops a paste from feeding
-the prompt:
+the prompt; `set +x` keeps shell tracing from printing it:
 
 ```bash
 (
+  set +x
   printf 'Authorization header value (e.g. Bearer <token>): '
   IFS= read -rs TOKEN; echo
   [ -n "$TOKEN" ] || { echo 'No value read; add-mcp not run.' >&2; exit 1; }

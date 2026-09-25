@@ -177,6 +177,16 @@ in the section below (its doctor-fixture item is DONE — #64), plus:
   nameable call id gets the normal "To approve:" line, and approving it
   terminalizes the row as `failed` (reported truthfully). Mark corrupt
   rows in the copy block, e.g. keyed on tool `(unreadable pause)`.
+- **Founder ruling — `approvals list` resolves `--state-dir` twice**
+  (codex re-pass on PR #65, 2026-09-26, P1): `daemonRequest` resolves it
+  for the RPC and `renderTable` resolves it again for the copy lines. A
+  symlink swapped in between makes the printed lines target another
+  daemon. Classified out of threat model in PR #65: swapping it needs
+  write access to a directory on the operator's own state path, and
+  such an attacker could point the link at the other daemon before the
+  list, which the operator would then review honestly. Fix if wanted:
+  resolve once per invocation and pass the canonical value to both, and
+  map resolver errors (EACCES) the way the daemon client does.
 - **Founder decision — same-user-shell agents and the approval seam**
   (PR #65 code review, 2026-09-26): spec §18 says "an agent must never
   approve its own paused call" but enforces it only by not exposing
