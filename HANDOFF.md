@@ -106,9 +106,11 @@ the state machine drawn in the comment above the direct arm in
    D-R6–D-R12 in its header). (a) `/plan-devex-review` DONE 2026-09-25
    (DX POLISH, 4 → 7.5/10; two more codex passes, converged; added Task
    3B). Final audit 2026-09-25: plan kept as reviewed incl. D-R10; ONE
-   change, D-R5 → two PRs (plan D-R5, D-R13). Remaining, in order:
-   (b) plan PR on `docs/r3a-plan`; (c) the `--doctor --offline` fixture
-   fix (pre-ship gate 1, moved first on CI evidence — see DEFERRED);
+   change, D-R5 → two PRs (plan D-R5, D-R13). (b) plan PR #63 MERGED
+   `60f1ebf`. (c) the `--doctor --offline` fixture fix #64 MERGED
+   `c69e686` (root cause: @libsql/client close() leaves the connection
+   alive until GC, whose WAL checkpoint rewrote the fixture; the doctor
+   never wrote). Remaining, in order:
    (d) PR A `fix/approval-guidance` = Task 3B + README shell-history fix;
    (e) PR B `feat/r3a-preview-packaging` = Tasks 1–6, from main after A
    merges — each via `superpowers:subagent-driven-development`, Tier 2
