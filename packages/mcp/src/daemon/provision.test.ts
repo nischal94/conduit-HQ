@@ -832,6 +832,25 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
     );
   });
 
+  it("error mapping: a whitespace-only secret reaching the HANDLER is not sent and counts as not supplied", async () => {
+    // The `run` helper drops a blank secret before the handler; this calls the
+    // handler directly so its own `hasFreshSecret` normalization is exercised.
+    const store = await openTestStore();
+    const fetchTools = vi.fn(async (_url: string, _opts?: { authorization?: string }) => {
+      throw new McpClientError("http_status", "MCP endpoint returned HTTP 403", { status: 403 });
+    });
+    await expect(
+      provisionSourceRequest({ ...BASE_ARGS, secret: "   " }, { store, fetchTools }),
+    ).rejects.toMatchObject({
+      name: "ProvisionRefused",
+      message:
+        "[conduit add-mcp] upstream requires authorization (HTTP 403): set CONDUIT_ADD_SECRET; nothing was written.",
+    });
+    expect(fetchTools).toHaveBeenCalledTimes(1);
+    expect(fetchTools.mock.calls[0]?.[1]).toBeUndefined();
+    expect(await store.sources.list()).toEqual([]);
+  });
+
   it("a non-McpClientError rejection still fails loud via the network fallback line", async () => {
     const store = await openTestStore();
     const deps = {

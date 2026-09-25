@@ -303,7 +303,7 @@ describe("conduit approvals list", () => {
     );
   });
 
-  it("shellQuote survives spaces, quotes, newlines, and ESC; an unsafe tool name never reaches a line", () => {
+  it("shellQuote survives spaces, quotes, newlines, and ESC", () => {
     for (const hostile of ["a b", "it's", "x\ny; rm -rf ~", "\u001b[2Jclear"]) {
       const quoted = shellQuote(hostile);
       expect(quoted.startsWith("'")).toBe(true);
@@ -314,8 +314,10 @@ describe("conduit approvals list", () => {
 
   it("an upstream tool name carrying a newline or ESC never appears in the decide block", async () => {
     const store = await seedPaused();
+    const base = await store.executions.get("exec_new");
+    if (base === undefined) throw new Error("[approvals.test] seed row exec_new missing");
     await store.executions.put({
-      ...(await store.executions.get("exec_new"))!,
+      ...base,
       id: "exec_evil",
       pausedOn: {
         callId: "c9",
@@ -336,11 +338,26 @@ describe("conduit approvals list", () => {
 
   it("a call id or execution id outside the safe set gets no copyable line", async () => {
     const store = await seedPaused();
+    const base = await store.executions.get("exec_new");
+    if (base === undefined) throw new Error("[approvals.test] seed row exec_new missing");
     await store.executions.put({
-      ...(await store.executions.get("exec_new"))!,
+      ...base,
       id: "exec_ok",
       pausedOn: {
         callId: "c\n\u001b]52;c;cm0gLXJmIH4=\u0007",
+        toolName: "gh.x",
+        input: {},
+        reason: "requires approval",
+        expiresAt: 999_999_999_999,
+      },
+    });
+    // A leading `-` would make the copied id parse as a flag (`--json`,
+    // `--state-dir`), so it gets no copyable line either.
+    await store.executions.put({
+      ...base,
+      id: "exec_flag",
+      pausedOn: {
+        callId: "--json",
         toolName: "gh.x",
         input: {},
         reason: "requires approval",
@@ -353,6 +370,9 @@ describe("conduit approvals list", () => {
     expect(out).toContain("not printing copyable lines for it");
     expect(out).not.toContain("approve 'exec_ok'");
     expect(out.slice(out.indexOf("A paused call has ids"))).not.toContain("\u001b");
+    expect(out).not.toContain("'exec_flag'");
+    expect(out).not.toContain("'--json'");
+    expect(out.split("not printing copyable lines for it").length - 1).toBe(2);
   });
 
   it("list --json is unchanged by the decide block", async () => {

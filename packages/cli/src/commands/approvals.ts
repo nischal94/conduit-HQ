@@ -193,8 +193,11 @@ export function shellQuote(value: string): string {
 
 /** Upstream-controlled; shown only when it cannot carry shell or terminal syntax. */
 const SAFE_LABEL = /^[A-Za-z0-9._-]{1,128}$/;
-/** Conduit-generated ids; a copyable line is printed only when both match. */
-const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
+/**
+ * Conduit-generated ids; a copyable line is printed only when both match.
+ * No leading `-`: an id like `--state-dir` would be parsed as a flag.
+ */
+const SAFE_ID = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
 
 function renderTable(rows: PausedRow[], now: number, stateDir: string | undefined): string {
   if (rows.length === 0) {

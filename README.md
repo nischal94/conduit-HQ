@@ -73,7 +73,7 @@ of argv — and is SecretBox-encrypted at rest. Type it at a hidden prompt so
 it stays out of your shell history too:
 
 ```bash
-read -rs TOKEN
+printf 'Token: '; read -rs TOKEN; echo
 CONDUIT_ADD_SECRET="$TOKEN" conduit add-mcp \
   --url https://api.githubcopilot.com/mcp/ \
   --namespace github --prefix github.personal
