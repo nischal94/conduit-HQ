@@ -1,4 +1,5 @@
-import { mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
+import { mkdirSync, mkdtempSync, rmSync, symlinkSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -8,7 +9,9 @@ import {
   createApprovalRuntime,
   DaemonUnavailable,
   pausedToListRow,
+  resolveEffectiveStateDir,
   resumeToPayload,
+  takeStateDir,
 } from "@conduithq/mcp";
 import type { ConduitStore, ResumeOutcome } from "@conduithq/sdk";
 import { normalizeMcp, openSqliteStore, SecretBox } from "@conduithq/sdk";
@@ -204,7 +207,9 @@ function makeDeps(
 }
 
 describe("conduit approvals list", () => {
-  let scratch: string;
+  // "" until a test seeds a store: the daemon-stub tests never do, and the
+  // cleanup must not hand `rmSync` an undefined path when one runs alone.
+  let scratch = "";
 
   afterEach(() => {
     if (scratch !== "") {
@@ -295,12 +300,54 @@ describe("conduit approvals list", () => {
       plain.indexOf("To approve: conduit approvals approve 'exec_new'"),
     );
     expect(plain).toContain("Call 'c2' (github.create_issue):");
+    // Both decidable rows get lines (the expired one too: approving it
+    // finalizes it as expired), oldest first, like the table.
+    expect(plain).toContain("  To deny:    conduit approvals deny 'exec_old' 'c1'");
+    expect(plain).toContain("  To approve: conduit approvals approve 'exec_old' 'c1'");
+    expect(plain.indexOf("Call 'c1'")).toBeGreaterThan(-1);
+    expect(plain.indexOf("Call 'c1'")).toBeLessThan(plain.indexOf("Call 'c2'"));
 
     const withDir = makeDeps({ store, now: () => 10_000 });
     await runList({ json: false, stateDir: "rel dir/it's" }, withDir);
     expect(withDir.stdoutLines.join("")).toContain(
-      `conduit approvals approve 'exec_new' 'c2' --state-dir '${resolve("rel dir/it's").replace(/'/g, `'\\''`)}'`,
+      `conduit approvals approve 'exec_new' 'c2' --state-dir '${resolveEffectiveStateDir("rel dir/it's").replace(/'/g, `'\\''`)}'`,
     );
+
+    // A symlinked spelling: the copied line must name the directory the
+    // daemon client resolves (`resolveEffectiveStateDir`), not the lexical
+    // string, or it reaches a different daemon than the list did.
+    mkdirSync(join(scratch, "elsewhere", "sub"), { recursive: true });
+    symlinkSync(join(scratch, "elsewhere", "sub"), join(scratch, "link"));
+    const aliased = join(scratch, "link", "..", "state");
+    expect(resolveEffectiveStateDir(aliased)).not.toBe(resolve(aliased));
+    const viaLink = makeDeps({ store, now: () => 10_000 });
+    await runList({ json: false, stateDir: aliased }, viaLink);
+    expect(viaLink.stdoutLines.join("")).toContain(
+      `--state-dir ${shellQuote(resolveEffectiveStateDir(aliased))}`,
+    );
+  });
+
+  it("a copied approve line survives a real shell and parses back to the same ids and --state-dir", async () => {
+    const store = await seedPaused();
+    const deps = makeDeps({ store, now: () => 10_000 });
+    await runList({ json: false, stateDir: "rel dir/it's" }, deps);
+    const line = deps.stdoutLines
+      .join("")
+      .split("\n")
+      .find(
+        (l) => l.startsWith("  To approve: conduit approvals approve ") && l.includes("exec_new"),
+      );
+    if (line === undefined) throw new Error("[approvals.test] no approve line for exec_new");
+    const rest = line.slice("  To approve: conduit ".length);
+    const words = execFileSync("/bin/sh", ["-c", `printf '%s\\0' ${rest}`], { encoding: "utf8" })
+      .split("\0")
+      .slice(0, -1);
+    const expectedDir = resolveEffectiveStateDir("rel dir/it's");
+    expect(words).toEqual(["approvals", "approve", "exec_new", "c2", "--state-dir", expectedDir]);
+    expect(takeStateDir("[approvals.test]", words)).toEqual({
+      rest: ["approvals", "approve", "exec_new", "c2"],
+      stateDir: expectedDir,
+    });
   });
 
   it("shellQuote survives spaces, quotes, newlines, and ESC", () => {
@@ -312,7 +359,7 @@ describe("conduit approvals list", () => {
     }
   });
 
-  it("an upstream tool name carrying a newline or ESC never appears in the decide block", async () => {
+  it("a corrupt tool name carrying a newline or ESC never appears in the decide block", async () => {
     const store = await seedPaused();
     const base = await store.executions.get("exec_new");
     if (base === undefined) throw new Error("[approvals.test] seed row exec_new missing");
@@ -351,8 +398,11 @@ describe("conduit approvals list", () => {
         expiresAt: 999_999_999_999,
       },
     });
-    // A leading `-` would make the copied id parse as a flag (`--json`,
-    // `--state-dir`), so it gets no copyable line either.
+    // A leading `-` is refused. `takeStateDir` (packages/mcp/src/args.ts)
+    // takes `--state-dir` from ANYWHERE in argv, so an id spelled
+    // `--state-dir` would be consumed as that flag. approve/deny read ids by
+    // position, so an id like `--json` would reach them as an id; it is
+    // refused by the same one rule.
     await store.executions.put({
       ...base,
       id: "exec_flag",
@@ -367,12 +417,70 @@ describe("conduit approvals list", () => {
     const deps = makeDeps({ store, now: () => 10_000 });
     await runList({ json: false }, deps);
     const out = deps.stdoutLines.join("");
-    expect(out).toContain("not printing copyable lines for it");
+    const notice =
+      "2 paused calls have ids with unexpected characters; no copyable lines printed for them. Use `conduit approvals list --json`.";
+    expect(out).toContain(notice);
+    expect(out.split("unexpected characters").length - 1).toBe(1);
+    // The notice comes after every per-row block.
+    expect(out.indexOf(notice)).toBeGreaterThan(out.lastIndexOf("To approve:"));
     expect(out).not.toContain("approve 'exec_ok'");
-    expect(out.slice(out.indexOf("A paused call has ids"))).not.toContain("\u001b");
+    expect(out.slice(out.indexOf(notice))).not.toContain("\u001b");
     expect(out).not.toContain("'exec_flag'");
     expect(out).not.toContain("'--json'");
-    expect(out.split("not printing copyable lines for it").length - 1).toBe(2);
+  });
+
+  it("an unsafe EXECUTION id with a safe call id gets no copyable line and is counted", async () => {
+    const store = await seedPaused();
+    const base = await store.executions.get("exec_new");
+    if (base === undefined) throw new Error("[approvals.test] seed row exec_new missing");
+    await store.executions.put({
+      ...base,
+      id: "-exec",
+      pausedOn: {
+        callId: "c5",
+        toolName: "gh.x",
+        input: {},
+        reason: "requires approval",
+        expiresAt: 999_999_999_999,
+      },
+    });
+    const deps = makeDeps({ store, now: () => 10_000 });
+    await runList({ json: false, stateDir: "rel dir" }, deps);
+    const out = deps.stdoutLines.join("");
+    expect(out).toContain(
+      `1 paused call has ids with unexpected characters; no copyable lines printed for it. Use \`conduit approvals list --json --state-dir ${shellQuote(resolveEffectiveStateDir("rel dir"))}\`.`,
+    );
+    expect(out.split("\n").filter((l) => l.includes("'c5'"))).toEqual([]);
+  });
+
+  it("a row with no call id beside a decidable row: the decidable row gets lines, the other gets neither lines nor a notice", async () => {
+    const deps = makeDeps({
+      daemon: async () =>
+        result([
+          {
+            executionId: "exec_old_daemon",
+            startedAt: 1_000,
+            toolName: "t",
+            reason: "r",
+            expiresAt: 9e12,
+          },
+          {
+            executionId: "exec_new",
+            callId: "c2",
+            startedAt: 2_000,
+            toolName: "github.create_issue",
+            reason: "r",
+            expiresAt: 9e12,
+          },
+        ]),
+      now: () => 10_000,
+    });
+    await runList({ json: false }, deps);
+    const out = deps.stdoutLines.join("");
+    expect(out).toContain("  To approve: conduit approvals approve 'exec_new' 'c2'");
+    expect(out).not.toContain("unexpected characters");
+    const decideBlock = out.slice(out.indexOf("\nCall "));
+    expect(decideBlock).not.toContain("exec_old_daemon");
   });
 
   it("list --json is unchanged by the decide block", async () => {

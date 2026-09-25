@@ -1,4 +1,3 @@
-import { resolve } from "node:path";
 import {
   DEFAULT_CONDUIT_DIR,
   daemonRequest,
@@ -7,6 +6,7 @@ import {
   type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
+  resolveEffectiveStateDir,
 } from "@conduithq/mcp";
 import { reportSkew } from "../skew.js";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
@@ -186,12 +186,22 @@ function pad(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
 }
 
-/** POSIX single-quote: safe for ANY string, including newlines and control bytes. */
+/**
+ * POSIX single-quote: safe for the SHELL to parse any NUL-free string. It
+ * does not make the string safe to print to a terminal (see SAFE_ID /
+ * SAFE_LABEL).
+ */
 export function shellQuote(value: string): string {
   return `'${value.replace(/'/g, `'\\''`)}'`;
 }
 
-/** Upstream-controlled; shown only when it cannot carry shell or terminal syntax. */
+/**
+ * Tool names are upstream-chosen but sanitized to `[A-Za-z0-9_.]` at intake
+ * (`toolSegment` in packages/sdk/src/normalize/mcp.ts) and prefixed by a
+ * `[a-z0-9_-]` namespace and a `.`, so a stored name normally matches. This gate is
+ * defense-in-depth against a corrupt row: the label is shown only when it
+ * cannot carry shell or terminal syntax.
+ */
 const SAFE_LABEL = /^[A-Za-z0-9._-]{1,128}$/;
 /**
  * Conduit-generated ids; a copyable line is printed only when both match.
@@ -211,19 +221,25 @@ function renderTable(rows: PausedRow[], now: number, stateDir: string | undefine
     return `${pad(row.executionId, idWidth)}  ${pad(row.callId, callWidth)}  ${pad(row.tool, toolWidth)}  ${pad(waiting, 24)}  ${expiryLabel(row, now)}`;
   });
   const header = `${pad("EXEC ID", idWidth)}  ${pad("CALL ID", callWidth)}  ${pad("TOOL", toolWidth)}  ${pad("WAITING SINCE", 24)}  EXPIRY`;
-  // Absolute, so a copied line targets the same database from any directory.
-  const dirFlag = stateDir !== undefined ? ` --state-dir ${shellQuote(resolve(stateDir))}` : "";
-  // A row from an older daemon carries no call id ("-") and cannot be decided by id.
+  // The same resolution `daemonRequest` applies, so a copied line reaches
+  // the daemon this list talked to from any directory, symlinked spellings
+  // included. Any error it throws propagates to the command's caller.
+  const dirFlag =
+    stateDir !== undefined ? ` --state-dir ${shellQuote(resolveEffectiveStateDir(stateDir))}` : "";
+  // A `-` call id means the row has no nameable call id: an older daemon, or
+  // a corrupt stored pause from the current one (the recovery row
+  // `pausedToListRow` in packages/mcp/src/payloads.ts). It cannot be decided
+  // by id, so no copy line is printed for it.
   const decidable = rows.filter((row) => row.callId !== "-");
+  // Quoting stops the shell, not the terminal: an id with a newline or ESC
+  // would still corrupt the screen or a copy. Ids are Conduit-generated, so
+  // anything outside the safe set means something is wrong: count it and
+  // say so once, below.
+  let unsafeCount = 0;
   const decide = decidable.flatMap((row) => {
-    // Quoting stops the shell, not the terminal: an id with a newline or ESC
-    // would still corrupt the screen or a copy. Ids are Conduit-generated,
-    // so anything outside the safe set means something is wrong: say so.
     if (!SAFE_ID.test(row.executionId) || !SAFE_ID.test(row.callId)) {
-      return [
-        "",
-        "A paused call has ids with unexpected characters; not printing copyable lines for it. Use `conduit approvals list --json`.",
-      ];
+      unsafeCount += 1;
+      return [];
     }
     const ids = `${shellQuote(row.executionId)} ${shellQuote(row.callId)}${dirFlag}`;
     const label = SAFE_LABEL.test(row.tool) ? ` (${row.tool})` : "";
@@ -235,6 +251,13 @@ function renderTable(rows: PausedRow[], now: number, stateDir: string | undefine
       `  To approve: conduit approvals approve ${ids}`,
     ];
   });
+  if (unsafeCount > 0) {
+    const subject =
+      unsafeCount === 1
+        ? "1 paused call has ids with unexpected characters; no copyable lines printed for it."
+        : `${unsafeCount} paused calls have ids with unexpected characters; no copyable lines printed for them.`;
+    decide.push("", `${subject} Use \`conduit approvals list --json${dirFlag}\`.`);
+  }
   return `${[header, ...lines, ...decide].join("\n")}\n`;
 }
 
