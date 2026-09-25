@@ -692,7 +692,7 @@ describe("provisionSourceRequest (add-mcp, daemon-side)", () => {
       expect(refusingFetch.mock.calls[0]?.[1]).toEqual({ authorization: "Bearer tok123" });
       const stderr = result.stderrLines.join("");
       expect(stderr).toContain(
-        `[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP ${status}): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"), or --clear-credential to drop it; nothing was written.`,
+        `[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP ${status}): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"); nothing was written.`,
       );
       expect(stderr).not.toContain("you supplied");
       expect(stderr).not.toContain("set CONDUIT_ADD_SECRET;");
@@ -962,7 +962,7 @@ describe("revalidateSourceRequest (the anti-oracle half)", () => {
     ).rejects.toMatchObject({
       name: "ProvisionRefused",
       message:
-        '[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP 403): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"), or --clear-credential to drop it; nothing was written.',
+        '[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP 403): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"); nothing was written.',
     });
     expect(await store.sources.list()).toEqual(sourcesBefore);
     expect(await store.tools.list()).toEqual(toolsBefore);

@@ -400,7 +400,7 @@ function mapFetchError(cause: unknown, url: string, authSent: "fresh" | "stored"
           return `[conduit add-mcp] the upstream rejected the credential you supplied (HTTP ${cause.status}): it is sent verbatim as the Authorization header, so include its scheme (e.g. "Bearer <token>"), and check its permissions for this upstream and that it has not expired; nothing was written.`;
         }
         if (authSent === "stored") {
-          return `[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP ${cause.status}): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"), or --clear-credential to drop it; nothing was written.`;
+          return `[conduit add-mcp] the upstream rejected the stored credential for this namespace (HTTP ${cause.status}): re-run with a fresh CONDUIT_ADD_SECRET (the full Authorization header value, e.g. "Bearer <token>"); nothing was written.`;
         }
         return `[conduit add-mcp] upstream requires authorization (HTTP ${cause.status}): set CONDUIT_ADD_SECRET; nothing was written.`;
       }

@@ -197,7 +197,7 @@ export function shellQuote(value: string): string {
 
 /**
  * Tool names are upstream-chosen but sanitized to `[A-Za-z0-9_.]` at intake
- * (`toolSegment` in packages/sdk/src/normalize/mcp.ts) and prefixed by a
+ * (`toolSegment` in packages/sdk/src/normalize/mcp.ts and openapi.ts) and prefixed by a
  * `[a-z0-9_-]` namespace and a `.`, so a stored name normally matches. This gate is
  * defense-in-depth against a corrupt row: the label is shown only when it
  * cannot carry shell or terminal syntax.
@@ -228,8 +228,8 @@ function renderTable(rows: PausedRow[], now: number, stateDir: string | undefine
     stateDir !== undefined ? ` --state-dir ${shellQuote(resolveEffectiveStateDir(stateDir))}` : "";
   // A `-` call id means the row has no nameable call id: an older daemon, or
   // a corrupt stored pause from the current one (the recovery row
-  // `pausedToListRow` in packages/mcp/src/payloads.ts). It cannot be decided
-  // by id, so no copy line is printed for it.
+  // `pausedToListRow` in packages/mcp/src/payloads.ts). No call id is shown
+  // to put in a command, so no copy line is printed for it.
   const decidable = rows.filter((row) => row.callId !== "-");
   // Quoting stops the shell, not the terminal: an id with a newline or ESC
   // would still corrupt the screen or a copy. Ids are Conduit-generated, so
