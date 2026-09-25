@@ -1229,6 +1229,7 @@ Make `packages/cli` build into a self-contained package: `@conduithq/sdk` and `@
 - Modify: `README.md:60,88,98`, `packages/cli/README.md:26,90`, `packages/mcp/README.md:44,92,93` (`packages/cli/dist/bin.js` → `packages/cli/dist/conduit.js`)
 - Create: `packages/cli/src/package-layout.test.ts`
 - Create: `packages/cli/src/entry.ts`, `packages/cli/src/node-support.ts`, `packages/cli/src/node-support.test.ts` (Node-version guard, DX review D5)
+- Rename: `packages/cli/src/bin.ts` → `packages/cli/src/cli.ts`, hashbang line removed (PR #63 review: `bin` must name one file only)
 - Founder-run: `pnpm install` (updates `pnpm-lock.yaml` importers; the agent does not run it)
 
 **Interfaces:**
@@ -1239,6 +1240,7 @@ Make `packages/cli` build into a self-contained package: `@conduithq/sdk` and `@
 
 ```ts
 // packages/cli/src/package-layout.test.ts
+import { execFileSync } from "node:child_process";
 import { readdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
@@ -1264,6 +1266,18 @@ describe("packed CLI layout", () => {
     const conduit = readFileSync(join(dist, "conduit.js"), "utf8");
     expect(conduit.startsWith("#!/usr/bin/env node")).toBe(true);
     expect(conduit).toContain("is not supported");
+    // It must never reach the daemon entry at runtime.
+    expect(conduit).not.toMatch(/import\(\s*["']\.\/bin\.js["']\s*\)/);
+  });
+
+  it("running dist/conduit.js reaches the DISPATCHER, not mcp's entry", () => {
+    // --help, not --version: mcp's entry also answers --version with the
+    // same string, so a version check passes when the wrong module loads.
+    const out = execFileSync(process.execPath, [join(dist, "conduit.js"), "--help"], {
+      encoding: "utf8",
+      timeout: 15_000,
+    });
+    expect(out).toContain("Usage: conduit <command>");
   });
 
   it("no emitted file imports a workspace package", () => {
@@ -1380,10 +1394,12 @@ if (!isSupportedNode(process.versions.node)) {
   process.stderr.write(UNSUPPORTED_NODE_LINE(process.versions.node));
   process.exit(1);
 }
-await import("./bin.js");
+await import("./cli.js");
 ```
 
-Run: `pnpm vitest run src/node-support.test.ts` — Expected: PASS. After the Step 7 build, confirm that `node dist/conduit.js --version` prints the version on the dev machine's Node 22. That proves the dynamic import of `bin.js`, whose own hashbang line is not in an entry position, loads without a syntax error. If it fails on the hashbang, delete the hashbang from `src/bin.ts` (it is no longer an entry) and record that under "Deviations". The engines range and `isSupportedNode` must change together; the `it.each` table is the pin.
+**Rename the dispatcher source first** (PR #63 review, Greptile P1): `git mv packages/cli/src/bin.ts packages/cli/src/cli.ts`, and delete its `#!/usr/bin/env node` line (it is no longer an entry; `entry.ts` carries the hashbang). After this, `bin` names exactly ONE file in the package: the emitted `dist/bin.js`, which is mcp's daemon entry (D-R6). tsup bundles `import("./cli.js")` from the source file `src/cli.ts` into a split chunk. It is never a runtime import of `dist/bin.js`, and no reader can mistake the two. Update the one other reference: `packages/cli/tsup.config.ts` has no `src/bin.ts` entry after Step 3.
+
+Run: `pnpm vitest run src/node-support.test.ts` — Expected: PASS. After the Step 7 build, the layout test's dispatcher check (Step 1) proves that `dist/conduit.js` reaches the dispatcher. Do NOT use `--version` for this: mcp's entry (`packages/mcp/src/bin.ts:311`) also answers `--version` with the same version string, so that check passes even when the wrong module loads. Only the dispatcher prints `Usage: conduit <command>`. The engines range and `isSupportedNode` must change together; the `it.each` table is the pin.
 
 - [ ] **Step 4: Change the manifests and version constants**
 
@@ -1444,7 +1460,7 @@ Expected: no output.
 - [ ] **Step 7: Build, run the layout test and the full CLI suite**
 
 Run (repo root): `pnpm -r build`
-Run (from `packages/cli`): `pnpm vitest run src/package-layout.test.ts` — Expected: PASS, 4 tests.
+Run (from `packages/cli`): `pnpm vitest run src/package-layout.test.ts` — Expected: PASS, 5 tests.
 Run (from `packages/cli`): `pnpm vitest run` — Expected: PASS.
 Run (repo root): `pnpm -r test` — Expected: PASS (the known flakes named in HANDOFF are the only acceptable reruns; name each rerun in the task report).
 
@@ -1459,7 +1475,7 @@ Run: `npx tsc --noEmit -p packages/sdk && npx tsc --noEmit -p packages/mcp && np
 Expected: exit 0.
 
 ```bash
-git add packages/cli/src/entry.ts packages/cli/src/version.ts packages/cli/src/node-support.ts packages/cli/src/node-support.test.ts
+git add packages/cli/src/entry.ts packages/cli/src/cli.ts packages/cli/src/node-support.ts packages/cli/src/node-support.test.ts   # the bin.ts → cli.ts rename is already staged by git mv
 git add package.json packages/cli/tsup.config.ts packages/cli/package.json packages/mcp/package.json packages/sdk/package.json packages/cli/src/dispatch.ts packages/mcp/src/env.ts packages/cli/src/integration.test.ts packages/cli/src/package-layout.test.ts README.md packages/cli/README.md packages/mcp/README.md pnpm-lock.yaml
 git add $(git diff --name-only -- 'packages/*/src/*.test.ts')
 git commit -m "feat(cli): pack sdk and mcp into one CLI tarball"
