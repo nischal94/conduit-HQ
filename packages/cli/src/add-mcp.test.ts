@@ -74,6 +74,9 @@ describe("USAGE (D5 — add-mcp --help)", () => {
       expect(USAGE).toContain(flag);
     }
     expect(USAGE).toContain("CONDUIT_ADD_SECRET");
+    expect(USAGE).toContain(
+      'CONDUIT_ADD_SECRET  The full Authorization header value for the upstream fetch, including its scheme (e.g. "Bearer <token>"); never logged',
+    );
   });
 });
 
