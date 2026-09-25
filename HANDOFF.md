@@ -113,7 +113,9 @@ the state machine drawn in the comment above the direct arm in
    never wrote). Remaining, in order:
    (d) PR A `fix/approval-guidance` = Task 3B + README shell-history fix;
    (e) PR B `feat/r3a-preview-packaging` = Tasks 1–6, from main after A
-   merges — each via `superpowers:subagent-driven-development`, Tier 2
+   merges. PR B's `docs/alpha/INSTALL.md` (plan Task 6 Step 3) must use
+   the README's prompted token form from PR A, `printf 'Token: '; read
+   -rs TOKEN; echo`, not the plan's bare `read -rs TOKEN` — each via `superpowers:subagent-driven-development`, Tier 2
    gauntlet + `/explain-diff` quiz; (f) Dependabot triage; (g) Task 7
    release on the founder's word. Then the
    three-week alpha window and the profiles decision (the default and its
@@ -180,12 +182,14 @@ the release tarball — due before PUBLIC R3, not R3a: the R3a `.sha256`
 proves integrity only, and attestation needs a separate privileged,
 tag-triggered workflow (`id-token: write`) with its own threat-model
 review (decided in the R3a plan's eng review, 2026-09-25). · `conduit
-approvals list` prints the upstream-controlled tool name raw in its table
-row (`packages/cli/src/commands/approvals.ts` `renderTable`): a name with
-terminal control bytes (ESC) or a newline reaches the operator's terminal
-unfiltered. Pre-existing; R3a hardens only its new decide block. Fix:
-render non-`[A-Za-z0-9._-]` names escaped (found by the R3a DX review's
-codex pass, 2026-09-25). · CI flake evidence (measured 2026-09-25 over the last 60 `ci.yml`
+approvals list` prints the tool name, execution id, and call id raw in
+its table row (`packages/cli/src/commands/approvals.ts` `renderTable`): a
+value with terminal control bytes (ESC, OSC 52) or a newline reaches the
+operator's terminal unfiltered. The tool name is upstream-controlled; the
+ids are Conduit-minted, so only a corrupt row carries them. Pre-existing;
+R3a hardens only its new decide block. Fix: render any of the three
+columns outside `[A-Za-z0-9._-]` escaped (found by the R3a DX review's
+codex pass and PR A's task review, 2026-09-25). · CI flake evidence (measured 2026-09-25 over the last 60 `ci.yml`
 runs): 7 needed a rerun, every one in "Unit tests", `packages/mcp`: 3× the
 `--doctor --offline performs ZERO writes` fixture (`integration.test.ts`),
 4× daemon auto-start timing tests in `daemon/client.test.ts` (§3.5
