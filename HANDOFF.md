@@ -31,7 +31,87 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-25 (**R3a plan MERGED #63 `60f1ebf`; doctor fixture fix MERGED #64 `c69e686`; PR A built + reviewed on `fix/approval-guidance`, NOT pushed**; NEXT: scoped re-review of the pre-PR fix wave, then push + open PR A)
+## Current handoff — updated 2026-09-26 (**PR A MERGED #65 `2fa9437`**, founder-named after all 8 checks green on the head; branches = main only; NEXT: PR B `feat/r3a-preview-packaging`)
+
+**State.** `main` is at `2fa9437`. PR A (plan R3a Task 3B + the README
+token-prompt fix, decision D-R5) merged as #65; the merged tree was
+verified byte-identical to the branch tip, and the branch is deleted
+local + remote. No open PRs, no other branches.
+
+**PR A review record (full detail in the #65 body).** Scoped re-review
+of the pre-PR fix wave: A–D ADDRESSED, plus one Must-fix — the
+stored-credential 401/403 advice suggested `--clear-credential`, which
+still sends the stored credential on a same-url re-run, so the advice
+looped; the clause was removed (`61fc47a`). Post-PR gauntlet:
+`code-review:code-review` (no finding ≥80; package README swept),
+`/security-review` (none), `/aikido:scan` (one false positive on an
+untouched line), `codex exec` `gpt-5.6-sol` `high` ×2 (pass 1: 1 P1 —
+the resolved `--state-dir` was not terminal-safe, fixed with a Unicode
+`Cc`/`Cf` gate; pass 2: fix verified, 2 P1 — `set -x` traced the README
+secret, fixed with `set +x`; state dir resolved twice, ruled out of
+threat model → DEFERRED), CodeRabbit (2 minor HANDOFF-text comments,
+fixed), `/explain-diff` explainer + quiz published 2026-09-26. CI
+"Unit tests" failed once on Linux: the state-dir alias test used
+`path.join`, which collapsed `link/..` so the symlink was never followed
+(LEARNINGS #44); fixed with a fail proof.
+
+**Founder decisions pending (both in the DEFERRED list below):** (1)
+same-user-shell agents vs the §18 "an agent must never approve its own
+paused call" seam — accept and record in §18, or design a
+human-presence check; (2) accept the "state dir resolved twice" ruling
+or fix it by resolving once.
+
+### NEXT
+
+1. **PR B** — `feat/r3a-preview-packaging` from `origin/main`, plan
+   `docs/superpowers/plans/2026-09-25-r3a-preview-packaging.md` Tasks
+   1–6, via `superpowers:subagent-driven-development` (task list up
+   front, one commit per task). PR B's `docs/alpha/INSTALL.md` (plan Task
+   6 Step 3) must copy README.md Quick start step 2 verbatim in form —
+   subshell, `set +x`, header-value prompt, `IFS= read -rs TOKEN`,
+   empty-read refusal — NOT the plan's bare `read -rs TOKEN`, and the
+   guided GitHub step must say the value is `Bearer <token>`. Tier 2
+   gauntlet + `/explain-diff` quiz before merge.
+2. **Then** Dependabot triage (pre-ship gate 2; GitHub reported 15
+   alerts on main at the 2026-09-26 push), then Task 7 (release) on the
+   founder's word. Then the §18 three-week alpha window.
+
+**Session quirks worth inheriting (2026-09-26):** all 2026-09-25 quirks
+below still hold · a CPU-heavy `ffmpeg` render on the host pushes load
+to 15–30 and makes the pre-commit hook's §16 QuickJS timing tests fail;
+the same tests pass at load < 8 — wait with a background `until uptime
+< 8` loop, never bypass (LEARNINGS #43) · the install-guard hook blocks
+`npx` even for local binaries — call `node_modules/.bin/<tool>` (tsc
+lives in each package's own `node_modules/.bin`) · run the cli suite
+from `packages/cli`, not `--root` from the repo root (the latter fails
+3 tests on cwd) · chain gates with `&&` so a failing test stops a
+commit/push (LEARNINGS #45) · "Allow auto-merge" is OFF for this repo,
+so merge-on-green needs the founder's word after green.
+
+**DEFERRED (live list, updated 2026-09-26):** the list in the
+2026-09-25 section directly below, unchanged and still live (it already
+carries the 2026-09-26 additions: `--clear-credential` reveal, the two
+founder decisions, the corrupt-row "To approve" line).
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #65 is
+> MERGED `2fa9437`; branches = main only). **Do NOT re-review the R3a
+> plan or reopen its decisions.** NEXT: PR B — branch
+> `feat/r3a-preview-packaging` from `origin/main` and run plan Tasks 1–6
+> via `superpowers:subagent-driven-development`, using the README's full
+> token-prompt snippet in `docs/alpha/INSTALL.md` (HANDOFF NEXT 1).
+> Raise the two pending founder decisions at session start. Carry the
+> DEFERRED list.
+
+---
+
+**Superseded (2026-09-26) — kept for the record:**
+
+### Previous handoff — 2026-09-25 (**R3a plan MERGED #63 `60f1ebf`; doctor fixture fix MERGED #64 `c69e686`; PR A built + reviewed on `fix/approval-guidance`, NOT pushed**; NEXT was: re-review the fix wave, push + open PR A — DONE and MERGED #65 by the section above)
 
 **State.** `main` is at `c69e686`. Two merges this session, both
 founder-named after green CI and every review comment read: the R3a plan

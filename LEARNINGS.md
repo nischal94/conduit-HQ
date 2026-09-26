@@ -2897,3 +2897,56 @@ examples said `YOUR_TOKEN`, and PR A's first cut prompted for a
 misdiagnosed. A silent-failure review caught it. **Lesson: before
 writing operator-facing guidance about a credential, read how the
 credential is consumed, not how it is named.**
+
+## 2026-09-26 — PR A re-reviewed, gauntleted, and merged (#65)
+
+### 43. The §16 timing tests measure host load as well as the sandbox
+
+The pre-commit hook's QuickJS §16 tests failed three times at the end of
+2026-09-25 and twice on 2026-09-26, each time while an unrelated
+`ffmpeg` render held load at 15–30 on 8 cores. At load < 8 the same
+tests passed every time (666/666, ~46 s vs ~112 s under load), which
+confirmed the handoff's diagnosis: the branch changed no sdk file. A
+background `until load < 8` wait, then a retry, cost minutes; a
+`--no-verify` bypass would have been an incident. **Lesson: when a
+timing test fails, read `uptime` before reading the test. Fix the
+conditions, not the gate; a failure at low load is the real signal.**
+
+### 44. `path.join` collapsed the symlink the test existed to follow
+
+The state-dir alias test built `join(scratch, "link", "..", "state")`.
+`path.join` applies `..` as text, so the input was just
+`<scratch>/state` and the symlink never took part. Its guard
+`not.toBe(resolve(aliased))` still passed on macOS because `tmpdir()`
+sits under `/var` → `/private/var`, a symlink the test did not create.
+Linux CI, with a real `/tmp`, failed it. The fix builds the path
+unnormalized and pins the exact resolved value; that assertion was seen
+failing against the old input on macOS too. A reviewer had flagged the
+guard as weak one pass earlier. **Lesson: a test of kernel path
+resolution must build its input without the path library that resolves
+lexically, and assert the exact expected value — a "not equal" guard
+passes for any reason the paths differ.**
+
+### 45. A chained command pushed past a failing test
+
+One Bash call ran the cli suite, lint, commit, and push joined by `;`.
+The suite reported 3 failures and the chain committed and pushed
+anyway. The failures came from running vitest with `--root` from the
+repo root (cwd-dependent tests); from `packages/cli` the suite passed
+126/126, and CI later confirmed the commit. The outcome was harmless;
+the shape was not. **Lesson: gates in one command are joined with `&&`
+(or `set -e`), and the test runner is invoked the way CI invokes it. A
+chain that can reach `git push` must be unable to pass a red step.**
+
+### 46. Two review passes that found nothing new still earned their cost
+
+After three rounds had called PR A ready, the scoped fix-wave re-review
+found an advice loop (`--clear-credential` still sends the stored
+credential), and the post-PR codex pass found the one field the terminal
+gates skipped (the resolved `--state-dir`). Each fold then introduced
+or exposed a smaller issue (`set -x` tracing; the double resolve), as
+LEARNINGS #40 predicts. The stop line held: pass 2's remaining finding
+was classified out of threat model with a written reason and sent to
+the founder, not patched into a third fold. **Lesson: "ready to merge"
+from one reviewer is an input, not a verdict. Re-review every fold, and
+end the loop with a written classification, not another fix.**
