@@ -59,7 +59,9 @@ Verdict each item ADDRESSED / NOT ADDRESSED against the diff:
   include its scheme (e.g. "Bearer <token>") …"), `stored` (a stored
   credential sent on a same-url re-run or any revalidate: "…rejected the
   stored credential for this namespace … re-run with a fresh
-  CONDUIT_ADD_SECRET … or --clear-credential …"), `none` (unchanged
+  CONDUIT_ADD_SECRET …"; the "or --clear-credential" clause was removed
+  in `61fc47a` because that flag still sends the stored credential on a
+  same-url re-run), `none` (unchanged
   "set CONDUIT_ADD_SECRET" line). Only the integer status is
   interpolated (§9.2). New tests: stored-credential re-run 401/403
   (asserting the stored credential WAS sent), revalidate 403, zero-writes
@@ -129,8 +131,8 @@ introduced — everything else went to DEFERRED below.
 4. **Then PR B** (`feat/r3a-preview-packaging`, plan Tasks 1–6, from
    main after PR A merges) via `superpowers:subagent-driven-development`.
    PR B's `docs/alpha/INSTALL.md` (plan Task 6 Step 3) must use PR A's
-   README snippet form — the subshell, the header-value prompt,
-   `IFS= read -rs`, the empty-read refusal — NOT the plan's bare
+   README snippet form — the subshell, `set +x`, the header-value
+   prompt, `IFS= read -rs`, the empty-read refusal — NOT the plan's bare
    `read -rs TOKEN`, and the guided GitHub step must say the value is
    `Bearer <token>`.
 5. **Then** Dependabot triage (pre-ship gate 2), then Task 7 (release)
@@ -313,8 +315,10 @@ the state machine drawn in the comment above the direct arm in
    (d) PR A `fix/approval-guidance` = Task 3B + README shell-history fix;
    (e) PR B `feat/r3a-preview-packaging` = Tasks 1–6, from main after A
    merges. PR B's `docs/alpha/INSTALL.md` (plan Task 6 Step 3) must use
-   the README's prompted token form from PR A, `printf 'Token: '; read
-   -rs TOKEN; echo`, not the plan's bare `read -rs TOKEN` — each via `superpowers:subagent-driven-development`, Tier 2
+   the README's full token-prompt snippet from PR A (subshell, `set +x`,
+   header-value prompt, `IFS= read -rs TOKEN`, empty-read refusal —
+   copy it from README.md Quick start step 2), not the plan's bare
+   `read -rs TOKEN` — each via `superpowers:subagent-driven-development`, Tier 2
    gauntlet + `/explain-diff` quiz; (f) Dependabot triage; (g) Task 7
    release on the founder's word. Then the
    three-week alpha window and the profiles decision (the default and its
