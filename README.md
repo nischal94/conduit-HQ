@@ -67,14 +67,24 @@ seals every credential in the store):
 conduit key generate
 ```
 
-**2. Onboard an upstream MCP server.** The optional credential travels via
-env var — never a flag, so it stays out of argv and shell history — and is
-SecretBox-encrypted at rest:
+**2. Onboard an upstream MCP server.**
+The optional credential is the full `Authorization` header value, scheme
+included (for example `Bearer <token>`). It travels via env var — never a
+flag, so it stays out of argv — and is SecretBox-encrypted at rest. Type it
+at a hidden prompt so it stays out of your shell history too. The subshell
+keeps the value out of your shell afterwards and stops a paste from feeding
+the prompt; `set +x` keeps shell tracing from printing it:
 
 ```bash
-CONDUIT_ADD_SECRET=YOUR_TOKEN conduit add-mcp \
-  --url https://api.githubcopilot.com/mcp/ \
-  --namespace github --prefix github.personal
+(
+  set +x
+  printf 'Authorization header value (e.g. Bearer <token>): '
+  IFS= read -rs TOKEN; echo
+  [ -n "$TOKEN" ] || { echo 'No value read; add-mcp not run.' >&2; exit 1; }
+  CONDUIT_ADD_SECRET="$TOKEN" conduit add-mcp \
+    --url https://api.githubcopilot.com/mcp/ \
+    --namespace github --prefix github.personal
+)
 ```
 
 `add-mcp` fetches the upstream's tool list first and writes nothing unless

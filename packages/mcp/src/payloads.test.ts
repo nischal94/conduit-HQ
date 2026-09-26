@@ -72,6 +72,7 @@ describe("outcomeToPayload (execute)", () => {
     expect(p.message).toMatch(/report .* to the (user|human)/i);
     expect(p.message).toMatch(/stop/i);
     expect(p.message).toMatch(/check_execution/);
+    expect(p.message).toContain("conduit approvals list");
   });
   it("conflict (duplicate requestKey) points at check_execution", () => {
     const p = outcomeToPayload({ status: "conflict", executionId: "e4" });

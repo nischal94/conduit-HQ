@@ -6,6 +6,7 @@ import {
   type RpcPayloadFor,
   type RpcRequest,
   type RpcResponse,
+  resolveEffectiveStateDir,
 } from "@conduithq/mcp";
 import { reportSkew } from "../skew.js";
 import { type Answer, type AnswerContext, ask as askDaemon } from "./daemon-answer.js";
@@ -91,9 +92,10 @@ function prodDeps(stateDir: string): ApprovalsDeps {
  *
  * Structurally FLAT and narrower than a stored `Execution`: the daemon
  * projects the six fields this command renders and drops the raw
- * `pausedOn`, whose `input` is the paused call's arguments. A corrupt row
- * (paused with no `pausedOn`) is omitted and logged daemon-side, so nothing
- * here has to defend against it.
+ * `pausedOn`, whose `input` is the paused call's arguments. A corrupt pause
+ * arrives as a recovery row (`pausedToListRow` in packages/mcp/src/payloads.ts):
+ * tool name "(unreadable pause)", expiry 0, and a call id only when the claim
+ * needs that exact id.
  */
 type PausedRowWire = PausedListRow;
 
@@ -140,7 +142,10 @@ function ask<K extends RpcRequest["kind"]>(
 
 interface PausedRow {
   executionId: string;
-  /** `-` when the daemon predates call-bound approvals (wire skew). */
+  /**
+   * `-` when the daemon predates call-bound approvals (wire skew), or for a
+   * corrupt pause whose stored call id is un-nameable.
+   */
   callId: string;
   tool: string;
   waitingSince: number;
@@ -185,7 +190,32 @@ function pad(value: string, width: number): string {
   return value.length >= width ? value : value + " ".repeat(width - value.length);
 }
 
-function renderTable(rows: PausedRow[], now: number): string {
+/**
+ * POSIX single-quote: safe for the SHELL to parse any NUL-free string. It
+ * does not make the string safe to print to a terminal (see SAFE_ID /
+ * SAFE_LABEL).
+ */
+export function shellQuote(value: string): string {
+  return `'${value.replace(/'/g, `'\\''`)}'`;
+}
+
+/**
+ * Tool names are upstream-chosen but sanitized to `[A-Za-z0-9_.]` at intake
+ * (`toolSegment` in packages/sdk/src/normalize/mcp.ts and openapi.ts) and prefixed by a
+ * `[a-z0-9_-]` namespace and a `.`, so a stored name normally matches. This gate is
+ * defense-in-depth against a corrupt row: the label is shown only when it
+ * cannot carry shell or terminal syntax.
+ */
+const SAFE_LABEL = /^[A-Za-z0-9._-]{1,128}$/;
+/**
+ * Conduit-generated ids; a copyable line is printed only when both match.
+ * No leading `-`: an id like `--state-dir` would be parsed as a flag.
+ */
+const SAFE_ID = /^[A-Za-z0-9_][A-Za-z0-9_-]{0,127}$/;
+/** Unicode control (Cc) and format (Cf) characters: what a terminal acts on. */
+const TERMINAL_UNSAFE = /[\p{Cc}\p{Cf}]/u;
+
+function renderTable(rows: PausedRow[], now: number, stateDir: string | undefined): string {
   if (rows.length === 0) {
     return "No paused executions awaiting approval.\n";
   }
@@ -197,11 +227,57 @@ function renderTable(rows: PausedRow[], now: number): string {
     return `${pad(row.executionId, idWidth)}  ${pad(row.callId, callWidth)}  ${pad(row.tool, toolWidth)}  ${pad(waiting, 24)}  ${expiryLabel(row, now)}`;
   });
   const header = `${pad("EXEC ID", idWidth)}  ${pad("CALL ID", callWidth)}  ${pad("TOOL", toolWidth)}  ${pad("WAITING SINCE", 24)}  EXPIRY`;
-  return `${[header, ...lines].join("\n")}\n`;
+  // The same resolution `daemonRequest` applies, so a copied line reaches
+  // the daemon this list talked to from any directory, symlinked spellings
+  // included. Any error it throws propagates to the command's caller.
+  const resolvedDir = stateDir !== undefined ? resolveEffectiveStateDir(stateDir) : undefined;
+  // The same terminal concern as the ids below, on the resolved value: a
+  // component reached through a symlink is not what the operator typed. A
+  // control or format character (ESC, newline, bidi override) prints no
+  // copyable line, and the path's bytes are never echoed.
+  if (resolvedDir !== undefined && TERMINAL_UNSAFE.test(resolvedDir)) {
+    const notice =
+      "The state directory's resolved path contains control or format characters; no copyable lines printed. Use `conduit approvals list --json` with the same --state-dir.";
+    return `${[header, ...lines, "", notice].join("\n")}\n`;
+  }
+  const dirFlag = resolvedDir !== undefined ? ` --state-dir ${shellQuote(resolvedDir)}` : "";
+  // A `-` call id means the row has no nameable call id: an older daemon, or
+  // a corrupt stored pause from the current one (the recovery row
+  // `pausedToListRow` in packages/mcp/src/payloads.ts). No call id is shown
+  // to put in a command, so no copy line is printed for it.
+  const decidable = rows.filter((row) => row.callId !== "-");
+  // Quoting stops the shell, not the terminal: an id with a newline or ESC
+  // would still corrupt the screen or a copy. Ids are Conduit-generated, so
+  // anything outside the safe set means something is wrong: count it and
+  // say so once, below.
+  let unsafeCount = 0;
+  const decide = decidable.flatMap((row) => {
+    if (!SAFE_ID.test(row.executionId) || !SAFE_ID.test(row.callId)) {
+      unsafeCount += 1;
+      return [];
+    }
+    const ids = `${shellQuote(row.executionId)} ${shellQuote(row.callId)}${dirFlag}`;
+    const label = SAFE_LABEL.test(row.tool) ? ` (${row.tool})` : "";
+    // Deny first, neutral wording: approving must be a choice, not the default.
+    return [
+      "",
+      `Call ${shellQuote(row.callId)}${label}:`,
+      `  To deny:    conduit approvals deny ${ids}`,
+      `  To approve: conduit approvals approve ${ids}`,
+    ];
+  });
+  if (unsafeCount > 0) {
+    const subject =
+      unsafeCount === 1
+        ? "1 paused call has ids with unexpected characters; no copyable lines printed for it."
+        : `${unsafeCount} paused calls have ids with unexpected characters; no copyable lines printed for them.`;
+    decide.push("", `${subject} Use \`conduit approvals list --json${dirFlag}\`.`);
+  }
+  return `${[header, ...lines, ...decide].join("\n")}\n`;
 }
 
 export async function runList(
-  args: { json: boolean },
+  args: { json: boolean; stateDir?: string },
   deps: ApprovalsDeps,
 ): Promise<ApprovalsResult> {
   const answer = await ask(deps, { kind: "approvals.list" }, "list");
@@ -229,7 +305,7 @@ export async function runList(
       )}\n`,
     );
   } else {
-    deps.stdout(renderTable(rows, now));
+    deps.stdout(renderTable(rows, now, args.stateDir));
   }
   return { exitCode: 0 };
 }
@@ -415,7 +491,10 @@ export async function approvals(argv: string[], opts: ApprovalsOptions = {}): Pr
   switch (sub) {
     case "list": {
       const json = rest.includes("--json");
-      const result = await runList({ json }, deps);
+      const result = await runList(
+        { json, ...(opts.stateDir === undefined ? {} : { stateDir: opts.stateDir }) },
+        deps,
+      );
       return result.exitCode;
     }
     case "approve":

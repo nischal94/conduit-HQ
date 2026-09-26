@@ -305,8 +305,9 @@ export function estimateDefinitionTokens(definition: unknown): number {
 
 const PAUSE_MESSAGE =
   "A human must approve this call out-of-band. Report the pending approval and this " +
-  "executionId to the user, then STOP — do not poll in a loop; approval may take hours. " +
-  "When the user says it is approved, call check_execution with this executionId (or your requestKey).";
+  "executionId to the user, and tell them to run `conduit approvals list` in a terminal " +
+  "to approve or deny it. Then STOP — do not poll in a loop; approval may take hours. " +
+  "When the user says it is decided, call check_execution with this executionId (or your requestKey).";
 
 const EXPIRED_MESSAGE =
   "The approval expired before a human decided (TTL lapsed). You may re-issue execute to retry.";

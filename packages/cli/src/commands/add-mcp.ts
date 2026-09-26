@@ -62,7 +62,7 @@ Options:
   --help, -h            Show this help text
 
 Environment:
-  CONDUIT_ADD_SECRET  Authorization credential for the upstream fetch (never logged)`;
+  CONDUIT_ADD_SECRET  The full Authorization header value for the upstream fetch, including its scheme (e.g. "Bearer <token>"); never logged`;
 
 export interface AddMcpArgs {
   url?: string;

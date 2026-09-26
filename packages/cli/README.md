@@ -53,7 +53,9 @@ in this package). `--help` and `--version` are available at the top level.
    stating the fail-closed §10.2 policy defaults. No policy rows are written.
 
    - **Credential (optional):** supply it via the `CONDUIT_ADD_SECRET` env
-     var — never a flag (keeps it out of argv and shell history). It travels
+     var — never a flag (keeps it out of argv and shell history). The value
+     is the full `Authorization` header value, scheme included (e.g.
+     `Bearer <token>`); it is sent verbatim. It travels
      once from the CLI to the daemon, which performs the authenticated fetch
      and seals it at rest; no response field and no log line ever carries it
      back. Re-running `add-mcp` without `CONDUIT_ADD_SECRET` PRESERVES an
@@ -193,7 +195,7 @@ environment.
 | `CONDUIT_MASTER_KEY` | The SecretBox key, **base64 encoding of exactly 32 bytes**. **Read by the daemon and by `conduit key`** — not by `serve`, `approvals` or `add-mcp`, none of which open a store. A client's value never transfers to an auto-started daemon; set it for a daemon you start by hand, or use the key file. `key generate` and `key rotate` both refuse when it is set. Malformed values fail startup non-zero. | optional when `~/.conduit/master-key` exists (env overrides file) |
 | `CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS` | Set to `1` to allow calls to loopback/private-network upstreams. **Dev/demo only.** It belongs to the **daemon**, which runs the sandbox and makes every upstream call — including the replay behind `approvals approve`, which no longer resumes in-process. Setting it on a `serve` client prints a stderr warning saying it does not transfer. | off (fail-closed; §9.3) |
 | `CONDUIT_APPROVAL_TTL` | How long a paused execution stays approvable, in **milliseconds**. Read by whichever process runs the execution — the daemon. | `259200000` (72 hours) |
-| `CONDUIT_ADD_SECRET` | `add-mcp` only: the upstream credential to store for this source. Read from the CLI's env and forwarded to the daemon in the provisioning request — the one secret that legitimately crosses client→daemon, since it is the operator supplying their own data. Never a flag, never echoed back. | none (optional — unauthenticated sources are legitimate) |
+| `CONDUIT_ADD_SECRET` | `add-mcp` only: the upstream credential to store for this source — the full `Authorization` header value, scheme included (e.g. `Bearer <token>`). Read from the CLI's env and forwarded to the daemon in the provisioning request — the one secret that legitimately crosses client→daemon, since it is the operator supplying their own data. Never a flag, never echoed back. | none (optional — unauthenticated sources are legitimate) |
 
 ## `conduit key`
 

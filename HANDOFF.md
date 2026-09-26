@@ -31,7 +31,208 @@ at session start.
 
 ---
 
-## Current handoff — updated 2026-09-20 (**R1 Lane A LANDED — PR #62 MERGED `240bfb9`**, founder-named merge after a full quiz pass; branches = main only; NEXT: R3a preview packaging)
+## Current handoff — updated 2026-09-25 (**R3a plan MERGED #63 `60f1ebf`; doctor fixture fix MERGED #64 `c69e686`; PR A built + reviewed on `fix/approval-guidance`, NOT pushed**; NEXT: scoped re-review of the pre-PR fix wave, then push + open PR A)
+
+**State.** `main` is at `c69e686`. Two merges this session, both
+founder-named after green CI and every review comment read: the R3a plan
+(#63, `docs/superpowers/plans/2026-09-25-r3a-preview-packaging.md`,
+reviewed by `/plan-eng-review` + `/plan-devex-review` + five `codex exec`
+passes) and the `--doctor --offline` fixture fix (#64; root cause in
+LEARNINGS #38). One local branch exists: **`fix/approval-guidance`** =
+PR A of the plan (decision D-R5): Task 3B + the README shell-history fix.
+It is committed but **NOT pushed**, and no PR exists yet.
+
+**PR A review record so far.** Built by subagent-driven development:
+task review (spec ✅; one Important — a `--json` test that could not
+fail — fixed and re-reviewed), final whole-branch review on the top tier
+("ready to merge"; five Minors fixed in one wave and re-reviewed clean),
+then the pre-PR gate `/pr-review-toolkit:review-pr all parallel` (four
+reviewers). Their findings were ruled on and sent to one fix wave, which
+landed as the last four commits on the branch (parts A–D below). **That
+fix wave has NOT been re-reviewed yet** — that is the next step.
+
+**The pre-PR fix wave to re-review (base `865da38`, head = the branch tip).**
+Verdict each item ADDRESSED / NOT ADDRESSED against the diff:
+- **A — `packages/mcp/src/daemon/provision.ts` `mapFetchError`**: the
+  401/403 advice is three-way on what was actually sent — `fresh` (a
+  supplied secret: "the upstream rejected the credential you supplied …
+  include its scheme (e.g. "Bearer <token>") …"), `stored` (a stored
+  credential sent on a same-url re-run or any revalidate: "…rejected the
+  stored credential for this namespace … re-run with a fresh
+  CONDUIT_ADD_SECRET …"; the "or --clear-credential" clause was removed
+  in `61fc47a` because that flag still sends the stored credential on a
+  same-url re-run), `none` (unchanged
+  "set CONDUIT_ADD_SECRET" line). Only the integer status is
+  interpolated (§9.2). New tests: stored-credential re-run 401/403
+  (asserting the stored credential WAS sent), revalidate 403, zero-writes
+  assertions on the fresh-secret cases. Why: the stored secret is the
+  full Authorization header value (`packages/sdk/src/credentials.ts:42`;
+  LEARNINGS #42).
+- **B — `packages/cli/src/commands/approvals.ts`**: copy lines use
+  `resolveEffectiveStateDir` (the daemon's own resolver) instead of
+  lexical `resolve`; the unsafe-ids notice is printed once, with a count
+  and `--json${dirFlag}`; comment corrections (`shellQuote` is
+  shell-safe, not terminal-safe; tool names are sanitized at intake by
+  `normalizeMcp`'s `toolSegment`; `-` rows include corrupt pauses from
+  the current daemon). New tests: a round-trip of a copied line through
+  `/bin/sh` and `takeStateDir`, two decidable rows in order, an unsafe
+  EXECUTION id, a `-` row mixed with decidable rows — each with a
+  recorded fail proof.
+- **C — `packages/cli/src/commands/add-mcp.ts` help**: `CONDUIT_ADD_SECRET`
+  is described as the full Authorization header value, scheme included.
+- **D — `README.md` Quick start step 2**: the add-mcp example is a
+  subshell with a prompt for the header value, `IFS= read -rs`, and an
+  empty-read refusal; the sentence says the value includes its scheme.
+
+**Rulings the agent made on the founder's behalf this session (review
+them):** the plan's `--json` "unchanged" test was rewritten into one that
+can fail; one final fix wave ran although the final review said "ready to
+merge" (PR unpublished, each fix 1–2 lines); expired rows keep their
+"To approve" line (approving an expired row finalizes it, no call runs);
+the pre-PR fix wave took only findings about text or behavior PR A itself
+introduced — everything else went to DEFERRED below.
+
+### NEXT
+
+0. **First, check for commits the last session could not make.** At its
+   end, an unrelated CPU-heavy render made the pre-commit hook's §16
+   QuickJS timing tests time out, so up to two commits may still be
+   pending on `fix/approval-guidance`. Run `git status --short`:
+   - `README.md` staged → commit it: `docs: README add-mcp prompt asks
+     for the header value, in a subshell` (plan Part D of the pre-PR fix
+     wave).
+   - `HANDOFF.md` / `LEARNINGS.md` modified → commit them together:
+     `docs: HANDOFF + LEARNINGS — R3a session (2026-09-25)`.
+   Let the hook run; never `--no-verify` (an incident, per CLAUDE.md
+   Commit routing). If the §16 tests time out again, check the load
+   (`uptime`) and wait for it to drop rather than bypass. The test that
+   failed three times at the end of the last session was
+   `packages/sdk/src/sandbox/quickjs.test.ts` "INVARIANT §16: concurrent
+   overflows PAST the poison threshold cannot fail an interleaved benign
+   call" (also failed when run alone; load average ~25; the branch
+   changes no `packages/sdk` file). If it still fails with load below ~8,
+   it is an sdk problem, not PR A's: stop and investigate it before
+   committing anything.
+1. **Re-review the pre-PR fix wave** (`865da38..fix/approval-guidance`) against the
+   list above, on the workhorse tier. Any NOT ADDRESSED item → one fix
+   round, then re-review. Verify the implementer's test evidence exists by
+   running, from each package dir: `packages/cli` full vitest (outside the
+   sandbox — loopback), `packages/mcp` `src/daemon/provision.test.ts`
+   `src/payloads.test.ts`, and `tsc --noEmit -p .` in both.
+2. **Push `fix/approval-guidance` and open PR A** — title
+   `fix: name the approve command where users need it`. Body: what/why,
+   the review record above, and "Gate proofs" (every new test was made to
+   fail once).
+3. **Post-PR gauntlet (Tier 2 — PR A touches credential-handling
+   messages):** `code-review:code-review`, `/aikido:scan`,
+   `/security-review`, one raw `codex exec` pass (`gpt-5.6-sol`, `high`:
+   credential handling is a named trigger), then `/explain-diff` + quiz
+   before any merge talk. Merge only on the founder naming the PR.
+4. **Then PR B** (`feat/r3a-preview-packaging`, plan Tasks 1–6, from
+   main after PR A merges) via `superpowers:subagent-driven-development`.
+   PR B's `docs/alpha/INSTALL.md` (plan Task 6 Step 3) must use PR A's
+   README snippet form — the subshell, `set +x`, the header-value
+   prompt, `IFS= read -rs`, the empty-read refusal — NOT the plan's bare
+   `read -rs TOKEN`, and the guided GitHub step must say the value is
+   `Bearer <token>`.
+5. **Then** Dependabot triage (pre-ship gate 2), then Task 7 (release)
+   on the founder's word. Then the §18 three-week alpha window.
+
+**Session quirks worth inheriting (2026-09-25):** `packages/mcp`
+integration tests bind a loopback port — run them with the sandbox
+disabled (inside it `beforeAll` hangs to its 120 s timeout) · git commit
+hooks call `mktemp` in the system temp dir, which the sandbox denies —
+commit with the sandbox disabled · the sfw install-guard hook matches
+install-command TEXT anywhere in a Bash command (even inside a prompt
+being built) — assemble long prompts with the Write tool · `gh`,
+`codex`, and `~/.gstack` writes need the sandbox disabled · Greptile's
+free credits are exhausted for this billing period (no Greptile reviews
+on new pushes) · the app forbids polling CI; "merge once green" needs the
+founder to say "merge" when green, or a monitor event.
+
+**DEFERRED (live list, updated 2026-09-25):** carry the 2026-09-20 list
+in the section below (its doctor-fixture item is DONE — #64), plus:
+- **`--clear-credential` on a same-url re-run still sends the stored
+  credential** (added 2026-09-26): `provision.ts` Step 5 reveals the
+  stored secret without checking `input.clearCredential`, which applies
+  only at write time. An expired stored token therefore cannot be
+  dropped by a re-run with `--clear-credential`: the fetch sends it,
+  gets 401, and writes nothing. PR A removed "or --clear-credential"
+  from the stored-credential 401/403 advice so it no longer loops. The
+  fix (skip the reveal when clearing) changes credential-boundary
+  behaviour: its own PR, with a test.
+- **README add-mcp snippet accepts a whitespace-only value**
+  (`[ -n "$TOKEN" ]`); the daemon treats it as no secret. Covered by the
+  CLI blank-secret item below — fix there, not in the snippet.
+- **Raw columns in the `approvals list` table** (`renderTable`): tool
+  name, execution id, and call id print unescaped. Tool names are
+  sanitized to `[A-Za-z0-9_.]` at intake (`normalizeMcp` `toolSegment`)
+  and ids are UUID-based, so only a corrupt row can carry control bytes:
+  defense-in-depth hardening, not a live injection path (corrects the
+  2026-09-25 entry below). Fix: render any column outside
+  `[A-Za-z0-9._-]` escaped.
+- **Corrupt `-` rows get no operator guidance**: a corrupt pause from the
+  current daemon arrives with no call id and the reason "deciding it with
+  any call id terminalizes it" (`payloads.ts` `pausedToListRow`), but
+  neither the table nor `--json` shows the reason. Same family (PR #65
+  code review, 2026-09-26, scored 25): a corrupt row that KEEPS a
+  nameable call id gets the normal "To approve:" line, and approving it
+  terminalizes the row as `failed` (reported truthfully). Mark corrupt
+  rows in the copy block, e.g. keyed on tool `(unreadable pause)`.
+- **Founder ruling — `approvals list` resolves `--state-dir` twice**
+  (codex re-pass on PR #65, 2026-09-26, P1): `daemonRequest` resolves it
+  for the RPC and `renderTable` resolves it again for the copy lines. A
+  symlink swapped in between makes the printed lines target another
+  daemon. Classified out of threat model in PR #65: swapping it needs
+  write access to a directory on the operator's own state path, and
+  such an attacker could point the link at the other daemon before the
+  list, which the operator would then review honestly. Fix if wanted:
+  resolve once per invocation and pass the canonical value to both, and
+  map resolver errors (EACCES) the way the daemon client does.
+- **Founder decision — same-user-shell agents and the approval seam**
+  (PR #65 code review, 2026-09-26): spec §18 says "an agent must never
+  approve its own paused call" but enforces it only by not exposing
+  approve as an MCP tool. An agent with a shell as the same OS user can
+  run `conduit approvals list` (which the pause message now names) and
+  paste the printed approve line. Not a new hole — the command was
+  already in README and `--help` — but no spec text models this threat.
+  Decide: accept and record in §18, or design a human-presence check.
+- **A pasted invisible character in `CONDUIT_ADD_SECRET`** makes
+  `http.request` throw `ERR_INVALID_CHAR` before any I/O, reported as
+  "upstream unreachable … re-run" (`provision.ts` `mapFetchError`).
+  Validate header characters in the CLI and map that error to its own
+  line.
+- **Blank `CONDUIT_ADD_SECRET` is dropped silently**, and the text
+  success line never states the credential outcome (only `--json` shows
+  `credential: "absent"`): an onboarding that meant to store a token can
+  succeed without one. Refuse a set-but-blank value; print the
+  credential state on success.
+- **The pause message names `conduit approvals list` without
+  `--state-dir`**: a `serve` on a custom state dir sends the operator to
+  the default daemon's queue (low while `--state-dir` is undocumented).
+- **`client.test.ts` flake family** (4 of the 7 recent reruns) —
+  unscheduled.
+- signed build provenance before public R3; `add-mcp` native secret
+  input — both as recorded in the section below.
+
+**SHELVED (unchanged):** the project-jail plan.
+
+### KICKOFF PROMPT for the next session
+
+> Continue Conduit in ~/projects/conduit-HQ. Read HANDOFF.md first and
+> follow its protocol (incl. `gh pr list --state all --limit 5` — #63 and
+> #64 are MERGED; PR A is on the local branch `fix/approval-guidance`,
+> NOT pushed, no PR yet). **Do NOT re-review the R3a
+> plan or reopen its decisions.** NEXT: re-review the pre-PR fix wave
+> `865da38..fix/approval-guidance` against the A–D list in HANDOFF, then push and
+> open PR A and run the Tier 2 gauntlet + `/explain-diff` (HANDOFF NEXT
+> 1–3). Carry the DEFERRED list.
+
+---
+
+**Superseded (2026-09-25) — kept for the record:**
+
+### Previous handoff — 2026-09-20 (**R1 Lane A LANDED — PR #62 MERGED `240bfb9`**, founder-named merge after a full quiz pass; branches = main only; NEXT was: R3a preview packaging — PLANNED, REVIEWED, and MERGED #63 by the section above)
 
 **Merge record.** The founder passed the explainer quiz and said "merge
 #62 once CI is green". All nine checks were green on the final head
@@ -106,12 +307,18 @@ the state machine drawn in the comment above the direct arm in
    D-R6–D-R12 in its header). (a) `/plan-devex-review` DONE 2026-09-25
    (DX POLISH, 4 → 7.5/10; two more codex passes, converged; added Task
    3B). Final audit 2026-09-25: plan kept as reviewed incl. D-R10; ONE
-   change, D-R5 → two PRs (plan D-R5, D-R13). Remaining, in order:
-   (b) plan PR on `docs/r3a-plan`; (c) the `--doctor --offline` fixture
-   fix (pre-ship gate 1, moved first on CI evidence — see DEFERRED);
+   change, D-R5 → two PRs (plan D-R5, D-R13). (b) plan PR #63 MERGED
+   `60f1ebf`. (c) the `--doctor --offline` fixture fix #64 MERGED
+   `c69e686` (root cause: @libsql/client close() leaves the connection
+   alive until GC, whose WAL checkpoint rewrote the fixture; the doctor
+   never wrote). Remaining, in order:
    (d) PR A `fix/approval-guidance` = Task 3B + README shell-history fix;
    (e) PR B `feat/r3a-preview-packaging` = Tasks 1–6, from main after A
-   merges — each via `superpowers:subagent-driven-development`, Tier 2
+   merges. PR B's `docs/alpha/INSTALL.md` (plan Task 6 Step 3) must use
+   the README's full token-prompt snippet from PR A (subshell, `set +x`,
+   header-value prompt, `IFS= read -rs TOKEN`, empty-read refusal —
+   copy it from README.md Quick start step 2), not the plan's bare
+   `read -rs TOKEN` — each via `superpowers:subagent-driven-development`, Tier 2
    gauntlet + `/explain-diff` quiz; (f) Dependabot triage; (g) Task 7
    release on the founder's word. Then the
    three-week alpha window and the profiles decision (the default and its
@@ -178,12 +385,14 @@ the release tarball — due before PUBLIC R3, not R3a: the R3a `.sha256`
 proves integrity only, and attestation needs a separate privileged,
 tag-triggered workflow (`id-token: write`) with its own threat-model
 review (decided in the R3a plan's eng review, 2026-09-25). · `conduit
-approvals list` prints the upstream-controlled tool name raw in its table
-row (`packages/cli/src/commands/approvals.ts` `renderTable`): a name with
-terminal control bytes (ESC) or a newline reaches the operator's terminal
-unfiltered. Pre-existing; R3a hardens only its new decide block. Fix:
-render non-`[A-Za-z0-9._-]` names escaped (found by the R3a DX review's
-codex pass, 2026-09-25). · CI flake evidence (measured 2026-09-25 over the last 60 `ci.yml`
+approvals list` prints the tool name, execution id, and call id raw in
+its table row (`packages/cli/src/commands/approvals.ts` `renderTable`): a
+value with terminal control bytes (ESC, OSC 52) or a newline reaches the
+operator's terminal unfiltered. The tool name is upstream-controlled; the
+ids are Conduit-minted, so only a corrupt row carries them. Pre-existing;
+R3a hardens only its new decide block. Fix: render any of the three
+columns outside `[A-Za-z0-9._-]` escaped (found by the R3a DX review's
+codex pass and PR A's task review, 2026-09-25). · CI flake evidence (measured 2026-09-25 over the last 60 `ci.yml`
 runs): 7 needed a rerun, every one in "Unit tests", `packages/mcp`: 3× the
 `--doctor --offline performs ZERO writes` fixture (`integration.test.ts`),
 4× daemon auto-start timing tests in `daemon/client.test.ts` (§3.5
