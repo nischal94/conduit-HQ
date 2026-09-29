@@ -1020,6 +1020,20 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). <strong>Next
 <h2 id="18-open-questions-decisions-to-lock">18. Open questions / decisions to lock</h2>
 <p><strong>Resolved (locked):</strong></p>
 <ul>
+<li><strong>Approval seam — two accepted limits from the PR #65 review (decided 2026-09-30):</strong> ✅
+<strong>(1) An agent with a same-user shell can approve its own paused call.</strong> The §10.2 rule &quot;an agent
+must never approve its own paused call&quot; is enforced by the MCP surface only: approve is not an MCP tool. An
+agent that also has a shell as the operator&#39;s OS user can run <code>conduit approvals list</code> and run the
+approve line it prints. The seam holds against an agent whose only reach is the MCP surface. It does not hold
+against an agent with a same-user shell, and an operator who gives an agent that shell accepts the limit. This is
+not a new hole: the approve command was already in the README and in <code>--help</code>, and PR #65 only names it
+in the pause message. If the limit must close, the successor is a human-presence check that a same-user process
+cannot pass. <strong>(2) <code>approvals list</code> resolves <code>--state-dir</code> twice</strong> — once for
+the RPC and once for the printed approve lines. A symlink swapped between the two resolutions makes the printed
+lines target another daemon. This is outside the threat model: the swap needs write access to a directory on the
+operator&#39;s own state path, and that attacker can point the link at the other daemon before the list runs,
+which the operator then reviews honestly. If wanted later, the fix is to resolve once per invocation and pass the
+canonical value to both paths.</li>
 <li><strong>R1 Lane A landed — two recorded deviations and one accepted limit (decided 2026-09-19):</strong> ✅
 Lane A (the SDK half of R1: execution kinds, provenance, the direct arm, scoped authority) landed with three
 departures from the R1 design spec, each deliberate. <strong>(1) The <code>unknown</code> outcome travels on the
