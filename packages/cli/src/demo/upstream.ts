@@ -70,14 +70,18 @@ export function startDemoUpstream(opts: { readOnly?: boolean } = {}): Promise<De
       body += chunk.toString("utf8");
     });
     req.on("end", () => {
-      let payload: RpcPayload;
+      let parsed: unknown;
       try {
-        payload = JSON.parse(body) as RpcPayload;
+        parsed = JSON.parse(body);
       } catch {
+        parsed = undefined;
+      }
+      if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
         res.writeHead(400);
         res.end();
         return;
       }
+      const payload = parsed as RpcPayload;
       const reply = (result: unknown, headers: Record<string, string> = {}): void => {
         res.writeHead(200, { "content-type": "application/json", ...headers });
         res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result }));

@@ -64,6 +64,14 @@ describe("demo upstream", () => {
       signal: AbortSignal.timeout(2000),
     });
     expect(bad.status).toBe(400);
+    for (const body of ["null", "[]"]) {
+      const notObject = await fetch(upstream.url, {
+        method: "POST",
+        body,
+        signal: AbortSignal.timeout(2000),
+      });
+      expect(notObject.status).toBe(400);
+    }
     expect(upstream.calls).toEqual([]);
   });
 });
