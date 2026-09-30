@@ -876,3 +876,15 @@ describe("ring-2: conduit approvals (spawned CLI bin) drives the whole loop thro
     expect(denied.stderr).toMatch(/is not paused on call .* Run "conduit approvals list"/);
   }, 60_000);
 });
+
+describe("ring-2: conduit demo (spawned CLI bin)", () => {
+  it("passes with a minimal environment and prints the verdict", async () => {
+    const { stdout } = await execFileAsync(process.execPath, [cliBinPath, "demo"], {
+      env: { PATH: process.env.PATH ?? "" },
+      timeout: 60_000,
+    });
+    expect(stdout.startsWith("conduit demo — the approval gate")).toBe(true);
+    expect(stdout).toContain("approve: paused before it ran");
+    expect(stdout).toMatch(/\nPASS\nNext: /);
+  }, 90_000);
+});

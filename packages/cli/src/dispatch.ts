@@ -1,15 +1,18 @@
 import { USAGE as ADD_MCP_USAGE } from "./commands/add-mcp.js";
+import { DEMO_USAGE } from "./commands/demo.js";
 import { KEY_USAGE } from "./commands/key.js";
+import { VERSION } from "./version.js";
 
-export const VERSION = "0.1.1";
+export { VERSION };
 
-export const COMMANDS = ["serve", "add-mcp", "approvals", "key", "daemon"] as const;
+export const COMMANDS = ["serve", "add-mcp", "approvals", "key", "daemon", "demo"] as const;
 
 export type Command = (typeof COMMANDS)[number];
 
 const HELP = `conduit ${VERSION} — Conduit CLI
 
 Usage: conduit <command> [options]
+New here? Run "conduit demo" to see approvals work in a few seconds.
 
 Commands:
   serve      Run the Conduit MCP server (stdio transport)
@@ -18,6 +21,7 @@ Commands:
   approvals  Manage pending tool-call approvals
   key        Manage the master key (generate | rotate)
   daemon     Inspect or stop the background daemon (status | stop)
+  demo       Show the approval gate end to end, in memory (no setup needed)
 
 Flags:
   --help     Show this help text
@@ -100,6 +104,10 @@ export function dispatch(argv: string[]): DispatchResult {
     // is a genuine help request — no flag-vs-value disambiguation needed.
     if (first === "key" && rest.some((token) => token === "--help" || token === "-h")) {
       return { kind: "help", stdout: `${KEY_USAGE}\n` };
+    }
+    // demo takes no value-taking flags either.
+    if (first === "demo" && rest.some((token) => token === "--help" || token === "-h")) {
+      return { kind: "help", stdout: `${DEMO_USAGE}\n` };
     }
     return { kind: "route", command: first, args: rest };
   }
