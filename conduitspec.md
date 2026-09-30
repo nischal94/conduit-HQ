@@ -802,13 +802,16 @@ tree that CI tested. `pack-preview` resolves it with a 4320-minute `--before` ag
 at `high`. D-R10: `check-shrinkwrap-in-pnpm` refuses any (package, version) absent from
 `pnpm-lock.yaml`, and it refuses an empty package set. `check-absent` counts a broken symlink as
 present. `check-tarball-paths` requires `package/LICENSE`. D-R11: one `pack` job builds
-the tarball once. Every CI leg that installs it matches its SHA-256 first, and the release promotes those tested
-bytes without a repack. D-R8: the adopter command is `npm install -g --ignore-scripts`, the same command CI
+the tarball once. Every CI leg that installs it matches its SHA-256 first. The release (plan Task 7) will publish
+those tested bytes without a repack; that step has not run yet. D-R8: the adopter command is `npm install -g --ignore-scripts`, the same command CI
 runs. D-R12: the Node floor is `>=22.12.0`. D-R9 and D-R12: CI tests the exact floor and the latest
 Node 24 on Linux and macOS. `ajv` stays a direct CLI dependency; it mirrors the inlined sdk manifest and
 adds no package to the graph.
 **Version.** D-R3: `0.2.0-alpha.0` on all three packages, the CLI `VERSION` constant,
-and the daemon's `AGENT_VERSION`. They move together because the CLI/daemon skew check compares them.
+and the daemon's `AGENT_VERSION`. They move together today. The skew check does not compare them: it
+compares the CLI's bundled mcp `AGENT_VERSION` with the running daemon's `AGENT_VERSION`
+(`skew.ts`). `daemon-cmd.test.ts` pins `VERSION === AGENT_VERSION` as a tripwire, so a
+future split must decide each display site on purpose.
 **Two PRs.** D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carries the
 packaging, the demo, CI, and the install notes. PR A (#65) took the Tier 2 review and the `/explain-diff`
 quiz. PR B requires the Tier 2 review and the quiz before merge (D-R5). D-R13 sets the build order and moves the

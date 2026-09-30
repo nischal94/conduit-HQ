@@ -9,9 +9,10 @@ as GitHub issues on this repository.
 
 ## Requirements
 
-- Node.js 22 (22.12.0 or later) or Node.js 24. CI installs and runs this
-  exact tarball on Node 22.12.0 and the latest Node 24.
-- Tested targets: Linux x64 with glibc, and macOS on Apple silicon
+- Node.js 22 (22.12.0 or later) or Node.js 24. CI installs and runs each
+  preview tarball on Node 22.12.0 and the latest Node 24 before it is
+  released.
+- Targets that CI tests: Linux x64 with glibc, and macOS on Apple silicon
   (arm64). Other combinations (Linux arm64, musl/Alpine, Intel macOS) are
   untested; they may work, but nothing has checked them. Windows is not
   supported (the daemon uses Unix sockets).
@@ -53,8 +54,8 @@ npm install -g --ignore-scripts ./conduithq-cli-0.2.0-alpha.0.tgz
 ```
 
 `--ignore-scripts` stops npm from running install-time scripts from any
-package in the tree. Conduit needs none; CI installs this same tarball with
-these same flags into an isolated prefix.
+package in the tree. Conduit needs none. Before a preview tarball is
+released, CI installs it with these same flags into an isolated prefix.
 
 This installs two commands: `conduit` and `conduit-mcp`. Check the version:
 
@@ -103,6 +104,12 @@ The counts come from the upstream's own record of the calls it received,
 not from Conduit's report. The demo exits 1 if any count is wrong.
 
 ## 4. Govern your own agent's calls
+
+> **Not yet verified end to end.** Nobody has run this walkthrough against
+> GitHub's remote MCP server yet; the founder's own run is still pending.
+> Two things are unverified: that the server accepts a fine-grained token
+> scoped to one repository, and that its create-issue tool pauses for
+> approval. If either fails, stop and report it (see "Tell us how it went").
 
 This walkthrough uses GitHub, with a token that can touch ONE scratch
 repository, so your first governed call has a small, known blast radius.
@@ -162,8 +169,9 @@ repository, so your first governed call has a small, known blast radius.
    Restart Claude Code (or open a new session) so it loads the server.
 
 5. **Ask your agent for a write.** For example: *"Create an issue in
-   YOUR_USER/conduit-scratch titled 'hello from conduit'."* The agent
-   reports that the call is waiting for approval and tells you to run
+   YOUR_USER/conduit-scratch titled 'hello from conduit'."* Conduit is
+   designed to pause this call before it reaches GitHub. The agent should
+   then report that the call is waiting for approval and tell you to run
    `conduit approvals list`.
 
 6. **Decide it** in a second terminal:
@@ -177,9 +185,9 @@ repository, so your first governed call has a small, known blast radius.
    your decision.
 
 7. **Go back to your agent and say it was approved.** The agent then
-   checks the execution and reports the result. The issue appears in your
-   scratch repository. Nothing ran before you approved; a denied call never
-   reaches GitHub.
+   checks the execution and reports the result. The issue should appear in
+   your scratch repository. Conduit is designed so that nothing runs before
+   you approve, and so that a denied call never reaches GitHub.
 
 ## Tell us how it went (3 minutes)
 

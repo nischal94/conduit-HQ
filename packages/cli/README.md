@@ -22,8 +22,10 @@ instead (see [Rotation walkthrough](#rotation-walkthrough)).
 | `conduit key generate` | Mints the master key. | Direct store, under the maintenance lock |
 | `conduit key rotate` | Rotates the master key. | Direct store, under the maintenance lock; re-seal via `reencryptSecrets` (`@conduithq/sdk`) |
 
-Nothing is published to npm yet. Install the alpha tarball per
-[`docs/alpha/INSTALL.md`](../../docs/alpha/INSTALL.md), or run the built file
+Nothing is published to npm yet. The alpha preview is published as a GitHub
+prerelease on the
+[Releases page](https://github.com/nischal94/conduit-HQ/releases); install
+it per [`docs/alpha/INSTALL.md`](../../docs/alpha/INSTALL.md). Or run the built file
 directly: `node <abs path>/packages/cli/dist/conduit.js <command>` (build with
 `npm run build` in this package). `--help` and `--version` are available at
 the top level. `conduit demo` shows the approval gate end to end with no setup.

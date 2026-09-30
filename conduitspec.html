@@ -1040,13 +1040,16 @@ tree that CI tested. <code>pack-preview</code> resolves it with a 4320-minute <c
 at <code>high</code>. D-R10: <code>check-shrinkwrap-in-pnpm</code> refuses any (package, version) absent from
 <code>pnpm-lock.yaml</code>, and it refuses an empty package set. <code>check-absent</code> counts a broken symlink as
 present. <code>check-tarball-paths</code> requires <code>package/LICENSE</code>. D-R11: one <code>pack</code> job builds
-the tarball once. Every CI leg that installs it matches its SHA-256 first, and the release promotes those tested
-bytes without a repack. D-R8: the adopter command is <code>npm install -g --ignore-scripts</code>, the same command CI
+the tarball once. Every CI leg that installs it matches its SHA-256 first. The release (plan Task 7) will publish
+those tested bytes without a repack; that step has not run yet. D-R8: the adopter command is <code>npm install -g --ignore-scripts</code>, the same command CI
 runs. D-R12: the Node floor is <code>&gt;=22.12.0</code>. D-R9 and D-R12: CI tests the exact floor and the latest
 Node 24 on Linux and macOS. <code>ajv</code> stays a direct CLI dependency; it mirrors the inlined sdk manifest and
 adds no package to the graph.
 <strong>Version.</strong> D-R3: <code>0.2.0-alpha.0</code> on all three packages, the CLI <code>VERSION</code> constant,
-and the daemon&#39;s <code>AGENT_VERSION</code>. They move together because the CLI/daemon skew check compares them.
+and the daemon&#39;s <code>AGENT_VERSION</code>. They move together today. The skew check does not compare them: it
+compares the CLI&#39;s bundled mcp <code>AGENT_VERSION</code> with the running daemon&#39;s <code>AGENT_VERSION</code>
+(<code>skew.ts</code>). <code>daemon-cmd.test.ts</code> pins <code>VERSION === AGENT_VERSION</code> as a tripwire, so a
+future split must decide each display site on purpose.
 <strong>Two PRs.</strong> D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carries the
 packaging, the demo, CI, and the install notes. PR A (#65) took the Tier 2 review and the <code>/explain-diff</code>
 quiz. PR B requires the Tier 2 review and the quiz before merge (D-R5). D-R13 sets the build order and moves the
