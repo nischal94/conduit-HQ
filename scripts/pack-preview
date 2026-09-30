@@ -29,13 +29,45 @@ cd "$stage/package"
 # devDependencies name workspace packages that are not on any registry, and
 # scripts must not run during resolution: drop both from the staged manifest.
 # Then steer npm to pnpm's tested versions (D-R10): direct dependencies are
-# pinned exactly (an override on a direct dependency is an npm error), and
-# every transitive package pnpm resolved to ONE version gets an override.
+# pinned exactly (an override on a direct dependency is an npm error), every
+# transitive package pnpm resolved to ONE version gets an override, and a
+# package pnpm resolved to several versions gets one override per dependent
+# parent, read from pnpm-lock.yaml's `snapshots:` section.
 # shellcheck disable=SC2016 # single quotes are intended: ${...} is a JS template literal.
 node -e '
   const fs = require("node:fs");
   const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
   const tree = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  // lockfileVersion 9.0: under `snapshots:`, each key sits at indent 2 as
+  // `  name@version(peers):` (quoted when scoped), its dependency maps at
+  // indent 4, and their entries at indent 6 as `      name: version(peers)`.
+  // Returns Map("name@version" -> Map(child -> version)), peer suffixes dropped.
+  const readSnapshotDeps = (file) => {
+    const unquote = (s) => s.replace(/^\x27|\x27$/g, "");
+    const snapshots = new Map();
+    let inSnapshots = false;
+    let key = null;
+    let inDeps = false;
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      if (/^\S/.test(line)) { inSnapshots = line === "snapshots:"; key = null; continue; }
+      if (!inSnapshots) continue;
+      let m;
+      if ((m = /^  (\S.*?):(?: \{\})?$/.exec(line))) {
+        key = unquote(m[1]).split("(")[0];
+        if (!snapshots.has(key)) snapshots.set(key, new Map());
+        inDeps = false;
+      } else if ((m = /^    (\S+):$/.exec(line))) {
+        inDeps = m[1] === "dependencies" || m[1] === "optionalDependencies";
+      } else if (key && inDeps && (m = /^      (\S+): (\S+)$/.exec(line))) {
+        const [child, version] = [unquote(m[1]), unquote(m[2]).split("(")[0]];
+        const deps = snapshots.get(key);
+        if (deps.has(child) && deps.get(child) !== version) throw new Error(`[pack-preview] Conflicting snapshot pins: ${key} names ${child} at ${deps.get(child)} and ${version}`);
+        deps.set(child, version);
+      }
+    }
+    if (snapshots.size === 0) throw new Error(`[pack-preview] No snapshots were read from the pnpm lockfile. Context: { lockfile: ${file} }`);
+    return snapshots;
+  };
   const seen = new Map();
   const collect = (deps) => {
     for (const [name, node] of Object.entries(deps ?? {})) {
@@ -56,10 +88,38 @@ node -e '
   for (const [name, versions] of seen) {
     if (!(name in pkg.dependencies) && versions.size === 1) pkg.overrides[name] = [...versions][0];
   }
+  const snapshots = readSnapshotDeps(process.argv[2]);
+  for (const [child, versions] of seen) {
+    if (versions.size === 1) continue;
+    const pinned = new Set();
+    for (const [parentKey, deps] of snapshots) {
+      const version = deps.get(child);
+      if (version === undefined) continue;
+      const at = parentKey.lastIndexOf("@");
+      const [parent, parentVersion] = [parentKey.slice(0, at), parentKey.slice(at + 1)];
+      if (!seen.get(parent)?.has(parentVersion)) continue;
+      if (!versions.has(version)) throw new Error(`[pack-preview] Snapshot ${parentKey} names ${child}@${version}, which the pnpm tree does not hold`);
+      // npm matches a nested pin only while the parent rule is the active one;
+      // a multi-version parent is itself pinned under its own parents, which
+      // would shadow a top-level rule for it.
+      if (seen.get(parent).size > 1) throw new Error(`[pack-preview] Cannot scope ${child} under ${parent}: pnpm resolved ${parent} to several versions`);
+      // npm takes the first rule that names the parent, so a plain `parent` rule
+      // would shadow a separate `parent@version` key: a single-version parent
+      // keeps its key and moves its version to ".". A direct dependency has no
+      // plain rule, so it gets `parent@version`, whose value equals its exact pin.
+      const key = parent in pkg.dependencies ? parentKey : parent;
+      if (typeof pkg.overrides[key] === "string") pkg.overrides[key] = { ".": pkg.overrides[key] };
+      pkg.overrides[key] ??= {};
+      pkg.overrides[key][child] = version;
+      pinned.add(version);
+    }
+    const unpinned = [...versions].filter((v) => !pinned.has(v));
+    if (unpinned.length > 0) throw new Error(`[pack-preview] No snapshot parent pins ${child}@${unpinned.join(", ")}`);
+  }
   fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
-' "$stage/pnpm-tree.json"
+' "$stage/pnpm-tree.json" "$root/pnpm-lock.yaml"
 # pnpm-workspace.yaml minimumReleaseAge is 4320 minutes; --before mirrors it
-# for any package pnpm resolved to more than one version.
+# as a second bound behind the overrides above.
 before="$(node -p 'new Date(Date.now() - 4320 * 60 * 1000).toISOString()')"
 npm install --package-lock-only --ignore-scripts --omit=dev --before="$before" >/dev/null
 mv package-lock.json npm-shrinkwrap.json
