@@ -1020,15 +1020,16 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). <strong>Next
 <h2 id="18-open-questions-decisions-to-lock">18. Open questions / decisions to lock</h2>
 <p><strong>Resolved (locked):</strong></p>
 <ul>
-<li><strong>R3a preview packaging — one CLI tarball and <code>conduit demo</code> (decided 2026-09-25; landed
-2026-09-30):</strong> ✅ <strong>Artifact form.</strong> D-R1: the preview ships as one CLI tarball. tsup
+<li><strong>R3a preview packaging — one CLI tarball and <code>conduit demo</code> (decided
+2026-09-25):</strong> ✅ <strong>Artifact form.</strong> D-R1: the preview ships as one CLI tarball. tsup
 <code>noExternal</code> inlines <code>@conduithq/sdk</code> and <code>@conduithq/mcp</code> into it. Three tarballs
 were rejected because sibling-tarball resolution under <code>npm i -g</code> is unverified. A vendored tree was
 rejected because libsql&#39;s native binary makes it platform-specific. D-R6: the CLI entry becomes
 <code>dist/conduit.js</code>, and mcp&#39;s daemon entry ships as <code>dist/bin.js</code>. The reason is that
 <code>daemonEntryPoint()</code> resolves <code>./bin.js</code> beside the running code. The tarball exposes two bins,
 <code>conduit</code> and <code>conduit-mcp</code>, so the <code>conduit-mcp --doctor</code> recovery lines stay true.
-No mcp or sdk source changes.
+D-R6 needs no mcp or sdk source change. The one mcp source change, the daemon&#39;s
+<code>AGENT_VERSION</code>, belongs to D-R3.
 <strong>The demo is a gate.</strong> D-R2: a built-in <code>conduit demo</code> runs in-process as the first-run
 path. It needs no PAT, no real side effects, and no unsafe egress flag. D-R4: the demo exits 1 unless three things
 hold. The approved call runs once with the exact approved input. The denied call runs zero times. A replayed approve
@@ -1046,9 +1047,10 @@ Node 24 on Linux and macOS. <code>ajv</code> stays a direct CLI dependency; it m
 adds no package to the graph.
 <strong>Version.</strong> D-R3: <code>0.2.0-alpha.0</code> on all three packages, the CLI <code>VERSION</code> constant,
 and the daemon&#39;s <code>AGENT_VERSION</code>. They move together because the CLI/daemon skew check compares them.
-<strong>Two PRs.</strong> D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carried the
+<strong>Two PRs.</strong> D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carries the
 packaging, the demo, CI, and the install notes. PR A (#65) took the Tier 2 review and the <code>/explain-diff</code>
-quiz. PR B requires both before merge (D-R5). D-R13 sets the build order and moves the doctor-fixture fix ahead of both PRs.
+quiz. PR B requires the Tier 2 review and the quiz before merge (D-R5). D-R13 sets the build order and moves the
+doctor-fixture fix ahead of both PRs.
 <strong>Accepted limits.</strong> (1) The demo&#39;s sdk path reads <code>CONDUIT_APPROVAL_TTL</code>. Removing the
 read needs an sdk change. A small TTL yields a loud FAIL, never a false pass. (2) D-R10 is a best-effort version-set
 guard, not graph equality. npm and pnpm hoist differently, so dependency edges may differ. The structural guarantee

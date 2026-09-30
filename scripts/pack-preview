@@ -14,7 +14,7 @@ stage="$(mktemp -d)"
 trap 'rm -rf "$stage"' EXIT
 
 cd "$root"
-pnpm -r build
+pnpm -r build >&2
 pnpm --filter @conduithq/cli list --prod --depth Infinity --json > "$stage/pnpm-tree.json"
 
 cd "$root/packages/cli"
@@ -64,7 +64,7 @@ before="$(node -p 'new Date(Date.now() - 4320 * 60 * 1000).toISOString()')"
 npm install --package-lock-only --ignore-scripts --omit=dev --before="$before" >/dev/null
 mv package-lock.json npm-shrinkwrap.json
 "$root/scripts/check-shrinkwrap-in-pnpm" npm-shrinkwrap.json "$root/pnpm-lock.yaml"
-npm audit --omit=dev --audit-level=high
+npm audit --omit=dev --audit-level=high >&2
 npm pack --pack-destination "$out" >/dev/null
 
 if [ ! -f "$tarball" ]; then
