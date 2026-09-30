@@ -797,14 +797,28 @@ path. It needs no PAT, no real side effects, and no unsafe egress flag. D-R4: th
 hold. The approved call runs once with the exact approved input. The denied call runs zero times. A replayed approve
 of the same call id returns `conflict` without a second upstream call. The demo therefore doubles as the
 install smoke test.
-**Supply chain.** D-R7: the tarball ships `npm-shrinkwrap.json`, so the adopter installs the
-tree that CI tested. `pack-preview` resolves it with a 4320-minute `--before` age and audits it
+**Supply chain.** D-R7: the tarball ships `npm-shrinkwrap.json`, the lockfile of the tree
+that CI tests; the adopter install renames it to `package-lock.json` and installs it with
+`npm ci` (D-R8). `pack-preview` resolves it with a 4320-minute `--before` age and audits it
 at `high`. D-R10: `check-shrinkwrap-in-pnpm` refuses any (package, version) absent from
 `pnpm-lock.yaml`, and it refuses an empty package set. `check-absent` counts a broken symlink as
 present. `check-tarball-paths` requires `package/LICENSE`. D-R11: one `pack` job builds
 the tarball once. Every CI leg that installs it matches its SHA-256 first. The release (plan Task 7) will publish
-those tested bytes without a repack; that step has not run yet. D-R8: the adopter command is `npm install -g --ignore-scripts`, the same command CI
-runs. D-R12: the Node floor is `>=22.12.0`. D-R9 and D-R12: CI tests the exact floor and the latest
+those tested bytes without a repack; that step has not run yet. D-R8: the adopter extracts the tarball into its own
+folder (`~/.local/share/conduit-preview/<version>`), renames `npm-shrinkwrap.json` to
+`package-lock.json`, runs `npm ci --omit=dev --ignore-scripts` in that folder, and links
+`conduit` (`dist/conduit.js`) and `conduit-mcp` (`dist/bin.js`) into
+`~/.local/bin`. No step uses `npm install -g` or needs root. Node resolves a symlinked main module
+to its real path, so `daemonEntryPoint()` still finds `dist/bin.js`. One tarball still serves every
+OS. The CI preview legs are specified to run the same commands; that CI change has not run yet.
+**D-R7 and D-R8 revised (founder, 2026-09-30).** D-R7 first said the shipped shrinkwrap pins the
+adopter's tree under `npm install -g`, and D-R8 made `npm install -g --ignore-scripts` the
+adopter command. Both are withdrawn. Evidence: in CI run 36692433505, every preview leg failed
+`check-shrinkwrap-installed`. On npm 10.9.0 (the Node 22.12.0 leg), `npm install -g` of the
+tarball ignored the shipped shrinkwrap and resolved a fresh tree (hono 4.13.11 against the pinned 4.12.28). npm's
+documentation says npm v12 no longer reads `npm-shrinkwrap.json` (summary-grade, read through Context7).
+The rename to `package-lock.json` is meant to keep the install working under npm 12; no npm 12 run has
+checked it. D-R12: the Node floor is `>=22.12.0`. D-R9 and D-R12: CI tests the exact floor and the latest
 Node 24 on Linux and macOS. `ajv` stays a direct CLI dependency; it mirrors the inlined sdk manifest and
 adds no package to the graph.
 **Version.** D-R3: `0.2.0-alpha.0` on all three packages, the CLI `VERSION` constant,
