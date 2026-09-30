@@ -50,12 +50,6 @@ tarball. This preview has no signature or build attestation.
 
 ## 2. Install
 
-> **Not yet verified by CI.** This install replaced `npm install -g` on
-> 2026-09-30: in CI, `npm install -g` ignored the dependency versions the
-> tarball pins. CI has not yet run the commands below on a preview
-> tarball. If a step fails, stop and report it (see "When something goes
-> wrong").
-
 Run this block in the folder that holds the verified tarball. It extracts
 Conduit into its own folder, `~/.local/share/conduit-preview/0.2.0-alpha.0`,
 installs its dependencies there, and links the two commands, `conduit` and
