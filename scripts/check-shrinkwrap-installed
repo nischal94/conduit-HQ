@@ -26,6 +26,10 @@ node -e '
   }
   const lock = JSON.parse(fs.readFileSync(lockFile, "utf8"));
   const entries = Object.entries(lock.packages ?? {}).filter(([rel]) => rel !== "");
+  if (entries.length === 0) {
+    console.error(`[check-shrinkwrap-installed] Refused: the lockfile names no packages to check. Context: { root: ${root} }`);
+    process.exit(1);
+  }
   const libc = process.platform !== "linux" ? undefined
     : process.report.getReport().header.glibcVersionRuntime ? "glibc" : "musl";
   // An optional package is excused only when its os/cpu/libc fields rule out
@@ -74,4 +78,5 @@ node -e '
     console.error(`[check-shrinkwrap-installed] Installed tree differs from the lockfile. Context: { root: ${root} }\n  ${bad.join("\n  ")}`);
     process.exit(1);
   }
+  console.log(`[check-shrinkwrap-installed] Checked ${checked} packages against the lockfile.`);
 ' "$1"
