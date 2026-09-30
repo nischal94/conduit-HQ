@@ -251,14 +251,23 @@ jobs:
           test "$actual" = "$EXPECTED"
           scripts/check-tarball-paths "$tarball"
           echo "TARBALL=$tarball" >> "$GITHUB_ENV"
-      - name: Install the tarball into a clean prefix (the adopter command, plus --prefix)
-        run: npm install -g --prefix "$RUNNER_TEMP/prefix" --ignore-scripts "$TARBALL"
-      - name: npm installed exactly the shrinkwrapped tree
-        run: scripts/check-shrinkwrap-installed "$RUNNER_TEMP/prefix/lib/node_modules/@conduithq/cli"
+      - name: Extract the tarball into a fresh folder, npm ci its lockfile, link the bins (the adopter commands)
+        run: |
+          # mkdir without -p: the folder must not exist yet.
+          mkdir "$RUNNER_TEMP/install"
+          tar -xzf "$TARBALL" -C "$RUNNER_TEMP/install"
+          cd "$RUNNER_TEMP/install/package"
+          mv npm-shrinkwrap.json package-lock.json
+          npm ci --omit=dev --ignore-scripts
+          mkdir "$RUNNER_TEMP/bin"
+          ln -s "$RUNNER_TEMP/install/package/dist/conduit.js" "$RUNNER_TEMP/bin/conduit"
+          ln -s "$RUNNER_TEMP/install/package/dist/bin.js" "$RUNNER_TEMP/bin/conduit-mcp"
+      - name: npm ci installed exactly the lockfile's tree
+        run: scripts/check-shrinkwrap-installed "$RUNNER_TEMP/install/package"
       - name: conduit demo neither opens nor creates the state path, and ignores CONDUIT_DB, CONDUIT_MASTER_KEY, and the egress env var
         working-directory: ${{ runner.temp }}
         run: |
-          export PATH="$RUNNER_TEMP/prefix/bin:$PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
           state="$(node -p 'require("node:path").join(require("node:os").userInfo().homedir, ".conduit")')"
           "$GITHUB_WORKSPACE/scripts/check-absent" "$state"
           # Each command runs in its own assignment, so set -e sees its exit status.
@@ -282,7 +291,7 @@ jobs:
       - name: A real daemon auto-starts from the installed tarball
         working-directory: ${{ runner.temp }}
         run: |
-          export PATH="$RUNNER_TEMP/prefix/bin:$PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
           conduit key generate
           listed="$(conduit approvals list)"
           if [ "$listed" != "No paused executions awaiting approval." ]; then
@@ -294,7 +303,7 @@ jobs:
       - name: The installed conduit-mcp doctor runs (the notes advertise it)
         working-directory: ${{ runner.temp }}
         run: |
-          export PATH="$RUNNER_TEMP/prefix/bin:$PATH"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
           conduit-mcp --doctor --offline
 
   preview-unsupported-node:
@@ -326,8 +335,13 @@ jobs:
       - name: Install (npm only warns on engines) and expect the guard's one-line refusal
         working-directory: ${{ runner.temp }}
         run: |
-          npm install -g --prefix "$RUNNER_TEMP/prefix" --ignore-scripts "$TARBALL"
-          export PATH="$RUNNER_TEMP/prefix/bin:$PATH"
+          mkdir "$RUNNER_TEMP/install"
+          tar -xzf "$TARBALL" -C "$RUNNER_TEMP/install"
+          mv "$RUNNER_TEMP/install/package/npm-shrinkwrap.json" "$RUNNER_TEMP/install/package/package-lock.json"
+          (cd "$RUNNER_TEMP/install/package" && npm ci --omit=dev --ignore-scripts)
+          mkdir "$RUNNER_TEMP/bin"
+          ln -s "$RUNNER_TEMP/install/package/dist/conduit.js" "$RUNNER_TEMP/bin/conduit"
+          export PATH="$RUNNER_TEMP/bin:$PATH"
           set +e
           conduit --version > out.txt 2> err.txt
           code=$?
