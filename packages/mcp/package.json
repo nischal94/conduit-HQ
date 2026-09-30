@@ -1,6 +1,6 @@
 {
   "name": "@conduithq/mcp",
-  "version": "0.1.1",
+  "version": "0.2.0-alpha.0",
   "description": "Conduit MCP server — stdio transport (spec §17 step 2).",
   "license": "Apache-2.0",
   "type": "module",
@@ -17,7 +17,7 @@
     "dist"
   ],
   "engines": {
-    "node": ">=20"
+    "node": ">=22.12.0 <23 || >=24 <25"
   },
   "scripts": {
     "build": "tsup",

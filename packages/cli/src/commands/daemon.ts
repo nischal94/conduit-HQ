@@ -342,7 +342,7 @@ export interface DaemonCmdOptions {
   stateDir?: string;
 }
 
-/** Production entrypoint wired into the CLI dispatch (bin.ts). */
+/** Production entrypoint wired into the CLI dispatch (cli.ts). */
 export async function daemonCommand(argv: string[], opts: DaemonCmdOptions = {}): Promise<number> {
   const deps = prodDeps(opts.stateDir ?? DEFAULT_CONDUIT_DIR);
   const [sub] = argv;

@@ -1,8 +1,8 @@
-#!/usr/bin/env node
 import { takeStateDir as parseStateDir } from "@conduithq/mcp";
 import { addMcp } from "./commands/add-mcp.js";
 import { approvals } from "./commands/approvals.js";
 import { daemonCommand } from "./commands/daemon.js";
+import { demo } from "./commands/demo.js";
 import { runKey } from "./commands/key.js";
 import { serve } from "./commands/serve.js";
 import { type Command, dispatch } from "./dispatch.js";
@@ -79,6 +79,9 @@ async function runCommand(command: Command, args: string[]): Promise<number> {
         parsed.stateDir !== undefined ? { stateDir: parsed.stateDir } : {},
       );
     }
+    case "demo":
+      // No --state-dir on purpose: the demo never selects a daemon or a database.
+      return demo(args);
     default: {
       const _exhaustive: never = command;
       return _exhaustive;

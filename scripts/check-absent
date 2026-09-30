@@ -1,0 +1,16 @@
+#!/bin/sh
+# Fails if the given path exists. CI runs it BEFORE `conduit demo`, to
+# confirm the state path is absent. The proof that the demo neither opens
+# nor creates the state path comes from the next part of that CI step: it
+# plants an unreadable sentinel file at the path, so an open or a mkdir
+# there fails the demo.
+set -eu
+if [ "$#" -ne 1 ]; then
+  echo "[check-absent] Usage: check-absent <path>" >&2
+  exit 2
+fi
+# -e follows symlinks, so a dangling link would read as absent; -L catches it.
+if [ -e "$1" ] || [ -L "$1" ]; then
+  echo "[check-absent] Path exists but must not: $1" >&2
+  exit 1
+fi

@@ -1,0 +1,42 @@
+#!/bin/sh
+# Refuses a preview tarball unless every entry is on the allowlist and the
+# shrinkwrap and LICENSE are present. Allowlist, not denylist: anything else
+# is a refusal.
+set -eu
+if [ "$#" -ne 1 ]; then
+  echo "[check-tarball-paths] Usage: check-tarball-paths <tarball.tgz>" >&2
+  exit 2
+fi
+entries="$(tar -tzf "$1")"
+# Shape first: no absolute path, no backslash, no empty / . / .. component.
+malformed="$(printf '%s\n' "$entries" | grep -E '^/|\\|//|(^|/)\.\.?(/|$)' || true)"
+if [ -n "$malformed" ]; then
+  echo "[check-tarball-paths] Refused: malformed entry names. Context: { tarball: $1, entries: $malformed }" >&2
+  exit 1
+fi
+# Then the allowlist: directory entries under package/ and package/dist/,
+# and files of the listed kinds.
+unexpected="$(printf '%s\n' "$entries" | grep -Ev '^package/((dist/)([^/]+/)*)?$|^package/(dist/.+\.(js|js\.map|d\.ts)|package\.json|npm-shrinkwrap\.json|README\.md|LICENSE)$' || true)"
+if [ -n "$unexpected" ]; then
+  echo "[check-tarball-paths] Refused: tarball holds paths outside the allowlist. Context: { tarball: $1, paths: $unexpected }" >&2
+  exit 1
+fi
+if ! printf '%s\n' "$entries" | grep -qx 'package/npm-shrinkwrap.json'; then
+  echo "[check-tarball-paths] Refused: npm-shrinkwrap.json is missing. Context: { tarball: $1 }" >&2
+  exit 1
+fi
+# The Apache-2.0 license must travel with every copy of the code.
+if ! printf '%s\n' "$entries" | grep -qx 'package/LICENSE'; then
+  echo "[check-tarball-paths] Refused: LICENSE is missing. Context: { tarball: $1 }" >&2
+  exit 1
+fi
+# Names alone are not enough: an allowed name can be a symlink or hard link.
+# The verbose listing's first character is the entry type on GNU tar and
+# bsdtar alike; only regular files (-) and directories (d) pass.
+listing="$(tar -tvzf "$1")"
+links="$(printf '%s\n' "$listing" | grep -Ev '^[-d]' || true)"
+linked="$(printf '%s\n' "$listing" | grep -E ' -> | link to ' || true)"
+if [ -n "$links" ] || [ -n "$linked" ]; then
+  echo "[check-tarball-paths] Refused: tarball holds a non-regular entry. Context: { tarball: $1, entries: $links $linked }" >&2
+  exit 1
+fi

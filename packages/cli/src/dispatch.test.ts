@@ -1,5 +1,6 @@
 import { createRequire } from "node:module";
 import { describe, expect, it } from "vitest";
+import { DEMO_USAGE } from "./commands/demo.js";
 import { COMMANDS, dispatch, VERSION } from "./dispatch.js";
 
 it("CLI VERSION matches package.json", () => {
@@ -89,8 +90,25 @@ describe("dispatch (design §6 — pure arg→route function)", () => {
     }
   });
 
-  it("COMMANDS contains exactly the five routed commands", () => {
-    expect(COMMANDS).toEqual(["serve", "add-mcp", "approvals", "key", "daemon"]);
+  it("COMMANDS contains exactly the six routed commands", () => {
+    expect(COMMANDS).toEqual(["serve", "add-mcp", "approvals", "key", "daemon", "demo"]);
+  });
+
+  it("demo --help prints the demo usage and does not route", () => {
+    for (const flag of ["--help", "-h"]) {
+      const result = dispatch(["demo", flag]);
+      expect(result.kind).toBe("help");
+      expect((result as { stdout: string }).stdout).toBe(`${DEMO_USAGE}\n`);
+    }
+  });
+
+  it("top-level help leads with the demo for a new user", () => {
+    const result = dispatch(["--help"]);
+    expect(result.kind).toBe("help");
+    const lines = (result as { stdout: string }).stdout.split("\n");
+    const usage = lines.findIndex((l) => l.startsWith("Usage: conduit <command>"));
+    expect(usage).toBeGreaterThan(-1);
+    expect(lines.slice(usage + 1, usage + 3).join("\n")).toContain('New here? Run "conduit demo"');
   });
 
   it("routes `daemon status` and `daemon stop` with the subcommand passed through", () => {

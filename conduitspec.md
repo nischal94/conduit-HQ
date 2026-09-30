@@ -782,6 +782,63 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). **Next: R1.*
 
 **Resolved (locked):**
 
+- **R3a preview packaging — one CLI tarball and `conduit demo` (decided
+2026-09-25):** ✅ **Artifact form.** D-R1: the preview ships as one CLI tarball. tsup
+`noExternal` inlines `@conduithq/sdk` and `@conduithq/mcp` into it. Three tarballs
+were rejected because sibling-tarball resolution under `npm i -g` is unverified. A vendored tree was
+rejected because libsql's native binary makes it platform-specific. D-R6: the CLI entry becomes
+`dist/conduit.js`, and mcp's daemon entry ships as `dist/bin.js`. The reason is that
+`daemonEntryPoint()` resolves `./bin.js` beside the running code. The tarball exposes two bins,
+`conduit` and `conduit-mcp`, so the `conduit-mcp --doctor` recovery lines stay true.
+D-R6 needs no mcp or sdk source change. The one mcp source change, the daemon's
+`AGENT_VERSION`, belongs to D-R3.
+**The demo is a gate.** D-R2: a built-in `conduit demo` runs in-process as the first-run
+path. It needs no PAT, no real side effects, and no unsafe egress flag. D-R4: the demo exits 1 unless three things
+hold. The approved call runs once with the exact approved input. The denied call runs zero times. A replayed approve
+of the same call id returns `conflict` without a second upstream call. The demo therefore doubles as the
+install smoke test.
+**Supply chain.** D-R7: the tarball ships `npm-shrinkwrap.json`, the lockfile of the tree
+that CI tests; the adopter install renames it to `package-lock.json` and installs it with
+`npm ci` (D-R8). `pack-preview` resolves it with a 4320-minute `--before` age and audits it
+at `high`. D-R10: `check-shrinkwrap-in-pnpm` refuses any (package, version) absent from
+`pnpm-lock.yaml`, and it refuses an empty package set. `check-absent` counts a broken symlink as
+present. `check-tarball-paths` requires `package/LICENSE`. D-R11: one `pack` job builds
+the tarball once. Every CI leg that installs it matches its SHA-256 first. The release (plan Task 7) will publish
+those tested bytes without a repack; that step has not run yet. D-R8: the adopter extracts the tarball into its own
+folder (`~/.local/share/conduit-preview/<version>`), renames `npm-shrinkwrap.json` to
+`package-lock.json`, runs `npm ci --omit=dev --ignore-scripts` in that folder, and links
+`conduit` (`dist/conduit.js`) and `conduit-mcp` (`dist/bin.js`) into
+`~/.local/bin`. No step uses `npm install -g` or needs root. Node resolves a symlinked main module
+to its real path, so `daemonEntryPoint()` still finds `dist/bin.js`. One tarball still serves every
+OS. The CI preview legs run the same commands; run 36695420072 passed on Linux and macOS with Node 22.12.0 and 24.
+**D-R7 and D-R8 revised (founder, 2026-09-30).** D-R7 first said the shipped shrinkwrap pins the
+adopter's tree under `npm install -g`, and D-R8 made `npm install -g --ignore-scripts` the
+adopter command. Both are withdrawn. Evidence: in CI run 36692433505, every preview leg failed
+`check-shrinkwrap-installed`. On npm 10.9.0 (the Node 22.12.0 leg), `npm install -g` of the
+tarball ignored the shipped shrinkwrap and resolved a fresh tree (hono 4.13.11 against the pinned 4.12.28). npm's
+documentation says npm v12 no longer reads `npm-shrinkwrap.json` (summary-grade, read through Context7).
+The rename to `package-lock.json` is meant to keep the install working under npm 12; no npm 12 run has
+checked it. D-R12: the Node floor is `>=22.12.0`. D-R9 and D-R12: CI tests the exact floor and the latest
+Node 24 on Linux and macOS. `ajv` stays a direct CLI dependency; it mirrors the inlined sdk manifest and
+adds no package to the graph.
+**Version.** D-R3: `0.2.0-alpha.0` on all three packages, the CLI `VERSION` constant,
+and the daemon's `AGENT_VERSION`. They move together today. The skew check does not compare them: it
+compares the CLI's bundled mcp `AGENT_VERSION` with the running daemon's `AGENT_VERSION`
+(`skew.ts`). `daemon-cmd.test.ts` pins `VERSION === AGENT_VERSION` as a tripwire, so a
+future split must decide each display site on purpose.
+**Two PRs.** D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carries the
+packaging, the demo, CI, and the install notes. PR A (#65) took the Tier 2 review and the `/explain-diff`
+quiz. PR B requires the Tier 2 review and the quiz before merge (D-R5). D-R13 sets the build order and moves the
+doctor-fixture fix ahead of both PRs.
+**Accepted limits.** (1) The demo's sdk path reads `CONDUIT_APPROVAL_TTL`. Removing the
+read needs an sdk change. A small TTL yields a loud FAIL, never a false pass. (2) D-R10 is a best-effort version-set
+guard, not graph equality. npm and pnpm hoist differently, so dependency edges may differ. The structural guarantee
+is the CI run of the real demo, daemon, and doctor on the exact npm tree. (3) Section 4 of the install notes guides
+an adopter through GitHub's remote MCP server. Nobody has verified that this server accepts a fine-grained PAT
+scoped to one repository with Issues read/write. Nobody has verified that its issue-creation tool classifies as
+`review` and pauses. This path stays unverified until founder dogfood.
+**Not in scope.** A public npm release; the preview is a GitHub prerelease asset. Signed build provenance
+for the tarball is deferred to public R3; the notes disclose integrity only.
 - **Approval seam — two accepted limits from the PR #65 review (decided 2026-09-30):** ✅
 **(1) An agent with a same-user shell can approve its own paused call.** The §10.2 rule "an agent
 must never approve its own paused call" is enforced by the MCP surface only: approve is not an MCP tool. An

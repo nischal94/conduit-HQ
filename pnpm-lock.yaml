@@ -19,19 +19,28 @@ importers:
 
   packages/cli:
     dependencies:
+      '@libsql/client':
+        specifier: ^0.14.0
+        version: 0.14.0
+      '@modelcontextprotocol/sdk':
+        specifier: 1.29.0
+        version: 1.29.0(zod@3.25.76)
+      ajv:
+        specifier: ^8.17.1
+        version: 8.20.0
+      quickjs-emscripten:
+        specifier: ^0.31.0
+        version: 0.31.0
+      zod:
+        specifier: ^3.24.1
+        version: 3.25.76
+    devDependencies:
       '@conduithq/mcp':
         specifier: workspace:*
         version: link:../mcp
       '@conduithq/sdk':
         specifier: workspace:*
         version: link:../sdk
-      '@libsql/client':
-        specifier: ^0.14.0
-        version: 0.14.0
-    devDependencies:
-      '@modelcontextprotocol/sdk':
-        specifier: 1.29.0
-        version: 1.29.0(zod@3.25.76)
       '@types/node':
         specifier: 26.0.1
         version: 26.0.1

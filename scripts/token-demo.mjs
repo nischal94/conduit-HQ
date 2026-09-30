@@ -28,7 +28,7 @@ import { CATALOG_SIZE } from "./token-demo-upstream.mjs";
 
 const ROOT = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const MCP_DIST = join(ROOT, "packages", "mcp", "dist", "index.js");
-const CLI_BIN = join(ROOT, "packages", "cli", "dist", "bin.js");
+const CLI_BIN = join(ROOT, "packages", "cli", "dist", "conduit.js");
 const UPSTREAM_SCRIPT = join(ROOT, "scripts", "token-demo-upstream.mjs");
 const DEMO_DIR = join(ROOT, "demo");
 const SPEC_TOOL_COUNT = 1600; // spec §4.2's headline catalog size (extrapolation only; design doc D6)

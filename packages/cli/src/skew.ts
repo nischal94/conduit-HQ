@@ -16,7 +16,7 @@ import { createSkewReporter } from "@conduithq/mcp";
  * package's build version — and that is correct: the daemon IS the mcp
  * package, so the skew being diagnosed is between this CLI's bundled mcp
  * and the running daemon's. It is deliberately NOT the CLI's own `VERSION`
- * from `dispatch.ts`, which names the user-facing CLI release.
+ * from `version.ts`, which names the user-facing CLI release.
  *
  * Production-only: tests build their own deps and never reach the
  * production entrypoints, so this latch is untouched across test cases.

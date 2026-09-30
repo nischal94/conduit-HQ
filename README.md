@@ -51,14 +51,29 @@ terminal.
 
 ## Quick start
 
-Not yet on npm — run from source (Node version in [`.nvmrc`](.nvmrc), pnpm):
+**Preview build:** the alpha preview goes out as a GitHub prerelease
+(tag `v0.2.0-alpha.0`) on the
+[Releases page](https://github.com/nischal94/conduit-HQ/releases). If the
+page lists one, install it per
+[`docs/alpha/INSTALL.md`](docs/alpha/INSTALL.md). After the install, run
+`conduit demo` to see the approval gate work in one command. If the page
+lists no prerelease yet, run from source.
+
+Or run from source (Node version in [`.nvmrc`](.nvmrc), pnpm):
 
 ```bash
 git clone https://github.com/nischal94/conduit-HQ.git && cd conduit-HQ
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm -r build
-alias conduit="node $PWD/packages/cli/dist/bin.js"
+alias conduit="node $PWD/packages/cli/dist/conduit.js"
 ```
+
+**Upgrading a source checkout:** the CLI entry moved from
+`packages/cli/dist/bin.js` to `packages/cli/dist/conduit.js`. Re-point any
+shell alias or saved MCP client config (for example a `claude mcp add`
+entry) at `packages/cli/dist/conduit.js`. After a rebuild,
+`packages/cli/dist/bin.js` is the `conduit-mcp` daemon entry. It ignores CLI
+subcommands and flags such as `--state-dir`, and it prints no error.
 
 **1. Mint a master key** (stored at `~/.conduit/master-key`, mode 0600 — it
 seals every credential in the store):
@@ -95,7 +110,7 @@ policy defaults: `safe (auto-allow) · review (approval) · destructive
 **3. Point any MCP client at the gateway.** For Claude Code:
 
 ```bash
-claude mcp add --scope user conduit -- node ABS_PATH/packages/cli/dist/bin.js serve
+claude mcp add --scope user conduit -- node ABS_PATH/packages/cli/dist/conduit.js serve
 ```
 
 or in a client's JSON config:
@@ -105,7 +120,7 @@ or in a client's JSON config:
   "mcpServers": {
     "conduit": {
       "command": "node",
-      "args": ["ABS_PATH/packages/cli/dist/bin.js", "serve"]
+      "args": ["ABS_PATH/packages/cli/dist/conduit.js", "serve"]
     }
   }
 }

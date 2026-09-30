@@ -1,0 +1,153 @@
+#!/bin/sh
+# Builds the workspace, packs @conduithq/cli, pins its production tree in
+# npm-shrinkwrap.json (resolved no newer than minimumReleaseAge allows),
+# audits that tree, repacks, and refuses the tarball unless its paths pass
+# the allowlist. Contacts the npm registry: not for agent shells.
+# The adopter install (docs/alpha/INSTALL.md) extracts the tarball, renames
+# npm-shrinkwrap.json to package-lock.json, and runs `npm ci` there. In
+# CI, `npm install -g` of the tarball ignored the shipped shrinkwrap.
+set -eu
+
+root="$(git rev-parse --show-toplevel)"
+out="${1:-$root/.preview}"
+mkdir -p "$out"
+# Absolute from here on: the script cds into the stage before packing.
+out="$(cd "$out" && pwd)"
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+
+cd "$root"
+pnpm -r build >&2
+pnpm --filter @conduithq/cli list --prod --depth Infinity --json > "$stage/pnpm-tree.json"
+
+cd "$root/packages/cli"
+version="$(node -p 'require("./package.json").version')"
+tarball="$out/conduithq-cli-$version.tgz"
+rm -f "$tarball" "$tarball.sha256"
+# pnpm pack, not npm pack: it rewrites workspace:* specifiers.
+pnpm pack --pack-destination "$stage" >/dev/null
+tar -xzf "$stage/conduithq-cli-$version.tgz" -C "$stage"
+
+cd "$stage/package"
+# devDependencies name workspace packages that are not on any registry, and
+# scripts must not run during resolution: drop both from the staged manifest.
+# Add npm-shrinkwrap.json to its `files` list so the repack ships it. Then steer npm to pnpm's tested versions (D-R10): direct dependencies are
+# pinned exactly (an override on a direct dependency is an npm error), every
+# transitive package pnpm resolved to ONE version gets an override, and a
+# package pnpm resolved to several versions gets one override per dependent
+# parent, read from pnpm-lock.yaml's `snapshots:` section.
+# shellcheck disable=SC2016 # single quotes are intended: ${...} is a JS template literal.
+node -e '
+  const fs = require("node:fs");
+  const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  const tree = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  // lockfileVersion 9.0: under `snapshots:`, each key sits at indent 2 as
+  // `  name@version(peers):` (quoted when scoped), its dependency maps at
+  // indent 4, and their entries at indent 6 as `      name: version(peers)`.
+  // Returns Map("name@version" -> Map(child -> version)), peer suffixes dropped.
+  const readSnapshotDeps = (file) => {
+    const unquote = (s) => s.replace(/^\x27|\x27$/g, "");
+    const snapshots = new Map();
+    let inSnapshots = false;
+    let key = null;
+    let inDeps = false;
+    for (const line of fs.readFileSync(file, "utf8").split("\n")) {
+      if (/^\S/.test(line)) { inSnapshots = line === "snapshots:"; key = null; continue; }
+      if (!inSnapshots) continue;
+      let m;
+      if ((m = /^  (\S.*?):(?: \{\})?$/.exec(line))) {
+        key = unquote(m[1]).split("(")[0];
+        if (!snapshots.has(key)) snapshots.set(key, new Map());
+        inDeps = false;
+      } else if ((m = /^    (\S+):$/.exec(line))) {
+        inDeps = m[1] === "dependencies" || m[1] === "optionalDependencies";
+      } else if (key && inDeps && (m = /^      (\S+): (\S+)$/.exec(line))) {
+        const [child, version] = [unquote(m[1]), unquote(m[2]).split("(")[0]];
+        const deps = snapshots.get(key);
+        if (deps.has(child) && deps.get(child) !== version) throw new Error(`[pack-preview] Conflicting snapshot pins: ${key} names ${child} at ${deps.get(child)} and ${version}`);
+        deps.set(child, version);
+      }
+    }
+    if (snapshots.size === 0) throw new Error(`[pack-preview] No snapshots were read from the pnpm lockfile. Context: { lockfile: ${file} }`);
+    return snapshots;
+  };
+  const seen = new Map();
+  const collect = (deps) => {
+    for (const [name, node] of Object.entries(deps ?? {})) {
+      if (!seen.has(name)) seen.set(name, new Set());
+      seen.get(name).add(node.version);
+      collect(node.dependencies);
+    }
+  };
+  for (const project of Array.isArray(tree) ? tree : [tree]) collect(project.dependencies);
+  delete pkg.devDependencies;
+  delete pkg.scripts;
+  // npm pack honors the `files` allowlist, and npm adds npm-shrinkwrap.json
+  // only when that list names it.
+  pkg.files ??= [];
+  if (!pkg.files.includes("npm-shrinkwrap.json")) pkg.files.push("npm-shrinkwrap.json");
+  pkg.overrides = {};
+  for (const name of Object.keys(pkg.dependencies)) {
+    const versions = [...(seen.get(name) ?? [])];
+    if (versions.length !== 1) throw new Error(`[pack-preview] Direct dependency ${name} has ${versions.length} pnpm versions`);
+    pkg.dependencies[name] = versions[0];
+  }
+  for (const [name, versions] of seen) {
+    if (!(name in pkg.dependencies) && versions.size === 1) pkg.overrides[name] = [...versions][0];
+  }
+  const snapshots = readSnapshotDeps(process.argv[2]);
+  for (const [child, versions] of seen) {
+    if (versions.size === 1) continue;
+    const pinned = new Set();
+    for (const [parentKey, deps] of snapshots) {
+      const version = deps.get(child);
+      if (version === undefined) continue;
+      const at = parentKey.lastIndexOf("@");
+      const [parent, parentVersion] = [parentKey.slice(0, at), parentKey.slice(at + 1)];
+      if (!seen.get(parent)?.has(parentVersion)) continue;
+      if (!versions.has(version)) throw new Error(`[pack-preview] Snapshot ${parentKey} names ${child}@${version}, which the pnpm tree does not hold`);
+      // npm matches a nested pin only while the parent rule is the active one;
+      // a multi-version parent is itself pinned under its own parents, which
+      // would shadow a top-level rule for it.
+      if (seen.get(parent).size > 1) throw new Error(`[pack-preview] Cannot scope ${child} under ${parent}: pnpm resolved ${parent} to several versions`);
+      // npm takes the first rule that names the parent, so a plain `parent` rule
+      // would shadow a separate `parent@version` key: a single-version parent
+      // keeps its key and moves its version to ".". A direct dependency has no
+      // plain rule, so it gets `parent@version`, whose value equals its exact pin.
+      const key = parent in pkg.dependencies ? parentKey : parent;
+      if (typeof pkg.overrides[key] === "string") pkg.overrides[key] = { ".": pkg.overrides[key] };
+      pkg.overrides[key] ??= {};
+      pkg.overrides[key][child] = version;
+      pinned.add(version);
+    }
+    const unpinned = [...versions].filter((v) => !pinned.has(v));
+    if (unpinned.length > 0) throw new Error(`[pack-preview] No snapshot parent pins ${child}@${unpinned.join(", ")}`);
+  }
+  fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+' "$stage/pnpm-tree.json" "$root/pnpm-lock.yaml"
+# pnpm-workspace.yaml minimumReleaseAge is 4320 minutes; --before mirrors it
+# as a second bound behind the overrides above.
+before="$(node -p 'new Date(Date.now() - 4320 * 60 * 1000).toISOString()')"
+npm install --package-lock-only --ignore-scripts --omit=dev --before="$before" >/dev/null
+mv package-lock.json npm-shrinkwrap.json
+"$root/scripts/check-shrinkwrap-in-pnpm" npm-shrinkwrap.json "$root/pnpm-lock.yaml"
+npm audit --omit=dev --audit-level=high >&2
+npm pack --pack-destination "$out" >/dev/null
+
+if [ ! -f "$tarball" ]; then
+  echo "[pack-preview] Pack failed: expected tarball is missing. Context: { tarball: $tarball }" >&2
+  exit 1
+fi
+"$root/scripts/check-tarball-paths" "$tarball"
+
+# shellcheck disable=SC2016 # single quotes are intended: ${...} is a JS template literal.
+node -e '
+  const { createHash } = require("node:crypto");
+  const { readFileSync, writeFileSync } = require("node:fs");
+  const { basename } = require("node:path");
+  const file = process.argv[1];
+  const sum = createHash("sha256").update(readFileSync(file)).digest("hex");
+  writeFileSync(`${file}.sha256`, `${sum}  ${basename(file)}\n`);
+' "$tarball"
+
+echo "$tarball"
