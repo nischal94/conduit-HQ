@@ -67,6 +67,13 @@ pnpm -r build
 alias conduit="node $PWD/packages/cli/dist/conduit.js"
 ```
 
+**Upgrading a source checkout:** the CLI entry moved from
+`packages/cli/dist/bin.js` to `packages/cli/dist/conduit.js`. Re-point any
+shell alias or saved MCP client config (for example a `claude mcp add`
+entry) at `packages/cli/dist/conduit.js`. After a rebuild,
+`packages/cli/dist/bin.js` is the `conduit-mcp` daemon entry. It ignores CLI
+subcommands and flags such as `--state-dir`, and it prints no error.
+
 **1. Mint a master key** (stored at `~/.conduit/master-key`, mode 0600 — it
 seals every credential in the store):
 

@@ -152,9 +152,10 @@ repository, so your first governed call has a small, known blast radius.
    It prints how many tools it found in each risk class, and the policy
    for each class: `safe` runs without asking; `review` and `destructive`
    pause for your approval. Conduit classifies each tool from the hints its
-   upstream publishes, so check the tool you intend to use: the
-   create-issue tool must be in `review` or `destructive`. If it is not,
-   stop here and report it (see "Tell us how it went").
+   upstream publishes. The output shows counts only, not the class of each
+   tool. Check that the `review` or `destructive` count is above zero. If
+   both are zero, stop here and report it (see "Tell us how it went").
+   Step 5 then tests the create-issue tool itself: the call must pause.
 
 4. **Point Claude Code at Conduit.** Pin both Node and Conduit by absolute
    path: a client started outside this shell (for example the desktop app)
@@ -172,7 +173,8 @@ repository, so your first governed call has a small, known blast radius.
    YOUR_USER/conduit-scratch titled 'hello from conduit'."* Conduit is
    designed to pause this call before it reaches GitHub. The agent should
    then report that the call is waiting for approval and tell you to run
-   `conduit approvals list`.
+   `conduit approvals list`. If the call runs without a pause, stop here
+   and report it (see "Tell us how it went").
 
 6. **Decide it** in a second terminal:
 
@@ -211,9 +213,12 @@ fill in the short form, whether it went well or not:
 
 ## Moving to a later preview
 
+Download and verify the new tarball as in step 1. In the install line,
+replace `NEW_VERSION` with the version in the new file's name.
+
 ```bash
 conduit daemon stop
-npm install -g --ignore-scripts ./conduithq-cli-<NEW_VERSION>.tgz
+npm install -g --ignore-scripts ./conduithq-cli-NEW_VERSION.tgz
 conduit demo
 ```
 

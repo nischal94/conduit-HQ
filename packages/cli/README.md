@@ -22,13 +22,22 @@ instead (see [Rotation walkthrough](#rotation-walkthrough)).
 | `conduit key generate` | Mints the master key. | Direct store, under the maintenance lock |
 | `conduit key rotate` | Rotates the master key. | Direct store, under the maintenance lock; re-seal via `reencryptSecrets` (`@conduithq/sdk`) |
 
-Nothing is published to npm yet. The alpha preview is published as a GitHub
+Nothing is published to npm yet. The alpha preview goes out as a GitHub
 prerelease on the
-[Releases page](https://github.com/nischal94/conduit-HQ/releases); install
-it per [`docs/alpha/INSTALL.md`](../../docs/alpha/INSTALL.md). Or run the built file
-directly: `node <abs path>/packages/cli/dist/conduit.js <command>` (build with
+[Releases page](https://github.com/nischal94/conduit-HQ/releases). If the
+page lists one, install it per
+[`docs/alpha/INSTALL.md`](../../docs/alpha/INSTALL.md). If the page lists no
+prerelease yet, run the built file directly:
+`node <abs path>/packages/cli/dist/conduit.js <command>` (build with
 `npm run build` in this package). `--help` and `--version` are available at
 the top level. `conduit demo` shows the approval gate end to end with no setup.
+
+**Upgrading a source checkout:** the CLI entry moved from
+`packages/cli/dist/bin.js` to `packages/cli/dist/conduit.js`. Re-point any
+shell alias or saved MCP client config (for example a `claude mcp add`
+entry) at `packages/cli/dist/conduit.js`. After a rebuild,
+`packages/cli/dist/bin.js` is the `conduit-mcp` daemon entry. It ignores CLI
+subcommands and flags such as `--state-dir`, and it prints no error.
 
 ## Quick start
 
