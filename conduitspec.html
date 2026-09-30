@@ -1047,13 +1047,15 @@ adds no package to the graph.
 <strong>Version.</strong> D-R3: <code>0.2.0-alpha.0</code> on all three packages, the CLI <code>VERSION</code> constant,
 and the daemon&#39;s <code>AGENT_VERSION</code>. They move together because the CLI/daemon skew check compares them.
 <strong>Two PRs.</strong> D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carried the
-packaging, the demo, CI, and the install notes. Each PR takes the Tier 2 review and the <code>/explain-diff</code>
-quiz. D-R13 sets the build order and moves the doctor-fixture fix ahead of both PRs.
+packaging, the demo, CI, and the install notes. PR A (#65) took the Tier 2 review and the <code>/explain-diff</code>
+quiz. PR B requires both before merge (D-R5). D-R13 sets the build order and moves the doctor-fixture fix ahead of both PRs.
 <strong>Accepted limits.</strong> (1) The demo&#39;s sdk path reads <code>CONDUIT_APPROVAL_TTL</code>. Removing the
 read needs an sdk change. A small TTL yields a loud FAIL, never a false pass. (2) D-R10 is a best-effort version-set
 guard, not graph equality. npm and pnpm hoist differently, so dependency edges may differ. The structural guarantee
-is the CI run of the real demo, daemon, and doctor on the exact npm tree. (3) Section 4 of the install notes, the
-guided path for an adopter&#39;s own GitHub calls, is unverified until founder dogfood.
+is the CI run of the real demo, daemon, and doctor on the exact npm tree. (3) Section 4 of the install notes guides
+an adopter through GitHub&#39;s remote MCP server. Nobody has verified that this server accepts a fine-grained PAT
+scoped to one repository with Issues read/write. Nobody has verified that its issue-creation tool classifies as
+<code>review</code> and pauses. This path stays unverified until founder dogfood.
 <strong>Not in scope.</strong> A public npm release; the preview is a GitHub prerelease asset. Signed build provenance
 for the tarball is deferred to public R3; the notes disclose integrity only.</li>
 <li><strong>R1 Lane A landed — two recorded deviations and one accepted limit (decided 2026-09-19):</strong> ✅

@@ -809,13 +809,15 @@ adds no package to the graph.
 **Version.** D-R3: `0.2.0-alpha.0` on all three packages, the CLI `VERSION` constant,
 and the daemon's `AGENT_VERSION`. They move together because the CLI/daemon skew check compares them.
 **Two PRs.** D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carried the
-packaging, the demo, CI, and the install notes. Each PR takes the Tier 2 review and the `/explain-diff`
-quiz. D-R13 sets the build order and moves the doctor-fixture fix ahead of both PRs.
+packaging, the demo, CI, and the install notes. PR A (#65) took the Tier 2 review and the `/explain-diff`
+quiz. PR B requires both before merge (D-R5). D-R13 sets the build order and moves the doctor-fixture fix ahead of both PRs.
 **Accepted limits.** (1) The demo's sdk path reads `CONDUIT_APPROVAL_TTL`. Removing the
 read needs an sdk change. A small TTL yields a loud FAIL, never a false pass. (2) D-R10 is a best-effort version-set
 guard, not graph equality. npm and pnpm hoist differently, so dependency edges may differ. The structural guarantee
-is the CI run of the real demo, daemon, and doctor on the exact npm tree. (3) Section 4 of the install notes, the
-guided path for an adopter's own GitHub calls, is unverified until founder dogfood.
+is the CI run of the real demo, daemon, and doctor on the exact npm tree. (3) Section 4 of the install notes guides
+an adopter through GitHub's remote MCP server. Nobody has verified that this server accepts a fine-grained PAT
+scoped to one repository with Issues read/write. Nobody has verified that its issue-creation tool classifies as
+`review` and pauses. This path stays unverified until founder dogfood.
 **Not in scope.** A public npm release; the preview is a GitHub prerelease asset. Signed build provenance
 for the tarball is deferred to public R3; the notes disclose integrity only.
 - **R1 Lane A landed — two recorded deviations and one accepted limit (decided 2026-09-19):** ✅
