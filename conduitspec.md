@@ -782,6 +782,42 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). **Next: R1.*
 
 **Resolved (locked):**
 
+- **R3a preview packaging — one CLI tarball and `conduit demo` (decided 2026-09-25; landed
+2026-09-30):** ✅ **Artifact form.** D-R1: the preview ships as one CLI tarball. tsup
+`noExternal` inlines `@conduithq/sdk` and `@conduithq/mcp` into it. Three tarballs
+were rejected because sibling-tarball resolution under `npm i -g` is unverified. A vendored tree was
+rejected because libsql's native binary makes it platform-specific. D-R6: the CLI entry becomes
+`dist/conduit.js`, and mcp's daemon entry ships as `dist/bin.js`. The reason is that
+`daemonEntryPoint()` resolves `./bin.js` beside the running code. The tarball exposes two bins,
+`conduit` and `conduit-mcp`, so the `conduit-mcp --doctor` recovery lines stay true.
+No mcp or sdk source changes.
+**The demo is a gate.** D-R2: a built-in `conduit demo` runs in-process as the first-run
+path. It needs no PAT, no real side effects, and no unsafe egress flag. D-R4: the demo exits 1 unless three things
+hold. The approved call runs once with the exact approved input. The denied call runs zero times. A replayed approve
+of the same call id returns `conflict` without a second upstream call. The demo therefore doubles as the
+install smoke test.
+**Supply chain.** D-R7: the tarball ships `npm-shrinkwrap.json`, so the adopter installs the
+tree that CI tested. `pack-preview` resolves it with a 4320-minute `--before` age and audits it
+at `high`. D-R10: `check-shrinkwrap-in-pnpm` refuses any (package, version) absent from
+`pnpm-lock.yaml`, and it refuses an empty package set. `check-absent` counts a broken symlink as
+present. `check-tarball-paths` requires `package/LICENSE`. D-R11: one `pack` job builds
+the tarball once. Every CI leg that installs it matches its SHA-256 first, and the release promotes those tested
+bytes without a repack. D-R8: the adopter command is `npm install -g --ignore-scripts`, the same command CI
+runs. D-R12: the Node floor is `>=22.12.0`. D-R9 and D-R12: CI tests the exact floor and the latest
+Node 24 on Linux and macOS. `ajv` stays a direct CLI dependency; it mirrors the inlined sdk manifest and
+adds no package to the graph.
+**Version.** D-R3: `0.2.0-alpha.0` on all three packages, the CLI `VERSION` constant,
+and the daemon's `AGENT_VERSION`. They move together because the CLI/daemon skew check compares them.
+**Two PRs.** D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carried the
+packaging, the demo, CI, and the install notes. Each PR takes the Tier 2 review and the `/explain-diff`
+quiz. D-R13 sets the build order and moves the doctor-fixture fix ahead of both PRs.
+**Accepted limits.** (1) The demo's sdk path reads `CONDUIT_APPROVAL_TTL`. Removing the
+read needs an sdk change. A small TTL yields a loud FAIL, never a false pass. (2) D-R10 is a best-effort version-set
+guard, not graph equality. npm and pnpm hoist differently, so dependency edges may differ. The structural guarantee
+is the CI run of the real demo, daemon, and doctor on the exact npm tree. (3) Section 4 of the install notes, the
+guided path for an adopter's own GitHub calls, is unverified until founder dogfood.
+**Not in scope.** A public npm release; the preview is a GitHub prerelease asset. Signed build provenance
+for the tarball is deferred to public R3; the notes disclose integrity only.
 - **R1 Lane A landed — two recorded deviations and one accepted limit (decided 2026-09-19):** ✅
 Lane A (the SDK half of R1: execution kinds, provenance, the direct arm, scoped authority) landed with three
 departures from the R1 design spec, each deliberate. **(1) The `unknown` outcome travels on the

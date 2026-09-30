@@ -1020,6 +1020,42 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). <strong>Next
 <h2 id="18-open-questions-decisions-to-lock">18. Open questions / decisions to lock</h2>
 <p><strong>Resolved (locked):</strong></p>
 <ul>
+<li><strong>R3a preview packaging — one CLI tarball and <code>conduit demo</code> (decided 2026-09-25; landed
+2026-09-30):</strong> ✅ <strong>Artifact form.</strong> D-R1: the preview ships as one CLI tarball. tsup
+<code>noExternal</code> inlines <code>@conduithq/sdk</code> and <code>@conduithq/mcp</code> into it. Three tarballs
+were rejected because sibling-tarball resolution under <code>npm i -g</code> is unverified. A vendored tree was
+rejected because libsql&#39;s native binary makes it platform-specific. D-R6: the CLI entry becomes
+<code>dist/conduit.js</code>, and mcp&#39;s daemon entry ships as <code>dist/bin.js</code>. The reason is that
+<code>daemonEntryPoint()</code> resolves <code>./bin.js</code> beside the running code. The tarball exposes two bins,
+<code>conduit</code> and <code>conduit-mcp</code>, so the <code>conduit-mcp --doctor</code> recovery lines stay true.
+No mcp or sdk source changes.
+<strong>The demo is a gate.</strong> D-R2: a built-in <code>conduit demo</code> runs in-process as the first-run
+path. It needs no PAT, no real side effects, and no unsafe egress flag. D-R4: the demo exits 1 unless three things
+hold. The approved call runs once with the exact approved input. The denied call runs zero times. A replayed approve
+of the same call id returns <code>conflict</code> without a second upstream call. The demo therefore doubles as the
+install smoke test.
+<strong>Supply chain.</strong> D-R7: the tarball ships <code>npm-shrinkwrap.json</code>, so the adopter installs the
+tree that CI tested. <code>pack-preview</code> resolves it with a 4320-minute <code>--before</code> age and audits it
+at <code>high</code>. D-R10: <code>check-shrinkwrap-in-pnpm</code> refuses any (package, version) absent from
+<code>pnpm-lock.yaml</code>, and it refuses an empty package set. <code>check-absent</code> counts a broken symlink as
+present. <code>check-tarball-paths</code> requires <code>package/LICENSE</code>. D-R11: one <code>pack</code> job builds
+the tarball once. Every CI leg that installs it matches its SHA-256 first, and the release promotes those tested
+bytes without a repack. D-R8: the adopter command is <code>npm install -g --ignore-scripts</code>, the same command CI
+runs. D-R12: the Node floor is <code>&gt;=22.12.0</code>. D-R9 and D-R12: CI tests the exact floor and the latest
+Node 24 on Linux and macOS. <code>ajv</code> stays a direct CLI dependency; it mirrors the inlined sdk manifest and
+adds no package to the graph.
+<strong>Version.</strong> D-R3: <code>0.2.0-alpha.0</code> on all three packages, the CLI <code>VERSION</code> constant,
+and the daemon&#39;s <code>AGENT_VERSION</code>. They move together because the CLI/daemon skew check compares them.
+<strong>Two PRs.</strong> D-R5: PR A carried the approval-guidance product fixes and landed first. PR B carried the
+packaging, the demo, CI, and the install notes. Each PR takes the Tier 2 review and the <code>/explain-diff</code>
+quiz. D-R13 sets the build order and moves the doctor-fixture fix ahead of both PRs.
+<strong>Accepted limits.</strong> (1) The demo&#39;s sdk path reads <code>CONDUIT_APPROVAL_TTL</code>. Removing the
+read needs an sdk change. A small TTL yields a loud FAIL, never a false pass. (2) D-R10 is a best-effort version-set
+guard, not graph equality. npm and pnpm hoist differently, so dependency edges may differ. The structural guarantee
+is the CI run of the real demo, daemon, and doctor on the exact npm tree. (3) Section 4 of the install notes, the
+guided path for an adopter&#39;s own GitHub calls, is unverified until founder dogfood.
+<strong>Not in scope.</strong> A public npm release; the preview is a GitHub prerelease asset. Signed build provenance
+for the tarball is deferred to public R3; the notes disclose integrity only.</li>
 <li><strong>R1 Lane A landed — two recorded deviations and one accepted limit (decided 2026-09-19):</strong> ✅
 Lane A (the SDK half of R1: execution kinds, provenance, the direct arm, scoped authority) landed with three
 departures from the R1 design spec, each deliberate. <strong>(1) The <code>unknown</code> outcome travels on the
