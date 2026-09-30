@@ -810,7 +810,7 @@ folder (`~/.local/share/conduit-preview/<version>`), renames `npm-shrinkwrap.jso
 `conduit` (`dist/conduit.js`) and `conduit-mcp` (`dist/bin.js`) into
 `~/.local/bin`. No step uses `npm install -g` or needs root. Node resolves a symlinked main module
 to its real path, so `daemonEntryPoint()` still finds `dist/bin.js`. One tarball still serves every
-OS. The CI preview legs are specified to run the same commands; that CI change has not run yet.
+OS. The CI preview legs run the same commands; run 36695420072 passed on Linux and macOS with Node 22.12.0 and 24.
 **D-R7 and D-R8 revised (founder, 2026-09-30).** D-R7 first said the shipped shrinkwrap pins the
 adopter's tree under `npm install -g`, and D-R8 made `npm install -g --ignore-scripts` the
 adopter command. Both are withdrawn. Evidence: in CI run 36692433505, every preview leg failed
