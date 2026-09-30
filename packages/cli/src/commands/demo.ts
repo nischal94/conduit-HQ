@@ -1,4 +1,4 @@
-import { type DemoResult, runDemo, times } from "../demo/run.js";
+import { type DemoResult, judgeEvidence, runDemo, times } from "../demo/run.js";
 import { INSTALL_NOTES_URL } from "../version.js";
 
 export const DEMO_USAGE = `Usage: conduit demo
@@ -17,30 +17,47 @@ export const DEMO_HEADER = "conduit demo — the approval gate, end to end (in m
 /** Printed after PASS: the adopter's next command, at the moment they need it. */
 export const NEXT_STEP = `Next: follow step 4 of ${INSTALL_NOTES_URL} to govern your own agent's calls.`;
 
+function runtimeLog(log: string[]): string[] {
+  return ["Runtime log:", ...log.map((l) => `  ${l}`)];
+}
+
+/**
+ * The verdict is re-derived here from the evidence, so a result whose `ok`
+ * flag disagrees with its evidence renders FAIL. Any disagreement fails closed.
+ */
 export function renderDemo(result: DemoResult): {
   stdout: string;
   stderr: string;
   exitCode: 0 | 1;
 } {
+  if (result.evidence === null) {
+    // Nothing ran, so there is no observation to report.
+    return {
+      stdout: `[conduit demo] Setup failed: ${result.failures.join("; ")}. Context: { checks: none ran }\n\nFAIL\n`,
+      stderr: [...runtimeLog(result.log), ""].join("\n"),
+      exitCode: 1,
+    };
+  }
+  const failures = [...new Set([...judgeEvidence(result.evidence), ...result.failures])];
+  const ok = result.ok && failures.length === 0;
   const { approve, deny, replay } = result.evidence;
   const lines = [
     `approve: ${approve.pausedBeforeRun ? "paused before it ran" : "DID NOT PAUSE"}; after approval the upstream received it ${times(approve.approvedCalls)}${approve.exactInput ? ", with the exact input" : ", NOT with the exact input"}`,
     `deny:    ${deny.pausedBeforeRun ? "paused before it ran" : "DID NOT PAUSE"}; after denial the upstream received it ${times(deny.deniedCalls)}`,
     `replay:  approving the same call again was ${replay.status === "conflict" ? "refused (conflict)" : `answered ${replay.status}`}; upstream total is still ${replay.totalCallsAfter}`,
     "",
-    result.ok ? "PASS" : "FAIL",
-    ...(result.ok ? [NEXT_STEP] : []),
+    ok ? "PASS" : "FAIL",
+    ...(ok ? [NEXT_STEP] : []),
   ];
-  const stderr = result.ok
+  const stderr = ok
     ? ""
     : [
         "[conduit demo] Checks failed:",
-        ...result.failures.map((f) => `  - ${f}`),
-        "Runtime log:",
-        ...result.log.map((l) => `  ${l}`),
+        ...failures.map((f) => `  - ${f}`),
+        ...runtimeLog(result.log),
         "",
       ].join("\n");
-  return { stdout: `${lines.join("\n")}\n`, stderr, exitCode: result.ok ? 0 : 1 };
+  return { stdout: `${lines.join("\n")}\n`, stderr, exitCode: ok ? 0 : 1 };
 }
 
 export async function demo(

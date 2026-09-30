@@ -1,6 +1,12 @@
 // packages/cli/src/demo/run.ts
 import { createApprovalRuntime, provisionSourceRequest } from "@conduithq/mcp";
-import { openSqliteStore, SecretBox } from "@conduithq/sdk";
+import {
+  type ExecutionManager,
+  type ExecutionOutcome,
+  openSqliteStore,
+  type ResumeOutcome,
+  SecretBox,
+} from "@conduithq/sdk";
 import { createClient } from "@libsql/client";
 import { DEMO_NAMESPACE, DEMO_TOOL, type DemoUpstream, startDemoUpstream } from "./upstream.js";
 
@@ -14,21 +20,43 @@ export interface DemoEvidence {
     decisionApplied: boolean;
     approvedCalls: number;
     exactInput: boolean;
+    /** The execution's error (`name: message`) when it ended `failed`. */
+    error?: string;
   };
-  deny: { pausedBeforeRun: boolean; status: string; decisionApplied: boolean; deniedCalls: number };
+  deny: {
+    pausedBeforeRun: boolean;
+    status: string;
+    decisionApplied: boolean;
+    deniedCalls: number;
+    /** The execution's error (`name: message`) when it ended `failed`. */
+    error?: string;
+  };
   replay: { status: string; totalCallsAfter: number };
 }
 
-export interface DemoResult {
+interface DemoResultBase {
   ok: boolean;
-  evidence: DemoEvidence;
   failures: string[];
   /** Runtime log lines, kept out of stdout; the command prints them only on failure. */
   log: string[];
 }
 
+/**
+ * `evidence` is null only when the demo could not start: nothing was
+ * observed, so there is nothing to report. `renderDemo` re-derives the
+ * verdict from `evidence` and does not trust `ok` alone.
+ */
+export type DemoResult =
+  | (DemoResultBase & { evidence: DemoEvidence })
+  | (DemoResultBase & { ok: false; evidence: null });
+
+/** The two manager calls the demo makes. */
+export type DemoManager = Pick<ExecutionManager, "start" | "resume">;
+
 export interface DemoDeps {
   startUpstream?: () => Promise<DemoUpstream>;
+  /** Test seam: wraps the runtime's manager so a test can make it lie. */
+  wrapManager?: (manager: DemoManager) => DemoManager;
 }
 
 function program(input: { title: string }): string {
@@ -46,10 +74,21 @@ export function times(n: number): string {
   return n === 1 ? "1 time" : `${n} times`;
 }
 
+function errorOf(outcome: ExecutionOutcome | ResumeOutcome): { error?: string } {
+  return outcome.status === "failed"
+    ? { error: `${outcome.error.name}: ${outcome.error.message}` }
+    : {};
+}
+
+function cause(error: string | undefined): string {
+  return error === undefined ? "" : `: ${error}`;
+}
+
 /**
  * The demo's verdict, as a pure function of the evidence, so each of the
- * nine predicates can be proven to fail on its own (run.test.ts). Returns
- * one message per broken predicate; an empty list is a PASS.
+ * nine checks can be proven to fail on its own (run.test.ts). Returns one
+ * message per broken check; an empty list is a PASS. A failed execution's
+ * error is appended to the message of the check it broke.
  */
 export function judgeEvidence(e: DemoEvidence): string[] {
   const failures: string[] = [];
@@ -57,7 +96,12 @@ export function judgeEvidence(e: DemoEvidence): string[] {
     failures.push("the approve execution did not pause before the upstream call");
   }
   if (e.approve.status !== "completed" || !e.approve.decisionApplied) {
-    failures.push(`the approval was not applied (status ${e.approve.status})`);
+    const status = `(status ${e.approve.status})${cause(e.approve.error)}`;
+    failures.push(
+      e.approve.decisionApplied
+        ? `the approval was applied, but the approved call did not complete ${status}`
+        : `the approval was not applied ${status}`,
+    );
   }
   if (e.approve.approvedCalls !== 1) {
     failures.push(`the approved call ran ${times(e.approve.approvedCalls)}, expected 1 time`);
@@ -69,7 +113,7 @@ export function judgeEvidence(e: DemoEvidence): string[] {
     failures.push("the deny execution did not pause before the upstream call");
   }
   if (!e.deny.decisionApplied) {
-    failures.push(`the denial was not applied (status ${e.deny.status})`);
+    failures.push(`the denial was not applied (status ${e.deny.status})${cause(e.deny.error)}`);
   }
   if (e.deny.deniedCalls !== 0) {
     failures.push(`the denied call ran ${times(e.deny.deniedCalls)}, expected 0 times`);
@@ -85,18 +129,6 @@ export function judgeEvidence(e: DemoEvidence): string[] {
   return failures;
 }
 
-const NOT_RUN: DemoEvidence = {
-  approve: {
-    pausedBeforeRun: false,
-    status: "not-run",
-    decisionApplied: false,
-    approvedCalls: 0,
-    exactInput: false,
-  },
-  deny: { pausedBeforeRun: false, status: "not-run", decisionApplied: false, deniedCalls: 0 },
-  replay: { status: "not-run", totalCallsAfter: 0 },
-};
-
 /**
  * Never throws: a run that cannot start (the loopback bind fails, onboarding
  * is refused, the store cannot open) is a FAIL with the reason and the
@@ -108,7 +140,7 @@ export async function runDemo(deps: DemoDeps = {}): Promise<DemoResult> {
     return await drive(deps, log);
   } catch (error) {
     const reason = error instanceof Error ? error.message : String(error);
-    return { ok: false, evidence: NOT_RUN, failures: [`the demo could not run: ${reason}`], log };
+    return { ok: false, evidence: null, failures: [`the demo could not run: ${reason}`], log };
   }
 }
 
@@ -140,7 +172,10 @@ async function drive(deps: DemoDeps, log: string[]): Promise<DemoResult> {
     // Private egress is granted HERE, in code, to this process only, for the
     // loopback server this process just started. The adopter's daemon and
     // the CONDUIT_UNSAFE_ALLOW_PRIVATE_EGRESS env var are never touched.
-    const { manager } = await createApprovalRuntime({ store, allowPrivateEgress: true, log: sink });
+    const runtime = await createApprovalRuntime({ store, allowPrivateEgress: true, log: sink });
+    const manager: DemoManager = deps.wrapManager
+      ? deps.wrapManager(runtime.manager)
+      : runtime.manager;
 
     // Act 1: approve.
     const a = await manager.start(program(APPROVED_INPUT));
@@ -178,12 +213,14 @@ async function drive(deps: DemoDeps, log: string[]): Promise<DemoResult> {
         decisionApplied: aResumed?.decisionApplied ?? false,
         approvedCalls,
         exactInput,
+        ...errorOf(aResumed ?? a),
       },
       deny: {
         pausedBeforeRun: dPausedBeforeRun,
         status: dResumed?.status ?? d.status,
         decisionApplied: dResumed?.decisionApplied ?? false,
         deniedCalls,
+        ...errorOf(dResumed ?? d),
       },
       replay: { status: replay?.status ?? "not-run", totalCallsAfter },
     };

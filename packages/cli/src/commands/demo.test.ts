@@ -87,6 +87,33 @@ describe("conduit demo rendering", () => {
     expect(out.exitCode).toBe(1);
   });
 
+  it("INVARIANT §18-R3a: an ok flag that contradicts failing evidence still renders FAIL and exits 1", () => {
+    const out = renderDemo({ ...FAIL, ok: true, failures: [] });
+    expect(out.exitCode).toBe(1);
+    expect(out.stdout).toContain("\nFAIL\n");
+    expect(out.stdout).not.toContain("PASS");
+    expect(out.stdout).not.toContain(NEXT_STEP);
+    expect(out.stderr).toContain("the approved call ran 2 times, expected 1 time");
+  });
+
+  it("a run that never started says why and prints no evidence lines", () => {
+    const out = renderDemo({
+      ok: false,
+      evidence: null,
+      failures: ["the demo could not run: listen EPERM 127.0.0.1"],
+      log: ["[runtime] boot"],
+    });
+    expect(out.exitCode).toBe(1);
+    expect(out.stdout).toContain(
+      "[conduit demo] Setup failed: the demo could not run: listen EPERM 127.0.0.1. Context: { checks: none ran }",
+    );
+    expect(out.stdout).not.toContain("DID NOT PAUSE");
+    expect(out.stdout).not.toContain("approve:");
+    expect(out.stdout).not.toContain("replay:");
+    expect(out.stdout).toContain("\nFAIL\n");
+    expect(out.stderr).toContain("[runtime] boot");
+  });
+
   it("refuses unexpected arguments with exit 1 and never runs the demo", async () => {
     const spy = vi.spyOn(process.stderr, "write").mockImplementation(() => true);
     let ran = false;
