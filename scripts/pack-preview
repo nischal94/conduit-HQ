@@ -3,6 +3,9 @@
 # npm-shrinkwrap.json (resolved no newer than minimumReleaseAge allows),
 # audits that tree, repacks, and refuses the tarball unless its paths pass
 # the allowlist. Contacts the npm registry: not for agent shells.
+# The adopter install (docs/alpha/INSTALL.md) extracts the tarball, renames
+# npm-shrinkwrap.json to package-lock.json, and runs `npm ci` there. In
+# CI, `npm install -g` of the tarball ignored the shipped shrinkwrap.
 set -eu
 
 root="$(git rev-parse --show-toplevel)"

@@ -16,11 +16,12 @@ as GitHub issues on this repository.
   (arm64). Other combinations (Linux arm64, musl/Alpine, Intel macOS) are
   untested; they may work, but nothing has checked them. Windows is not
   supported (the daemon uses Unix sockets).
+- `npm` (it ships with Node) and `tar` on your PATH.
 - Network access to the npm registry during install: the tarball contains
-  Conduit's own code, and npm fetches its dependencies at the exact
-  versions pinned in the tarball's `npm-shrinkwrap.json`. Those versions
-  were at least three days old when the tarball was packed, and they
-  passed `npm audit` at level `high`.
+  Conduit's own code, and `npm ci` fetches its dependencies at the exact
+  versions pinned in the tarball's lockfile. Those versions were at least
+  three days old when the tarball was packed, and they passed `npm audit`
+  at level `high`.
 
 ## 1. Download and verify
 
@@ -49,32 +50,71 @@ tarball. This preview has no signature or build attestation.
 
 ## 2. Install
 
+> **Not yet verified by CI.** This install replaced `npm install -g` on
+> 2026-09-30: in CI, `npm install -g` ignored the dependency versions the
+> tarball pins. CI has not yet run the commands below on a preview
+> tarball. If a step fails, stop and report it (see "When something goes
+> wrong").
+
+Run this block in the folder that holds the verified tarball. It extracts
+Conduit into its own folder, `~/.local/share/conduit-preview/0.2.0-alpha.0`,
+installs its dependencies there, and links the two commands, `conduit` and
+`conduit-mcp`, into `~/.local/bin`. It needs no `sudo` and does not change
+your global npm packages. It stops at the first failed command.
+
 ```bash
-npm install -g --ignore-scripts ./conduithq-cli-0.2.0-alpha.0.tgz
+(
+  set -eu
+  version=0.2.0-alpha.0
+  tarball="$PWD/conduithq-cli-$version.tgz"
+  dir="$HOME/.local/share/conduit-preview/$version"
+  [ -f "$tarball" ] || { echo "Not found: $tarball. Run this in the download folder." >&2; exit 1; }
+  [ ! -e "$dir" ] || { echo "Already exists: $dir. Remove it, then run this again." >&2; exit 1; }
+  mkdir -p "$dir"
+  tar -xzf "$tarball" -C "$dir"
+  cd "$dir/package"
+  mv npm-shrinkwrap.json package-lock.json
+  npm ci --omit=dev --ignore-scripts
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$dir/package/dist/conduit.js" "$HOME/.local/bin/conduit"
+  ln -sf "$dir/package/dist/bin.js" "$HOME/.local/bin/conduit-mcp"
+)
 ```
 
-`--ignore-scripts` stops npm from running install-time scripts from any
-package in the tree. Conduit needs none. Before a preview tarball is
-released, CI installs it with these same flags into an isolated prefix.
+The tarball carries its dependency versions in `npm-shrinkwrap.json`. The
+block renames that file to `package-lock.json`, and `npm ci` then installs
+exactly the versions it lists. `--ignore-scripts` stops npm from running
+install-time scripts from any package in the tree. Conduit needs none.
+Your master key and credentials live in `~/.conduit`, not in this folder.
 
-This installs two commands: `conduit` and `conduit-mcp`. Check the version:
+If the block fails part-way, remove the partial folder, then run the block
+again:
 
 ```bash
+rm -rf ~/.local/share/conduit-preview/0.2.0-alpha.0
+```
+
+If `~/.local/bin` is not on your PATH, add it for this shell, and add the
+same line to your shell profile:
+
+```bash
+export PATH="$HOME/.local/bin:$PATH"
+```
+
+Check which `conduit` your shell finds, and its version:
+
+```bash
+command -v conduit
 conduit --version
 ```
 
-If `npm install -g` fails with `EACCES`, your Node is a system install
-that npm cannot write to. Do not use `sudo`. Either install Node with a
-version manager (nvm, fnm, or volta) or give npm a user-owned prefix:
-
-```bash
-npm config set prefix ~/.npm-global
-export PATH="$HOME/.npm-global/bin:$PATH"   # add this line to your shell profile
-```
+The first line should end in `.local/bin/conduit`. If it shows another
+path, a different `conduit` comes first on your PATH: remove it, or put
+`~/.local/bin` before it. The second line should print `0.2.0-alpha.0`.
 
 If `conduit` prints `Node … is not supported`, switch to Node 22.12+ or 24
-(for example `nvm install 24 && nvm use 24`), then run the install command
-again: a version manager keeps global packages per Node version.
+(for example `nvm install 24 && nvm use 24`), then run `conduit --version`
+again. The linked command runs the first `node` on your PATH.
 
 ## 3. See the approval gate work (no setup)
 
@@ -159,13 +199,15 @@ repository, so your first governed call has a small, known blast radius.
 
 4. **Point Claude Code at Conduit.** Pin both Node and Conduit by absolute
    path: a client started outside this shell (for example the desktop app)
-   may not have your Node on its PATH:
+   may not have your Node or `~/.local/bin` on its PATH:
 
    ```bash
-   claude mcp add --scope user conduit -- "$(command -v node)" "$(realpath "$(command -v conduit)")" serve
+   claude mcp add --scope user conduit -- "$(command -v node)" "$HOME/.local/share/conduit-preview/0.2.0-alpha.0/package/dist/conduit.js" serve
    ```
 
-   If you later switch Node versions, run this command again.
+   If you later switch Node versions, run
+   `claude mcp remove --scope user conduit`, then this command again.
+   "Moving to a later preview" has the command for a new version.
 
    Restart Claude Code (or open a new session) so it loads the server.
 
@@ -213,13 +255,45 @@ fill in the short form, whether it went well or not:
 
 ## Moving to a later preview
 
-Download and verify the new tarball as in step 1. In the install line,
-replace `NEW_VERSION` with the version in the new file's name.
+Download and verify the new tarball as in step 1. Each version installs
+into its own folder, and the links in `~/.local/bin` move to the new one.
+In the blocks below, replace `NEW_VERSION` with the version in the new
+file's name.
+
+Stop the running daemon first:
 
 ```bash
 conduit daemon stop
-npm install -g --ignore-scripts ./conduithq-cli-NEW_VERSION.tgz
+```
+
+Then run this block in the folder that holds the new tarball:
+
+```bash
+(
+  set -eu
+  version=NEW_VERSION
+  tarball="$PWD/conduithq-cli-$version.tgz"
+  dir="$HOME/.local/share/conduit-preview/$version"
+  [ -f "$tarball" ] || { echo "Not found: $tarball. Run this in the download folder." >&2; exit 1; }
+  [ ! -e "$dir" ] || { echo "Already exists: $dir. Remove it, then run this again." >&2; exit 1; }
+  mkdir -p "$dir"
+  tar -xzf "$tarball" -C "$dir"
+  cd "$dir/package"
+  mv npm-shrinkwrap.json package-lock.json
+  npm ci --omit=dev --ignore-scripts
+  mkdir -p "$HOME/.local/bin"
+  ln -sf "$dir/package/dist/conduit.js" "$HOME/.local/bin/conduit"
+  ln -sf "$dir/package/dist/bin.js" "$HOME/.local/bin/conduit-mcp"
+)
+```
+
+Check the new version, and point Claude Code at it:
+
+```bash
+conduit --version
 conduit demo
+claude mcp remove --scope user conduit
+claude mcp add --scope user conduit -- "$(command -v node)" "$HOME/.local/share/conduit-preview/NEW_VERSION/package/dist/conduit.js" serve
 ```
 
 If the new daemon refuses your existing state, move it aside instead of
@@ -227,6 +301,14 @@ deleting it (it holds your master key and sealed credentials):
 
 ```bash
 mv ~/.conduit ~/.conduit.previous
+```
+
+The previous version's folder stays until you remove it. When the new
+version works, remove the old folder. Replace `OLD_VERSION` with the
+version you moved from:
+
+```bash
+rm -rf "$HOME/.local/share/conduit-preview/OLD_VERSION"
 ```
 
 ## Known limits of this preview
@@ -237,16 +319,38 @@ mv ~/.conduit ~/.conduit.previous
   `conduit daemon stop`.
 - No state migration between previews: moving `~/.conduit` aside is the
   upgrade path when a new build refuses old state.
+- An agent with a shell can approve its own paused call. Conduit keeps
+  approve off the MCP surface, so an agent that reaches Conduit only
+  through MCP cannot approve its own call. Many coding agents can also run
+  shell commands as your user. Such an agent can run
+  `conduit approvals list` and then the approve line it prints. Until
+  Conduit adds a human-presence check, the approval gate protects against
+  MCP-only agents, not against an agent with your shell.
 
 ## Uninstall
 
+This block stops the daemon, then removes the two links and the preview
+folder with every installed version. It stops at the first failed command,
+so it removes nothing while a daemon it cannot stop is still running.
+
 ```bash
-conduit daemon stop
-npm uninstall -g @conduithq/cli
+(
+  set -eu
+  conduit daemon stop
+  rm -f "$HOME/.local/bin/conduit" "$HOME/.local/bin/conduit-mcp"
+  rm -rf "$HOME/.local/share/conduit-preview"
+)
 ```
 
-Your state stays in `~/.conduit`. It holds the master key and your sealed
-credentials. Delete it only if you intend to lose them:
+If you added Conduit to Claude Code in step 4, remove it there too:
+
+```bash
+claude mcp remove --scope user conduit
+```
+
+These commands do not remove `~/.conduit`. It is your data: it holds the
+master key and your sealed credentials. Delete it only if you intend to
+lose them:
 
 ```bash
 rm -rf ~/.conduit

@@ -1,9 +1,13 @@
 #!/bin/sh
-# Verifies npm installed exactly the shrinkwrapped tree: every non-optional
-# package the shrinkwrap names is present at the pinned version.
+# Verifies `npm ci` installed exactly the lockfile's tree in an extracted
+# preview folder: every non-optional package the lockfile names is present
+# at the pinned version, and nothing else is installed. The install renames
+# the shipped npm-shrinkwrap.json to package-lock.json, so this reads
+# package-lock.json and refuses a folder that still holds
+# npm-shrinkwrap.json: npm before v12 would have installed from that file.
 set -eu
 if [ "$#" -ne 1 ]; then
-  echo "[check-shrinkwrap-installed] Usage: check-shrinkwrap-installed <installed package dir>" >&2
+  echo "[check-shrinkwrap-installed] Usage: check-shrinkwrap-installed <extracted package dir>" >&2
   exit 2
 fi
 # shellcheck disable=SC2016 # single quotes are intended: ${...} is a JS template literal.
@@ -11,7 +15,16 @@ node -e '
   const fs = require("node:fs");
   const path = require("node:path");
   const root = process.argv[1];
-  const lock = JSON.parse(fs.readFileSync(path.join(root, "npm-shrinkwrap.json"), "utf8"));
+  const lockFile = path.join(root, "package-lock.json");
+  if (fs.existsSync(path.join(root, "npm-shrinkwrap.json"))) {
+    console.error(`[check-shrinkwrap-installed] Refused: npm-shrinkwrap.json is still present, so npm may have installed from it instead of package-lock.json. Context: { root: ${root} }`);
+    process.exit(1);
+  }
+  if (!fs.existsSync(lockFile)) {
+    console.error(`[check-shrinkwrap-installed] Refused: package-lock.json is missing. Context: { root: ${root} }`);
+    process.exit(1);
+  }
+  const lock = JSON.parse(fs.readFileSync(lockFile, "utf8"));
   const entries = Object.entries(lock.packages ?? {}).filter(([rel]) => rel !== "");
   const libc = process.platform !== "linux" ? undefined
     : process.report.getReport().header.glibcVersionRuntime ? "glibc" : "musl";
@@ -37,9 +50,9 @@ node -e '
     }
     checked++;
     const version = JSON.parse(fs.readFileSync(manifest, "utf8")).version;
-    if (version !== meta.version) bad.push(`${rel}: installed ${version}, shrinkwrap ${meta.version}`);
+    if (version !== meta.version) bad.push(`${rel}: installed ${version}, lockfile ${meta.version}`);
   }
-  // The other direction: nothing installed that the shrinkwrap does not name.
+  // The other direction: nothing installed that the lockfile does not name.
   const known = new Set(entries.map(([rel]) => rel));
   const walk = (dir, relBase) => {
     const nm = path.join(dir, "node_modules");
@@ -50,15 +63,15 @@ node -e '
       for (const pkg of scoped) {
         const rel = `${relBase}node_modules/${pkg}`;
         if (!fs.existsSync(path.join(nm, pkg, "package.json"))) continue;
-        if (!known.has(rel)) bad.push(`${rel}: installed but not in the shrinkwrap`);
+        if (!known.has(rel)) bad.push(`${rel}: installed but not in the lockfile`);
         walk(path.join(nm, pkg), `${rel}/`);
       }
     }
   };
   walk(root, "");
-  if (checked === 0) bad.push("no shrinkwrapped package was found installed");
+  if (checked === 0) bad.push("no package the lockfile names was found installed");
   if (bad.length > 0) {
-    console.error(`[check-shrinkwrap-installed] Installed tree differs from the shrinkwrap. Context: { root: ${root} }\n  ${bad.join("\n  ")}`);
+    console.error(`[check-shrinkwrap-installed] Installed tree differs from the lockfile. Context: { root: ${root} }\n  ${bad.join("\n  ")}`);
     process.exit(1);
   }
 ' "$1"
