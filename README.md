@@ -51,12 +51,13 @@ terminal.
 
 ## Quick start
 
-**Preview build:** the alpha preview is published as a GitHub prerelease
+**Preview build:** the alpha preview goes out as a GitHub prerelease
 (tag `v0.2.0-alpha.0`) on the
-[Releases page](https://github.com/nischal94/conduit-HQ/releases). The
-install notes are in [`docs/alpha/INSTALL.md`](docs/alpha/INSTALL.md).
-After the install, run `conduit demo` to see the approval gate work in one
-command. If the Releases page lists no prerelease yet, run from source.
+[Releases page](https://github.com/nischal94/conduit-HQ/releases). If the
+page lists one, install it per
+[`docs/alpha/INSTALL.md`](docs/alpha/INSTALL.md). After the install, run
+`conduit demo` to see the approval gate work in one command. If the page
+lists no prerelease yet, run from source.
 
 Or run from source (Node version in [`.nvmrc`](.nvmrc), pnpm):
 
