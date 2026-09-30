@@ -12,6 +12,7 @@ dist/
 # Generated outputs that don't exist yet — ignored before first appearance.
 coverage/
 *.tsbuildinfo
+.preview/
 .claude/launch.json
 # Daemon test harness bundles the spawnable helper into the package so
 # node_modules resolution still works; removed on clean exit, left behind

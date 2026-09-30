@@ -1,0 +1,13 @@
+#!/bin/sh
+# Fails if the given path exists. Used by CI to prove `conduit demo`
+# created no state directory.
+set -eu
+if [ "$#" -ne 1 ]; then
+  echo "[check-absent] Usage: check-absent <path>" >&2
+  exit 2
+fi
+# -e follows symlinks, so a dangling link would read as absent; -L catches it.
+if [ -e "$1" ] || [ -L "$1" ]; then
+  echo "[check-absent] Path exists but must not: $1" >&2
+  exit 1
+fi

@@ -1,0 +1,48 @@
+#!/bin/sh
+# Version-set guard (best-effort, not graph equality): refuses an npm
+# shrinkwrap naming any (package, version) that pnpm-lock.yaml's
+# `packages:` section does not contain.
+set -eu
+if [ "$#" -ne 2 ]; then
+  echo "[check-shrinkwrap-in-pnpm] Usage: check-shrinkwrap-in-pnpm <npm-shrinkwrap.json> <pnpm-lock.yaml>" >&2
+  exit 2
+fi
+# shellcheck disable=SC2016 # single quotes are intended: ${...} is a JS template literal.
+node -e '
+  const fs = require("node:fs");
+  const lock = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const seen = new Map();
+  let inPackages = false;
+  // lockfileVersion 9.0: under `packages:`, each key sits at indent 2 as
+  // `  name@version:` or `  '"'"'@scope/name@version'"'"':`.
+  for (const line of fs.readFileSync(process.argv[2], "utf8").split("\n")) {
+    if (/^\S/.test(line)) { inPackages = line === "packages:"; continue; }
+    const m = inPackages && /^  (\S.*):$/.exec(line);
+    if (!m) continue;
+    const key = m[1].replace(/^'"'"'|'"'"'$/g, "");
+    const at = key.lastIndexOf("@");
+    if (at <= 0) continue;
+    const name = key.slice(0, at);
+    if (!seen.has(name)) seen.set(name, new Set());
+    seen.get(name).add(key.slice(at + 1));
+  }
+  if (seen.size === 0) {
+    console.error("[check-shrinkwrap-in-pnpm] Refused: no packages were read from the pnpm lockfile, so nothing can be compared.");
+    process.exit(1);
+  }
+  const named = Object.keys(lock.packages ?? {}).filter((rel) => rel !== "");
+  if (named.length === 0) {
+    console.error(`[check-shrinkwrap-in-pnpm] Refused: the shrinkwrap names no packages, so nothing can be compared. Context: { shrinkwrap: ${process.argv[1]} }`);
+    process.exit(1);
+  }
+  const bad = [];
+  for (const [rel, meta] of Object.entries(lock.packages ?? {})) {
+    if (rel === "") continue;
+    const name = rel.slice(rel.lastIndexOf("node_modules/") + "node_modules/".length);
+    if (!seen.get(name)?.has(meta.version)) bad.push(`${name}@${meta.version} (pnpm has: ${[...(seen.get(name) ?? [])].join(", ") || "none"})`);
+  }
+  if (bad.length > 0) {
+    console.error(`[check-shrinkwrap-in-pnpm] Refused: the shrinkwrap names versions pnpm never resolved:\n  ${bad.join("\n  ")}`);
+    process.exit(1);
+  }
+' "$1" "$2"

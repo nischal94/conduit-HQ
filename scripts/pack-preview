@@ -1,0 +1,86 @@
+#!/bin/sh
+# Builds the workspace, packs @conduithq/cli, pins its production tree in
+# npm-shrinkwrap.json (resolved no newer than minimumReleaseAge allows),
+# audits that tree, repacks, and refuses the tarball unless its paths pass
+# the allowlist. Contacts the npm registry: not for agent shells.
+set -eu
+
+root="$(git rev-parse --show-toplevel)"
+out="${1:-$root/.preview}"
+mkdir -p "$out"
+# Absolute from here on: the script cds into the stage before packing.
+out="$(cd "$out" && pwd)"
+stage="$(mktemp -d)"
+trap 'rm -rf "$stage"' EXIT
+
+cd "$root"
+pnpm -r build
+pnpm --filter @conduithq/cli list --prod --depth Infinity --json > "$stage/pnpm-tree.json"
+
+cd "$root/packages/cli"
+version="$(node -p 'require("./package.json").version')"
+tarball="$out/conduithq-cli-$version.tgz"
+rm -f "$tarball" "$tarball.sha256"
+# pnpm pack, not npm pack: it rewrites workspace:* specifiers.
+pnpm pack --pack-destination "$stage" >/dev/null
+tar -xzf "$stage/conduithq-cli-$version.tgz" -C "$stage"
+
+cd "$stage/package"
+# devDependencies name workspace packages that are not on any registry, and
+# scripts must not run during resolution: drop both from the staged manifest.
+# Then steer npm to pnpm's tested versions (D-R10): direct dependencies are
+# pinned exactly (an override on a direct dependency is an npm error), and
+# every transitive package pnpm resolved to ONE version gets an override.
+# shellcheck disable=SC2016 # single quotes are intended: ${...} is a JS template literal.
+node -e '
+  const fs = require("node:fs");
+  const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+  const tree = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+  const seen = new Map();
+  const collect = (deps) => {
+    for (const [name, node] of Object.entries(deps ?? {})) {
+      if (!seen.has(name)) seen.set(name, new Set());
+      seen.get(name).add(node.version);
+      collect(node.dependencies);
+    }
+  };
+  for (const project of Array.isArray(tree) ? tree : [tree]) collect(project.dependencies);
+  delete pkg.devDependencies;
+  delete pkg.scripts;
+  pkg.overrides = {};
+  for (const name of Object.keys(pkg.dependencies)) {
+    const versions = [...(seen.get(name) ?? [])];
+    if (versions.length !== 1) throw new Error(`[pack-preview] Direct dependency ${name} has ${versions.length} pnpm versions`);
+    pkg.dependencies[name] = versions[0];
+  }
+  for (const [name, versions] of seen) {
+    if (!(name in pkg.dependencies) && versions.size === 1) pkg.overrides[name] = [...versions][0];
+  }
+  fs.writeFileSync("package.json", `${JSON.stringify(pkg, null, 2)}\n`);
+' "$stage/pnpm-tree.json"
+# pnpm-workspace.yaml minimumReleaseAge is 4320 minutes; --before mirrors it
+# for any package pnpm resolved to more than one version.
+before="$(node -p 'new Date(Date.now() - 4320 * 60 * 1000).toISOString()')"
+npm install --package-lock-only --ignore-scripts --omit=dev --before="$before" >/dev/null
+mv package-lock.json npm-shrinkwrap.json
+"$root/scripts/check-shrinkwrap-in-pnpm" npm-shrinkwrap.json "$root/pnpm-lock.yaml"
+npm audit --omit=dev --audit-level=high
+npm pack --pack-destination "$out" >/dev/null
+
+if [ ! -f "$tarball" ]; then
+  echo "[pack-preview] Pack failed: expected tarball is missing. Context: { tarball: $tarball }" >&2
+  exit 1
+fi
+"$root/scripts/check-tarball-paths" "$tarball"
+
+# shellcheck disable=SC2016 # single quotes are intended: ${...} is a JS template literal.
+node -e '
+  const { createHash } = require("node:crypto");
+  const { readFileSync, writeFileSync } = require("node:fs");
+  const { basename } = require("node:path");
+  const file = process.argv[1];
+  const sum = createHash("sha256").update(readFileSync(file)).digest("hex");
+  writeFileSync(`${file}.sha256`, `${sum}  ${basename(file)}\n`);
+' "$tarball"
+
+echo "$tarball"
