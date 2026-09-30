@@ -23,7 +23,7 @@ instead (see [Rotation walkthrough](#rotation-walkthrough)).
 | `conduit key rotate` | Rotates the master key. | Direct store, under the maintenance lock; re-seal via `reencryptSecrets` (`@conduithq/sdk`) |
 
 Nothing is published to npm yet — run the built file directly:
-`node <abs path>/packages/cli/dist/bin.js <command>` (build with `npm run build`
+`node <abs path>/packages/cli/dist/conduit.js <command>` (build with `npm run build`
 in this package). `--help` and `--version` are available at the top level.
 
 ## Quick start
@@ -89,7 +89,7 @@ in this package). `--help` and `--version` are available at the top level.
      "mcpServers": {
        "conduit": {
          "command": "node",
-         "args": ["<abs path>/packages/cli/dist/bin.js", "serve"]
+         "args": ["<abs path>/packages/cli/dist/conduit.js", "serve"]
        }
      }
    }

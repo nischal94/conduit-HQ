@@ -479,7 +479,7 @@ export interface ApprovalsOptions {
   stateDir?: string;
 }
 
-/** Production entrypoint wired into the CLI dispatch (bin.ts). */
+/** Production entrypoint wired into the CLI dispatch (cli.ts). */
 export async function approvals(argv: string[], opts: ApprovalsOptions = {}): Promise<number> {
   // NOTE: sandbox module-recovery diagnostics are registered by the DAEMON
   // (`conduitd.ts`), not here — the same move `server.ts` made in D-B1.

@@ -1,4 +1,3 @@
-#!/usr/bin/env node
 import { takeStateDir as parseStateDir } from "@conduithq/mcp";
 import { addMcp } from "./commands/add-mcp.js";
 import { approvals } from "./commands/approvals.js";

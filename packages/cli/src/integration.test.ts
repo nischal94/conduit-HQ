@@ -16,14 +16,14 @@ const execFileAsync = promisify(execFile);
 
 /**
  * Ring-2 integration suite (Lane B Task 7): drives the REAL COMPILED conduit
- * CLI bin (`dist/bin.js serve`) over a real stdio child process — proves the
+ * CLI bin (`dist/conduit.js serve`) over a real stdio child process — proves the
  * `serve` command actually starts the shared `runStdioServer` seam through
  * the CLI's own dispatch/bin door, and that the M8 stdout-purity invariant
  * (pinned in packages/mcp) survives that extra layer.
  *
  * Mirrors packages/mcp/src/integration.test.ts's fixtures and helpers; the
- * one difference is the spawned command: `node dist/bin.js serve` instead of
- * `node dist/bin.js`.
+ * one difference is the spawned command: `node dist/conduit.js serve` instead
+ * of mcp's `node dist/bin.js`.
  */
 
 const PREFIX = "github.acme.prod";
@@ -156,7 +156,7 @@ chmodSync(stateDir, 0o700);
 const dbPath = join(stateDir, "conduit.db");
 const masterKey = SecretBox.generateKeyBytes();
 const masterKeyB64 = Buffer.from(masterKey).toString("base64");
-const cliBinPath = join(process.cwd(), "dist", "bin.js");
+const cliBinPath = join(process.cwd(), "dist", "conduit.js");
 /** The compiled mcp bin — `--daemon --state-dir` is the by-hand start path. */
 const mcpBinPath = join(process.cwd(), "..", "mcp", "dist", "bin.js");
 

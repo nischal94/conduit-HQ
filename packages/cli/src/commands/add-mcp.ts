@@ -306,7 +306,7 @@ export interface AddMcpOptions {
   stateDir?: string;
 }
 
-/** Production entrypoint wired into the CLI dispatch (bin.ts). */
+/** Production entrypoint wired into the CLI dispatch (cli.ts). */
 export async function addMcp(argv: string[], opts: AddMcpOptions = {}): Promise<number> {
   const stateDir = opts.stateDir ?? DEFAULT_CONDUIT_DIR;
   const args = parseAddMcpArgs(argv);

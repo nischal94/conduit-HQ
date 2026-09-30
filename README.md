@@ -57,7 +57,7 @@ Not yet on npm — run from source (Node version in [`.nvmrc`](.nvmrc), pnpm):
 git clone https://github.com/nischal94/conduit-HQ.git && cd conduit-HQ
 pnpm install --frozen-lockfile --ignore-scripts
 pnpm -r build
-alias conduit="node $PWD/packages/cli/dist/bin.js"
+alias conduit="node $PWD/packages/cli/dist/conduit.js"
 ```
 
 **1. Mint a master key** (stored at `~/.conduit/master-key`, mode 0600 — it
@@ -95,7 +95,7 @@ policy defaults: `safe (auto-allow) · review (approval) · destructive
 **3. Point any MCP client at the gateway.** For Claude Code:
 
 ```bash
-claude mcp add --scope user conduit -- node ABS_PATH/packages/cli/dist/bin.js serve
+claude mcp add --scope user conduit -- node ABS_PATH/packages/cli/dist/conduit.js serve
 ```
 
 or in a client's JSON config:
@@ -105,7 +105,7 @@ or in a client's JSON config:
   "mcpServers": {
     "conduit": {
       "command": "node",
-      "args": ["ABS_PATH/packages/cli/dist/bin.js", "serve"]
+      "args": ["ABS_PATH/packages/cli/dist/conduit.js", "serve"]
     }
   }
 }

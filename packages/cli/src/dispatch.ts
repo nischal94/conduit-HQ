@@ -74,7 +74,7 @@ function requestsAddMcpHelp(rest: string[]): boolean {
 /**
  * Pure arg→route function (design §6). Takes argv (without the node/script
  * entries) and returns a route decision. Never touches process.stdout,
- * process.stderr, or process.exit — the caller (bin.ts) is responsible for
+ * process.stderr, or process.exit — the caller (cli.ts) is responsible for
  * acting on the result.
  */
 export function dispatch(argv: string[]): DispatchResult {
