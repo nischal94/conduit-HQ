@@ -267,29 +267,37 @@ describe("runDemo", () => {
 
   it("closes the upstream when the run cannot start", async () => {
     const real = await startDemoUpstream();
-    const dead = await startDemoUpstream();
-    await dead.close();
-    const close = vi.fn(() => real.close());
-    const result = await runDemo({
-      // Onboarding targets a closed port, so drive() throws after the start.
-      startUpstream: async () => ({ url: dead.url, calls: real.calls, close }),
-    });
-    expect(result.ok).toBe(false);
-    expect(result.evidence).toBeNull();
-    expect(close).toHaveBeenCalledTimes(1);
-    await expect(postToolCall(real.url, { title: "after close" })).rejects.toThrow();
+    try {
+      const dead = await startDemoUpstream();
+      await dead.close();
+      const close = vi.fn(() => real.close());
+      const result = await runDemo({
+        // Onboarding targets a closed port, so drive() throws after the start.
+        startUpstream: async () => ({ url: dead.url, calls: real.calls, close }),
+      });
+      expect(result.ok).toBe(false);
+      expect(result.evidence).toBeNull();
+      expect(close).toHaveBeenCalledTimes(1);
+      await expect(postToolCall(real.url, { title: "after close" })).rejects.toThrow();
+    } finally {
+      await real.close().catch(() => {});
+    }
   }, 60_000);
 
   it("closes the upstream when the checks fail", async () => {
     const real = await startDemoUpstream({ readOnly: true });
-    const close = vi.fn(() => real.close());
-    const result = await runDemo({
-      startUpstream: async () => ({ url: real.url, calls: real.calls, close }),
-    });
-    expect(result.ok).toBe(false);
-    expect(result.evidence).not.toBeNull();
-    expect(close).toHaveBeenCalledTimes(1);
-    await expect(postToolCall(real.url, { title: "after close" })).rejects.toThrow();
+    try {
+      const close = vi.fn(() => real.close());
+      const result = await runDemo({
+        startUpstream: async () => ({ url: real.url, calls: real.calls, close }),
+      });
+      expect(result.ok).toBe(false);
+      expect(result.evidence).not.toBeNull();
+      expect(close).toHaveBeenCalledTimes(1);
+      await expect(postToolCall(real.url, { title: "after close" })).rejects.toThrow();
+    } finally {
+      await real.close().catch(() => {});
+    }
   }, 60_000);
 });
 
