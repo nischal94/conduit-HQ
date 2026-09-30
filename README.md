@@ -51,7 +51,11 @@ terminal.
 
 ## Quick start
 
-Not yet on npm — run from source (Node version in [`.nvmrc`](.nvmrc), pnpm):
+**Preview build:** an alpha tarball with install notes is in
+[`docs/alpha/INSTALL.md`](docs/alpha/INSTALL.md) — install it and run
+`conduit demo` to see the approval gate work in one command.
+
+Or run from source (Node version in [`.nvmrc`](.nvmrc), pnpm):
 
 ```bash
 git clone https://github.com/nischal94/conduit-HQ.git && cd conduit-HQ

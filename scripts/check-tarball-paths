@@ -1,6 +1,7 @@
 #!/bin/sh
 # Refuses a preview tarball unless every entry is on the allowlist and the
-# shrinkwrap is present. Allowlist, not denylist: anything else is a refusal.
+# shrinkwrap and LICENSE are present. Allowlist, not denylist: anything else
+# is a refusal.
 set -eu
 if [ "$#" -ne 1 ]; then
   echo "[check-tarball-paths] Usage: check-tarball-paths <tarball.tgz>" >&2
@@ -22,6 +23,11 @@ if [ -n "$unexpected" ]; then
 fi
 if ! printf '%s\n' "$entries" | grep -qx 'package/npm-shrinkwrap.json'; then
   echo "[check-tarball-paths] Refused: npm-shrinkwrap.json is missing. Context: { tarball: $1 }" >&2
+  exit 1
+fi
+# The Apache-2.0 license must travel with every copy of the code.
+if ! printf '%s\n' "$entries" | grep -qx 'package/LICENSE'; then
+  echo "[check-tarball-paths] Refused: LICENSE is missing. Context: { tarball: $1 }" >&2
   exit 1
 fi
 # Names alone are not enough: an allowed name can be a symlink or hard link.

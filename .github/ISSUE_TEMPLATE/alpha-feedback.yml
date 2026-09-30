@@ -1,0 +1,46 @@
+name: Alpha feedback
+description: Tell us how the R3a preview went (about 3 minutes).
+title: "[alpha] feedback"
+labels: ["alpha-feedback"]
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        Thanks for trying the preview. This form creates a PUBLIC GitHub
+        issue: anyone can read it. Never paste a token, the contents of
+        ~/.conduit, your master key, or private repository names.
+  - type: input
+    id: version
+    attributes:
+      label: Output of `conduit --version`
+    validations:
+      required: true
+  - type: input
+    id: minutes-to-pass
+    attributes:
+      label: Minutes from download to `conduit demo` printing PASS
+  - type: input
+    id: minutes-to-governed-call
+    attributes:
+      label: Minutes to the first governed call from your own agent (leave blank if you did not get there)
+  - type: dropdown
+    id: clients
+    attributes:
+      label: How many agents or MCP clients do you connect, or want to connect, to Conduit?
+      options: ["1", "2-3", "4 or more"]
+    validations:
+      required: true
+  - type: dropdown
+    id: per-client-access
+    attributes:
+      label: Should any of them get different tool access than the others?
+      options:
+        - "No: one policy for all of them is fine"
+        - "Yes: I need different access per agent or client"
+        - "Not sure yet"
+    validations:
+      required: true
+  - type: textarea
+    id: stuck
+    attributes:
+      label: Where did you get stuck, if anywhere?

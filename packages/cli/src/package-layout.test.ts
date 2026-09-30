@@ -62,3 +62,11 @@ describe("packed CLI layout", () => {
     expect(Object.keys(pkg.dependencies).filter((d) => d.startsWith("@conduithq/"))).toEqual([]);
   });
 });
+
+describe("license travels with the tarball", () => {
+  it("packages/cli/LICENSE is byte-identical to the root LICENSE", () => {
+    const here = readFileSync(join(process.cwd(), "LICENSE"));
+    const root = readFileSync(join(process.cwd(), "..", "..", "LICENSE"));
+    expect(here.equals(root)).toBe(true);
+  });
+});
