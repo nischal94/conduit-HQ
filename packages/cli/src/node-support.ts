@@ -10,5 +10,5 @@ export function isSupportedNode(version: string): boolean {
 }
 
 export function UNSUPPORTED_NODE_LINE(version: string): string {
-  return `[conduit] Node ${version} is not supported: this preview runs on Node 22 (22.12.0 or later) or Node 24. Switch to a supported Node, then install the tarball again (a version manager keeps global packages per Node version). Notes: ${INSTALL_NOTES_URL}\n`;
+  return `[conduit] Node ${version} is not supported: this preview runs on Node 22 (22.12.0 or later) or Node 24. Switch to a supported Node, then run the command again. Notes: ${INSTALL_NOTES_URL}\n`;
 }
