@@ -782,6 +782,20 @@ R5, and R3/R4 respectively (full continuity map in the §18 entry). **Next: R1.*
 
 **Resolved (locked):**
 
+- **Approval seam — two accepted limits from the PR #65 review (decided 2026-09-30):** ✅
+**(1) An agent with a same-user shell can approve its own paused call.** The §10.2 rule "an agent
+must never approve its own paused call" is enforced by the MCP surface only: approve is not an MCP tool. An
+agent that also has a shell as the operator's OS user can run `conduit approvals list` and run the
+approve line it prints. The seam holds against an agent whose only reach is the MCP surface. It does not hold
+against an agent with a same-user shell, and an operator who gives an agent that shell accepts the limit. This is
+not a new hole: the approve command was already in the README and in `--help`, and PR #65 only names it
+in the pause message. If the limit must close, the successor is a human-presence check that a same-user process
+cannot pass. **(2) `approvals list` resolves `--state-dir` twice** — once for
+the RPC and once for the printed approve lines. A symlink swapped between the two resolutions makes the printed
+lines target another daemon. This is outside the threat model: the swap needs write access to a directory on the
+operator's own state path, and that attacker can point the link at the other daemon before the list runs,
+which the operator then reviews honestly. If wanted later, the fix is to resolve once per invocation and pass the
+canonical value to both paths.
 - **R1 Lane A landed — two recorded deviations and one accepted limit (decided 2026-09-19):** ✅
 Lane A (the SDK half of R1: execution kinds, provenance, the direct arm, scoped authority) landed with three
 departures from the R1 design spec, each deliberate. **(1) The `unknown` outcome travels on the
