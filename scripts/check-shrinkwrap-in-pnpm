@@ -30,14 +30,13 @@ node -e '
     console.error("[check-shrinkwrap-in-pnpm] Refused: no packages were read from the pnpm lockfile, so nothing can be compared.");
     process.exit(1);
   }
-  const named = Object.keys(lock.packages ?? {}).filter((rel) => rel !== "");
-  if (named.length === 0) {
+  const entries = Object.entries(lock.packages ?? {}).filter(([rel]) => rel !== "");
+  if (entries.length === 0) {
     console.error(`[check-shrinkwrap-in-pnpm] Refused: the shrinkwrap names no packages, so nothing can be compared. Context: { shrinkwrap: ${process.argv[1]} }`);
     process.exit(1);
   }
   const bad = [];
-  for (const [rel, meta] of Object.entries(lock.packages ?? {})) {
-    if (rel === "") continue;
+  for (const [rel, meta] of entries) {
     const name = rel.slice(rel.lastIndexOf("node_modules/") + "node_modules/".length);
     if (!seen.get(name)?.has(meta.version)) bad.push(`${name}@${meta.version} (pnpm has: ${[...(seen.get(name) ?? [])].join(", ") || "none"})`);
   }

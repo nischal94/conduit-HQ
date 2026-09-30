@@ -33,8 +33,9 @@ fi
 # Names alone are not enough: an allowed name can be a symlink or hard link.
 # The verbose listing's first character is the entry type on GNU tar and
 # bsdtar alike; only regular files (-) and directories (d) pass.
-links="$(tar -tvzf "$1" | grep -Ev '^[-d]' || true)"
-linked="$(tar -tvzf "$1" | grep -E ' -> | link to ' || true)"
+listing="$(tar -tvzf "$1")"
+links="$(printf '%s\n' "$listing" | grep -Ev '^[-d]' || true)"
+linked="$(printf '%s\n' "$listing" | grep -E ' -> | link to ' || true)"
 if [ -n "$links" ] || [ -n "$linked" ]; then
   echo "[check-tarball-paths] Refused: tarball holds a non-regular entry. Context: { tarball: $1, entries: $links $linked }" >&2
   exit 1

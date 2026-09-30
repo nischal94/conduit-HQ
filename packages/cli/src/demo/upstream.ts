@@ -82,17 +82,22 @@ export function startDemoUpstream(opts: { readOnly?: boolean } = {}): Promise<De
         return;
       }
       const payload = parsed as RpcPayload;
-      const reply = (result: unknown, headers: Record<string, string> = {}): void => {
+      const send = (
+        message: { result: unknown } | { error: { code: number; message: string } },
+        headers: Record<string, string> = {},
+      ): void => {
         res.writeHead(200, { "content-type": "application/json", ...headers });
-        res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, result }));
+        res.end(JSON.stringify({ jsonrpc: "2.0", id: payload.id, ...message }));
       };
       switch (payload.method) {
         case "initialize":
-          reply(
+          send(
             {
-              protocolVersion: "2025-06-18",
-              capabilities: { tools: {} },
-              serverInfo: { name: "conduit-demo-upstream", version: "0" },
+              result: {
+                protocolVersion: "2025-06-18",
+                capabilities: { tools: {} },
+                serverInfo: { name: "conduit-demo-upstream", version: "0" },
+              },
             },
             { "mcp-session-id": "conduit-demo" },
           );
@@ -102,21 +107,14 @@ export function startDemoUpstream(opts: { readOnly?: boolean } = {}): Promise<De
           res.end();
           return;
         case "tools/list":
-          reply({ tools });
+          send({ result: { tools } });
           return;
         case "tools/call":
           calls.push({ name: payload.params?.name ?? "", arguments: payload.params?.arguments });
-          reply({ content: [{ type: "text", text: "note created" }] });
+          send({ result: { content: [{ type: "text", text: "note created" }] } });
           return;
         default:
-          res.writeHead(200, { "content-type": "application/json" });
-          res.end(
-            JSON.stringify({
-              jsonrpc: "2.0",
-              id: payload.id,
-              error: { code: -32601, message: "Method not found" },
-            }),
-          );
+          send({ error: { code: -32601, message: "Method not found" } });
       }
     });
   });
