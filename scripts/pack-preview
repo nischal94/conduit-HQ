@@ -28,7 +28,7 @@ tar -xzf "$stage/conduithq-cli-$version.tgz" -C "$stage"
 cd "$stage/package"
 # devDependencies name workspace packages that are not on any registry, and
 # scripts must not run during resolution: drop both from the staged manifest.
-# Then steer npm to pnpm's tested versions (D-R10): direct dependencies are
+# Add npm-shrinkwrap.json to its `files` list so the repack ships it. Then steer npm to pnpm's tested versions (D-R10): direct dependencies are
 # pinned exactly (an override on a direct dependency is an npm error), every
 # transitive package pnpm resolved to ONE version gets an override, and a
 # package pnpm resolved to several versions gets one override per dependent
@@ -79,6 +79,10 @@ node -e '
   for (const project of Array.isArray(tree) ? tree : [tree]) collect(project.dependencies);
   delete pkg.devDependencies;
   delete pkg.scripts;
+  // npm pack honors the `files` allowlist, and npm adds npm-shrinkwrap.json
+  // only when that list names it.
+  pkg.files ??= [];
+  if (!pkg.files.includes("npm-shrinkwrap.json")) pkg.files.push("npm-shrinkwrap.json");
   pkg.overrides = {};
   for (const name of Object.keys(pkg.dependencies)) {
     const versions = [...(seen.get(name) ?? [])];
