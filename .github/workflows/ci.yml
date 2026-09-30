@@ -167,6 +167,7 @@ jobs:
   pack:
     name: Pack preview tarball (once)
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     outputs:
       sha256: ${{ steps.pack.outputs.sha256 }}
     steps:
@@ -182,11 +183,17 @@ jobs:
       - name: Pack, then record the tarball and its SHA-256
         id: pack
         run: |
-          # No pipe: a failed pack must fail THIS step (set -e sees the script's exit).
-          scripts/pack-preview "$RUNNER_TEMP/preview" > "$RUNNER_TEMP/pack.log"
+          # No pipe: the step captures the script's exit status itself, so a
+          # failed pack fails THIS step, and pack.log (stdout) is printed.
+          status=0
+          scripts/pack-preview "$RUNNER_TEMP/preview" > "$RUNNER_TEMP/pack.log" || status=$?
           tarball="$(tail -n 1 "$RUNNER_TEMP/pack.log")"
-          test -f "$tarball"
-          test -f "$tarball.sha256"
+          if [ "$status" -ne 0 ] || [ ! -f "$tarball" ] || [ ! -f "$tarball.sha256" ]; then
+            echo "[pack] Pack failed: pack-preview exited $status or wrote no tarball and checksum. Context: { tarball: $tarball }" >&2
+            echo "--- pack-preview stdout (pack.log):" >&2
+            cat "$RUNNER_TEMP/pack.log" >&2
+            exit 1
+          fi
           echo "sha256=$(cut -d ' ' -f 1 "$tarball.sha256")" >> "$GITHUB_OUTPUT"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
@@ -198,6 +205,7 @@ jobs:
     name: Preview tarball (${{ matrix.os }}, Node ${{ matrix.node }})
     needs: pack
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 10
     strategy:
       fail-fast: false
       matrix:
@@ -211,6 +219,8 @@ jobs:
       - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020 # v4.4.0
         with:
           node-version: ${{ matrix.node }}
+          # The Node 24 legs test the newest 24.x, not a cached older one.
+          check-latest: ${{ matrix.node == '24' }}
       - name: This leg is the target the notes claim (Linux x64 glibc / macOS arm64)
         env:
           OS: ${{ matrix.os }}
@@ -245,13 +255,19 @@ jobs:
         run: npm install -g --prefix "$RUNNER_TEMP/prefix" --ignore-scripts "$TARBALL"
       - name: npm installed exactly the shrinkwrapped tree
         run: scripts/check-shrinkwrap-installed "$RUNNER_TEMP/prefix/lib/node_modules/@conduithq/cli"
-      - name: conduit demo neither opens nor creates the state path, and ignores CONDUIT_*
+      - name: conduit demo neither opens nor creates the state path, and ignores CONDUIT_DB, CONDUIT_MASTER_KEY, and the egress env var
         working-directory: ${{ runner.temp }}
         run: |
           export PATH="$RUNNER_TEMP/prefix/bin:$PATH"
           state="$(node -p 'require("node:path").join(require("node:os").userInfo().homedir, ".conduit")')"
           "$GITHUB_WORKSPACE/scripts/check-absent" "$state"
-          test "$(conduit --version)" = "$(node -p "require('$GITHUB_WORKSPACE/packages/cli/package.json').version")"
+          # Each command runs in its own assignment, so set -e sees its exit status.
+          got="$(conduit --version)"
+          want="$(node -p "require('$GITHUB_WORKSPACE/packages/cli/package.json').version")"
+          if [ "$got" != "$want" ]; then
+            echo "[preview] conduit --version mismatch. Context: { got: $got, want: $want }" >&2
+            exit 1
+          fi
           # A FILE where the state dir would be, unreadable: any open fails
           # (EACCES) and any mkdir fails (EEXIST), so a demo that opens or
           # creates state cannot PASS. It does NOT catch a bare stat/exists.
@@ -268,7 +284,11 @@ jobs:
         run: |
           export PATH="$RUNNER_TEMP/prefix/bin:$PATH"
           conduit key generate
-          test "$(conduit approvals list)" = "No paused executions awaiting approval."
+          listed="$(conduit approvals list)"
+          if [ "$listed" != "No paused executions awaiting approval." ]; then
+            echo "[preview] conduit approvals list mismatch. Context: { got: $listed }" >&2
+            exit 1
+          fi
           conduit daemon status
           conduit daemon stop
       - name: The installed conduit-mcp doctor runs (the notes advertise it)
@@ -281,6 +301,7 @@ jobs:
     name: Preview tarball refuses an unsupported Node (20)
     needs: pack
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4.3.1
         with:
@@ -311,6 +332,15 @@ jobs:
           conduit --version > out.txt 2> err.txt
           code=$?
           set -e
+          # On any failed assertion below, show what the guard printed.
+          report() {
+            echo "[preview] Node-guard check failed. Context: { exit: $code }" >&2
+            echo "--- stdout (out.txt):" >&2
+            cat out.txt >&2
+            echo "--- stderr (err.txt):" >&2
+            cat err.txt >&2
+          }
+          trap report ERR
           test "$code" = "1"
           test ! -s out.txt
           test "$(wc -l < err.txt)" -eq 1
