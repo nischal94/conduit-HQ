@@ -1,8 +1,4 @@
 // packages/cli/src/demo/run.ts
-
-import { mkdirSync } from "node:fs";
-import { userInfo } from "node:os";
-import { join } from "node:path";
 import { createApprovalRuntime, provisionSourceRequest } from "@conduithq/mcp";
 import {
   type ExecutionManager,
@@ -149,7 +145,6 @@ export async function runDemo(deps: DemoDeps = {}): Promise<DemoResult> {
 }
 
 async function drive(deps: DemoDeps, log: string[]): Promise<DemoResult> {
-  mkdirSync(join(userInfo().homedir, ".conduit"), { recursive: true });
   const sink = (line: string): void => {
     log.push(line);
   };
