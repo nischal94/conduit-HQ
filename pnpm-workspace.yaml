@@ -25,6 +25,7 @@ overrides:
   # line: an open ">=3.1.6" resolved to fast-uri 4.1.3 on the first install
   # — a major outside ajv's declared ^3.0.1, the nanoid-6 trap of 2026-08-17.
   # 2026-09-30: two more HIGH advisories name 3.1.6 itself (GHSA-qw65-cvwx-89v3,
-  # host confusion via an unclosed bracket; GHSA-58mr-gqgx-xq4g). The range
-  # widens by one patch; the floor moves to 3.1.7, still on the 3.x line.
+  # authority injection via an unvalidated port in serialize; GHSA-58mr-gqgx-xq4g,
+  # host confusion via an unclosed bracket). The range widens by one patch;
+  # the floor moves to 3.1.7, still on the 3.x line.
   "fast-uri@>=3.1.3 <3.1.7": ">=3.1.7 <4"
